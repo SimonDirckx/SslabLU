@@ -1,5 +1,11 @@
 import numpy as np
 
+
+##################################
+#       px=py=p
+##################################
+
+
 def cheb_pts(p):
     xpts = np.zeros(shape=(p+1,))
     for i in range(p+1):
@@ -34,33 +40,35 @@ def Diffmat(xpts):
     return D
 
 
-def XYpoints(H,L,p):
-    xpts = -cheb_pts(p)
-    ypts = xpts
+def XYpoints(H,L,px,py):
+    xpts = -cheb_pts(px)
+    ypts = -cheb_pts(py)
     xpts = .5*H*(xpts+1.)
     ypts =.5*L*(ypts+1.)
-    XY=np.zeros(shape=((p+1)*(p+1),2))
-    for j in range(0,p+1):
-        for i in range(0,p+1):    
-            XY[j+i*(p+1),:] = [xpts[i],ypts[j]]
+    XY=np.zeros(shape=((px+1)*(py+1),2))
+    for j in range(0,py+1):
+        for i in range(0,px+1):    
+            XY[j+i*(py+1),:] = [xpts[i],ypts[j]]
     return XY,xpts,ypts
 
-def discrN(pts):
-    D = Diffmat(pts)
-    n=len(pts)
-    E = np.identity(n)
-    N = np.kron(D,E)
+def discrN(xpts,ypts):
+    D = Diffmat(xpts)
+    py=len(ypts)-1
+    Ey = np.identity(py+1)
+    N = np.kron(D,Ey)
     return N
 
 def discrLaplace(xpts,ypts):
-    p=len(xpts)-1
+    px=len(xpts)-1
+    py=len(ypts)-1
     Dx=Diffmat(xpts)
     Dy=Diffmat(ypts)
-    E=np.identity(p+1)
+    Ex=np.identity(px+1)
+    Ey=np.identity(py+1)
     Dxx=Dx@Dx
     Dyy=Dy@Dy
-    Lx = np.kron(Dxx,E)
-    Ly = np.kron(E,Dyy)
+    Lx = np.kron(Dxx,Ey)
+    Ly = np.kron(Ex,Dyy)
     L = Lx+Ly
     return L
 def partition_single_slab(H,L,XY):

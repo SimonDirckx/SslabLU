@@ -18,9 +18,10 @@ import spectralDisc as spectral
 # restriction will be dropped
 
 
-H = 1./3.
+H = 1./5.
 L = 1.
-p = 10
+px = 12
+py = 20
 
 
 # Per slab, we specify a
@@ -32,13 +33,17 @@ def l2g2(x,y):
     return x+H,y
 def l2g3(x,y):
     return x+2.*H,y
+def l2g4(x,y):
+    return x+3.*H,y
+def l2g5(x,y):
+    return x+4.*H,y
 
 
 # We collect the dofs and their partitions
 # note: because the discr. are all the same
 # we can get away here with only doing this once
 
-XY,xpts,ypts = spectral.XYpoints(H,L,p)
+XY,xpts,ypts = spectral.XYpoints(H,L,px,py)
 Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii  = spectral.partition_single_slab(H,L,XY)
 
 
@@ -46,7 +51,7 @@ Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii  = spectral.partition_single_slab
 # discrete laplacians
 # Again, here we can recycle
 
-N = spectral.discrN(xpts)
+N = spectral.discrN(xpts,ypts)
 Lp = spectral.discrLaplace(xpts,ypts)
 
 
@@ -55,19 +60,27 @@ Lp = spectral.discrLaplace(xpts,ypts)
 slab1 = mS.Slab(Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii,Lp,N,N,XY,l2g1)
 slab2 = mS.Slab(Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii,Lp,N,N,XY,l2g2)
 slab3 = mS.Slab(Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii,Lp,N,N,XY,l2g3)
+slab4 = mS.Slab(Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii,Lp,N,N,XY,l2g4)
+slab5 = mS.Slab(Iobl,Ioblc,Icbl,Icblc,Iobr,Iobrc,Icbr,Icbrc,Ii,Lp,N,N,XY,l2g5)
 
 # we indicate to the program
 # that slab 1 & 3 live at the edge of the domain
 
 slab1.set_edge()
-slab3.set_edge()
+slab5.set_edge()
 
 
 # we create the two corresponding double slabs
 # and collect them
 dSlab1 = mS.dSlab(slab1,slab2)
 dSlab2 = mS.dSlab(slab2,slab3)
-slabList = [dSlab1,dSlab2]
+dSlab3 = mS.dSlab(slab3,slab4)
+dSlab4 = mS.dSlab(slab4,slab5)
+slabList = [dSlab1,dSlab2,dSlab3,dSlab4]
+
+totalDofs=0
+for dS in slabList:
+    totalDofs+=dS.SL.ndofs
 
 # until we command it to,
 # the double slab object does not compute its
@@ -81,6 +94,8 @@ slabList = [dSlab1,dSlab2]
 
 dSlab1.computeL()
 dSlab2.computeL()
+dSlab3.computeL()
+dSlab4.computeL()
 
 
 # multislab is now a rather simple wrapper
@@ -119,4 +134,4 @@ u = np.linalg.solve(Stot,btot)
 # function at the interface dofs
 
 u0 = MS.eval_at_interfaces(func)
-print('u err. = ',np.linalg.norm(u-u0,np.inf))
+print('u err. @ ',totalDofs,' dofs = ',np.linalg.norm(u-u0,np.inf))
