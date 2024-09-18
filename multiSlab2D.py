@@ -1,5 +1,9 @@
 import numpy as np
+import scipy as sc
+import scipy.sparse as sparse
+import scipy.sparse.linalg as splinalg
 import spectralDisc as spectral
+import stencilDisc as stencil
 
 class partition:
      '''
@@ -93,11 +97,22 @@ class discretization:
         self.discType = discType
         if self.discType=='cheb':
             self.ordx = 2*(ordx//2)
+        if self.discType=='stencil':
+            self.ordx = 2*(ordx//2)+1
         self.ordy = ordy
+    #def __init__(self,ord:int,discType:str):
+    #    self.discType = discType
+    #    if self.discType=='cheb':
+    #        self.ordx = 2*(ord//2)
+    #    if self.discType=='stencil':
+    #        self.ordx = 2*(ord//2)+1
+    #    self.ordy = self.ordx
     
     def discretize(self,H,L):
         self.H = H
         self.L = L
+        xpts=[]
+        ypts=[]
         if self.discType == 'cheb':    
             xpts = -spectral.cheb_pts(self.ordx)
             ypts = -spectral.cheb_pts(self.ordy)
@@ -105,16 +120,25 @@ class discretization:
             ypts = .5*self.L*(ypts+1.)
             self.xpts=xpts
             self.ypts=ypts
-            XY=np.zeros(shape=((self.ordx+1)*(self.ordy+1),2))
-            for j in range(self.ordy+1):
-                y = ypts[j]
-                for i in range(self.ordx+1):    
-                    XY[j+i*(self.ordy+1),:] = [xpts[i],y]
-            self.XY=XY
+        if self.discType == 'stencil':    
+            xpts = np.linspace(0,1,self.ordx)
+            ypts = np.linspace(0,1,self.ordy)
+            xpts = 2.*self.H*(xpts)
+            ypts = self.L*ypts
+            self.xpts=xpts
+            self.ypts=ypts
+        XY=np.zeros(shape=(len(xpts)*len(ypts),2))
+        for j in range(len(ypts)):
+            y = ypts[j]
+            for i in range(len(xpts)):    
+                XY[j+i*len(ypts),:] = [xpts[i],y]
+        self.XY=XY
     
     def ndofs(self):
         if self.discType=='cheb':
             return (self.ordx+1)*(self.ordy+1)
+        if self.discType=='stencil':
+            return self.ordx*self.ordy
         else:
             return 0
     
@@ -122,12 +146,18 @@ class discretization:
         if self.discType=='cheb':
             Dx = spectral.Diffmat(self.xpts)
             return Dx
+        if self.discType=='stencil':
+            Dx = stencil.Diffmat(self.xpts)
+            return Dx
         else:
             return 0
     
     def get_Dy(self):
         if self.discType=='cheb':
             Dy = spectral.Diffmat(self.ypts)
+            return Dy
+        if self.discType=='stencil':
+            Dy = stencil.Diffmat(self.ypts)
             return Dy
         else:
             return 0
@@ -223,6 +253,11 @@ class dSlab:
         self.Ii     =   Ii
         self.Ic     =   Ic
         self.Ib     =   Ib
+        #print('Ibl' , Ibl)
+        #print('Ibr' , Ibr)
+        #print('Ii'  , Ii)
+        #print('Ic'  , Ic)
+        #print('Ib'  , Ib)
     
     
     def computeL(self):
@@ -234,8 +269,9 @@ class dSlab:
         Dyy = Dy@Dy
         Ex  = self.disc.get_Ex()
         Ey  = self.disc.get_Ey()
-        L = np.kron(Ex,Dyy)+np.kron(Dxx,Ey)
+        L = sparse.kron(Ex,Dyy)+sparse.kron(Dxx,Ey)
         self.L=L
+    
     
     def computeS_left(self):
         L=self.L
@@ -244,7 +280,7 @@ class dSlab:
         Libl=L[Ii,:][:,Il]
         Lii = L[Ii,:][:,Ii]
         S0 =np.zeros(shape=(self.ndofs,len(Il)))
-        S0[Ii,:] = np.linalg.solve(Lii,Libl)
+        S0[Ii,:] = splinalg.spsolve(Lii,Libl).todense()
         S=S0[self.Ic,:]
         self.SL = S
         self.SLComputed = True
@@ -258,7 +294,7 @@ class dSlab:
         Libr=L[Ii,:][:,Ir]
         Lii = L[Ii,:][:,Ii]
         S0 =np.zeros(shape=(self.ndofs,len(Ir)))
-        S0[Ii,:] = np.linalg.solve(Lii,Libr)
+        S0[Ii,:] = splinalg.spsolve(Lii,Libr).todense()
         S=S0[self.Ic,:]
         self.SR=S
         self.SRComputed = True
@@ -310,7 +346,7 @@ class dSlab:
         f0[Il] = 0.
         f0[Ir] = 0.
         
-        b0[Ii] = -np.linalg.solve(Lii,Lib@f0[Ib])
+        b0[Ii] = -splinalg.spsolve(Lii,Lib@f0[Ib]).todense()
         
         b   =   b0[self.Ic]
         b  -=   b00

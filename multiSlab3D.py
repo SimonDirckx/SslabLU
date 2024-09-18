@@ -1,6 +1,7 @@
 import numpy as np
 import spectralDisc as spectral
-
+import scipy.sparse as sparse
+import scipy.sparse.linalg as splinalg
 class partition:
      '''
      
