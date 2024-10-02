@@ -169,6 +169,24 @@ class discretization:
     def get_Ey(self):
         Ey = np.identity(len(self.ypts))
         return Ey
+    def get_Dxx(self):
+        if self.discType=='cheb':
+            Dx = spectral.Diffmat(self.xpts)
+            return Dx.T@Dx
+        if self.discType=='stencil':
+            Dx = stencil.Diffmat(self.xpts)
+            return Dx.T@Dx
+        else:
+            return 0
+    def get_Dyy(self):
+        if self.discType=='cheb':
+            Dy = spectral.Diffmat(self.ypts)
+            return Dy.T@Dy
+        if self.discType=='stencil':
+            Dy = stencil.Diffmat(self.ypts)
+            return Dy.T@Dy
+        else:
+            return 0
      
     
 class dSlab:
@@ -263,10 +281,8 @@ class dSlab:
     def computeL(self):
         
         # future work: implement diff operator from "self.prblm"
-        Dx = self.disc.get_Dx()
-        Dy = self.disc.get_Dy()
-        Dxx = Dx@Dx
-        Dyy = Dy@Dy
+        Dxx = self.disc.get_Dxx()
+        Dyy = self.disc.get_Dyy()
         Ex  = self.disc.get_Ex()
         Ey  = self.disc.get_Ey()
         L = sparse.kron(Ex,Dyy)+sparse.kron(Dxx,Ey)

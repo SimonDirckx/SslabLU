@@ -10,10 +10,9 @@ def Diffmat(xpts0):
     h=xpts0[1]-xpts0[0]
     nx=len(xpts0)
     e=np.ones(shape=(nx-1,))
-    D = 2.*np.identity(nx)-1.*np.diag(e,-1)-1.*np.diag(e,-1)
+    D = np.identity(nx)-1.*np.diag(e,-1)
     D/=h
     return D
-
 
 def discrLaplace(xpts,ypts):
     Dx=Diffmat(xpts)

@@ -12,6 +12,14 @@ def qr_null(A, rnk0:int):
 def qr_col(A, rnk:int):
     Q, R, P = qr(A, mode='full', pivoting=True)
     return Q[:, 0:rnk]
+def qr_col_eps(A,B, eps):
+    QA, RA, PA = qr(A, mode='full', pivoting=True)
+    QB, RB, PB = qr(B, mode='full', pivoting=True)
+    tol=.1*eps*min(np.linalg.norm(np.diag(RA)),np.linalg.norm(np.diag(RB)))
+    rnkA = min(A.shape) - np.abs(np.diag(RA))[::-1].searchsorted(tol)
+    rnkB = min(B.shape) - np.abs(np.diag(RB))[::-1].searchsorted(tol)
+    rnk=max(rnkA,rnkB)
+    return QA[:, 0:rnk],QB[:, 0:rnk]
 
 
 '''
@@ -139,34 +147,80 @@ def compress_HBS(T:HBSTree,OMEGA,PSI,Y,Z,rnk,s):
         Psi = PSI[idxs,:]
         Yt  = Y[idxs,:]
         Zt  = Z[idxs,:]
+        n=len(idxs)
         T.set_OmPsiYZ(Om,Psi,Yt,Zt)
         P = qr_null(Om,rnk)
         Q = qr_null(Psi,rnk)
-        U = qr_col(Yt@P,rnk)
-        V = qr_col(Zt@Q,rnk)
-        n=len(idxs)
-        D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T
+        U = qr_col(Yt@P,min(rnk,n))
+        V = qr_col(Zt@Q,min(rnk,n))
+        D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
         T.set_UDV(U,D,V)
     else:
-        n   = rnk*T.number_of_children
+        n=0
+        for child in T.children:
+            compress_HBS(child,OMEGA,PSI,Y,Z,rnk,s)
+            n+= child.rnk
         Om  = np.zeros(shape=(n,s))
         Psi = np.zeros(shape=(n,s))
         Yt  = np.zeros(shape=(n,s))
         Zt  = np.zeros(shape=(n,s))
+        n0 = 0
         for child in T.children:
-            compress_HBS(child,OMEGA,PSI,Y,Z,rnk,s)
-            n0  =   rnk*child.child_index
-            Om[n0:n0+rnk,:]     = child.V.T@child.Om
-            Psi[n0:n0+rnk,:]    = child.U.T@child.Psi
-            Yt[n0:n0+rnk,:]     = child.U.T@(child.Y - child.D@child.Om)
-            Zt[n0:n0+rnk,:]     = child.V.T@(child.Z - child.D.T@child.Psi)
+            Om[n0:n0+child.rnk,:]     = child.V.T@child.Om
+            Psi[n0:n0+child.rnk,:]    = child.U.T@child.Psi
+            Yt[n0:n0+child.rnk,:]     = child.U.T@(child.Y - child.D@child.Om)
+            Zt[n0:n0+child.rnk,:]     = child.V.T@(child.Z - child.D.T@child.Psi)
+            n0  +=   child.rnk
         T.set_OmPsiYZ(Om,Psi,Yt,Zt)
         if T.level>0:
             P = qr_null(Om,rnk)
             Q = qr_null(Psi,rnk)
             U = qr_col(Yt@P,rnk)
             V = qr_col(Zt@Q,rnk)
-            D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T
+            D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
+            T.set_UDV(U,D,V)
+            
+        else:
+            D = Yt@np.linalg.pinv(Om)
+            T.set_D(D)
+def compress_HBS_eps(T:HBSTree,OMEGA,PSI,Y,Z,rnk,s,eps):
+    if T.is_leaf:
+        idxs=T.idxs
+        Om  = OMEGA[idxs,:]
+        Psi = PSI[idxs,:]
+        Yt  = Y[idxs,:]
+        Zt  = Z[idxs,:]
+        n=len(idxs)
+        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
+        P = qr_null(Om,rnk)
+        Q = qr_null(Psi,rnk)
+        #U = qr_col(Yt@P,min(rnk,n))
+        #V = qr_col(Zt@Q,min(rnk,n))
+        U,V = qr_col_eps(Yt@P,Zt@Q,eps)
+        D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
+        T.set_UDV(U,D,V)
+    else:
+        n=0
+        for child in T.children:
+            compress_HBS_eps(child,OMEGA,PSI,Y,Z,rnk,s,eps)
+            n+= child.rnk
+        Om  = np.zeros(shape=(n,s))
+        Psi = np.zeros(shape=(n,s))
+        Yt  = np.zeros(shape=(n,s))
+        Zt  = np.zeros(shape=(n,s))
+        n0 = 0
+        for child in T.children:
+            Om[n0:n0+child.rnk,:]     = child.V.T@child.Om
+            Psi[n0:n0+child.rnk,:]    = child.U.T@child.Psi
+            Yt[n0:n0+child.rnk,:]     = child.U.T@(child.Y - child.D@child.Om)
+            Zt[n0:n0+child.rnk,:]     = child.V.T@(child.Z - child.D.T@child.Psi)
+            n0  +=   child.rnk
+        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
+        if T.level>0:
+            P = qr_null(Om,rnk)
+            Q = qr_null(Psi,rnk)
+            U,V=qr_col_eps(Yt@P,Zt@Q,eps)
+            D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
             T.set_UDV(U,D,V)
             
         else:
@@ -177,60 +231,74 @@ def random_compression_HBS(tree,OMEGA,PSI,Y,Z,rnk,s):
     T=copy_tree_to_HBS(tree)
     compress_HBS(T,OMEGA,PSI,Y,Z,rnk,s)
     return T
+def random_compression_HBS_eps(tree,OMEGA,PSI,Y,Z,rnk,s,eps):
+    T=copy_tree_to_HBS(tree)
+    compress_HBS_eps(T,OMEGA,PSI,Y,Z,rnk,s,eps)
+    return T
 
 
-def apply_HBS_upward(HBSMat:HBSTree,q,rnk):
+def apply_HBS_upward(HBSMat:HBSTree,q):
     #upward pass
     if HBSMat.is_leaf:
         qhat = HBSMat.V.T@q[HBSMat.idxs]
         HBSMat.set_qhat(qhat)
     elif HBSMat.level>0:
-        n   = rnk*HBSMat.number_of_children
-        qhat = np.zeros(shape=(n,))
+        n   = 0
         for child in HBSMat.children:
-            apply_HBS_upward(child,q,rnk)
-            n0=rnk*child.child_index
-            qhat[n0:n0+rnk]=child.qhat
+            n+=child.rnk
+        qhat = np.zeros(shape=(n,))
+        n0 = 0
+        for child in HBSMat.children:
+            apply_HBS_upward(child,q)
+            qhat[n0:n0+child.rnk]=child.qhat
+            n0+=child.rnk
         qhat = HBSMat.V.T@qhat
         HBSMat.set_qhat(qhat)
     else:
-        
         for child in HBSMat.children:
-            apply_HBS_upward(child,q,rnk)
+            apply_HBS_upward(child,q)
 
-def apply_HBS_downward(HBSMat:HBSTree,u,q,rnk):
+def apply_HBS_downward(HBSMat:HBSTree,u,q):
     if HBSMat.level==0:
         D=HBSMat.D
-        n = rnk*HBSMat.number_of_children
+        n   = 0
+        for child in HBSMat.children:
+            n+=child.rnk
         qhat = np.zeros(shape=(n,))
+        n0 = 0
         for child in HBSMat.children:
-            n0=rnk*child.child_index
-            qhat[n0:n0+rnk] = child.qhat
+            qhat[n0:n0+child.rnk] = child.qhat
+            n0+=child.rnk
         uhat = D@qhat
+        n0 = 0
         for child in HBSMat.children:
-            n0=rnk*child.child_index
-            child.set_uhat(uhat[n0:n0+rnk])
-            apply_HBS_downward(child,u,q,rnk)
+            child.set_uhat(uhat[n0:n0+child.rnk])
+            n0+=child.rnk
+            apply_HBS_downward(child,u,q)
     elif not HBSMat.is_leaf:
         U = HBSMat.U
         D = HBSMat.D
-        n = rnk*HBSMat.number_of_children
+        n   = 0
+        for child in HBSMat.children:
+            n+=child.rnk
         qhat = np.zeros(shape=(n,))
+        n0 = 0
         for child in HBSMat.children:
-            n0=rnk*child.child_index
-            qhat[n0:n0+rnk] = child.qhat
+            qhat[n0:n0+child.rnk] = child.qhat
+            n0+=child.rnk
         uhat = U@HBSMat.uhat+D@qhat
+        n0=0
         for child in HBSMat.children:
-            n0=rnk*child.child_index
-            child.set_uhat(uhat[n0:n0+rnk])
-            apply_HBS_downward(child,u,q,rnk)
+            child.set_uhat(uhat[n0:n0+child.rnk])
+            n0+=child.rnk
+            apply_HBS_downward(child,u,q)
     else:
         U=HBSMat.U
         D=HBSMat.D
         u[HBSMat.idxs]=U@HBSMat.uhat+D@q[HBSMat.idxs]
 
-def apply_HBS(HBSMat:HBSTree,q,rnk):
+def apply_HBS(HBSMat:HBSTree,q):
     u=np.zeros(shape=q.shape)
-    apply_HBS_upward(HBSMat,q,rnk)
-    apply_HBS_downward(HBSMat,u,q,rnk)
+    apply_HBS_upward(HBSMat,q)
+    apply_HBS_downward(HBSMat,u,q)
     return u
