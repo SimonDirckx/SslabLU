@@ -1,0 +1,3 @@
+[submodule "spectralmultidomain"]
+	path = spectralmultidomain
+	url = https://github.com/annayesy/spectralmultidomain.git
