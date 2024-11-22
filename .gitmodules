@@ -1,3 +1,6 @@
 [submodule "spectralmultidomain"]
 	path = spectralmultidomain
 	url = https://github.com/annayesy/spectralmultidomain.git
+[submodule "simpleoctree"]
+	path = simpleoctree
+	url = https://github.com/annayesy/simpleoctree
