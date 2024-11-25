@@ -1,0 +1,5 @@
+QUESTIONS:
+
+(1) DtN <-> Schur Complement:	* Can we always relate Schur to some (co-)normal deriv?
+				* If not, what is the interpretation of simple Schur?
+				

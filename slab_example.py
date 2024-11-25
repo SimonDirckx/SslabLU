@@ -1,7 +1,7 @@
 import numpy as np
-
-from hps.pdo               import PDO2d,PDO3d,const
-from hps.geom              import BoxGeometry
+import spectralmultidomain.hps as hps
+from spectralmultidomain.hps.pdo               import PDO2d,PDO3d,const
+from spectralmultidomain.hps.geom              import BoxGeometry
 from slab_subdomain        import SlabSubdomain
 
 from time import time

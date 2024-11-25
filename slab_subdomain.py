@@ -1,5 +1,5 @@
-from hps.hps_multidomain   import HPSMultidomain
-from hps.fd_discretization import FDDiscretization
+from spectralmultidomain.hps.hps_multidomain   import HPSMultidomain
+from spectralmultidomain.hps.fd_discretization import FDDiscretization
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 
