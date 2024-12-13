@@ -1,7 +1,8 @@
-import hps.hps_multidomain as hps
 import geometry.slabGeometry as slabGeom
-import hps.pdo as pdo
-
+import pdo.pdo as pdo
+import numpy as np
+from scipy.sparse.linalg   import LinearOperator
+from solver.stencil.stencilSolver import stencilSolver as stencil
 
 
 class solverOptions:
@@ -12,70 +13,108 @@ class solverOptions:
     ordx,ordy:  order in x and y directions
     a:          characteristic scale in case of HPS
     """
-    def __init__(self,type:str,ordx,ordy,a=1):
+    def __init__(self,type:str,ord,a=1):
         self.type   =   type
-        self.ordx   =   ordx
-        self.ordy   =   ordy
+        self.ord    =   ord
         self.a      =   a
+        self.nyz    =   1
+        if type=='stencil':
+            for i in range(1,len(ord)):
+                self.nyz *= (ord[i]-2)
 
 
-class localSolver:
+class solverWrapper:
     """
-    Class for local Solver
+    Wrapper class for local Solver
     @param:
     opts:       slab options
     """
     def __init__(self,opts:solverOptions):
-        self.opts=opts
-
-    def construct(self,geom:slabGeom,PDE:pdo.PDO2d):
+        self.ord   = opts.ord
+        self.type   = opts.type
+        self.a      = opts.a
+        self.solver = None
+        self.type = opts.type
+        self.constructed = False
+    def construct(self,geom:slabGeom.slabGeometry,PDE:pdo):
         """
         Actual construction of the local solver
         """
         self.geom   = geom
         self.PDE    = PDE
-        if self.opts.type=='HPS':
-            self.solver = hps(PDE, geom, self.opts.a, self.opts.ordx)
+        if self.type=='stencil':
+            self.solver = stencil(PDE, geom, self.ord)
+            self.constructed=True
         
         self.XX = self.solver.XX
+        self.XXi = self.solver.XXi
+        self.XXb = self.solver.XXb
         self.ndofs = self.XX.shape[0]
-    def get_T(self,I,J):
-        """DtN map from I to J"""
-        return 0
-    def get_S(self,I,J):
-        """DtD map from I to J"""
-        return 0
+        self.constructMapIdxs()
+    
+    def constructMapIdxs(self):
+        Il,Ic,Ir,IGB=self.geom.getIlIcIr(self.XXi,self.XXb)
+        self.leftIdxs=Il
+        self.rightIdxs=Ir
+        self.middleIdxs=Ic
+        self.IGB=IGB
+            
 
-class localMapper:
-    """
-    Class for local Mapper
-    @param:
-    typeS2T:    type of source-to-target map
-    locSl:      location of left sources
-    locSr:      location of right sources
-    locTl:      location of left targets
-    locTr:      location of right targets
+    def stMap(self,J:list[int],I:list[int],stType):
+        #for now:   in case of DtD, I should be subset indices in Ii, J should be subset indices in Ib
+        #           in case of DtN, both should be subset indices in Ib
+        if stType=='DtD':
+            if not I==J:
+                AiJ  = self.solver.Aib[:,J]
+            LUii  = self.solver.solver_ii
 
-    @leftMap:   maps left sources to right targets
-    @rightMap:  maps right sources to left targets
+            def matmat(v,transpose=False):
+                if I==J:
+                    return v 
+                if (v.ndim == 1):
+                    v_tmp = v[:,np.newaxis]
+                else:
+                    v_tmp = v
 
-    """
-    def __init__(self,locSl,locSr,locTl,locTr,typeS2T:str='DtD'):
-        self.typeS2T    = typeS2T
-        self.locSl      = locSl
-        self.locSr      = locSr
-        self.locTl      = locTl
-        self.locTr      = locTr
+                if (not transpose):
+                    result = LUii.matmat(AiJ@v_tmp)[I]
+                else:
+                    result      = np.zeros(shape=(len(self.solver._Ji,)))
+                    result[I]   = v_tmp
+                    result      = AiJ.T @ LUii.rmatmat(v_tmp)
 
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
 
-    def leftMap(self,solver:localSolver):
-        if(self.typeS2T == 'DtN'):
-            return solver.get_T(self.locSl,self.locTr)
-        if(self.typeS2T == 'DtD'):
-            return solver.get_S(self.locSl,self.locTr)
+            return LinearOperator(shape=(len(I),len(J)),\
+                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
+                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
+        if stType=='DtN':
+            AIJ = self.solver.Abb[I][:,J]
+            AIi  = self.solver.Abi[I]
+            AiJ  = self.solver.Aib[:,J]
+            LUii  = self.solver.solver_ii
 
-    def rightMap(self,solver:localSolver):
-        if(self.typeS2T == 'DtN'):
-            return solver.get_T(self.locSr,self.locTl)
-        if(self.typeS2T == 'DtD'):
-            return solver.get_S(self.locSr,self.locTl)
+            def matmat(v,transpose=False):
+
+                if (v.ndim == 1):
+                    v_tmp = v[:,np.newaxis]
+                else:
+                    v_tmp = v
+
+                if (not transpose):
+
+                    result = AIJ @ v_tmp
+                    result -= AIi @ LUii.matmat(AiJ @ v_tmp)
+                else:
+                    result = AIJ.T @ v_tmp
+                    result -= AiJ.T @ LUii.rmatmat(AIi.T @ v_tmp)
+
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
+
+            return LinearOperator(shape=AIJ.shape,\
+                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
+                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))

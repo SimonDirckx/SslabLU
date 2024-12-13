@@ -22,8 +22,25 @@ class matAssembler:
     """
     Wrapper class for the construction of matrices
     """
-    def __init__(self,linOp:LinearOperator,matOpts:matAssemblerOptions):
-        self.linOp      = linOp
+    def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
-    def assemble(self):
-        return 0
+    def assemble(self,linOp:LinearOperator):
+        if self.matOpts.method == 'dense':
+            return linOp.matmat(np.identity(linOp.shape[1]))
+
+
+'''
+DEFAULT ASSEMBLERS
+'''
+
+class denseMatAssembler(matAssembler):
+    def __init__(self):
+        super(denseMatAssembler,self).__init__(matAssemblerOptions())
+
+class rkHMatAssembler(matAssembler):
+    def __init__(self,rk,tree):
+        super(denseMatAssembler,self).__init__(matAssemblerOptions('HBF',1e-5,rk,tree))
+
+class tolHMatAssembler(matAssembler):
+    def __init__(self,tol,tree):
+        super(denseMatAssembler,self).__init__(matAssemblerOptions('HBF',tol,20,tree))
