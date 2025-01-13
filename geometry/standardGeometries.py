@@ -13,11 +13,11 @@ class Box:
     
 class unitSquare(Box):
     def __init__(self):
-        super(unitSquare,self).__init__([[0,0],[1,1]])
+        super(unitSquare,self).__init__([np.array([0,0]),np.array([1,1])])
 
-class unitCube:
+class unitCube(Box):
     def __init__(self):
-        super(unitCube,self).__init__([[0,0,0],[1,1,1]])
+        super(unitCube,self).__init__([np.array([0,0,0]),np.array([1,1,1])])
 
 class Circle:
     def __init__(self,r):

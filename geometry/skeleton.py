@@ -74,9 +74,9 @@ class standardBoxSkeleton:
         
         delta[0]=delta[0]+d
         if self.ndim==2:
-            bounds=[[0,0],[H,self.Om.bnds[1][1]-self.Om.bnds[0][1]]]
+            bounds=[np.array([0,0]),np.array([H,self.Om.bnds[1][1]-self.Om.bnds[0][1]])]
         elif self.ndim==3:
-            bounds=[[0,0,0],[H,self.Om.bnds[1][1]-self.Om.bnds[0][1],self.Om.bnds[1][2]-self.Om.bnds[0][2]]]
+            bounds=[ np.array([0,0,0]) , np.array([H,self.Om.bnds[1][1]-self.Om.bnds[0][1],self.Om.bnds[1][2]-self.Om.bnds[0][2]]) ]
         else:
             raise(ValueError("ndim must be 2 or 3"))
         return slab.boxSlab(self.l2g_factory(delta),bounds,self.Om)
@@ -94,9 +94,9 @@ class standardBoxSkeleton:
         
         delta[0]=delta[0]+d
         if self.ndim==2:
-            bounds=[[-Hl,0],[Hr,self.Om.bnds[1][1]-self.Om.bnds[0][1]]]
+            bounds=[np.array([-Hl,0]) , np.array([Hr,self.Om.bnds[1][1]-self.Om.bnds[0][1]]) ]
         elif self.ndim==3:
-            bounds=[[-Hl,0,0],[Hr,self.Om.bnds[1][1]-self.Om.bnds[0][1],self.Om.bnds[1][2]-self.Om.bnds[0][2]]]
+            bounds=[ np.array([-Hl,0,0]) , np.array([Hr,self.Om.bnds[1][1]-self.Om.bnds[0][1],self.Om.bnds[1][2]-self.Om.bnds[0][2]])]
         else:
             raise(ValueError("ndim must be 2 or 3"))
         return slab.boxSlab(self.l2g_factory(delta),bounds,self.Om)

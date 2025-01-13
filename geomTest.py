@@ -9,14 +9,16 @@ import matplotlib.pyplot as plt
 import geometry.standardGeometries as stdGeom
 import geometry.skeleton as skelTon
 # set-up global geometry
-Om=stdGeom.unitSquare()
+Om=stdGeom.unitCube()
 
 #set up pde
 def c11(p):
     return np.ones(shape=(p.shape[0],))
 def c22(p):
     return np.ones(shape=(p.shape[0],))
-Lapl=pdo.PDO2d(c11,c22)
+def c33(p):
+    return np.ones(shape=(p.shape[0],))
+Lapl=pdo.PDO3d(c11,c22,c33)
 
 ########################
 #   Set up skeleton
@@ -32,9 +34,9 @@ Lapl=pdo.PDO2d(c11,c22)
 #   and the global Idxs ('skel.globIdxs') are deferred to seperate methods.
 #   The uniform, standardly ordered case is provided below
 
-N=4
+N=3
 skel = skelTon.standardBoxSkeleton(Om,N)
-ord=[5,10]
+ord=[10,5,5]
 opts = solverWrap.solverOptions('stencil',ord)
 overlapping = False #toggle
 if overlapping:
@@ -57,9 +59,8 @@ for i in range(1,N):
     XXiGlob=np.vstack((XXiGlob,slabi.geom.l2g(slabi.solverWrap.XXi)))
     XXbGlob=np.vstack((XXbGlob,slabi.geom.l2g(slabi.solverWrap.XXb)))
 
-plt.figure(1)
-plt.scatter(XXiGlob[:,0],XXiGlob[:,1])
-plt.scatter(XXbGlob[:,0],XXbGlob[:,1])
-plt.legend(['internal','skel'])
-plt.axis('equal')
+fig = plt.figure(1)
+ax = fig.add_subplot(projection='3d')
+ax.scatter(XXiGlob[:,0],XXiGlob[:,1],XXiGlob[:,2])
+ax.scatter(XXbGlob[:,0],XXbGlob[:,1],XXbGlob[:,2])
 plt.show()

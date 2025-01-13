@@ -3,7 +3,20 @@ import pdo.pdo as pdo
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
-
+from solver.spectralmultidomain.hps import hps_multidomain as hps
+import solver.spectralmultidomain.hps.geom as hpsGeom
+"""
+    This header takes care of the Solver Wrapper class
+    Recipe:
+    - user has some external solver (e.g. 'mySolver') in folder 'mySolverFolder'
+    - places mySolverFolder in folder 'solver'
+    - add 'from solver.mySolverFolder.mySolver import mySolver' (or variant thereof)
+    - add to class solverOptions: 'type==mySolver' and then set order//nyz//...
+    - add geometry conversion if needed to 'convertGeom'
+    - add class init ( if self.type=='mySolver'...self.solver=mySolver(...) )to solverWrapper
+    REQUIREMENTS FOR SOLVER:
+    Solver must inherit from AbstractPDESolver or be compatible with it
+"""
 
 class solverOptions:
     """
@@ -21,6 +34,12 @@ class solverOptions:
         if type=='stencil':
             for i in range(1,len(ord)):
                 self.nyz *= (ord[i]-2)
+        if type=='hps':
+            for i in range(1,len(ord)):
+                self.nyz = (int)(np.round((ord[i]-2)*(.5/a)))
+def convertGeom(opts,geom):
+    if opts.type=='hps':
+        return hpsGeom.BoxGeometry(np.array([geom.bounds[0],geom.bounds[1]]))
 
 
 class solverWrapper:
@@ -36,6 +55,7 @@ class solverWrapper:
         self.solver = None
         self.type = opts.type
         self.constructed = False
+        self.opts=opts
     def construct(self,geom:slabGeom.slabGeometry,PDE:pdo):
         """
         Actual construction of the local solver
@@ -45,10 +65,34 @@ class solverWrapper:
         if self.type=='stencil':
             self.solver = stencil(PDE, geom, self.ord)
             self.constructed=True
+            '''
+            adapt these to fit the notation of custom solver
+            '''
+            self.XX = self.solver.XX
+            self.Ii = self.solver._Ji
+            self.Ib = self.solver._Jb
+            
+            self.Aib = self.solver.Aib
+            self.Abi = self.solver.Abi
+            self.Abb = self.solver.Abb
+            self.solver_ii = self.solver.solver_ii
+        if self.type=='hps':
+            geomHPS = convertGeom(self.opts,geom)
+            self.solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0])
+            self.constructed=True
+            '''
+            adapt these to fit the notation of custom solver
+            '''
+            self.XX = self.solver.XX
+            self.Ii = self.solver._Ji
+            self.Ib = self.solver._Jx
+            self.Aib = self.solver.Aix
+            self.Abi = self.solver.Axi
+            self.Abb = self.solver.Axx
+            self.solver_ii = self.solver.solver_Aii
         
-        self.XX = self.solver.XX
-        self.XXi = self.solver.XXi
-        self.XXb = self.solver.XXb
+        self.XXi = self.solver.XX[self.Ii,:]
+        self.XXb = self.solver.XX[self.Ib,:]
         self.ndofs = self.XX.shape[0]
         self.constructMapIdxs()
     
@@ -59,14 +103,14 @@ class solverWrapper:
         self.middleIdxs=Ic
         self.IGB=IGB
             
-
     def stMap(self,J:list[int],I:list[int],stType):
         #for now:   in case of DtD, I should be subset indices in Ii, J should be subset indices in Ib
         #           in case of DtN, both should be subset indices in Ib
+    
         if stType=='DtD':
             if not I==J:
-                AiJ  = self.solver.Aib[:,J]
-            LUii  = self.solver.solver_ii
+                AiJ  = self.Aib[:,J]
+            LUii  = self.solver_ii
 
             def matmat(v,transpose=False):
                 if I==J:
@@ -77,11 +121,11 @@ class solverWrapper:
                     v_tmp = v
 
                 if (not transpose):
-                    result = LUii.matmat(AiJ@v_tmp)[I]
+                    result = (LUii@(AiJ@v_tmp))[I]
                 else:
                     result      = np.zeros(shape=(len(self.solver._Ji,)))
                     result[I]   = v_tmp
-                    result      = AiJ.T @ LUii.rmatmat(v_tmp)
+                    result      = AiJ.T @ (LUii.T@(v_tmp))
 
                 if (v.ndim == 1):
                     result = result.flatten()
@@ -91,10 +135,10 @@ class solverWrapper:
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
         if stType=='DtN':
-            AIJ = self.solver.Abb[I][:,J]
-            AIi  = self.solver.Abi[I]
-            AiJ  = self.solver.Aib[:,J]
-            LUii  = self.solver.solver_ii
+            AIJ = self.Abb[I][:,J]
+            AIi  = self.Abi[I]
+            AiJ  = self.Aib[:,J]
+            LUii  = self.solver_ii
 
             def matmat(v,transpose=False):
 
@@ -106,10 +150,10 @@ class solverWrapper:
                 if (not transpose):
 
                     result = AIJ @ v_tmp
-                    result -= AIi @ LUii.matmat(AiJ @ v_tmp)
+                    result -= AIi @ (LUii@(AiJ @ v_tmp))
                 else:
                     result = AIJ.T @ v_tmp
-                    result -= AiJ.T @ LUii.rmatmat(AIi.T @ v_tmp)
+                    result -= AiJ.T @ (LUii.T@(AIi.T @ v_tmp))
 
                 if (v.ndim == 1):
                     result = result.flatten()

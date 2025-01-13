@@ -43,6 +43,8 @@ class Slab:
         self.solverWrap         =   solverWrap
         #
         self.solverWrap.construct(geom,PDE)
+        self.Ii = self.solverWrap.Ii
+        self.Ib = self.solverWrap.Ib
         self.XX             =   solverWrap.XX
         self.ndofs          =   self.XX.shape[0]
         self.N              =   self.ndofs
@@ -85,14 +87,15 @@ class Slab:
     
     def computeRHS(self,f):
         """helper function to compute local RHS"""
-        fGb=np.array([f(self.geom.l2g(self.solverWrap.solver._XXb[i,:])) for i in self.idxsGB])
-        rhs=[-self.solverWrap.stMap(self.idxsGB,idxs,self.mapType)@fGb for idxs in self.targetIdxs]
-        rhsIdxs = [idxs for idxs in self.globTargetIdxs]
+        fGb=np.array([f(self.geom.l2g(self.solverWrap.XXb[i,:])) for i in self.idxsGB])
+        rhs=[-self.solverWrap.stMap(self.idxsGB,idxs,self.mapType)@fGb for idxs in self.targetIdxs if idxs]
+        rhsIdxs = [idxs for idxs in self.globTargetIdxs if idxs]
+        self.rhs    =   rhs
+        self.rhsIdxs=   rhsIdxs
         return rhs,rhsIdxs
 
     def computeLocalIdxs(self):
-        self.Ji = self.solverWrap.solver._Ji
-        self.Jb = self.solverWrap.solver._Jb
+        
         
         leftIdxs    = self.solverWrap.leftIdxs
         rightIdxs   = self.solverWrap.rightIdxs
@@ -109,8 +112,8 @@ class Slab:
             targetIdxs=[rightIdxs,leftIdxs]
         else:
             TypeError("Slab: Invalid mapping type")
-        self.sourceIdxs = sourceIdxs
-        self.targetIdxs = targetIdxs
+        self.sourceIdxs = [Idx for Idx in sourceIdxs if Idx]
+        self.targetIdxs = [Idx for Idx in targetIdxs if Idx]
         self.idxsGB     = idxsGB
 
     ######################################################################
@@ -161,11 +164,11 @@ class Slab:
 
     def constructMats(self,matAssembler:matAssembler):
         
-        globIdxs=[x for x in itertools.product(self.globSourceIdxs,self.globTargetIdxs)]#cart. prod.
-        [globIdxs.append(x) for x in itertools.product(self.globTargetIdxs,self.globTargetIdxs) if x not in globIdxs]
+        globIdxs=[x for x in itertools.product(self.globSourceIdxs,self.globTargetIdxs) if x[0] and x[1]]#cart. prod.
+        [globIdxs.append(x) for x in itertools.product(self.globTargetIdxs,self.globTargetIdxs) if x not in globIdxs and x[0] and x[1]]
 
-        locIdxs=[x for x in itertools.product(self.sourceIdxs,self.targetIdxs)]
-        [locIdxs.append(x) for x in itertools.product(self.targetIdxs,self.targetIdxs) if x not in locIdxs]
+        locIdxs=[x for x in itertools.product(self.sourceIdxs,self.targetIdxs) if x[0] and x[1]]
+        [locIdxs.append(x) for x in itertools.product(self.targetIdxs,self.targetIdxs) if x not in locIdxs and x[0] and x[1]]
         
         self.locIdxs=locIdxs
         self.globIdxs=globIdxs
@@ -244,7 +247,24 @@ class multiSlab:
         return LinearOperator(shape=(self.N,self.N),\
             matvec = self.apply, rmatvec = self.applyT,\
             matmat = self.apply, rmatmat = self.applyT)
-            
+
+
+"""
+    evalSolInterior
+    method to evaluate the solution u (given as a vector) in the interior of a slab
+    @param:
+    slab        : slab object
+    b           : vector of values on the boundary (source Idxs set!)
+"""
+def evalSolInterior(slab:Slab,b):
+    locIdxs = slab.sourceIdxs
+    I   = [Idx for Idx in locIdxs]
+    A   = slab.solverWrap.solver
+    u   = A.solver_ii@A.Aib[:,I]@b
+    return u
+    
+
+
 
 
 

@@ -1,5 +1,6 @@
 import numpy as np
 from   abc              import ABCMeta, abstractmethod, abstractproperty
+from solver import sparse_utils
 
 class AbstractPDESolver(metaclass=ABCMeta):
 
@@ -54,3 +55,17 @@ class AbstractPDESolver(metaclass=ABCMeta):
 	@abstractproperty
 	def Abi(self):
 		pass
+	
+	def constructSolverii(self):
+		self.solver_ii = sparse_utils.SparseSolver(self.Aii).solve_op	
+	
+	def solver_ii(self):
+		if self.solver_ii==None:
+			self.constructSolverii()
+			return sparse_utils.SparseSolver(self.Aii).solve_op
+		else:
+			return sparse_utils.SparseSolver(self.Aii).solve_op
+	def solveDirichlet(self,b):
+		if self.solver_ii==None:
+			self.constructSolverii()
+		return self.solver_ii@(self.Aib@b)
