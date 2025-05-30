@@ -3,14 +3,15 @@
 
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
-import HBS.HBSTree as HBS
-
-
+from .HBS import HBSTree as HBS
+import solver.solver as solver
+import time
+import matplotlib.pyplot as plt
 class matAssemblerOptions:
     """
     Options for matrix constuction
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,maxRank:int=20,tree=None):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,maxRank:int=8,tree=None):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
@@ -24,38 +25,58 @@ class matAssembler:
     """
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
-    def assemble(self,linOp:LinearOperator):
+    def assemble(self,stMap:solver.stMap,tree=None):
+        linOp = stMap.A
+        
+        if self.matOpts.method == 'epsHBS' or self.matOpts.method == 'rkHBS':
+            #for now we assume only one tree needed, in the future we generalize
+            #start=time.time()
+            treeI = HBS.HBS_tree_from_points(stMap.XXI,self.matOpts.maxRank)
+            #stop=time.time()
+            #print("time tree = ",stop-start)
+            #treeJ = HBS.HBS_tree_from_points(stMap.XXJ)
         if self.matOpts.method == 'dense':
             return linOp.matmat(np.identity(linOp.shape[1]))
-        if self.matOpts.method == 'HBS':
-            T = HBS.copy_tree_to_HBS(self.matOpts.tree)
+        
+        if self.matOpts.method == 'epsHBS':
+            
             m=linOp.shape[0]
             n=linOp.shape[1]
-            Om  = np.random.standard_normal(size=(n,self.matOpts.maxRank))
-            Psi = np.random.standard_normal(size=(m,self.matOpts.maxRank))
+            s=3*(self.matOpts.maxRank+10)
+            Om  = np.random.standard_normal(size=(n,s))
+            Psi = np.random.standard_normal(size=(m,s))
             Y = linOp.matmat(Om)
             Z = linOp.rmatmat(Psi)
-            HBS.compress_HBS_eps(T,Om,Psi,Y,Z,self.matOpts.maxRank,self.matOpts.tol)
+            HBS.compress_HBS_eps(treeI,Om,Psi,Y,Z,self.matOpts.maxRank,s,self.matOpts.tol)
+            self.tree = treeI
             def matmat(v,transpose=False):
-
-                if (v.ndim == 1):
-                    v_tmp = v[:,np.newaxis]
-                else:
-                    v_tmp = v
-
-                if (not transpose):
-                    result = HBS.apply_HBS(T,v)
-                else:
-                    result = AIJ.T @ v_tmp
-                    result -= AiJ.T @ (LUii.T@(AIi.T @ v_tmp))
-
-                if (v.ndim == 1):
-                    result = result.flatten()
-                return result
+                return HBS.apply_HBS(treeI,v,transpose)
             return LinearOperator(shape=(m,n),\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
-
+        if self.matOpts.method == 'rkHBS':
+            m=linOp.shape[0]
+            n=linOp.shape[1]
+            s=5*self.matOpts.maxRank
+            Om  = np.random.standard_normal(size=(n,s))
+            Psi = np.random.standard_normal(size=(m,s))
+            #print("sizes = ",n,"//",m)
+            start = time.time()
+            Y = linOp.matmat(Om)
+            Z = linOp.rmatmat(Psi)
+            stop = time.time()
+            #print("YZ time = ",stop-start)
+            #print("sizes Y,Z = ",Y.shape,"//",Z.shape)
+            #start=time.time()
+            HBS.compress_HBS(treeI,Om,Psi,Y,Z,self.matOpts.maxRank,s)
+            self.tree = treeI
+            #stop=time.time()
+            #print("time compress = ",stop-start)
+            def matmat(v,transpose=False):
+                return HBS.apply_HBS(treeI,v,transpose)
+            return LinearOperator(shape=(m,n),\
+                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
+                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
 
 '''
 DEFAULT ASSEMBLERS
@@ -66,9 +87,9 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,rk,tree):
-        super(denseMatAssembler,self).__init__(matAssemblerOptions('HBS',1e-5,rk,tree))
+    def __init__(self,rk):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,rk))
 
 class tolHMatAssembler(matAssembler):
-    def __init__(self,tol,tree):
-        super(denseMatAssembler,self).__init__(matAssemblerOptions('HBS',tol,20,tree))
+    def __init__(self,tol,rk=4):
+        super(tolHMatAssembler,self).__init__(matAssemblerOptions('epsHBS',tol,rk))

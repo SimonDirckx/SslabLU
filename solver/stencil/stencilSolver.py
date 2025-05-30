@@ -30,10 +30,15 @@ def stencilDxy(ptsx,ptsy):
 
 def constructPDO2D(pdo,xpts,ypts,XX,geom):
     N=XX.shape[0]
-    C11 = sparse.spdiags(pdo.c11(geom.l2g(XX)),[0],N,N)
-    C22 = sparse.spdiags(pdo.c22(geom.l2g(XX)),[0],N,N)
+    C11 = -sparse.spdiags(pdo.c11(geom.l2g(XX)),[0],N,N)
+    C22 = -sparse.spdiags(pdo.c22(geom.l2g(XX)),[0],N,N)
     L   =  C11@sparse.kron(stencilD2(xpts),np.identity(len(ypts)))
     L   += C22@sparse.kron(np.identity(len(xpts)),stencilD2(ypts))
+    if pdo.c1:
+        C1 = sparse.spdiags(pdo.c1(geom.l2g(XX)),[0],N,N)
+        print(np.max(pdo.c1(geom.l2g(XX))))
+        print(np.min(pdo.c1(geom.l2g(XX))))
+        L   += C1@sparse.kron(np.identity(len(xpts)),stencilD(ypts))
     if pdo.c:
         C = sparse.spdiags(pdo.c(geom.l2g(XX)),[0],N,N)
         L   += C

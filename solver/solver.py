@@ -3,6 +3,7 @@ import pdo.pdo as pdo
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
+from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
 """
@@ -17,6 +18,13 @@ import solver.spectralmultidomain.hps.geom as hpsGeom
     REQUIREMENTS FOR SOLVER:
     Solver must inherit from AbstractPDESolver or be compatible with it
 """
+
+class stMap:
+    def __init__(self,A:LinearOperator,XXI,XXJ):
+        self.XXI = XXI
+        self.XXJ = XXJ
+        self.A = A
+
 
 class solverOptions:
     """
@@ -36,7 +44,11 @@ class solverOptions:
                 self.nyz *= (ord[i]-2)
         if type=='hps':
             for i in range(1,len(ord)):
-                self.nyz = (int)(np.round((ord[i]-2)*(.5/a)))
+                self.nyz *= (int)(np.round((ord[i]-2)*(.5/a)))
+        if type=='spectral':
+            for i in range(1,len(ord)):
+                self.nyz *= (ord[i]-1)
+        print("#dofs = ",self.nyz)
 def convertGeom(opts,geom):
     if opts.type=='hps':
         return hpsGeom.BoxGeometry(np.array([geom.bounds[0],geom.bounds[1]]))
@@ -84,12 +96,30 @@ class solverWrapper:
             adapt these to fit the notation of custom solver
             '''
             self.XX = self.solver.XX
+            print("XX shape in wrap = ",self.XX.shape)
             self.Ii = self.solver._Ji
+            print("Ii len in wrap = ",len(self.Ii))
             self.Ib = self.solver._Jx
+            print("Ib len in wrap = ",len(self.Ib))
             self.Aib = self.solver.Aix
             self.Abi = self.solver.Axi
             self.Abb = self.solver.Axx
             self.solver_ii = self.solver.solver_Aii
+            print("solver shape in wrap = ",self.solver_ii.shape)
+        if self.type=='spectral':
+            self.solver = spectral(PDE, geom, self.ord)
+            self.constructed=True
+            '''
+            adapt these to fit the notation of custom solver
+            '''
+            self.XX = self.solver.XX
+            self.Ii = self.solver._Ji
+            self.Ib = self.solver._Jb
+            
+            self.Aib = self.solver.Aib
+            self.Abi = self.solver.Abi
+            self.Abb = self.solver.Abb
+            self.solver_ii = self.solver.solver_ii
         
         self.XXi = self.solver.XX[self.Ii,:]
         self.XXb = self.solver.XX[self.Ib,:]
@@ -103,13 +133,17 @@ class solverWrapper:
         self.middleIdxs=Ic
         self.IGB=IGB
             
-    def stMap(self,J:list[int],I:list[int],stType):
+    def compute_stMap(self,J:list[int],I:list[int],stType):
         #for now:   in case of DtD, I should be subset indices in Ii, J should be subset indices in Ib
         #           in case of DtN, both should be subset indices in Ib
     
         if stType=='DtD':
+            XXI = self.XXi[I,:]
             if not I==J:
                 AiJ  = self.Aib[:,J]
+                XXJ = self.XXb[J,:]
+            else:
+                XXJ = self.XXi[J,:]
             LUii  = self.solver_ii
 
             def matmat(v,transpose=False):
@@ -123,17 +157,18 @@ class solverWrapper:
                 if (not transpose):
                     result = (LUii@(AiJ@v_tmp))[I]
                 else:
-                    result      = np.zeros(shape=(len(self.solver._Ji,)))
-                    result[I]   = v_tmp
-                    result      = AiJ.T @ (LUii.T@(v_tmp))
-
+                    result      = np.zeros(shape=(len(self.solver._Ji),v.shape[1]))
+                    result[I,:] = v_tmp
+                    result      = AiJ.T @ (LUii.T@(result))
                 if (v.ndim == 1):
                     result = result.flatten()
                 return result
 
-            return LinearOperator(shape=(len(I),len(J)),\
+            A = LinearOperator(shape=(len(I),len(J)),\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
+            
+            return stMap(A,XXI,XXJ)
         if stType=='DtN':
             AIJ = self.Abb[I][:,J]
             AIi  = self.Abi[I]
@@ -162,3 +197,6 @@ class solverWrapper:
             return LinearOperator(shape=AIJ.shape,\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
+    def solveInterior(self,g,load):
+        
+        return 0

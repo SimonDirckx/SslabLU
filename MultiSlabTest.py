@@ -11,7 +11,7 @@ import itertools
 import scipy.linalg as splinalg
 from scipy.sparse.linalg import gmres
 import time
-import matplotlib.tri as tri
+import pandas as pd
 
 try:
 	from petsc4py import PETSc
@@ -32,18 +32,24 @@ class gmres_info(object):
 
 # set-up global geometry
 start = time.time()
-Om=stdGeom.unitSquare()
-kapp = 20.5
+bnds = [[0.,0.],[1.,1.]]
+Om=stdGeom.Box(bnds)
+kapp = 0.
 #set up pde
+#def c11(p):
+#    f = np.zeros(shape=(p.shape[0],))
+#    for i in range(p.shape[0]):
+#        f[i] = 1.+(np.sin(5*np.pi*p[i,0])*np.sin(5*np.pi*p[i,0]))
+#    return f
 def c11(p):
     return np.ones(shape=(p.shape[0],))
 def c22(p):
     return np.ones(shape=(p.shape[0],))
+def c33(p):
+    return np.ones(shape=(p.shape[0],))
 def c(p):
     return kapp*kapp*np.ones(shape=(p.shape[0],))
 Lapl=pdo.PDO2d(c11,c22,None,None,None,c)
-
-
 
 ########################
 #   Set up skeleton
@@ -62,118 +68,93 @@ Lapl=pdo.PDO2d(c11,c22,None,None,None,c)
 # set-up constants
 # N             : number of interfaces in skeleton
 # [ordx,ordy]   : stencil order in x-and-y direction
+#with open("nGMRES_HPS103D.dat", "w") as f:
+#    f.write("Nslabs H ITERS err\n")
+kmax = 5
+Nmax = 2**kmax-1
+Hmin = Om.bnds[1][0]/(Nmax+1) 
+kvec = [2,3,4,5]
+for k in kvec:
+    N=2**k-1
+    H=Om.bnds[1][0]/(N+1)
+    skel = skelTon.standardBoxSkeleton(Om,N)
+    ny = 100
+    nx = (int)(np.ceil(ny*H))
+    nx = 2*nx+1
+    print("nx = ",nx)
+    ord=[6,6]
+    a=Hmin/4.
+    hx = H/(ord[0]-1)
+    overlapping = True
+    opts = solverWrap.solverOptions('hps',ord,a)
 
-N=80
-H=1./(N+1)
-skel = skelTon.standardBoxSkeleton(Om,N)
-ny = 80
-nx = 5#int(np.round(ny/(N+1)))
-ord=[nx,ny]
-hx = H/(ord[0]-1)
-overlapping = True
-if overlapping:
-    ord[0]=2*ord[0]-1 #for fair comparison
-    hx=2*H/(ord[0]-1)
+    # a skeleton is a collection of interfaces each carrying their own indices
+    # referred to as 'global idxs'
+    # uniformGlobalIdxs is a special method that assumes each will be discretized
+    # in the same way
+    # a slablist is a list of overlapping/non-overlapping slabs
 
-# solver wrapper
-opts = solverWrap.solverOptions('stencil',ord)
-
-# a skeleton is a collection of interfaces each carrying their own indices
-# referred to as 'global idxs'
-# uniformGlobalIdxs is a special method that assumes each will be discretized
-# in the same way
-# a slablist is a list of overlapping/non-overlapping slabs
-
-skel.setGlobalIdxs(skelTon.computeUniformGlobalIdxs(skel,opts))
-slabList = skelTon.buildSlabs(skel,Lapl,opts,overlapping)
+    skel.setGlobalIdxs(skelTon.computeUniformGlobalIdxs(skel,opts))
+    slabList = skelTon.buildSlabs(skel,Lapl,opts,overlapping)
 
 
-########################
-#   Test assembly
-########################
+    ########################
+    #   Test assembly
+    ########################
 
-# known solution
-def f(xy):
-    if xy.ndim==1:
-        return np.sin(kapp*xy[0])
+
+    #default dense assembler
+    assembler = mA.denseMatAssembler()
+    assemblerList = [assembler for slab in slabList]
+    MultiSlab = MS.multiSlab(slabList,assemblerList)
+    MultiSlab.constructMats()
+    hy=1./(ord[1]-1)
+
+    u = np.random.normal(0.,1./np.sqrt(N),size=(MultiSlab.N,))
+    Linop       = MultiSlab.getLinOp()
+    rhs = Linop@u
+    gInfo = gmres_info()
+    stol = (1e-5)*H*H
+    if petsc_imported == True:
+        uhat,info   = gmres(Linop,rhs,rtol=stol,callback=gInfo,maxiter=25000,restart=25000)
     else:
-        return np.sin(kapp*xy[:,0])
+        uhat,info   = gmres(Linop,rhs,tol=stol,callback=gInfo,maxiter=25000,restart=25000)
+    res = MultiSlab.apply(uhat)-rhs
+    stop = time.time()
+    print("=============SUMMARY==============")
+    print("H            = ",'%10.3E'%H)
+    print("(hx//hy)     = ("'%10.3E'%hx,"//",'%10.3E'%hy,")")
+    print("L2 rel. res  = ", np.linalg.norm(res)/np.linalg.norm(rhs))
+    print("L2 rel. err  = ", np.linalg.norm(u-uhat)/np.linalg.norm(u))
+    print("GMRES iters  = ", gInfo.niter)
+    print("elapsed time = ",stop-start)
+    print("==================================")
 
-#default dense assembler
-assembler = mA.denseMatAssembler()
-assemblerList = [assembler for slab in slabList]
-MultiSlab = MS.multiSlab(slabList,assemblerList)
-MultiSlab.constructMats()
-rhs = MultiSlab.RHS(f)
+    #with open("nGMRES_HPS103D.dat", "a") as f:
+    #    s=[str(N)," ",str(H)," ",str(gInfo.niter)," ",str(np.linalg.norm(u-uhat)/np.linalg.norm(u)),"\n"]
+    #    f.writelines(s)
+    E=np.identity(Linop.shape[0])
+    Stot = E-Linop@E
+    [T,V] = splinalg.schur(Stot)
+    e = np.diag(T)
+    [U,s,V] = np.linalg.svd(Stot)
+    emin = np.min(np.abs(e))
+    smin = np.min(s)
+    print("dep = ",np.linalg.norm(T-np.diag(e),ord=2))
+    print("emin = ",emin)
+    print("smin = ",smin)
+    print("diff = ",smin-emin)
+    w=np.zeros(shape=(100,))
+    for i in range(len(w)):
+         x=np.array(np.random.standard_normal(size=(Stot.shape[1])))
+         x=x/np.linalg.norm(x)
+         w[i] = x.T@Stot@x
+    plt.figure(1)
+    plt.scatter(np.real(w),np.imag(w))
+    plt.show()
+#E=np.identity(Linop.shape[0])
+#Stot = Linop@E
+#nyy = ny-2
+#ndofs = nyy*N
 
-u=np.zeros(shape=(MultiSlab.N,))
-n0=0
-hy=1./(ord[1]-1)
-step=(ord[1]-2)
-
-for i in range(N):
-    slabi:MS.Slab=slabList[i]
-    if overlapping:
-        J=slabi.Ii
-    else:
-        J=slabi.Ib
-    u[range(n0,n0+step)] = slabi.eval_global_func( f,[J[i] for i in slabi.targetIdxs[0]] )
-    n0+=step
-
-Linop       = MultiSlab.getLinOp()
-gInfo = gmres_info()
-if petsc_imported == True:
-    uhat,info   = gmres(Linop,rhs,rtol=1e-5,callback=gInfo,maxiter=25000,restart=200)
-else:
-    uhat,info   = gmres(Linop,rhs,tol=1e-5,callback=gInfo,maxiter=25000,restart=200)
-res = MultiSlab.apply(uhat)-rhs
-stop = time.time()
-print("=============SUMMARY==============")
-print("H            = ",'%10.3E'%H)
-print("(hx//hy)     = ("'%10.3E'%hx,"//",'%10.3E'%hy,")")
-print("L2 rel. res  = ", np.linalg.norm(res)/np.linalg.norm(rhs))
-print("L2 rel. err  = ", np.linalg.norm(u-uhat)/np.linalg.norm(u))
-print("GMRES iters  = ", gInfo.niter)
-print("elapsed time = ",stop-start)
-print("==================================")
-
-########################
-#   recover global sol
-########################
-'''
-# test how to get interior solution from interface solution
-XXList = np.zeros(shape=(0,2))
-u=np.zeros(shape=(0,))
-for i in range(len(slabList)):
-    slab    = slabList[i]    
-    XXi     = slab.solverWrap.XXi
-    XXb     = slab.solverWrap.XXb
-    XX      = slab.solverWrap.solver.XX
-    b       = np.zeros(shape=(XXb.shape[0],))
-    for Idx,IdxG in zip(slab.sourceIdxs,slab.globSourceIdxs):
-        b[Idx] = uhat[IdxG]
-    b[slab.idxsGB] = f(slab.geom.l2g(slab.solverWrap.XXb[slab.idxsGB,:]))
-    u0      = -slab.solverWrap.solver.solver_ii@(slab.solverWrap.solver.Aib@b)
-    Ji      = slab.solverWrap.solver.Ji
-    Jb      = slab.solverWrap.solver.Jb
-    utest   = np.zeros(shape=(slab.solverWrap.solver.XX.shape[0],))
-    utest[Ji] = u0
-    utest[Jb] = b
-    if i==0:
-        u00 = utest
-        XX0 = XX
-    else:
-        u00 = np.array([utest[i] for i in range(len(utest)) if XX[i,0]>0])
-        XX0 = np.array([XX[i,:] for i in range(XX.shape[0]) if XX[i,0]>0])
-    u       = np.append(u,u00)
-    XXList  = np.append(XXList,slab.geom.l2g(XX0),axis=0)
-
-
-triang = tri.Triangulation(XXList[:,0], XXList[:,1])
-
-plt.figure(1)
-plt.tricontourf(triang, u,100)
-plt.colorbar()
-plt.axis('equal')
-plt.show()
-'''
+#print("normality of S: ",np.linalg.norm(Stot-Stot.T)/np.linalg.norm(Stot))

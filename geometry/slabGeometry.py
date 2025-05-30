@@ -45,19 +45,19 @@ class boxSlab(slabGeometry):
         return self._ndim
     def l2g(self,p):
         return self._l2g(p)
-    def isIn(self,p,tol=1e-13):
+    def isIn(self,p,tol=1e-10):
         delta = np.array(self.bounds[0])
         p0 = p-delta
         b0 = np.array(self.bounds[1])-delta
         return all(p0<=b0) and all(p0>=0)
     
-    def isLocalBoundary(self,p,tol=1e-13):
+    def isLocalBoundary(self,p,tol=1e-14):
         return any(np.abs(p-self.bounds[0])<tol) or any(np.abs(p-self.bounds[1])<tol)
     
     def isGlobalBoundary(self,p):
         return self.globalGeometry.isBoundary((self.l2g(p)))
     
-    def getIlIcIr(self,XXi,XXb,tol = 1e-13):
+    def getIlIcIr(self,XXi,XXb,tol = 1e-14):
         xl = self.bounds[0][0]
         xr = self.bounds[1][0]
         Il=[i for i in range(XXb.shape[0]) if not self.isGlobalBoundary(XXb[i,:]) and np.abs(XXb[i,0]-xl)<tol]

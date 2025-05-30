@@ -1,7 +1,7 @@
 import numpy as np
 from collections import deque
 from scipy.linalg import qr
-
+from .simpleoctree import simpletree as tree
 
 def qr_null(A, rnk0:int):
     Q, R, P = qr(A.T, mode='full', pivoting=True)
@@ -72,15 +72,17 @@ class HBSTree:
         assert U.shape[1]==V.shape[1]
         assert D.shape[0]==D.shape[1]
         assert D.shape[0]==V.shape[0]
-        self.U = U
-        self.V = V
-        self.D = D
-        self.rnk = U.shape[1]
-        self.local_data += 8*(U.shape[0]*U.shape[1]+V.shape[0]*V.shape[1]+D.shape[0]*D.shape[1])
+        self.U          = U
+        self.V          = V
+        self.D          = D
+        self.rnk        = U.shape[1]
+        self.local_data += U.data.nbytes+V.data.nbytes+D.data.nbytes
+        #self.local_data += U.shape[1]*U.shape[0]+V.shape[1]*V.shape[0]+D.shape[1]*D.shape[0]#+D.data.nbytes
     
     def set_D(self,D):
         self.D = D
-        self.local_data += D.shape[0]*D.shape[1]*8
+        self.local_data += D.data.nbytes
+        #self.local_data += D.shape[1]*D.shape[0]
     
     def set_OmPsiYZ(self,Om,Psi,Y,Z):
         self.Om=Om
@@ -136,7 +138,11 @@ def copy_tree_to_HBS(tree,m=0,T=None):
         node = HBSTree(np.sort(tree.get_box_inds(child)))
         T.add_child(node)
         copy_tree_to_HBS(tree,child,node)
-    return T        
+    return T
+def HBS_tree_from_points(XX,nl=8):
+    t =  tree.BalancedTree(XX,nl)
+    print("tree levels = ",t.nlevels)
+    return copy_tree_to_HBS(t)       
 
 
 
@@ -237,68 +243,136 @@ def random_compression_HBS_eps(tree,OMEGA,PSI,Y,Z,rnk,s,eps):
     return T
 
 
-def apply_HBS_upward(HBSMat:HBSTree,q):
+def apply_HBS_upward(HBSMat:HBSTree,q,transpose=False):
     #upward pass
-    if HBSMat.is_leaf:
-        qhat = HBSMat.V.T@q[HBSMat.idxs]
-        HBSMat.set_qhat(qhat)
-    elif HBSMat.level>0:
-        n   = 0
-        for child in HBSMat.children:
-            n+=child.rnk
-        qhat = np.zeros(shape=(n,))
-        n0 = 0
-        for child in HBSMat.children:
-            apply_HBS_upward(child,q)
-            qhat[n0:n0+child.rnk]=child.qhat
-            n0+=child.rnk
-        qhat = HBSMat.V.T@qhat
-        HBSMat.set_qhat(qhat)
+    m00 = q.shape[1]
+    if not transpose:
+        if HBSMat.is_leaf:
+            qhat = HBSMat.V.T@q[HBSMat.idxs,:]
+            HBSMat.set_qhat(qhat)
+        elif HBSMat.level>0:
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                apply_HBS_upward(child,q)
+                qhat[n0:n0+child.rnk,:]=child.qhat
+                n0+=child.rnk
+            qhat = HBSMat.V.T@qhat
+            HBSMat.set_qhat(qhat)
+        else:
+            for child in HBSMat.children:
+                apply_HBS_upward(child,q)
     else:
-        for child in HBSMat.children:
-            apply_HBS_upward(child,q)
+        if HBSMat.is_leaf:
+            qhat = HBSMat.U.T@q[HBSMat.idxs,:]
+            HBSMat.set_qhat(qhat)
+        elif HBSMat.level>0:
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                apply_HBS_upward(child,q,transpose)
+                qhat[n0:n0+child.rnk,:]=child.qhat
+                n0+=child.rnk
+            qhat = HBSMat.U.T@qhat
+            HBSMat.set_qhat(qhat)
+        else:
+            for child in HBSMat.children:
+                apply_HBS_upward(child,q,transpose)
 
-def apply_HBS_downward(HBSMat:HBSTree,u,q):
-    if HBSMat.level==0:
-        D=HBSMat.D
-        n   = 0
-        for child in HBSMat.children:
-            n+=child.rnk
-        qhat = np.zeros(shape=(n,))
-        n0 = 0
-        for child in HBSMat.children:
-            qhat[n0:n0+child.rnk] = child.qhat
-            n0+=child.rnk
-        uhat = D@qhat
-        n0 = 0
-        for child in HBSMat.children:
-            child.set_uhat(uhat[n0:n0+child.rnk])
-            n0+=child.rnk
-            apply_HBS_downward(child,u,q)
-    elif not HBSMat.is_leaf:
-        U = HBSMat.U
-        D = HBSMat.D
-        n   = 0
-        for child in HBSMat.children:
-            n+=child.rnk
-        qhat = np.zeros(shape=(n,))
-        n0 = 0
-        for child in HBSMat.children:
-            qhat[n0:n0+child.rnk] = child.qhat
-            n0+=child.rnk
-        uhat = U@HBSMat.uhat+D@qhat
-        n0=0
-        for child in HBSMat.children:
-            child.set_uhat(uhat[n0:n0+child.rnk])
-            n0+=child.rnk
-            apply_HBS_downward(child,u,q)
+def apply_HBS_downward(HBSMat:HBSTree,u,q,transpose=False):
+    m00 = q.shape[1]
+    if not transpose:
+        if HBSMat.level==0:
+            D=HBSMat.D
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                qhat[n0:n0+child.rnk,:] = child.qhat
+                n0+=child.rnk
+            uhat = D@qhat
+            n0 = 0
+            for child in HBSMat.children:
+                child.set_uhat(uhat[n0:n0+child.rnk])
+                n0+=child.rnk
+                apply_HBS_downward(child,u,q)
+        elif not HBSMat.is_leaf:
+            U = HBSMat.U
+            D = HBSMat.D
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                qhat[n0:n0+child.rnk,:] = child.qhat
+                n0+=child.rnk
+            uhat = U@HBSMat.uhat+D@qhat
+            n0=0
+            for child in HBSMat.children:
+                child.set_uhat(uhat[n0:n0+child.rnk,:])
+                n0+=child.rnk
+                apply_HBS_downward(child,u,q)
+        else:
+            U=HBSMat.U
+            D=HBSMat.D
+            u[HBSMat.idxs,:]=U@HBSMat.uhat+D@q[HBSMat.idxs,:]
     else:
-        U=HBSMat.U
-        D=HBSMat.D
-        u[HBSMat.idxs]=U@HBSMat.uhat+D@q[HBSMat.idxs]
+        if HBSMat.level==0:
+            D=HBSMat.D
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                qhat[n0:n0+child.rnk,:] = child.qhat
+                n0+=child.rnk
+            uhat = D.T@qhat
+            n0 = 0
+            for child in HBSMat.children:
+                child.set_uhat(uhat[n0:n0+child.rnk])
+                n0+=child.rnk
+                apply_HBS_downward(child,u,q,transpose)
+        elif not HBSMat.is_leaf:
+            V = HBSMat.V
+            D = HBSMat.D
+            n   = 0
+            for child in HBSMat.children:
+                n+=child.rnk
+            qhat = np.zeros(shape=(n,m00))
+            n0 = 0
+            for child in HBSMat.children:
+                qhat[n0:n0+child.rnk,:] = child.qhat
+                n0+=child.rnk
+            uhat = V@HBSMat.uhat+D.T@qhat
+            n0=0
+            for child in HBSMat.children:
+                child.set_uhat(uhat[n0:n0+child.rnk])
+                n0+=child.rnk
+                apply_HBS_downward(child,u,q,transpose)
+        else:
+            V=HBSMat.V
+            D=HBSMat.D
+            u[HBSMat.idxs,:]=V@HBSMat.uhat+D.T@q[HBSMat.idxs,:]
 
-def apply_HBS(HBSMat:HBSTree,q):
+
+def apply_HBS(HBSMat:HBSTree,q0,transpose=False):
+    if q0.ndim == 1:
+        q = q0[:,np.newaxis]
+    else:
+        q = q0
     u=np.zeros(shape=q.shape)
-    apply_HBS_upward(HBSMat,q)
-    apply_HBS_downward(HBSMat,u,q)
+    apply_HBS_upward(HBSMat,q,transpose)
+    apply_HBS_downward(HBSMat,u,q,transpose)
+    if q0.ndim == 1:
+        u = u.flatten()
     return u

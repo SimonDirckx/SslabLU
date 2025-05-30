@@ -10,6 +10,9 @@ from scipy.sparse.linalg   import LinearOperator
 import itertools
 import pdo.pdo as pdo
 from matAssembly.matAssembler import matAssembler
+import matplotlib.pyplot as plt
+from scipy import interpolate
+from scipy.interpolate import griddata
 
 class slabMap:
     def __init__(self,A,I,J):
@@ -65,6 +68,7 @@ class Slab:
 
     def l2g(self,i):
         """maps the ith local dof to the corresponding global coordinates"""
+        # important: these are ALL indices, not just the interior DOFs
         p=self.XX[i,:]
         return self.geom.l2g(p)
     
@@ -72,11 +76,14 @@ class Slab:
         """return global coordinates of vectorized dofs"""
         return np.array([self.l2g(i) for i in range(self.ndofs)])
     
-    def eval_global_func(self,f,i):
+    def evalGlobalFuncAtIntDof(self,f,i):
         """helper function to evaluate globally defined f @ dof i"""
         p=self.l2g(i)
-        #print(p)
         return f(p)
+    def evalGlobFuncAtLocPts(self,f,p):
+        """helper function to evaluate globally defined f @ dof i"""
+        p0=self.geom.l2g(p)
+        return f(p0)
     ######################################################################
 
     #########################
@@ -85,10 +92,15 @@ class Slab:
 
     ######################################################################
     
-    def computeRHS(self,f):
+    def computeRHS(self,f,globalLoad=lambda p : 0):
         """helper function to compute local RHS"""
+        # unified framework for T and S map
         fGb=np.array([f(self.geom.l2g(self.solverWrap.XXb[i,:])) for i in self.idxsGB])
-        rhs=[-self.solverWrap.stMap(self.idxsGB,idxs,self.mapType)@fGb for idxs in self.targetIdxs if idxs]
+        # currently only for S-map!!!
+        # TODO: similar for T-map
+        load = np.array([self.evalGlobalFuncAtIntDof(globalLoad,i) for i in self.Ii])
+        rr = self.solverWrap.solver_ii@load
+        rhs=[rr[idxs]-self.solverWrap.compute_stMap(self.idxsGB,idxs,self.mapType).A@fGb for idxs in self.targetIdxs if idxs]
         rhsIdxs = [idxs for idxs in self.globTargetIdxs if idxs]
         self.rhs    =   rhs
         self.rhsIdxs=   rhsIdxs
@@ -172,10 +184,64 @@ class Slab:
         
         self.locIdxs=locIdxs
         self.globIdxs=globIdxs
-        B                   = [matAssembler.assemble(self.solverWrap.stMap(Idxs[0],Idxs[1],self.mapType)) for Idxs in locIdxs]
+        B                   = [matAssembler.assemble(self.solverWrap.compute_stMap(Idxs[0],Idxs[1],self.mapType)) for Idxs in locIdxs]
         maps                = [slabMap(b,Idxs[0],Idxs[1]) for b,Idxs in zip(B,globIdxs)]
         self.maps           = maps
         self.mapsComputed   = True
+    """
+    evalSolInterior
+    method to evaluate the solution u (given as a vector) in the interior of a slab
+    @param:
+    slab        : slab object
+    b           : vector of values on the boundary (source Idxs set!)
+    """
+    def solveInterior(self,b,f,load = lambda p : 0):
+        g   =   np.zeros(shape=(len(self.Ib),))
+        for idxs,ind in zip(self.sourceIdxs,range(len(self.sourceIdxs))):
+            if idxs:
+                g[idxs] =   b[ind]
+        g[self.Ib[self.idxsGB]]  =   np.array([f(self.geom.l2g(self.XX[self.Ib[i],:])) for i in self.idxsGB])
+        return self.solverWrap.solveInterior(g,load)
+        
+    def evalSol(self,b,f,load = lambda p : 0):
+        # important: assumes that ordering is consistent!
+        Aib = self.solverWrap.Aib
+        fGb=np.array([f(self.geom.l2g(self.solverWrap.XXb[i,:])) for i in self.idxsGB])
+        rhs = Aib[:,self.idxsGB]@fGb
+        ind = 0
+        for idxs in self.sourceIdxs:
+            rhs += Aib[:,idxs]@b[ind]
+            ind += 1
+        ld   = np.array([self.evalGlobalFuncAtIntDof(load,i) for i in self.Ii])
+        solver   = self.solverWrap.solver_ii
+        ui   = solver@(ld-rhs)
+        u = np.zeros(shape=(self.XX.shape[0],))
+        u[self.Ii] = ui
+        #u[self.idxsGB] = fGb
+        ind = 0
+        #for idxs in self.sourceIdxs:
+        #    u[self.Ib[idxs]] = b[ind]
+        #    ind += 1
+        resolution = 2000
+        Ii = self.Ii
+        min_x = np.min(self.XX[Ii,0])
+        max_x = np.max(self.XX[Ii,0])
+        min_y = np.min(self.XX[Ii,1])
+        max_y = np.max(self.XX[Ii,1])
+        grid_x, grid_y    = np.mgrid[min_x:max_x:resolution*1j, min_y:max_y:resolution*1j]
+        grid_solution     = griddata(self.XX, u, (grid_x, grid_y), method='linear').T
+        plot_pad=0.1
+        max_sol = np.max(u)
+        min_sol = np.min(u)
+        plt.figure(1)
+        plt.scatter(self.XX[:,0],self.XX[:,1])
+        plt.figure(2)
+        plt.imshow(grid_solution, extent=(min_x-plot_pad,max_x+plot_pad,\
+                                    min_y-plot_pad,max_y+plot_pad),\
+                                        #vmin=min_sol, vmax=max_sol,\
+                origin='lower',cmap = 'jet')
+        plt.show()
+        return u
     
 
 class multiSlab:
@@ -197,10 +263,10 @@ class multiSlab:
             slab.constructMats(assembler)
         self.constructed = True
 
-    def RHS(self,f):
+    def RHS(self,bdry,load=lambda p:0):
         rhs=np.zeros(shape=(self.N,))
         for slab in self.slabList:
-            rhsloc,idxsloc=slab.computeRHS(f)
+            rhsloc,idxsloc=slab.computeRHS(bdry,load)
             for xi,idxs in zip(rhsloc,idxsloc):
                 rhs[idxs]+=xi
         return rhs
@@ -247,21 +313,19 @@ class multiSlab:
         return LinearOperator(shape=(self.N,self.N),\
             matvec = self.apply, rmatvec = self.applyT,\
             matmat = self.apply, rmatmat = self.applyT)
+    
+    def evalGlobalOnInterfaces(self,f):
+        fvec = np.zeros(shape=(self.N,))
+        for slab in self.slabList:
+            globIdxs    = slab.globTargetIdxs
+            locIdxs     = slab.targetIdxs
+            for idxGlob,idxLoc in zip(globIdxs,locIdxs):
+                floc = np.array([f(slab.geom.l2g(slab.XX[slab.Ii[i],:])) for i in idxLoc])
+                fvec[idxGlob] = floc
+        return fvec
 
 
-"""
-    evalSolInterior
-    method to evaluate the solution u (given as a vector) in the interior of a slab
-    @param:
-    slab        : slab object
-    b           : vector of values on the boundary (source Idxs set!)
-"""
-def evalSolInterior(slab:Slab,b):
-    locIdxs = slab.sourceIdxs
-    I   = [Idx for Idx in locIdxs]
-    A   = slab.solverWrap.solver
-    u   = A.solver_ii@A.Aib[:,I]@b
-    return u
+
     
 
 
