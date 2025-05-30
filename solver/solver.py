@@ -49,9 +49,10 @@ class solverOptions:
             for i in range(1,len(ord)):
                 self.nyz *= (ord[i]-1)
         print("#dofs = ",self.nyz)
+
 def convertGeom(opts,geom):
     if opts.type=='hps':
-        return hpsGeom.BoxGeometry(np.array([geom.bounds[0],geom.bounds[1]]))
+        return hpsGeom.BoxGeometry(np.array([geom.bounds[0,:],geom.bounds[1,:]]))
 
 
 class solverWrapper:
@@ -68,7 +69,7 @@ class solverWrapper:
         self.type = opts.type
         self.constructed = False
         self.opts=opts
-    def construct(self,geom:slabGeom.slabGeometry,PDE:pdo):
+    def construct(self,geom,PDE:pdo):
         """
         Actual construction of the local solver
         """
@@ -124,7 +125,7 @@ class solverWrapper:
         self.XXi = self.solver.XX[self.Ii,:]
         self.XXb = self.solver.XX[self.Ib,:]
         self.ndofs = self.XX.shape[0]
-        self.constructMapIdxs()
+        #self.constructMapIdxs()
     
     def constructMapIdxs(self):
         Il,Ic,Ir,IGB=self.geom.getIlIcIr(self.XXi,self.XXb)

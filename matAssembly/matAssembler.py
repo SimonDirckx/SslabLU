@@ -3,7 +3,7 @@
 
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
-from .HBS import HBSTree as HBS
+import matAssembly.HBS.HBSTree as HBS
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt

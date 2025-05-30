@@ -1,7 +1,7 @@
 import numpy as np
 from collections import deque
 from scipy.linalg import qr
-from .simpleoctree import simpletree as tree
+from matAssembly.HBS.simpleoctree import simpletree as tree
 
 def qr_null(A, rnk0:int):
     Q, R, P = qr(A.T, mode='full', pivoting=True)

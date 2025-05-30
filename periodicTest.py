@@ -1,7 +1,6 @@
 import numpy as np
 import pdo.pdo as pdo
 import solver.solver as solverWrap
-import multiSlab as MS
 import matAssembly.matAssembler as mA
 import matplotlib.pyplot as plt
 import geometry.standardGeometries as stdGeom
@@ -28,6 +27,7 @@ from hps.geom              import BoxGeometry, ParametrizedGeometry2D,Parametriz
 import matplotlib as mpl
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import solver.HPSInterp3D as interp
+import multislab.oms as oms
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -158,9 +158,9 @@ period = 1.
 tol = 1e-5
 
 data = 0
-p = 12
+p = 6
 a = H/2.
-assembler = mA.rkHMatAssembler(((p+2)//2)*((p+2)//2))
+assembler = mA.denseMatAssembler()#rkHMatAssembler(((p+2)//2)*((p+2)//2))
 
 
 Sl_list = []
@@ -199,6 +199,8 @@ for slabInd in range(len(connectivity)):
     Ir = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xr)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
     Ic = [i for i in range(len(disc.Ji)) if np.abs(XXi[i,0]-xc)<1e-14]
     Igb = [i for i in range(len(disc.Jx)) if gb(XXb[i,:])]
+
+
     nc = len(Ic)
     
     IFLeft  = connectivity[slabInd][0]
@@ -283,6 +285,22 @@ def smatmat(v,transpose=False):
 Linop = LinearOperator(shape=(Ntot,Ntot),\
 matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
 matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
+
+opts = solverWrap.solverOptions('hps',[p,p,p],a)
+OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity)
+Stot0_LO,rhstot0 = OMS.construct_Stot_and_rhstot(bc,assembler)
+E = np.identity(Ntot)
+
+Stot0 = Stot0_LO@E
+Stot = Linop@E
+
+Stot0T = Stot0_LO.T@E
+StotT = Linop.T@E
+
+
+print("Stot err. = ",np.linalg.norm(Stot-Stot0))
+print("Stot T err. = ",np.linalg.norm(StotT-Stot0T))
+print("rhs err. = ",np.linalg.norm(rhstot-rhstot0))
 
 gInfo = gmres_info()
 stol = 1e-10*H*H
