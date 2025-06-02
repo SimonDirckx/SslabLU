@@ -52,7 +52,7 @@ class solverOptions:
 
 def convertGeom(opts,geom):
     if opts.type=='hps':
-        return hpsGeom.BoxGeometry(np.array([geom.bounds[0,:],geom.bounds[1,:]]))
+        return hpsGeom.BoxGeometry(geom)
 
 
 class solverWrapper:

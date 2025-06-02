@@ -150,6 +150,10 @@ for n in range(N):
 connectivity = [[N-1,0]]
 for i in range(N-1):
     connectivity+=[[i,i+1]]
+if_connectivity = [[N-1,1]]
+
+for i in range(N-1):
+    if_connectivity+=[[i,(i+2)%N]]
 
 print(connectivity)
 
@@ -287,7 +291,7 @@ matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
 matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
 
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity)
+OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity)
 Stot0_LO,rhstot0 = OMS.construct_Stot_and_rhstot(bc,assembler)
 E = np.identity(Ntot)
 
