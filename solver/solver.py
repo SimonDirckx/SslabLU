@@ -34,21 +34,10 @@ class solverOptions:
     ordx,ordy:  order in x and y directions
     a:          characteristic scale in case of HPS
     """
-    def __init__(self,type:str,ord,a=1):
+    def __init__(self,type:str,ord,a=None):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
-        self.nyz    =   1
-        if type=='stencil':
-            for i in range(1,len(ord)):
-                self.nyz *= (ord[i]-2)
-        if type=='hps':
-            for i in range(1,len(ord)):
-                self.nyz *= (int)(np.round((ord[i]-2)*(.5/a)))
-        if type=='spectral':
-            for i in range(1,len(ord)):
-                self.nyz *= (ord[i]-1)
-        print("#dofs = ",self.nyz)
 
 def convertGeom(opts,geom):
     if opts.type=='hps':

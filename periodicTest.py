@@ -28,6 +28,7 @@ import matplotlib as mpl
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import solver.HPSInterp3D as interp
 import multislab.oms as oms
+import jax.numpy as jnp
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -79,43 +80,45 @@ def join(slab1,slab2,period=None):
 nwaves = 1.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-def c11(p):
-    return np.ones(shape=(p.shape[0],))
-def c22(p):
-    return np.ones(shape=(p.shape[0],))
-def c(p):
-    return -kh*kh*np.ones(shape=(p.shape[0],))
 def bfield(p,kh):
-    return -kh*kh*np.ones(shape=(p.shape[0],))
+    return -kh*kh*jnp.ones(p[...,0].shape)
 
 
 const_theta = 1/(2.*np.pi)
-r           = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
+r           = lambda zz: jnp.sqrt((zz[...,0]**2 + zz[...,1]**2))
 
-z1 = lambda zz: np.multiply( 1 + 1 * zz[:,1], np.cos(zz[:,0]/const_theta) )
-z2 = lambda zz: np.multiply( 1 + 1 * zz[:,1], np.sin(zz[:,0]/const_theta) )
-z3 = lambda zz: zz[:,2]
+z1 = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.cos(zz[...,0]/const_theta) )
+z2 = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.sin(zz[...,0]/const_theta) )
+z3 = lambda zz: zz[...,2]
 
-
-y1 = lambda zz: const_theta* np.atan2(zz[:,1],zz[:,0])
+y1 = lambda zz: const_theta* jnp.atan2(zz[...,1],zz[...,0])
 y2 = lambda zz: r(zz) - 1
-y3 = lambda zz: zz[:,2]
+y3 = lambda zz: zz[...,2]
 
-y1_d1    = lambda zz: -const_theta     * np.divide(zz[:,1], r(zz)**2)
-y1_d2    = lambda zz: +const_theta     * np.divide(zz[:,0], r(zz)**2)
-y1_d1d1  = lambda zz: +2*const_theta   * np.divide(np.multiply(zz[:,0],zz[:,1]), r(zz)**4)
-y1_d2d2  = lambda zz: -2*const_theta   * np.divide(np.multiply(zz[:,0],zz[:,1]), r(zz)**4)
+y1_d1    = lambda zz: -const_theta     * zz[...,1]/(r(zz)**2)
+y1_d2    = lambda zz: +const_theta     * zz[...,0]/ (r(zz)**2)
+y1_d1d1  = lambda zz: +2*const_theta   * (zz[...,0]*zz[...,1])/ (r(zz)**4)
+y1_d2d2  = lambda zz: -2*const_theta   * (zz[...,0]*zz[...,1])/ (r(zz)**4)
 y1_d1d1 = None; y1_d2d2 = None
 
 
-y2_d1    = lambda zz: np.divide(zz[:,0], r(zz))
-y2_d2    = lambda zz: np.divide(zz[:,1], r(zz))
-y2_d1d1  = lambda zz: np.divide(zz[:,1]**2, r(zz)**3)
-y2_d2d2  = lambda zz: np.divide(zz[:,0]**2, r(zz)**3)
+y2_d1    = lambda zz: zz[...,0]/ r(zz)
+y2_d2    = lambda zz: zz[...,1]/ r(zz)
+y2_d1d1  = lambda zz: (zz[...,1]**2)/(r(zz)**3)
+y2_d2d2  = lambda zz: (zz[...,0]**2)/(r(zz)**3)
 
-y3_d3    = lambda zz: np.ones(shape=zz[:,2].shape)
+y3_d3    = lambda zz: jnp.ones_like(zz[...,2])
 
 
+# Parametrized geometry
+box_geom = jnp.array([[0, 0, 0], [1.0, 1.0, 1.0]])
+param_geom = ParametrizedGeometry3D(
+    box_geom,
+    z1, z2, z3, y1, y2, y3,
+    y1_d1=y1_d1, y2_d1=y2_d1, y3_d3=y3_d3,
+    y2_d2=y2_d2, y2_d1d1=y2_d1d1
+)
+pdo_mod = param_geom.transform_helmholtz_pdo(bfield, kh)
 
 def bc(p):
     r = np.sqrt((z1(p)+3)**2+(z2(p))**2)
@@ -124,20 +127,20 @@ def u_exact(p):
     r = np.sqrt((z1(p)+3)**2+(z2(p))**2)
     return special.yn(0, kh*r)/4
 
-# periodic: x=0 and x=1 NOT part of gb
+# periodic: x=0 and x=1 NOT part of gb.
 def gb(p):
     return np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14 or np.abs(p[2]-bnds[0][2])<1e-14 or np.abs(p[2]-bnds[1][2])<1e-14
 
 
 bnds = [[0.,0.,0.],[1.,1.,1.]]
-box_geom   = np.array(bnds)
+#box_geom = jnp.array([[0, 0, 0], [1.0, 1.0, 1.0]])
 Om=stdGeom.Box(bnds)
-param_geom = ParametrizedGeometry3D(box_geom,z1,z2,z3,y1,y2,y3,\
-                    y1_d1=y1_d1, y1_d2=y1_d2,\
-                    y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
-                    y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
-                    y3_d3=y3_d3)
-pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
+#param_geom = ParametrizedGeometry3D(box_geom,z1,z2,z3,y1,y2,y3,\
+                    #y1_d1=y1_d1, y1_d2=y1_d2,\
+                    #y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
+                    #y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
+                    #y3_d3=y3_d3)
+#pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 
 H = 1./4.
@@ -162,9 +165,9 @@ period = 1.
 tol = 1e-5
 
 data = 0
-p = 6
-a = H/2.
-assembler = mA.denseMatAssembler()#rkHMatAssembler(((p+2)//2)*((p+2)//2))
+p = 12
+a = [H/2.,1/2,1/2]
+assembler = mA.rkHMatAssembler(((p+2)//2)*((p+2)//2))
 
 
 Sl_list = []
@@ -192,7 +195,7 @@ for slabInd in range(len(connectivity)):
     box_geom   = np.array(bnds)
     
     print("building HPS...")
-    geom = hpsGeom.BoxGeometry(np.array([[xl,yl,zl],[xr,yr,zr]]))
+    geom = hpsGeom.BoxGeometry(jnp.array([[xl,yl,zl],[xr,yr,zr]]))
     disc = HPS.HPSMultidomain(pdo_mod, geom, a, p)
     print("...done")
     XX = disc._XX
@@ -326,7 +329,7 @@ print("GMRES iters              = ", gInfo.niter)
 #print("data (MB)                = ",data/1e6)
 #print("data orig (MB)           = ",(8*Ntot+8*(nc*nc)*2.*(N-1))/1e6)
 print("==================================")
-
+'''
 uitot = np.zeros(shape=(0,))
 XXtot = np.zeros(shape=(0,3))
 dofs = 0
@@ -387,3 +390,4 @@ plt.tripcolor(ZZ[:,0],ZZ[:,1],uitot,triangles = tri.simplices.copy(),cmap='jet',
 plt.colorbar()
 plt.axis('equal')
 plt.show()
+'''
