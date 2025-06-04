@@ -141,7 +141,6 @@ def copy_tree_to_HBS(tree,m=0,T=None):
     return T
 def HBS_tree_from_points(XX,nl=8):
     t =  tree.BalancedTree(XX,nl)
-    print("tree levels = ",t.nlevels)
     return copy_tree_to_HBS(t)       
 
 

@@ -11,12 +11,14 @@ class matAssemblerOptions:
     """
     Options for matrix constuction
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,maxRank:int=8,tree=None):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int = 0,maxRank:int=8,tree=None):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
+        self.leaf_size  = leaf_size
         self.maxRank    = maxRank
         self.tree       = tree
+        
 
 
 class matAssembler:
@@ -29,12 +31,7 @@ class matAssembler:
         linOp = stMap.A
         
         if self.matOpts.method == 'epsHBS' or self.matOpts.method == 'rkHBS':
-            #for now we assume only one tree needed, in the future we generalize
-            #start=time.time()
-            treeI = HBS.HBS_tree_from_points(stMap.XXI,self.matOpts.maxRank)
-            #stop=time.time()
-            #print("time tree = ",stop-start)
-            #treeJ = HBS.HBS_tree_from_points(stMap.XXJ)
+            treeI = HBS.HBS_tree_from_points(stMap.XXI,self.matOpts.leaf_size)
         if self.matOpts.method == 'dense':
             return linOp.matmat(np.identity(linOp.shape[1]))
         
@@ -42,7 +39,7 @@ class matAssembler:
             
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=3*(self.matOpts.maxRank+10)
+            s=(self.matOpts.maxRank+10)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
             Y = linOp.matmat(Om)
@@ -87,8 +84,8 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,rk):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,rk))
+    def __init__(self,leaf_size,rk):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk))
 
 class tolHMatAssembler(matAssembler):
     def __init__(self,tol,rk=4):
