@@ -162,9 +162,9 @@ class oms:
 
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
-                v_tmp = v[:,np.newaxis]
+                v_tmp = v[:,np.newaxis].astype('float64')
             else:
-                v_tmp = v
+                v_tmp = v.astype('float64')
             result  = v_tmp.copy()
             if (not transpose):
                 for i in range(len(glob_target_dofs)):
@@ -231,7 +231,7 @@ class oms:
                 v_tmp = v[:,np.newaxis]
             else:
                 v_tmp = v
-            result  = v_tmp.copy()
+            result  = v_tmp.copy().astype('float64')
             if (not transpose):
                 for i in range(len(glob_target_dofs)):
                     result[glob_target_dofs[i]]+=Sl_rk_list[i]@v_tmp[self.glob_source_dofs[i][0]]

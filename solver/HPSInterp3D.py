@@ -119,7 +119,7 @@ def sortInHPSBoxes(disc,XY):
 def interpHPS(disc,vals,XY):
     assert(vals.shape[0]==disc._XXfull.shape[0])
     p = disc._p
-    XX = disc._XXfull
+    XX = np.array(disc._XXfull)
     XYlist = sortInHPSBoxes(disc,XY)
     ndofs = (p+2)*(p+2)*(p+2)
     F_approx = np.zeros(shape=(0,1))
