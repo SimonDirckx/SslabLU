@@ -1,39 +1,21 @@
+# basic packages
 import numpy as np
-import pdo.pdo as pdo
-import solver.solver as solverWrap
-import multiSlab as MS
-import matAssembly.matAssembler as mA
-import matplotlib.pyplot as plt
-import geometry.standardGeometries as stdGeom
-import geometry.skeleton as skelTon
-import time
-import hps.hps_multidomain as HPS
-import hps.geom as hpsGeom
-from scipy.sparse        import block_diag
-import scipy.sparse as sparse
-import scipy.sparse.linalg as splinalg
-from scipy import interpolate
-from scipy.interpolate import griddata
-from scipy.sparse.linalg   import LinearOperator
-from scipy.sparse.linalg import gmres
-from solver.solver import stMap
-import matAssembly.matAssembler as mA
-import matplotlib as mpl
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from scipy.spatial import Delaunay 
-from hps.geom              import BoxGeometry, ParametrizedGeometry2D,ParametrizedGeometry3D
-import scipy.special as special
-from matplotlib.patches import Polygon
-from hps.geom              import BoxGeometry, ParametrizedGeometry2D,ParametrizedGeometry3D
-import matplotlib as mpl
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-import solver.HPSInterp3D as interp
-import multislab.oms as oms
 import jax.numpy as jnp
-#import jax
-#jax.config.update('jax_platform_name', 'cpu')
+import scipy
+from packaging.version import Version
 
+# oms packages
+import solver.solver as solverWrap
+import matAssembly.matAssembler as mA
+import multislab.oms as oms
+from hps.geom              import ParametrizedGeometry3D
 
+# validation&testing
+import time
+from scipy.sparse.linalg import gmres
+import solver.HPSInterp3D as interp
+
+jax_avail = True
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -44,58 +26,19 @@ class gmres_info(object):
         self.resList+=[rk]
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
-def mesh(slab):
-    xpts = np.linspace(slab[0][0],slab[1][0],20)
-    ypts = np.linspace(slab[0][1],slab[1][1],20)
-    nx = len(xpts)
-    ny = len(ypts)
-    XY = np.zeros(shape = (nx*ny,2))
-    for j in range(ny):
-        for i in range(nx):
-            XY[j+i*ny] = [xpts[i],ypts[j]]
-    return XY
 
 
-# description: slab1<slab2 assumed!
-def join(slab1,slab2,period=None):
-    xl1 = slab1[0][0]
-    xr1 = slab1[1][0]
-    yl1 = slab1[0][1]
-    yr1 = slab1[1][1]
-    zl1 = slab1[0][2]
-    zr1 = slab1[1][2]
-
-    xl2 = slab2[0][0]
-    xr2 = slab2[1][0]
-    yl2 = slab2[0][1]
-    yr2 = slab2[1][1]
-    zl2 = slab2[0][2]
-    zr2 = slab2[1][2]
-    if(np.abs(xr1-xl2)>1e-10):
-        if period:
-            xl1 -= period
-            xr1 -= period
-            return join([[xl1,yl1,zl1],[xr1,yr1,zr1]],slab2)
-        else:
-            ValueError("slab shift did not work (is your period correct?)")
-    else:
-        totalSlab = [[xl1, yl1,zl1],[xr2,yr2,zr2]]
-    return totalSlab
-# the final diameter of the domain is 4, so kh = (nwaves/4)*2pi
-nwaves = 2.24
-wavelength = 4/nwaves
-kh = (nwaves/4)*2.*np.pi
-def c11(p):
-    return np.ones(shape=(p.shape[0],))
-def c22(p):
-    return np.ones(shape=(p.shape[0],))
-def c(p):
-    return -kh*kh*np.ones(shape=(p.shape[0],))
+#########################################################################################################
+#
+#   SET-UP GEOMETRY:        3D Annulus
+#   - forward transform     (z1,z2,z3)
+#   - backward transform    (y1,y2,y3)
+#   - derivatives (up to 2nd) of backward
+#   - Annulus boundary      (gb)
+#
+#########################################################################################################
 
 
-
-
-jax_avail = True
 if jax_avail:
     const_theta = 1/(2.*np.pi)
     r           = lambda zz: (zz[...,0]**2 + zz[...,1]**2)**0.5
@@ -123,10 +66,6 @@ if jax_avail:
 
     y3_d3    = lambda zz: jnp.ones(shape=zz[...,2].shape)
 
-
-    def bfield(p,kh):
-        return -kh*kh*jnp.ones_like(p[...,0])
-
     bnds = [[0.,0.,0.],[1.,1.,1.]]
     box_geom   = jnp.array(bnds)
     param_geom = ParametrizedGeometry3D(box_geom,z1,z2,z3,y1,y2,y3,\
@@ -134,7 +73,7 @@ if jax_avail:
                         y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
-    pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
+    
 else:
     const_theta = 1/(2.*np.pi)
     r           = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
@@ -162,30 +101,65 @@ else:
 
     y3_d3    = lambda zz: np.ones(shape=zz[:,2].shape)
     bnds = [[0.,0.,0.],[1.,1.,1.]]
-    def bfield(p,kh):
-        return -kh*kh*np.ones(shape=(p.shape[0],))
+    
     box_geom   = np.array(bnds)
-    Om=stdGeom.Box(bnds)
     param_geom = ParametrizedGeometry3D(box_geom,z1,z2,z3,y1,y2,y3,\
                         y1_d1=y1_d1, y1_d2=y1_d2,\
                         y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
-    pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
-
-
-def bc(p):
-    #r = np.sqrt((z1(p)+3)**2+(z2(p))**2)
-    z=z1(p)
-    return np.sin(kh*z)#special.yn(0, kh*r)/4.
-def u_exact(p):
-    #r = np.sqrt((z1(p)+3)**2+(z2(p))**2)
-    z=z1(p)
-    return np.sin(kh*z)#special.yn(0, kh*r)/4
-
-# periodic: x=0 and x=1 NOT part of gb
+    
 def gb(p):
     return np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14 or np.abs(p[2]-bnds[0][2])<1e-14 or np.abs(p[2]-bnds[1][2])<1e-14
+
+#########################################################################################################
+
+
+################################################################
+#
+#   SET-UP BVP:         Helmholtz on 3D Annulus
+#   - wave number       (kh)
+#   - bfield            (= kh*ones)
+#   - pdo_mod           (pdo transformed to square)
+#   - BC
+#   - known exact sol.  (u_exact)
+#
+################################################################
+
+nwaves = 2.24
+wavelength = 4/nwaves
+kh = (nwaves/4)*2.*np.pi
+
+if jax_avail:
+    def bfield(p,kh):
+        return -kh*kh*jnp.ones_like(p[...,0])
+else:
+    def bfield(p,kh):
+        return -kh*kh*np.ones(shape=(p.shape[0],))
+
+pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
+
+def bc(p):
+    z=z1(p)
+    return np.sin(kh*z)
+
+def u_exact(p):
+    z=z1(p)
+    return np.sin(kh*z)
+
+################################################################
+
+
+##############################################################################################
+#
+#   SET-UP Slabs
+#   - left-to-right convention  (!!!)
+#   - single slabs              (slabs)
+#   - slab connectivity         (connectivity, i.e. are two single slabs connected)
+#   - interface connectivity    (if_connectivity, i.e. are two interfaces connected by a slab) 
+#   - periodicity               (period, i.e. period in the x-dir)
+#
+##############################################################################################
 
 
 H = 1./16.
@@ -203,30 +177,48 @@ for i in range(N):
     if_connectivity+=[[(i-1)%N,(i+1)%N]]
 
 period = 1.
-tol = 1e-5
 
-data = 0
+##############################################################################################
+
+#################################################################
+#
+#   Compute OMS (overlapping multislab)
+#   - discretization options    (opts)
+#   - off-diag block assembler  (assembler)
+#   - Overlapping Multislab     (OMS)
+#
+#################################################################
+
+tol = 1e-5
 p = 6
 a = [H/2.,1/4,1/4]
 assembler = mA.rkHMatAssembler((p+2)*(p+2),60)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity)
 print("computing Stot & rhstot...")
-Stot_LO,rhstot0 = OMS.construct_Stot_and_rhstot(bc,assembler)
+Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler)
 print("done")
+#################################################################
+
+
+#Finally, solve
+
 gInfo = gmres_info()
 stol = 1e-10*H*H
-uhat,info   = gmres(Stot_LO,rhstot0,tol=stol,callback=gInfo,maxiter=100,restart=100)
+
+if Version(scipy.__version__)>=Version("1.14"):
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
+else:
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
+
 stop_solve = time.time()
-res = Stot_LO@uhat-rhstot0
-nc = len(OMS.glob_target_dofs[0])
-print('wavelength = ',wavelength)
-print('ppw = ',wavelength*nc)
+res = Stot@uhat-rhstot
+
 
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p)
-print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot0))
+print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
 #print("constuction time rk.     = ",trk)
 #print("par. constuction time rk.= ",trk/(N-1))
@@ -242,7 +234,7 @@ dofs = 0
 
 
 
-
+# check err.
 for i in range(len(slabs)):
     slab = slabs[i]
     ul = uhat[OMS.glob_target_dofs[i]]
