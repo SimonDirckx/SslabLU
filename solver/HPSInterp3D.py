@@ -1,7 +1,9 @@
 import numpy as np
 import tensorly as tl
 import tensorly.tenalg as tenalg
-
+import jax.numpy as jnp
+import hps.geom as hpsGeom
+import hps.hps_multidomain as HPS
 #functions
 
 def computeTransform(x):
@@ -85,18 +87,17 @@ def chebInterpFromSamples3D_XX(xyzpts,p,f,XY):
                 F_approx+=core[k0,k1,k2]*cx[k0,:]*cy[k1,:]*cz[k2,:]
     return F_approx
 
-def sortInHPSBoxes(disc,XY):
-    npan_dim = disc.npan_dim
+def sortInHPSBoxes(geom,npan_dim,XY):
     nx = npan_dim[0]
     ny = npan_dim[1]
-    nz = npan_dim[1]
+    nz = npan_dim[2]
     XYlist =[]
-    xmin = disc._box_geom[0][0]
-    xmax = disc._box_geom[1][0]
-    ymin = disc._box_geom[0][1]
-    ymax = disc._box_geom[1][1]
-    zmin = disc._box_geom[0][2]
-    zmax = disc._box_geom[1][2]
+    xmin = geom.bounds[0][0]
+    xmax = geom.bounds[1][0]
+    ymin = geom.bounds[0][1]
+    ymax = geom.bounds[1][1]
+    zmin = geom.bounds[0][2]
+    zmax = geom.bounds[1][2]
     dx = xmax-xmin
     dy = ymax-ymin
     dz = zmax-zmin
@@ -116,14 +117,61 @@ def sortInHPSBoxes(disc,XY):
         XYlist[xmod+ymod*nx+zmod*nx*ny] = np.append(XYlist[xmod+ymod*nx+zmod*nx*ny],xyz,axis=0)
     return XYlist
 
-def interpHPS(disc,vals,XY):
-    assert(vals.shape[0]==disc._XXfull.shape[0])
-    p = disc._p
-    XX = np.array(disc._XXfull)
-    XYlist = sortInHPSBoxes(disc,XY)
+def interpHPS(XX,geom,npan_dim,a,p,vals,XY):
+    XYlist = sortInHPSBoxes(geom,npan_dim,XY)
     ndofs = (p+2)*(p+2)*(p+2)
     F_approx = np.zeros(shape=(0,1))
     for i in range(len(XYlist)):
         ff = chebInterpFromSamples3D_XX(XX[ndofs*i:ndofs*(i+1),:],p,vals[ndofs*i:ndofs*(i+1)],XYlist[i])
         F_approx= np.append(F_approx,ff)
     return F_approx,XYlist
+
+
+def check_err(slab,ul,ur,a,p,pdo,gb,bc,u_exact):
+    
+    xl = slab[0][0]
+    xr = slab[1][0]
+
+    yl = slab[0][1]
+    yr = slab[1][1]
+
+    zl = slab[0][2]
+    zr = slab[1][2]
+    
+    geom = hpsGeom.BoxGeometry(jnp.array([[xl,yl,zl],[xr,yr,zr]]))
+    disc = HPS.HPSMultidomain(pdo, geom, a, p)
+    
+    XXb = disc._XX[disc.Jx,:]
+    Ir = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xr)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
+    Il = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xl)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
+    Igb = [i for i in range(len(disc.Jx)) if gb(XXb[i,:])]
+    
+    bvec = np.zeros(shape=(len(disc.Jx),1))
+    bvec[Igb,0] = bc(XXb[Igb,:])
+    
+    bvec[Il,0] = ul   
+    bvec[Ir,0] = ur
+    
+    print("solving local dirichlet...")
+    ui = disc.solve_dir_full(bvec)
+    print("done")
+    resx = 50
+    resy = 30
+    x_eval = np.linspace(disc._box_geom[0][0],disc._box_geom[1][0],resx)
+    y_eval = np.linspace(disc._box_geom[0][1],disc._box_geom[1][1],resy)
+
+    XY = np.zeros(shape=(resx*resy,3))
+    XY[:,0] = np.kron(x_eval,np.ones(shape=y_eval.shape))
+    XY[:,1] = np.kron(np.ones(shape=x_eval.shape),y_eval)
+    XY[:,2] = .6*np.ones(shape = (resx*resy,))
+    print("interpolating...")
+    XXfull = np.array(disc._XXfull)
+    npan_dim=disc.npan_dim
+    u_approx,XYlist = interpHPS(XXfull,geom,npan_dim,a,p,ui[:,0],XY)
+    print("done")
+    u_exact_vec = np.zeros(shape=(0,1))
+    for i in range(len(XYlist)):
+        ue = u_exact(XYlist[i])
+        u_exact_vec= np.append(u_exact_vec,ue)
+    errInf = np.linalg.norm(u_exact_vec-u_approx,ord=np.inf)
+    print('errInf = ',errInf)

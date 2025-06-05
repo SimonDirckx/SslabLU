@@ -30,8 +30,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import solver.HPSInterp3D as interp
 import multislab.oms as oms
 import jax.numpy as jnp
-import jax
-jax.config.update('jax_platform_name', 'cpu')
+#import jax
+#jax.config.update('jax_platform_name', 'cpu')
 
 
 class gmres_info(object):
@@ -95,8 +95,8 @@ def c(p):
 
 
 
-jax = True
-if jax:
+jax_avail = True
+if jax_avail:
     const_theta = 1/(2.*np.pi)
     r           = lambda zz: (zz[...,0]**2 + zz[...,1]**2)**0.5
 
@@ -206,7 +206,7 @@ period = 1.
 tol = 1e-5
 
 data = 0
-p = 8
+p = 6
 a = [H/2.,1/4,1/4]
 assembler = mA.rkHMatAssembler((p+2)*(p+2),60)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
@@ -240,44 +240,17 @@ uitot = np.zeros(shape=(0,))
 XXtot = np.zeros(shape=(0,3))
 dofs = 0
 
-for i in range(N):
-    xl = i*H
-    xr = (i+1)*H
-    geom = hpsGeom.BoxGeometry(jnp.array([[xl,0.,0.],[xr,1.,1.]]))
-    disc = HPS.HPSMultidomain(pdo_mod, geom, a, p)
-    XX = disc._XX
-    XXb = XX[disc.Jx,:]
-    XXi = XX[disc.Ji,:]
-    Ir = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xr)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
-    Il = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xl)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
-    Igb = [i for i in range(len(disc.Jx)) if gb(XXb[i,:])]
-    bvec = np.zeros(shape=(len(disc.Jx),1))
-    bvec[Igb,0] = bc(XXb[Igb,:])
-    bvec[Il,0] = uhat[i*nc:(i+1)*nc]
-    start = ((i+1)%N)*nc
-    bvec[Ir,0] = uhat[start:start+nc]
-    dofs+=bvec.shape[0]
-    ui = disc.solve_dir_full(bvec)
-    u_exact_loc = u_exact(disc._XXfull)
-    resx = 50
-    resy = 30
-    x_eval = np.linspace(disc._box_geom[0][0],disc._box_geom[1][0],resx)
-    y_eval = np.linspace(disc._box_geom[0][1],disc._box_geom[1][1],resy)
 
-    XY = np.zeros(shape=(resx*resy,3))
-    XY[:,0] = np.kron(x_eval,np.ones(shape=y_eval.shape))
-    XY[:,1] = np.kron(np.ones(shape=x_eval.shape),y_eval)
-    XY[:,2] = .6*np.ones(shape = (resx*resy,))
-    u_approx,XYlist = interp.interpHPS(disc,ui[:,0],XY)
-    uitot=np.append(uitot,u_approx,axis=0)
-    u_exact_vec = np.zeros(shape=(0,1))
-    for i in range(len(XYlist)):
-        ue = u_exact(XYlist[i])
-        u_exact_vec= np.append(u_exact_vec,ue)
-        XXtot=np.append(XXtot,XYlist[i],axis=0)
-    errInf = np.linalg.norm(u_exact_vec-u_approx,ord=np.inf)
-    print('errInf = ',errInf)
-    del disc,geom
+
+
+for i in range(len(slabs)):
+    slab = slabs[i]
+    ul = uhat[OMS.glob_target_dofs[i]]
+    ur = uhat[OMS.glob_source_dofs[i][1]]
+    interp.check_err(slab,ul,ur,a,p,pdo_mod,gb,bc,u_exact)
+
+
+'''
 XXtot,I=np.unique(XXtot,axis=0,return_index=True)
 ui_exact = u_exact(XXtot)
 uitot=uitot[I]
@@ -292,3 +265,4 @@ plt.tripcolor(ZZ[:,0],ZZ[:,1],uitot,triangles = tri.simplices.copy(),cmap='jet',
 plt.colorbar()
 plt.axis('equal')
 plt.show()
+'''
