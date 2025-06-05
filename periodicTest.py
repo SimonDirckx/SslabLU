@@ -30,6 +30,10 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import solver.HPSInterp3D as interp
 import multislab.oms as oms
 import jax.numpy as jnp
+import jax
+jax.config.update('jax_platform_name', 'cpu')
+
+
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -202,13 +206,14 @@ period = 1.
 tol = 1e-5
 
 data = 0
-p = 10
+p = 8
 a = [H/2.,1/4,1/4]
 assembler = mA.rkHMatAssembler((p+2)*(p+2),60)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity)
+print("computing Stot & rhstot...")
 Stot_LO,rhstot0 = OMS.construct_Stot_and_rhstot(bc,assembler)
-
+print("done")
 gInfo = gmres_info()
 stol = 1e-10*H*H
 uhat,info   = gmres(Stot_LO,rhstot0,tol=stol,callback=gInfo,maxiter=100,restart=100)
@@ -236,12 +241,8 @@ XXtot = np.zeros(shape=(0,3))
 dofs = 0
 
 for i in range(N):
-    print("i = ",i)
-    print("H = ",H)
     xl = i*H
     xr = (i+1)*H
-    print("xl = ",xl)
-    print("xr = ",xr)
     geom = hpsGeom.BoxGeometry(jnp.array([[xl,0.,0.],[xr,1.,1.]]))
     disc = HPS.HPSMultidomain(pdo_mod, geom, a, p)
     XX = disc._XX
@@ -257,15 +258,11 @@ for i in range(N):
     bvec[Ir,0] = uhat[start:start+nc]
     dofs+=bvec.shape[0]
     ui = disc.solve_dir_full(bvec)
-    print("ui type//shape",type(ui),"//",ui.shape)
     u_exact_loc = u_exact(disc._XXfull)
-    print("ui type//shape",type(u_exact_loc),"//",u_exact_loc.shape)
-    print("uloc err = ",np.linalg.norm(ui[:,0]-u_exact_loc,ord=np.inf))
     resx = 50
     resy = 30
     x_eval = np.linspace(disc._box_geom[0][0],disc._box_geom[1][0],resx)
     y_eval = np.linspace(disc._box_geom[0][1],disc._box_geom[1][1],resy)
-    #eval at z=.6
 
     XY = np.zeros(shape=(resx*resy,3))
     XY[:,0] = np.kron(x_eval,np.ones(shape=y_eval.shape))
@@ -280,10 +277,11 @@ for i in range(N):
         XXtot=np.append(XXtot,XYlist[i],axis=0)
     errInf = np.linalg.norm(u_exact_vec-u_approx,ord=np.inf)
     print('errInf = ',errInf)
+    del disc,geom
 XXtot,I=np.unique(XXtot,axis=0,return_index=True)
 ui_exact = u_exact(XXtot)
 uitot=uitot[I]
-print('u err inf = ',np.linalg.norm(ui_exact-uitot,ord=np.inf))
+print('total u err inf = ',np.linalg.norm(ui_exact-uitot,ord=np.inf))
 ZZ = np.zeros(shape = XXtot.shape)
 ZZ[:,0] = z1(XXtot)
 ZZ[:,1] = z2(XXtot)

@@ -146,27 +146,20 @@ class oms:
             fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-            print("assembling...")
             rkMat_r = assembler.assemble(st_r)
             rkMat_l = assembler.assemble(st_l)
-            print("done")
             Sl_rk_list += [rkMat_l]
             Sr_rk_list += [rkMat_r]
             rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
             del solver
-        print("slabs done")
         self.glob_target_dofs = glob_target_dofs
-        print("computing global dofs...")
         self.compute_global_dofs()
-        print("done")
-        print("collecting rhs...")
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc]=-rhs_list[rhsInd]
-        print("done")
-        print("computing Linop...")
+
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
                 v_tmp = v[:,np.newaxis].astype('float64')
@@ -188,7 +181,6 @@ class oms:
         Linop = LinearOperator(shape=(Ntot,Ntot),\
         matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
         matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
-        print("done")
         return Linop,rhstot
     
 
