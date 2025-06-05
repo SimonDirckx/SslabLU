@@ -184,10 +184,7 @@ def gb(p):
     return np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14 or np.abs(p[2]-bnds[0][2])<1e-14 or np.abs(p[2]-bnds[1][2])<1e-14
 
 
-
-
-
-H = 1./4.
+H = 1./16.
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -201,166 +198,30 @@ if_connectivity = []
 for i in range(N):
     if_connectivity+=[[(i-1)%N,(i+1)%N]]
 
-print(connectivity)
-
-
 period = 1.
 tol = 1e-5
 
 data = 0
-p = 12
-a = H/2.
-assembler = mA.denseMatAssembler()
-
-
-Sl_list = []
-Sr_list = []
-
-Sl_rk_list = []
-Sr_rk_list = []
-
-rhs_list = []
-Ntotcheck = 0
-
-glob_source_dofs=[]
-glob_target_dofs=[]
-
-for slabInd in range(len(connectivity)):
-    slab = join(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period)
-    xl = slab[0][0]
-    xr = slab[1][0]
-    yl = slab[0][1]
-    yr = slab[1][1]
-    zl = slab[0][2]
-    zr = slab[1][2]
-    xc = (xl+xr)/2.
-    bnds = [[xl,0.,0.],[xr,1.,1.]]
-    box_geom   = np.array(bnds)
-    
-    print("building HPS...")
-    geom = hpsGeom.BoxGeometry(jnp.array([[xl,yl,zl],[xr,yr,zr]]))
-    disc = HPS.HPSMultidomain(pdo_mod, geom, a, p)
-    print("...done")
-    XX = disc._XX
-    XXb = XX[disc.Jx,:]
-    XXi = XX[disc.Ji,:]
-
-    Il = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xl)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-    Ir = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xr)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-    Ic = [i for i in range(len(disc.Ji)) if np.abs(XXi[i,0]-xc)<1e-14]
-    Igb = [i for i in range(len(disc.Jx)) if gb(XXb[i,:])]
-    nc = len(Ic)
-    
-    IFLeft  = connectivity[slabInd][0]
-    IFRight = connectivity[slabInd][1]
-    startLeft = IFLeft*nc
-    startRight = ((IFRight+1)%len(connectivity))*nc
-    startCentral = (IFLeft+1)%len(connectivity)*nc
-    glob_source_dofs+=[[range(startLeft,startLeft+nc),range(startRight,startRight+nc)]]
-    glob_target_dofs+=[range(startCentral,startCentral+nc)]
-    fgb = bc(XXb[Igb,:])
-    start_rk = time.time()
-    solver = disc.solver_Aii    
-    def smatmat(v,I,J,transpose=False):
-        if (v.ndim == 1):
-            v_tmp = v[:,np.newaxis]
-        else:
-            v_tmp = v
-
-        if (not transpose):
-            result = (solver@(disc.Aix[:,J]@v_tmp))[I]
-        else:
-            result      = np.zeros(shape=(len(disc.Ji),v.shape[1]))
-            result[I,:] = v_tmp
-            result      = disc.Aix[:,J].T @ (solver.T@(result))
-        if (v.ndim == 1):
-            result = result.flatten()
-        return result
-
-    Linop_r = LinearOperator(shape=(len(Ic),len(Ir)),\
-        matvec = lambda v:smatmat(v,Ic,Ir), rmatvec = lambda v:smatmat(v,Ic,Ir,transpose=True),\
-        matmat = lambda v:smatmat(v,Ic,Ir), rmatmat = lambda v:smatmat(v,Ic,Ir,transpose=True))
-    Linop_l = LinearOperator(shape=(len(Ic),len(Il)),\
-        matvec = lambda v:smatmat(v,Ic,Il), rmatvec = lambda v:smatmat(v,Ic,Il,transpose=True),\
-        matmat = lambda v:smatmat(v,Ic,Il), rmatmat = lambda v:smatmat(v,Ic,Il,transpose=True))
-    
-    st_r = stMap(Linop_r,XXb[Ir,:],XXi[Ic,:])
-    st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
-    rkMat_r = assembler.assemble(st_r)
-    #data+=assembler.tree.total_bytes()
-    rkMat_l = assembler.assemble(st_l)
-    #data+=assembler.tree.total_bytes()
-    Sl_rk_list += [rkMat_l]
-    Sr_rk_list += [rkMat_r]
-    rhs = splinalg.spsolve(disc.Aii,disc.Aix[:,Igb]@fgb)
-    rhs = rhs[Ic]
-    rhs_list+=[rhs]
-    Ntotcheck+=len(rhs)
-
-print("dofs sources : ",glob_source_dofs)
-print("dofs targets : ",glob_target_dofs)
-
-nc = len(Ic)
-print("nc = ",nc)
-Ntot = N*nc
-print("Ntot = ",Ntot)
-print("Ntotcheck = ",Ntot)
-print("Nslab = ",(N-1))
-rhstot = np.zeros(shape = (Ntot,))
-
-
-for rhsInd in range(len(rhs_list)):
-    rhstot[rhsInd*nc:(rhsInd+1)*nc]=-rhs_list[rhsInd]
-
-def smatmat(v,transpose=False):
-    if (v.ndim == 1):
-        v_tmp = v[:,np.newaxis]
-    else:
-        v_tmp = v
-    result  = v_tmp.copy().astype('float64')
-    if (not transpose):
-        for i in range(len(glob_target_dofs)):
-            result[glob_target_dofs[i]]+=Sl_rk_list[i]@v_tmp[glob_source_dofs[i][0]]
-            result[glob_target_dofs[i]]+=Sr_rk_list[i]@v_tmp[glob_source_dofs[i][1]]
-    else:
-        for i in range(len(glob_target_dofs)):
-            result[glob_source_dofs[i][0]]+=Sl_rk_list[i].T@v_tmp[glob_target_dofs[i]]
-            result[glob_source_dofs[i][1]]+=Sr_rk_list[i].T@v_tmp[glob_target_dofs[i]]
-    if (v.ndim == 1):
-        result = result.flatten()
-    return result
-
-Linop = LinearOperator(shape=(Ntot,Ntot),\
-matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
-matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
-
-
-
-assembler = mA.rkHMatAssembler((p+2)*(p+2),100)
+p = 10
+a = [H/2.,1/4,1/4]
+assembler = mA.rkHMatAssembler((p+2)*(p+2),60)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity)
 Stot_LO,rhstot0 = OMS.construct_Stot_and_rhstot(bc,assembler)
-E = np.identity(Stot_LO.shape[0])
-Stot0 = Stot_LO@E
-Stot = Linop@E
-print(Stot0.shape)
-print(Stot.shape)
-print("S err. = ",np.linalg.norm(Stot0-Stot))
-
-
 
 gInfo = gmres_info()
 stol = 1e-10*H*H
-uhat,info   = gmres(Linop,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
+uhat,info   = gmres(Stot_LO,rhstot0,tol=stol,callback=gInfo,maxiter=100,restart=100)
 stop_solve = time.time()
-res = Linop@uhat-rhstot
+res = Stot_LO@uhat-rhstot0
+nc = len(OMS.glob_target_dofs[0])
 print('wavelength = ',wavelength)
 print('ppw = ',wavelength*nc)
 
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p)
-print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhs))
+print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot0))
 print("GMRES iters              = ", gInfo.niter)
 #print("constuction time rk.     = ",trk)
 #print("par. constuction time rk.= ",trk/(N-1))

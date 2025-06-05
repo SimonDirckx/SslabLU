@@ -86,16 +86,12 @@ class solverWrapper:
             adapt these to fit the notation of custom solver
             '''
             self.XX = self.solver.XX
-            print("XX shape in wrap = ",self.XX.shape)
             self.Ii = self.solver._Ji
-            print("Ii len in wrap = ",len(self.Ii))
             self.Ib = self.solver._Jx
-            print("Ib len in wrap = ",len(self.Ib))
             self.Aib = self.solver.Aix
             self.Abi = self.solver.Axi
             self.Abb = self.solver.Axx
             self.solver_ii = self.solver.solver_Aii
-            print("solver shape in wrap = ",self.solver_ii.shape)
         if self.type=='spectral':
             self.solver = spectral(PDE, geom, self.ord)
             self.constructed=True
