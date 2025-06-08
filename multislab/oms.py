@@ -11,30 +11,54 @@ import time
 
 
 def join_geom(slab1,slab2,period=None):
-    
-    xl1 = slab1[0][0]
-    xr1 = slab1[1][0]
-    yl1 = slab1[0][1]
-    yr1 = slab1[1][1]
-    zl1 = slab1[0][2]
-    zr1 = slab1[1][2]
-
-    xl2 = slab2[0][0]
-    xr2 = slab2[1][0]
-    yl2 = slab2[0][1]
-    yr2 = slab2[1][1]
-    zl2 = slab2[0][2]
-    zr2 = slab2[1][2]
-    if(np.abs(xr1-xl2)>1e-10):
-        if period:
-            xl1 -= period
-            xr1 -= period
-            return join_geom([[xl1,yl1,zl1],[xr1,yr1,zr1]],slab2)
+    ndim = len(slab1[0])
+    if ndim==2:
+        xl1 = slab1[0][0]
+        xr1 = slab1[1][0]
+        yl1 = slab1[0][1]
+        yr1 = slab1[1][1]
+        
+        xl2 = slab2[0][0]
+        xr2 = slab2[1][0]
+        yl2 = slab2[0][1]
+        yr2 = slab2[1][1]
+        if(np.abs(xr1-xl2)>1e-10):
+            if period:
+                xl1 -= period
+                xr1 -= period
+                return join_geom([[xl1,yl1],[xr1,yr1]],slab2)
+            else:
+                ValueError("slab shift did not work (is your period correct?)")
         else:
-            ValueError("slab shift did not work (is your period correct?)")
+            totalSlab = [[xl1, yl1],[xr2,yr2]]
+        return totalSlab
+    elif ndim==3:
+        xl1 = slab1[0][0]
+        xr1 = slab1[1][0]
+        yl1 = slab1[0][1]
+        yr1 = slab1[1][1]
+        zl1 = slab1[0][2]
+        zr1 = slab1[1][2]
+
+        xl2 = slab2[0][0]
+        xr2 = slab2[1][0]
+        yl2 = slab2[0][1]
+        yr2 = slab2[1][1]
+        zl2 = slab2[0][2]
+        zr2 = slab2[1][2]
+        if(np.abs(xr1-xl2)>1e-10):
+            if period:
+                xl1 -= period
+                xr1 -= period
+                return join_geom([[xl1,yl1,zl1],[xr1,yr1,zr1]],slab2)
+            else:
+                ValueError("slab shift did not work (is your period correct?)")
+        else:
+            totalSlab = [[xl1, yl1,zl1],[xr2,yr2,zr2]]
+        return totalSlab
     else:
-        totalSlab = [[xl1, yl1,zl1],[xr2,yr2,zr2]]
-    return totalSlab
+        raise ValueError("ndim incorrect")
+    
 
 
 class slab:
@@ -59,7 +83,7 @@ class slab:
 
 
 class oms:
-    def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity,if_connectivity):
+    def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity,if_connectivity,period = 0.,dbg=False):
         self.slabList=slabList
         self.pdo = pdo
         self.connectivity = connectivity
@@ -69,6 +93,8 @@ class oms:
         self.glob_target_dofs = []
         self.glob_source_dofs = []
         self.localSolver=None
+        self.period = period
+        self.dbg=dbg
     def compute_global_dofs(self):
         if not self.glob_source_dofs:
             glob_source_dofs=[]
@@ -76,7 +102,12 @@ class oms:
                 for slabInd in range(len(self.if_connectivity)):
                     IFLeft  = self.if_connectivity[slabInd][0]
                     IFRight = self.if_connectivity[slabInd][1]
-                    glob_source_dofs+=[[self.glob_target_dofs[IFLeft],self.glob_target_dofs[IFRight]]]
+                    if IFLeft<0:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFRight]]]
+                    elif IFRight<0:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFLeft]]]
+                    else:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFLeft],self.glob_target_dofs[IFRight]]]
         self.glob_source_dofs=glob_source_dofs
 
     def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
@@ -106,7 +137,7 @@ class oms:
         
         st_r = stMap(Linop_r,XXb[Ir,:],XXi[Ic,:])
         st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
-        return st_r,st_l
+        return st_l,st_r
 
     def construct_Stot_and_rhstot(self,bc,assembler):
         '''
@@ -123,11 +154,9 @@ class oms:
         connectivity    = self.connectivity
         slabs           = self.slabList
         Ntot = 0
-        period = 1.
-
-        Sl_rk_list = []
-        Sr_rk_list = []
-
+        period = self.period
+        S_rk_list = []
+        
         rhs_list = []
 
         glob_target_dofs=[]
@@ -135,12 +164,12 @@ class oms:
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
-            print("construct HPS...")
+            if self.dbg: print("construct HPS...")
             start = time.time()
             self.localSolver = solverWrap.solverWrapper(self.opts)
             self.localSolver.construct(geom,self.pdo)
             stop = time.time()
-            print("done in ",stop-start,"s")
+            if self.dbg: print("done in ",stop-start,"s")
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(self.localSolver)
             
             nc = len(Ic)
@@ -151,20 +180,23 @@ class oms:
             fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,self.localSolver)
-            print("assembling...")
+            if self.dbg: print("assembling...")
             start = time.time()
-            assembler0 = assembler
-            rkMat_r = assembler0.assemble(st_r)
-            rkMat_l = assembler0.assemble(st_l)
+            rkMat_r = assembler.assemble(st_r)
+            rkMat_l = assembler.assemble(st_l)
             stop = time.time()
-            print("done in ",stop-start,"s")
-            Sl_rk_list += [rkMat_l]
-            Sr_rk_list += [rkMat_r]
+            if self.dbg: print("done in ",stop-start,"s")
+            
+            if self.if_connectivity[slabInd][0]<0:
+                S_rk_list += [[rkMat_r]]
+            elif self.if_connectivity[slabInd][1]<0:
+                S_rk_list += [[rkMat_l]]
+            else:
+                S_rk_list += [[rkMat_l,rkMat_r]]
             rhs = self.localSolver.solver_ii@(self.localSolver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
-            #gc.collect()
-            del assembler0,XXi,XXb
+            del XXi,XXb
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        
@@ -178,13 +210,13 @@ class oms:
                 v_tmp = v.astype('float64')
             result  = v_tmp.copy()
             if (not transpose):
-                for i in range(len(glob_target_dofs)):
-                    result[glob_target_dofs[i]]+=Sl_rk_list[i]@v_tmp[self.glob_source_dofs[i][0]]
-                    result[glob_target_dofs[i]]+=Sr_rk_list[i]@v_tmp[self.glob_source_dofs[i][1]]
+                for i in range(len(self.glob_target_dofs)):
+                    for j in range(len(self.glob_source_dofs[i])):
+                            result[glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
             else:
                 for i in range(len(glob_target_dofs)):
-                    result[self.glob_source_dofs[i][0]]+=Sl_rk_list[i].T@v_tmp[glob_target_dofs[i]]
-                    result[self.glob_source_dofs[i][1]]+=Sr_rk_list[i].T@v_tmp[glob_target_dofs[i]]
+                    for j in range(len(self.glob_source_dofs[i])):
+                            result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[glob_target_dofs[i]]
             if (v.ndim == 1):
                 result = result.flatten()
             return result
