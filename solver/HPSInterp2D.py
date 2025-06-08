@@ -92,7 +92,7 @@ def sortInHPSBoxes(disc,XY):
         XYlist[xmod+ymod*nx] = np.append(XYlist[xmod+ymod*nx],xy,axis=0)
     return XYlist
 
-def interpHPS2D(disc,vals,XY):
+def interpHPS(disc,vals,XY):
     assert(vals.shape[0]==disc._XXfull.shape[0])
     p = disc._p
     XX = disc._XXfull

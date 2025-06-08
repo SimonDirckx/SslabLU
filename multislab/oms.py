@@ -6,8 +6,8 @@ import numpy as np
 import solver.solver as solverWrap
 from scipy.sparse.linalg   import LinearOperator
 from solver.solver import stMap
-
-
+import time
+#import gc
 
 
 def join_geom(slab1,slab2,period=None):
@@ -68,6 +68,7 @@ class oms:
         self.gb = gb
         self.glob_target_dofs = []
         self.glob_source_dofs = []
+        self.localSolver=None
     def compute_global_dofs(self):
         if not self.glob_source_dofs:
             glob_source_dofs=[]
@@ -134,9 +135,13 @@ class oms:
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
-            solver = solverWrap.solverWrapper(self.opts)
-            solver.construct(geom,self.pdo)
-            Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+            print("construct HPS...")
+            start = time.time()
+            self.localSolver = solverWrap.solverWrapper(self.opts)
+            self.localSolver.construct(geom,self.pdo)
+            stop = time.time()
+            print("done in ",stop-start,"s")
+            Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(self.localSolver)
             
             nc = len(Ic)
             Ntot += nc
@@ -145,15 +150,21 @@ class oms:
             
             fgb = bc(XXb[Igb,:])
             
-            st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-            rkMat_r = assembler.assemble(st_r)
-            rkMat_l = assembler.assemble(st_l)
+            st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,self.localSolver)
+            print("assembling...")
+            start = time.time()
+            assembler0 = assembler
+            rkMat_r = assembler0.assemble(st_r)
+            rkMat_l = assembler0.assemble(st_l)
+            stop = time.time()
+            print("done in ",stop-start,"s")
             Sl_rk_list += [rkMat_l]
             Sr_rk_list += [rkMat_r]
-            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
+            rhs = self.localSolver.solver_ii@(self.localSolver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
-            del solver
+            #gc.collect()
+            del assembler0,XXi,XXb
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        
@@ -209,6 +220,7 @@ class oms:
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
+            
             solver = solverWrap.solverWrapper(self.opts)
             solver.construct(geom,self.pdo)
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)

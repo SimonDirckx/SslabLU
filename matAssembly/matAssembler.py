@@ -31,44 +31,49 @@ class matAssembler:
         linOp = stMap.A
         
         if self.matOpts.method == 'epsHBS' or self.matOpts.method == 'rkHBS':
+            print("constructing tree...")
+            start = time.time()
             treeI = HBS.HBS_tree_from_points(stMap.XXI,self.matOpts.leaf_size)
+            stop = time.time()
+            print("done in ",stop-start,'s')
         if self.matOpts.method == 'dense':
             return linOp.matmat(np.identity(linOp.shape[1]))
-        
         if self.matOpts.method == 'epsHBS':
             
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=(self.matOpts.maxRank+10)
+            s=3*(self.matOpts.maxRank+10)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
             Y = linOp.matmat(Om)
             Z = linOp.rmatmat(Psi)
             HBS.compress_HBS_eps(treeI,Om,Psi,Y,Z,self.matOpts.maxRank,s,self.matOpts.tol)
-            self.tree = treeI
+            #data = treeI.total_bytes()
+            #print("data = ",data/1e9,"GB")
             def matmat(v,transpose=False):
                 return HBS.apply_HBS(treeI,v,transpose)
             return LinearOperator(shape=(m,n),\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
         if self.matOpts.method == 'rkHBS':
+            print('random mult...')
+            start = time.time()
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=5*self.matOpts.maxRank
+            s=3*(self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
-            #print("sizes = ",n,"//",m)
-            start = time.time()
             Y = linOp.matmat(Om)
             Z = linOp.rmatmat(Psi)
             stop = time.time()
-            #print("YZ time = ",stop-start)
-            #print("sizes Y,Z = ",Y.shape,"//",Z.shape)
-            #start=time.time()
+            print('done in ',stop-start,'s')
+            print('compressing...')
+            start = time.time()
             HBS.compress_HBS(treeI,Om,Psi,Y,Z,self.matOpts.maxRank,s)
-            self.tree = treeI
-            #stop=time.time()
-            #print("time compress = ",stop-start)
+            stop = time.time()
+            print('done in ',stop-start,'s')
+            #data = treeI.total_bytes()
+            #print("data = ",data/1e9,"GB")
             def matmat(v,transpose=False):
                 return HBS.apply_HBS(treeI,v,transpose)
             return LinearOperator(shape=(m,n),\
