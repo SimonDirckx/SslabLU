@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import scipy
 from packaging.version import Version
 
+
 # oms packages
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
@@ -128,7 +129,7 @@ def gb(p):
 #
 ################################################################
 
-nwaves = 2.24
+nwaves = 5.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
@@ -164,7 +165,7 @@ def u_exact(p):
 ##############################################################################################
 
 
-H = 1./16.
+H = 1./8.
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -194,9 +195,9 @@ period = 1.
 tol = 1e-5
 p = 10
 a = [H/2.,1/16,1/16]
-assembler = mA.denseMatAssembler()#((p+2)*(p+2),50)
+assembler = mA.rkHMatAssembler((p+2)*(p+2),150)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity)
+OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.,True)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler)
 print("done")

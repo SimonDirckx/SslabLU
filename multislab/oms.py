@@ -7,6 +7,7 @@ import solver.solver as solverWrap
 from scipy.sparse.linalg   import LinearOperator
 from solver.solver import stMap
 import time
+import sys
 #import gc
 
 
@@ -161,16 +162,18 @@ class oms:
 
         glob_target_dofs=[]
         startCentral = 0
+        opts = self.opts
+        pdo = self.pdo
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
             if self.dbg: print("construct HPS...")
             start = time.time()
-            self.localSolver = solverWrap.solverWrapper(self.opts)
-            self.localSolver.construct(geom,self.pdo)
+            solver = solverWrap.solverWrapper(opts)
+            solver.construct(geom,pdo)
             stop = time.time()
             if self.dbg: print("done in ",stop-start,"s")
-            Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(self.localSolver)
+            Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
             
             nc = len(Ic)
             Ntot += nc
@@ -179,12 +182,17 @@ class oms:
             
             fgb = bc(XXb[Igb,:])
             
-            st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,self.localSolver)
+            st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
+            rhs = rhs[Ic]
+            rhs_list+=[rhs]
+            
             if self.dbg: print("assembling...")
             start = time.time()
             rkMat_r = assembler.assemble(st_r)
             rkMat_l = assembler.assemble(st_l)
             stop = time.time()
+            del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
             if self.dbg: print("done in ",stop-start,"s")
             
             if self.if_connectivity[slabInd][0]<0:
@@ -193,10 +201,8 @@ class oms:
                 S_rk_list += [[rkMat_l]]
             else:
                 S_rk_list += [[rkMat_l,rkMat_r]]
-            rhs = self.localSolver.solver_ii@(self.localSolver.Aib[:,Igb]@fgb)
-            rhs = rhs[Ic]
-            rhs_list+=[rhs]
-            del XXi,XXb
+            
+            if self.dbg: print("overlapping slab ",slabInd," done")
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        

@@ -6,6 +6,7 @@ from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
+import jax.numpy as jnp
 """
     This header takes care of the Solver Wrapper class
     Recipe:
@@ -38,10 +39,12 @@ class solverOptions:
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
+    def __del__(self):
+        print("solver options deleted")
 
 def convertGeom(opts,geom):
     if opts.type=='hps':
-        return hpsGeom.BoxGeometry(geom)
+        return hpsGeom.BoxGeometry(jnp.array(geom))
 
 
 class solverWrapper:
@@ -54,16 +57,15 @@ class solverWrapper:
         self.ord   = opts.ord
         self.type   = opts.type
         self.a      = opts.a
-        self.solver = None
         self.type = opts.type
         self.constructed = False
         self.opts=opts
+    def __del__(self):
+        print("solver deleted")
     def construct(self,geom,PDE:pdo):
         """
         Actual construction of the local solver
         """
-        self.geom   = geom
-        self.PDE    = PDE
         if self.type=='stencil':
             self.solver = stencil(PDE, geom, self.ord)
             self.constructed=True
@@ -80,18 +82,18 @@ class solverWrapper:
             self.solver_ii = self.solver.solver_ii
         if self.type=='hps':
             geomHPS = convertGeom(self.opts,geom)
-            self.solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0])
+            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0])
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
             '''
-            self.XX = self.solver.XX
-            self.Ii = self.solver._Ji
-            self.Ib = self.solver._Jx
-            self.Aib = self.solver.Aix
-            self.Abi = self.solver.Axi
-            self.Abb = self.solver.Axx
-            self.solver_ii = self.solver.solver_Aii
+            self.XX = solver.XX
+            self.Ii = solver._Ji
+            self.Ib = solver._Jx
+            self.Aib = solver.Aix
+            self.Abi = solver.Axi
+            self.Abb = solver.Axx
+            self.solver_ii = solver.solver_Aii
         if self.type=='spectral':
             self.solver = spectral(PDE, geom, self.ord)
             self.constructed=True
@@ -107,82 +109,8 @@ class solverWrapper:
             self.Abb = self.solver.Abb
             self.solver_ii = self.solver.solver_ii
         
-        self.XXi = self.solver.XX[self.Ii,:]
-        self.XXb = self.solver.XX[self.Ib,:]
-        self.ndofs = self.XX.shape[0]
+        self.XXi = solver.XX[self.Ii,:]
+        self.XXb = solver.XX[self.Ib,:]
+        self.ndofs = solver.XX.shape[0]
+        del solver
         #self.constructMapIdxs()
-    
-    def constructMapIdxs(self):
-        Il,Ic,Ir,IGB=self.geom.getIlIcIr(self.XXi,self.XXb)
-        self.leftIdxs=Il
-        self.rightIdxs=Ir
-        self.middleIdxs=Ic
-        self.IGB=IGB
-            
-    def compute_stMap(self,J:list[int],I:list[int],stType):
-        #for now:   in case of DtD, I should be subset indices in Ii, J should be subset indices in Ib
-        #           in case of DtN, both should be subset indices in Ib
-    
-        if stType=='DtD':
-            XXI = self.XXi[I,:]
-            if not I==J:
-                AiJ  = self.Aib[:,J]
-                XXJ = self.XXb[J,:]
-            else:
-                XXJ = self.XXi[J,:]
-            LUii  = self.solver_ii
-
-            def matmat(v,transpose=False):
-                if I==J:
-                    return v 
-                if (v.ndim == 1):
-                    v_tmp = v[:,np.newaxis]
-                else:
-                    v_tmp = v
-
-                if (not transpose):
-                    result = (LUii@(AiJ@v_tmp))[I]
-                else:
-                    result      = np.zeros(shape=(len(self.solver._Ji),v.shape[1]))
-                    result[I,:] = v_tmp
-                    result      = AiJ.T @ (LUii.T@(result))
-                if (v.ndim == 1):
-                    result = result.flatten()
-                return result
-
-            A = LinearOperator(shape=(len(I),len(J)),\
-                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
-                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
-            
-            return stMap(A,XXI,XXJ)
-        if stType=='DtN':
-            AIJ = self.Abb[I][:,J]
-            AIi  = self.Abi[I]
-            AiJ  = self.Aib[:,J]
-            LUii  = self.solver_ii
-
-            def matmat(v,transpose=False):
-
-                if (v.ndim == 1):
-                    v_tmp = v[:,np.newaxis]
-                else:
-                    v_tmp = v
-
-                if (not transpose):
-
-                    result = AIJ @ v_tmp
-                    result -= AIi @ (LUii@(AiJ @ v_tmp))
-                else:
-                    result = AIJ.T @ v_tmp
-                    result -= AiJ.T @ (LUii.T@(AIi.T @ v_tmp))
-
-                if (v.ndim == 1):
-                    result = result.flatten()
-                return result
-
-            return LinearOperator(shape=AIJ.shape,\
-                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
-                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
-    def solveInterior(self,g,load):
-        
-        return 0

@@ -1,5 +1,5 @@
 import numpy as np
-import pdo.pdo as pdo
+import hps.pdo as pdo
 import solver.solver as solverWrap
 #import multiSlab as MS
 import matAssembly.matAssembler as mA
@@ -19,7 +19,7 @@ from scipy.sparse.linalg import gmres
 from solver.solver import stMap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-
+import jax.numpy as jnp
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -40,51 +40,95 @@ nwaves = 24.623521102434587
 #kapp = 11.1
 #nwaves = 24.673521102434584
 kh = (nwaves+0.03)*2*np.pi+1.8
+jax_avail=True
+if jax_avail:
+    def bfield(xx):
+        
+        mag   = 0.930655
+        width = 2500; 
+        
+        b = jnp.zeros_like(xx[...,0])
+        
+        dist = 0.04
+        x0=0.1+0.5*dist; x1 = 0.50; x2 = x1+2.5*dist; x3= 0.9
+        y0=0.1+0.5*dist; y1 = 0.50; y2 = y1+2.5*dist; y3= 0.9
+        
+        # box of points [x0,x1] x [y0,y1]
+        for x in np.arange(x0,x1,dist):
+            for y in np.arange(y0,y1,dist):
+                xx_sq_c = (xx[...,0] - x)**2 + (xx[...,1] - y)**2
+                b += mag * jnp.exp(-width * xx_sq_c)
 
-def bfield(xx):
-    
-    mag   = 0.930655
-    width = 2500; 
-    
-    b = np.zeros(shape = (xx.shape[0],))
-    
-    dist = 0.04
-    x0=0.1+0.5*dist; x1 = 0.50; x2 = x1+2.5*dist; x3= 0.9
-    y0=0.1+0.5*dist; y1 = 0.50; y2 = y1+2.5*dist; y3= 0.9
-    
-    # box of points [x0,x1] x [y0,y1]
-    for x in np.arange(x0,x1,dist):
-        for y in np.arange(y0,y1,dist):
-            xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
-            b += mag * np.exp(-width * xx_sq_c)
-
-    # box of points [x0,x1] x [y0,y2]
-    for x in np.arange(x2,x3,dist):
-        for y in np.arange(y0,y2-0.5*dist,dist):
-            xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
-            b += mag * np.exp(-width * xx_sq_c)
-            
-    # box of points [x0,x3] x [y2,y3]
-    for x in np.arange(x0,x3,dist):
-        for y in np.arange(y2,y3,dist):
-            xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
-            b += mag * np.exp(-width * xx_sq_c)    
-    
-    kh_fun = -kh**2 * (1 - b)
-    return kh_fun
+        # box of points [x0,x1] x [y0,y2]
+        for x in np.arange(x2,x3,dist):
+            for y in np.arange(y0,y2-0.5*dist,dist):
+                xx_sq_c = (xx[...,0] - x)**2 + (xx[...,1] - y)**2
+                b += mag * jnp.exp(-width * xx_sq_c)
+                
+        # box of points [x0,x3] x [y2,y3]
+        for x in np.arange(x0,x3,dist):
+            for y in np.arange(y2,y3,dist):
+                xx_sq_c = (xx[...,0] - x)**2 + (xx[...,1] - y)**2
+                b += mag * jnp.exp(-width * xx_sq_c)    
+        
+        kh_fun = -kh**2 * (1 - b)
+        return kh_fun
 
 
-def c11(p):
-    return np.ones(shape=(p.shape[0],))
-def c22(p):
-    return np.ones(shape=(p.shape[0],))
-def c(p):
-    return bfield(p)
-Lapl=pdo.PDO2d(c11,c22,None,None,None,c)
+    def c11(p):
+        return jnp.ones_like(p[...,0])
+    def c22(p):
+        return jnp.ones_like(p[...,0])
+    def c(p):
+        return bfield(p)
+    Lapl=pdo.PDO2d(c11,c22,None,None,None,c)
+
+    
+else:
+    def bfield(xx):
+        
+        mag   = 0.930655
+        width = 2500; 
+        
+        b = np.zeros(shape = (xx.shape[0],))
+        
+        dist = 0.04
+        x0=0.1+0.5*dist; x1 = 0.50; x2 = x1+2.5*dist; x3= 0.9
+        y0=0.1+0.5*dist; y1 = 0.50; y2 = y1+2.5*dist; y3= 0.9
+        
+        # box of points [x0,x1] x [y0,y1]
+        for x in np.arange(x0,x1,dist):
+            for y in np.arange(y0,y1,dist):
+                xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
+                b += mag * np.exp(-width * xx_sq_c)
+
+        # box of points [x0,x1] x [y0,y2]
+        for x in np.arange(x2,x3,dist):
+            for y in np.arange(y0,y2-0.5*dist,dist):
+                xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
+                b += mag * np.exp(-width * xx_sq_c)
+                
+        # box of points [x0,x3] x [y2,y3]
+        for x in np.arange(x0,x3,dist):
+            for y in np.arange(y2,y3,dist):
+                xx_sq_c = (xx[:,0] - x)**2 + (xx[:,1] - y)**2
+                b += mag * np.exp(-width * xx_sq_c)    
+        
+        kh_fun = -kh**2 * (1 - b)
+        return kh_fun
+
+
+    def c11(p):
+        return np.ones_like(p[:,0])
+    def c22(p):
+        return np.ones_like(p[:,0])
+    def c(p):
+        return bfield(p)
+    Lapl=pdo.PDO2d(c11,c22,None,None,None,c)
+
 
 def bc(p):
     return np.ones_like(p[:,0])
-
 bnds = [[0.,0.],[1.,1.]]
 Om=stdGeom.Box(bnds)
 def gb(p):
