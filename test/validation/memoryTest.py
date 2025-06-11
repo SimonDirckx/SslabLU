@@ -168,7 +168,7 @@ if_connectivity = []
 for i in range(N):
     if_connectivity+=[[(i-1)%N,(i+1)%N]]
 
-p=8
+p=20
 a = [H/2.,1/16,1/16]
 
 period = 1.

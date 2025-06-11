@@ -164,6 +164,7 @@ class oms:
         startCentral = 0
         opts = self.opts
         pdo = self.pdo
+        data = 0
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
@@ -174,7 +175,7 @@ class oms:
             stop = time.time()
             if self.dbg: print("done in ",stop-start,"s")
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-            
+            if self.dbg: print("shape Sblock = (",len(Il),",",len(Ic),")")
             nc = len(Ic)
             Ntot += nc
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
@@ -193,7 +194,13 @@ class oms:
             rkMat_l = assembler.assemble(st_l)
             stop = time.time()
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
+            time.sleep(5)
             if self.dbg: print("done in ",stop-start,"s")
+            data+=rkMat_l.nbytes+rkMat_r.nbytes
+            if self.dbg: 
+                print("data = ",data/1e9,"GB")
+                print("rkMat_l shape = ",rkMat_l.shape)
+                print("rkMat_r shape = ",rkMat_r.shape)
             
             if self.if_connectivity[slabInd][0]<0:
                 S_rk_list += [[rkMat_r]]

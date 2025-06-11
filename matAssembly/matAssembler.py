@@ -37,7 +37,7 @@ class matAssembler:
             #print("time tree = ",stop-start)
             #treeJ = HBS.HBS_tree_from_points(stMap.XXJ)
         if self.matOpts.method == 'dense':
-            return linOp.matmat(np.identity(linOp.shape[1]))
+            return linOp@np.identity(linOp.shape[1])
         
         if self.matOpts.method == 'epsHBS':
             

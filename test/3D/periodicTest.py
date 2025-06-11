@@ -1,6 +1,4 @@
 # basic packages
-import sys
-sys.path.append('/home/simond/SslabLU')
 import numpy as np
 import jax.numpy as jnp
 import scipy
@@ -193,9 +191,9 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10
+p = 12
 a = [H/2.,1/16,1/16]
-assembler = mA.rkHMatAssembler((p+2)*(p+2),150)
+assembler = mA.denseMatAssembler()#((p+2)*(p+2),150)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.,True)
 print("computing Stot & rhstot...")
