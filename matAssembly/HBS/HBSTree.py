@@ -132,6 +132,7 @@ class HBSTree:
 
 
 def copy_tree_to_HBS(tree,m=0,T=None):
+    print("copying")
     if m==0:
         T=HBSTree(np.sort(tree.get_box_inds(0)))
     for child in tree.get_box_children(m):
@@ -375,3 +376,7 @@ def apply_HBS(HBSMat:HBSTree,q0,transpose=False):
     if q0.ndim == 1:
         u = u.flatten()
     return u
+
+
+
+    
