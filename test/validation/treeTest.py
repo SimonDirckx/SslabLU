@@ -5,6 +5,7 @@ from scipy.linalg import qr
 from scipy.linalg import block_diag
 from scipy.spatial import distance_matrix
 from scipy.linalg import lstsq
+import scipy.linalg
 import time
 import torch
 import torch.linalg as tla
@@ -21,8 +22,8 @@ def qr_col_torch(x,k):
     return q[:,0:k]
 
 
-x=np.linspace(0,1,128)
-y=np.linspace(0,1,128)
+x=np.linspace(0,1,64)
+y=np.linspace(0,1,64)
 
 
 
@@ -32,7 +33,7 @@ XX = np.zeros(shape=(nx*ny,3))
 XX[:,0] = np.kron(x,np.ones_like(y))
 XX[:,1] = np.kron(np.ones_like(x),y)
 YY = XX
-YY[:,2] = 1
+YY[:,2] = 10
 
 
 
@@ -46,12 +47,12 @@ A = torch.from_numpy(A)
 #    A[ij,ij]=1.
 
 print("shape A = ",A.shape)
-nl = 8*8
+nl = 4*4
 t =  tree.BalancedTree(XX,nl)
 
 print("NoL = ",t.nlevels)
 
-rk  =  8*8
+rk  =  2*2
 s   =   5*(rk+10)
 
 
@@ -190,6 +191,10 @@ D2 = block_diag(*D_list[2])
 D3 = block_diag(*D_list[3])
 D4 = block_diag(*D_list[4])
 
+print("norm D0 = ",scipy.linalg.norm(D0))
+print(tla.norm(D_list[0][0]))
+
+
 
 V1 = block_diag(*V_list[1])
 V2 = block_diag(*V_list[2])
@@ -229,20 +234,12 @@ qhat_list = [[] for _ in range(t.nlevels)]
 uhat_list = [[] for _ in range(t.nlevels)]
 
 def matvec(Ulist,Vlist,Dlist,v,tree):
+    print("D0 norm in loop = ",tla.norm(Dlist[0][0]))
     # permute
     indtot = []
     for leaf in t.get_leaves():
         indtot += t.get_box_inds(leaf).tolist()
     vperm = v[indtot,:]
-    
-    u = np.zeros_like(vperm)
-    n0=0
-    leafshift = t.get_boxes_level(t.nlevels-1)[-1]+1
-    
-    for leaf in t.get_leaves():
-        step = len(t.get_box_inds(leaf))
-        u[n0:n0+step,:] = Dlist[t.nlevels-1][leaf-leafshift]@vperm[:,n0:n0+step]
-        n0+=step
     
     n0 = 0
     qhat = torch.zeros(0,vperm.shape[1])
@@ -253,7 +250,7 @@ def matvec(Ulist,Vlist,Dlist,v,tree):
         step = V.shape[0]
         qhat=torch.cat((qhat,V.T@vperm[n0:n0+step,:]),dim=0)
         n0+=step
-    qhat_list[tree.nlevels-1]+=[qhat]
+    qhat_list[tree.nlevels-1]=qhat
 
     for level in range(tree.nlevels-2,0,-1):
         n0 = 0
@@ -262,10 +259,66 @@ def matvec(Ulist,Vlist,Dlist,v,tree):
             step = V.shape[0]
             qhat=torch.cat((qhat,V.T@qhat_list[level+1][n0:n0+step,:]),dim=0)
             n0+=step
-        qhat_list[level]+=[qhat]
+        qhat_list[level]=qhat
 
-    return u[indtot,:]
+        
+    #########################
+    #       DOWNWARD PASS
+    #########################
+
+    u = torch.zeros(vperm.shape[0],vperm.shape[1])
+
+    for level in range(0,tree.nlevels):
+        n0 = 0
+        if level==0:
+            uhat=Dlist[0][0]@qhat_list[1]
+            uhat_list[0]=uhat
+            print("norm uhat = ",tla.norm(uhat))
+        elif level<t.nlevels-1:
+            print("level = ",level)
+            uhat = torch.zeros(0,vperm.shape[1])
+            n0 = 0
+            for U in Ulist[level]:
+                step = U.shape[1]
+                uhat=torch.cat((uhat,U@uhat_list[level-1][n0:n0+step,:]),dim=0)#is this right?
+                n0+=step
+            n0l = 0
+            stepl = 0
+            n0r = 0
+            stepr = 0
+            for D in Dlist[level]:
+                stepl = D.shape[0]
+                stepr = D.shape[1]
+                uhat[n0l:n0l+stepl,:]+=D@qhat_list[level+1][n0r:n0r+stepr,:]
+                n0r+=stepr
+                n0l+=stepl
+            uhat_list[level]=uhat
+            print("norm uhat = ",tla.norm(uhat))
+        else:
+            n0l=0
+            n0r=0
+            for U in Ulist[level]:
+                stepl=U.shape[0]
+                stepr=U.shape[1]
+                u[n0l:n0l+stepl,:] = U@uhat_list[level-1][n0r:n0r+stepr,:]
+                n0l+=stepl
+                n0r+=stepr
+            print("norm u = ",tla.norm(u))
+            n0l=0
+            n0r=0
+            for D in Dlist[level]:
+                stepl = D.shape[0]
+                stepr = D.shape[1]
+                u[n0l:n0l+stepl,:]+=D@vperm[n0r:n0r+stepr,:]
+                n0r+=stepr
+                n0l+=stepl
+    return u
 v=np.random.standard_normal(size=(Atest.shape[1],1))
+v1 = torch.from_numpy(v)
 u0 = Atest@v
-u1 = matvec(U_list,V_list,D_list,v,t)
-print('matvec err = ',np.linalg.norm(u0+u1)/np.linalg.norm(u0))
+print("norm D0 = ",tla.norm(D_list[0][0]))
+u1 = matvec(U_list,V_list,D_list,v1,t)
+u1 = u1.detach().cpu().numpy()
+u1[indtot,:]=u1
+print('matvec err = ',np.linalg.norm(u0-u1)/np.linalg.norm(u0))
+print('u1 norm = ',np.linalg.norm(u1))
