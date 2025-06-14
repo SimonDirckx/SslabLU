@@ -39,8 +39,6 @@ class solverOptions:
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
-    def __del__(self):
-        print("solver options deleted")
 
 def convertGeom(opts,geom):
     if opts.type=='hps':
@@ -60,8 +58,7 @@ class solverWrapper:
         self.type = opts.type
         self.constructed = False
         self.opts=opts
-    def __del__(self):
-        print("solver deleted")
+
     def construct(self,geom,PDE:pdo):
         """
         Actual construction of the local solver

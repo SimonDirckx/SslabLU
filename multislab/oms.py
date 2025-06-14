@@ -84,7 +84,7 @@ class slab:
 
 
 class oms:
-    def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity,if_connectivity,period = 0.,dbg=False):
+    def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity,if_connectivity,period = 0.):
         self.slabList=slabList
         self.pdo = pdo
         self.connectivity = connectivity
@@ -95,7 +95,8 @@ class oms:
         self.glob_source_dofs = []
         self.localSolver=None
         self.period = period
-        self.dbg=dbg
+        self.nbytes = 0
+        self.densebytes = 0 
     def compute_global_dofs(self):
         if not self.glob_source_dofs:
             glob_source_dofs=[]
@@ -140,7 +141,7 @@ class oms:
         st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
         return st_l,st_r
 
-    def construct_Stot_and_rhstot(self,bc,assembler):
+    def construct_Stot_and_rhstot(self,bc,assembler,dbg=False):
         '''
         construct S operator and total global rhs
 
@@ -165,17 +166,19 @@ class oms:
         opts = self.opts
         pdo = self.pdo
         data = 0
+        discrTime = 0
+        compressTime=0
+        shapeMatch = True
+        relerrl=0
+        relerrr=0
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
-            if self.dbg: print("construct HPS...")
             start = time.time()
             solver = solverWrap.solverWrapper(opts)
             solver.construct(geom,pdo)
-            stop = time.time()
-            if self.dbg: print("done in ",stop-start,"s")
+            discrTime += time.time()-start
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-            if self.dbg: print("shape Sblock = (",len(Il),",",len(Ic),")")
             nc = len(Ic)
             Ntot += nc
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
@@ -188,19 +191,32 @@ class oms:
             rhs = rhs[Ic]
             rhs_list+=[rhs]
             
-            if self.dbg: print("assembling...")
             start = time.time()
+            
             rkMat_r = assembler.assemble(st_r)
+            self.nbytes+=assembler.nbytes
             rkMat_l = assembler.assemble(st_l)
-            stop = time.time()
+            self.nbytes+=assembler.nbytes
+            
+            self.densebytes+=np.prod(st_l.A.shape)*8
+            self.densebytes+=np.prod(st_r.A.shape)*8
+            
+            compressTime += time.time()-start
+            shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
+
+
+            if dbg:
+                Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
+                Vr=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
+                Ul=st_l.A@Vl
+                Ur=st_r.A@Vr
+                Ulhat=rkMat_l@Vl
+                Urhat=rkMat_r@Vr
+                relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
+                relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
+
+
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
-            time.sleep(5)
-            if self.dbg: print("done in ",stop-start,"s")
-            data+=rkMat_l.nbytes+rkMat_r.nbytes
-            if self.dbg: 
-                print("data = ",data/1e9,"GB")
-                print("rkMat_l shape = ",rkMat_l.shape)
-                print("rkMat_r shape = ",rkMat_r.shape)
             
             if self.if_connectivity[slabInd][0]<0:
                 S_rk_list += [[rkMat_r]]
@@ -209,7 +225,16 @@ class oms:
             else:
                 S_rk_list += [[rkMat_l,rkMat_r]]
             
-            if self.dbg: print("overlapping slab ",slabInd," done")
+            if dbg: print("overlapping slab ",slabInd+1," of ",len(connectivity)-1," done")
+        if dbg:
+            print('============================OMS SUMMARY============================')
+            print('avg. discr. time             = ',discrTime/(len(connectivity)-1))
+            print('avg. compr. time             = ',compressTime/(len(connectivity)-1))
+            print('compression rate             = ',self.nbytes/self.densebytes)
+            print('shapes match?                = ',shapeMatch)
+            print('total dofs                   = ',sum([len(dof) for dof in glob_target_dofs]))
+            print('estim. max. err. ( l // r )  = (',relerrl," // ", relerrr,")")
+            print('===================================================================')
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        

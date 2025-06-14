@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 setup(
     name='SslabLU',
     version='1.0',
-    packages=['multislab','matAssembly','solver'],
+    packages=['multislab','matAssembly','solver','matAssembly'],
     license="MIT",
     author="Simon Dirckx",
     author_email='simon.dirckx@austin.utexas.edu',

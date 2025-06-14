@@ -136,8 +136,8 @@ def gb(p):
 
 H = 1./16.
 N = (int)(1./H)
-p = 40
-a = H/2.
+p = 20
+a = [H/2.,1/64]
 Sl_list = []
 Sr_list = []
 
@@ -148,7 +148,7 @@ rhs_list = []
 disc_list = []
 trk     = 0
 tol = 1e-5
-assembler = mA.tolHMatAssembler(tol,p,32)
+assembler = mA.rkHMatAssembler(p,p)
 data = 0
 
 slabs = []
@@ -168,19 +168,19 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),-1]]
     else:
         if_connectivity+=[[(i-1),(i+1)]]
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
+opts = solverWrap.solverOptions('hps',[p,p],a)
 #assembler = mA.denseMatAssembler()#((p+2)*(p+2),50)
 OMS = oms.oms(slabs,Lapl,gb,opts,connectivity,if_connectivity)
 print("computing Stot & rhstot...")
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler)
+Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,True)
 print("done")
 gInfo = gmres_info()
 stol = 1e-6*H*H
-uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart=1000)
+uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart = 1000)
 stop_solve = time.time()
 res = Stot@uhat-rhstot
 
-print("=============SUMMARY==============")
+print("=============SOLVER SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p)
 print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
@@ -191,7 +191,7 @@ print("GMRES iters              = ", gInfo.niter)
 #print("par. solve time          = ",(stop_solve-start_solve)/(N-1))
 #print("data (MB)                = ",data/1e6)
 #print("data orig (MB)           = ",(8*Ntot+8*(nc*nc)*2.*(N-1))/1e6)
-print("==================================")
+print("=========================================")
 
 
 uitot = np.zeros(shape=(0,1))
@@ -202,10 +202,10 @@ global_dofs = OMS.glob_target_dofs
 for i in range(len(global_dofs)+1):
     xl = i*H
     xr = (i+1)*H
-    print("constructing HPS...")
+    #print("constructing HPS...")
     geom = hpsGeom.BoxGeometry(np.array([[xl,0.],[xr,1.]]))
     disc = HPS.HPSMultidomain(Lapl, geom, a, p)
-    print("done")
+    #print("done")
     XX = disc._XX
     XXb = XX[disc.Jx,:]
     XXi = XX[disc.Ji,:]
@@ -217,9 +217,9 @@ for i in range(len(global_dofs)+1):
     if i<N-1:
         bvec[Ir,0] = uhat[global_dofs[i]]
     dofs+=bvec.shape[0]
-    print("solving dirichlet...")
+    #print("solving dirichlet...")
     ui = disc.solve_dir_full(bvec)
-    print("done")
+    #print("done")
     uitot=np.append(uitot,ui,axis=0)
     XXtot=np.append(XXtot,disc._XXfull,axis=0)
     

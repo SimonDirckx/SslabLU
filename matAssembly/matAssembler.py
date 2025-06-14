@@ -3,10 +3,17 @@
 
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
-from .HBS import HBSTree as HBS
+from matAssembly.HBS import HBSTreeNEW as HBS
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
+from matAssembly.HBS.simpleoctree import simpletree as tree
+import torch
+def compute_c0_L0(XX):
+    N,ndim = XX.shape
+    c0 = np.sum(XX,axis=0)/N
+    L0 = np.max(np.max(XX,axis=0)-np.min(XX,axis=0)) #too tight for some reason
+    return c0,L0+1e-5
 class matAssemblerOptions:
     """
     Options for matrix constuction
@@ -26,60 +33,47 @@ class matAssembler:
     """
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
-    def assemble(self,stMap:solver.stMap,tree=None):
+        self.nbytes       = 0
+    def assemble(self,stMap:solver.stMap):
         linOp = stMap.A
-        
-        if self.matOpts.method == 'epsHBS' or self.matOpts.method == 'rkHBS':
-            #for now we assume only one tree needed, in the future we generalize
-            #start=time.time()
-            treeI = HBS.HBS_tree_from_points(stMap.XXI,self.matOpts.leaf_size)
-            #stop=time.time()
-            #print("time tree = ",stop-start)
-            #treeJ = HBS.HBS_tree_from_points(stMap.XXJ)
         if self.matOpts.method == 'dense':
-            return linOp@np.identity(linOp.shape[1])
+            M=linOp@np.identity(linOp.shape[1])
+            self.nbytes = M.nbytes
+            return M
         
         if self.matOpts.method == 'epsHBS':
             
-            m=linOp.shape[0]
-            n=linOp.shape[1]
-            s=5*(self.matOpts.maxRank+10)
-            s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
-            Om  = np.random.standard_normal(size=(n,s))
-            Psi = np.random.standard_normal(size=(m,s))
-            Y = linOp.matmat(Om)
-            Z = linOp.rmatmat(Psi)
-            HBS.compress_HBS_eps(treeI,Om,Psi,Y,Z,self.matOpts.maxRank+10,s,self.matOpts.tol)
-            self.tree = treeI
-            def matmat(v,transpose=False):
-                return HBS.apply_HBS(treeI,v,transpose)
-            return LinearOperator(shape=(m,n),\
-                matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
-                matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
+            return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
+            c0,L0 = compute_c0_L0(stMap.XXI)
+            tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=5*self.matOpts.maxRank
+            s=6*(self.matOpts.maxRank+10)
             s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
-            #print("sizes = ",n,"//",m)
-            start = time.time()
-            Y = linOp.matmat(Om)
-            Z = linOp.rmatmat(Psi)
-            stop = time.time()
-            #print("YZ time = ",stop-start)
-            #print("sizes Y,Z = ",Y.shape,"//",Z.shape)
-            #start=time.time()
-            HBS.compress_HBS(treeI,Om,Psi,Y,Z,self.matOpts.maxRank+10,s)
-            self.tree = treeI
+            
+            Y = linOp@Om
+            Z = linOp.T@Psi
+            Y = torch.from_numpy(Y)
+            Z = torch.from_numpy(Z)
+            Om = torch.from_numpy(Om)
+            Psi = torch.from_numpy(Psi)
+            hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10)
+            self.nbytes = hbsMat.nbytes
             #stop=time.time()
             #print("time compress = ",stop-start)
             def matmat(v,transpose=False):
-                return HBS.apply_HBS(treeI,v,transpose)
-            return LinearOperator(shape=(m,n),\
+                if transpose:
+                    return hbsMat.matvecT(v.astype('float64'))
+                else:
+                    return hbsMat.matvec(v.astype('float64'))
+            
+            LinopTest = LinearOperator(shape=(m,n),\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
+            return LinopTest
 
 '''
 DEFAULT ASSEMBLERS
