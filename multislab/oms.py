@@ -141,7 +141,7 @@ class oms:
         st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
         return st_l,st_r
 
-    def construct_Stot_and_rhstot(self,bc,assembler,dbg=False):
+    def construct_Stot_and_rhstot(self,bc,assembler,dbg=0):
         '''
         construct S operator and total global rhs
 
@@ -177,7 +177,10 @@ class oms:
             start = time.time()
             solver = solverWrap.solverWrapper(opts)
             solver.construct(geom,pdo)
-            discrTime += time.time()-start
+            tDisc = time.time()-start
+            discrTime += tDisc
+            if dbg>1:
+                print("discretization time = ",tDisc)
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
             nc = len(Ic)
             Ntot += nc
@@ -193,19 +196,17 @@ class oms:
             
             start = time.time()
             
-            rkMat_r = assembler.assemble(st_r)
+            rkMat_r = assembler.assemble(st_r,dbg)
             self.nbytes+=assembler.nbytes
-            rkMat_l = assembler.assemble(st_l)
+            rkMat_l = assembler.assemble(st_l,dbg)
             self.nbytes+=assembler.nbytes
             
             self.densebytes+=np.prod(st_l.A.shape)*8
             self.densebytes+=np.prod(st_r.A.shape)*8
-            
-            compressTime += time.time()-start
+            tCompress=time.time()-start
+            compressTime += tCompress
             shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
-
-
-            if dbg:
+            if dbg>0:
                 Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                 Vr=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                 Ul=st_l.A@Vl
@@ -214,9 +215,11 @@ class oms:
                 Urhat=rkMat_r@Vr
                 relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
                 relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
-
-
+            if dbg>1:
+                print("compression time = ",tCompress)
+                print("error = ",relerrl,"//",relerrr)
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
+            
             
             if self.if_connectivity[slabInd][0]<0:
                 S_rk_list += [[rkMat_r]]
@@ -225,8 +228,8 @@ class oms:
             else:
                 S_rk_list += [[rkMat_l,rkMat_r]]
             
-            if dbg: print("overlapping slab ",slabInd+1," of ",len(connectivity)-1," done")
-        if dbg:
+            if dbg>0: print("overlapping slab ",slabInd+1," of ",len(connectivity)," done")
+        if dbg>0:
             print('============================OMS SUMMARY============================')
             print('avg. discr. time             = ',discrTime/(len(connectivity)-1))
             print('avg. compr. time             = ',compressTime/(len(connectivity)-1))

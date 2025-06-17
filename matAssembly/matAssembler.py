@@ -34,7 +34,7 @@ class matAssembler:
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
         self.nbytes       = 0
-    def assemble(self,stMap:solver.stMap):
+    def assemble(self,stMap:solver.stMap,dbg=0):
         linOp = stMap.A
         if self.matOpts.method == 'dense':
             M=linOp@np.identity(linOp.shape[1])
@@ -45,6 +45,7 @@ class matAssembler:
             
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
+            start = time.time()
             c0,L0 = compute_c0_L0(stMap.XXI)
             tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
             m=linOp.shape[0]
@@ -60,7 +61,14 @@ class matAssembler:
             Z = torch.from_numpy(Z)
             Om = torch.from_numpy(Om)
             Psi = torch.from_numpy(Psi)
+            timeTreeAndRand = time.time()-start
+            if dbg>0:
+                print("time tree & Om+Psi = ",timeTreeAndRand)
+            start = time.time()
             hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10)
+            timeHBS = time.time()-start
+            if dbg>0:
+                print("time HBS construction = ",timeHBS)
             self.nbytes = hbsMat.nbytes
             #stop=time.time()
             #print("time compress = ",stop-start)

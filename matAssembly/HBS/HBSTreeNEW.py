@@ -20,6 +20,9 @@ def qr_torch(x):
 def qr_col_torch(x,k):
     q,r= tla.qr(x)
     return q[:,0:k]
+def qr_col_torch_full(x):
+    q,r= tla.qr(x,mode='reduced')
+    return q,r
 
 def null_torch(x,k):
     q,r= tla.qr(x.T,mode='complete')
@@ -86,20 +89,29 @@ class HBSMAT:
                 if level>0:
                     rk0 = rk
                     
-                    Ptau = null_torch(Omtau,rk0)
-                    Qtau = null_torch(Psitau,rk0)
-                    Utau = qr_col_torch(Ytau@Ptau,rk0)
-                    Vtau = qr_col_torch(Ztau@Qtau,rk0)
+                    #Ptau = null_torch(Omtau,rk0)
+                    #Qtau = null_torch(Psitau,rk0)
+                    #Utau = qr_col_torch(Ytau@Ptau,rk0)
+                    #Vtau = qr_col_torch(Ztau@Qtau,rk0)
                     
-                    YO=Ytau@tla.pinv(Omtau)
-                    ZP = Ztau@tla.pinv(Psitau)
+                    PP,RP = qr_col_torch_full(Omtau.T)
+                    QQ,RQ = qr_col_torch_full(Psitau.T)
+                    YP = Ytau@PP
+                    ZQ = Ztau@QQ
+                    Utau = qr_col_torch(Ytau-YP@PP.T,rk0)
+                    Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0)
+
+
+                    YO=tla.lstsq(RP,YP.T)[0].T
+                    ZP = tla.lstsq(RQ,ZQ.T)[0].T
                     Dtau = (YO-Utau@(Utau.T@YO))\
                         +Utau@(Utau.T@((ZP-Vtau@(Vtau.T@ZP)).T))
                     self.U_list[level]+=[Utau]
                     self.V_list[level]+=[Vtau]
                     self.D_list[level]+=[Dtau]
                 else:
-                    Dtau=Ytau@tla.pinv(Omtau)
+                    Q,R = qr_col_torch_full(Omtau.T)
+                    Dtau=tla.lstsq(R,Q.T@Ytau.T)[0].T
                     self.D_list[level]+=[Dtau]
             Om_list=Om_list_new
             Om_list_new=[]

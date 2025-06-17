@@ -191,13 +191,13 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 12
-a = [H/2.,1/16,1/16]
-assembler = mA.denseMatAssembler()#((p+2)*(p+2),150)
+p = 10
+a = [H/4.,1/16,1/16]
+assembler = mA.rkHMatAssembler((p+2)*(p+2),160)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.,True)
+OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler)
+Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")
 #################################################################
 
@@ -241,8 +241,7 @@ del OMS
 for i in range(len(slabs)):
     slab = slabs[i]
     ul = uhat[glob_target_dofs[i]]
-    ur = uhat[
-        glob_source_dofs[i][1]]
+    ur = uhat[glob_source_dofs[i][1]]
     interp.check_err(slab,ul,ur,a,p,pdo_mod,gb,bc,u_exact)
 
 
