@@ -32,8 +32,8 @@ class gmres_info(object):
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
 
-nwaves = 24.623521102434587
-#nwaves = 24.673521102434584
+#nwaves = 24.623521102434587
+nwaves = 24.673521102434584
 #kh = (nwaves+0.03)*2*np.pi+1.8
 #kh=157.02
 #print("kh = ",kh)
@@ -238,6 +238,9 @@ grid_x, grid_y    = np.mgrid[min_x:max_x:resolution*1j, min_y:max_y:resolution*1
 
 grid_solution           = griddata(XXtot, uitot[:,0], (grid_x, grid_y), method='cubic').T
 
+bf = -bfield(XXtot)/(kh**2)
+grid_bf           = griddata(XXtot, bf, (grid_x, grid_y), method='cubic').T
+
 plot_pad=0.1
 max_sol = np.max(grid_solution[:])
 min_sol = np.min(grid_solution[:])
@@ -247,5 +250,17 @@ plt.imshow(grid_solution, extent=(min_x-plot_pad,max_x+plot_pad,\
                                         #vmin=min_sol, vmax=max_sol,\
                 origin='lower',cmap = 'jet')
 plt.colorbar()
-plt.savefig('bfield.png', transparent=True,format='png',bbox_inches='tight')
+figString = 'waveGuide_'+str(kh)+'.png'
+plt.savefig(figString, transparent=True,format='png',bbox_inches='tight')
+
+
+plt.figure(1)
+plt.imshow(grid_bf, extent=(min_x-plot_pad,max_x+plot_pad,\
+                                    min_y-plot_pad,max_y+plot_pad),\
+                                        #vmin=min_sol, vmax=max_sol,\
+                origin='lower',cmap = 'jet')
+plt.colorbar()
+figString = 'bfield_'+str(kh)+'.png'
+plt.savefig(figString, transparent=True,format='png',bbox_inches='tight')
+
 plt.show()
