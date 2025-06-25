@@ -193,7 +193,6 @@ class oms:
             rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
-            
             start = time.time()
             
             rkMat_r = assembler.assemble(st_r,dbg)

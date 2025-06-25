@@ -191,8 +191,8 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10
-a = [H/4.,1/16,1/16]
+p = 8
+a = [H/4.,1/8,1/8]
 assembler = mA.rkHMatAssembler((p+2)*(p+2),160)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
