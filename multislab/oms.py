@@ -171,6 +171,10 @@ class oms:
         shapeMatch = True
         relerrl=0
         relerrr=0
+
+        st_l_list = []
+        st_r_list = []
+
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
@@ -190,11 +194,21 @@ class oms:
             fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+
+            st_l_list += [st_l]
+            st_r_list += [st_r]
+
             rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
+            del Il,Ir,Ic,XXi,XXb,solver
+
+        for slabInd in range(len(connectivity)):
+
+            st_l = st_l_list[slabInd]
+            st_r = st_r_list[slabInd]
+
             start = time.time()
-            
             rkMat_r = assembler.assemble(st_r,dbg)
             self.nbytes+=assembler.nbytes
             rkMat_l = assembler.assemble(st_l,dbg)
@@ -217,8 +231,6 @@ class oms:
             if dbg>1:
                 print("compression time = ",tCompress)
                 print("error = ",relerrl,"//",relerrr)
-            del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
-            
             
             if self.if_connectivity[slabInd][0]<0:
                 S_rk_list += [[rkMat_r]]
@@ -239,9 +251,11 @@ class oms:
             print('===================================================================')
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
-        rhstot = np.zeros(shape = (Ntot,))        
+
+        # Set up the rhs:
+        rhstot = np.zeros(shape = (Ntot,))  
         for rhsInd in range(len(rhs_list)):
-            rhstot[rhsInd*nc:(rhsInd+1)*nc]=-rhs_list[rhsInd]
+            rhstot[rhsInd*nc:(rhsInd+1)*nc] = -rhs_list[rhsInd]
 
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
@@ -260,6 +274,15 @@ class oms:
             if (v.ndim == 1):
                 result = result.flatten()
             return result
+
+        print("Size of list:")
+        print(len(S_rk_list))
+        for thing in S_rk_list:
+            print("    {}", len(thing))
+            for pair in thing:
+                print("        {}", type(pair))
+
+        print(self.glob_source_dofs)
         
         Linop = LinearOperator(shape=(Ntot,Ntot),\
         matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
@@ -310,11 +333,13 @@ class oms:
         
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
+
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
                 v_tmp = v[:,np.newaxis]
             else:
                 v_tmp = v
+            # How identity is represented, copy v into result and increment:
             result  = v_tmp.copy().astype('float64')
             if (not transpose):
                 for i in range(len(glob_target_dofs)):

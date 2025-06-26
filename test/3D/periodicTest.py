@@ -4,6 +4,9 @@ import jax.numpy as jnp
 import scipy
 from packaging.version import Version
 
+import sys
+sys.path.append("/Users/jkump/Desktop/SslabLU")
+
 
 # oms packages
 import solver.solver as solverWrap
@@ -163,7 +166,7 @@ def u_exact(p):
 ##############################################################################################
 
 
-H = 1./8.
+H = 1./4. # was 1/8
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -191,8 +194,8 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 8
-a = [H/4.,1/8,1/8]
+p = 6 # was 8
+a = [H/2.,1/4,1/4] # Was [H/4.,1/8,1/8]
 assembler = mA.rkHMatAssembler((p+2)*(p+2),160)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)

@@ -34,6 +34,7 @@ class matAssembler:
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
         self.nbytes       = 0
+        
     def assemble(self,stMap:solver.stMap,dbg=0):
         linOp = stMap.A
         if self.matOpts.method == 'dense':
