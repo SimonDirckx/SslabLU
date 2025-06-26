@@ -157,7 +157,6 @@ class oms:
         slabs           = self.slabList
         Ntot = 0
         period = self.period
-        S_rk_list = []
         
         rhs_list = []
 
@@ -175,6 +174,7 @@ class oms:
         st_l_list = []
         st_r_list = []
 
+        # Here we form the component slab operators, st_l and st_r:
         for slabInd in range(len(connectivity)):
             geom = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
             slab_i = slab(geom,self.gb)
@@ -203,10 +203,15 @@ class oms:
             rhs_list+=[rhs]
             del Il,Ir,Ic,XXi,XXb,solver
 
+        # Here we generate the compressed matrices rkMat_l/rkMat_r and stack into S_rk_list
+        S_rk_list = []
         for slabInd in range(len(connectivity)):
 
             st_l = st_l_list[slabInd]
             st_r = st_r_list[slabInd]
+
+            print(st_l)
+            print(st_l.A)
 
             start = time.time()
             rkMat_r = assembler.assemble(st_r,dbg)
@@ -257,6 +262,7 @@ class oms:
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc] = -rhs_list[rhsInd]
 
+        # Define S_tot using S_rk_list:
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
                 v_tmp = v[:,np.newaxis].astype('float64')
@@ -282,6 +288,7 @@ class oms:
             for pair in thing:
                 print("        {}", type(pair))
 
+        print(self.glob_target_dofs)
         print(self.glob_source_dofs)
         
         Linop = LinearOperator(shape=(Ntot,Ntot),\

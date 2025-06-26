@@ -210,6 +210,7 @@ print("done")
 gInfo = gmres_info()
 stol = 1e-10*H*H
 
+start_solve = time.time()
 if Version(scipy.__version__)>=Version("1.14"):
     uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
 else:
@@ -226,7 +227,7 @@ print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
 #print("constuction time rk.     = ",trk)
 #print("par. constuction time rk.= ",trk/(N-1))
-#print("solve time               = ",(stop_solve-start_solve))
+print("solve time               = ",(stop_solve-start_solve))
 #print("par. solve time          = ",(stop_solve-start_solve)/(N-1))
 #print("data (MB)                = ",data/1e6)
 #print("data orig (MB)           = ",(8*Ntot+8*(nc*nc)*2.*(N-1))/1e6)
