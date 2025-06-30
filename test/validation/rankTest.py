@@ -154,7 +154,7 @@ for i in range(N-1):
 period = 0.
 
 
-plist = [6,8,10,12,14,16]
+plist = [6,8]
 totalDofs = []
 slabDofs = []
 timingsMatvec=[]

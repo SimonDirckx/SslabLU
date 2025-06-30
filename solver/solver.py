@@ -109,5 +109,5 @@ class solverWrapper:
         self.XXi = solver.XX[self.Ii,:]
         self.XXb = solver.XX[self.Ib,:]
         self.ndofs = solver.XX.shape[0]
-        del solver
+        #del solver
         #self.constructMapIdxs()
