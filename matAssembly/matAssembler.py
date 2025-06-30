@@ -25,6 +25,11 @@ class matAssemblerOptions:
         self.maxRank    = maxRank
         self.tree       = tree
         self.leaf_size  = leaf_size
+class matAssemblerStats:
+    def __init__(self):
+        self.timeMatvecs    = 0
+        self.timeHBS        = 0
+        self.nbytes         = 0
 
 
 class matAssembler:
@@ -34,6 +39,7 @@ class matAssembler:
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
         self.nbytes       = 0
+        self.stats = matAssemblerStats()
     def assemble(self,stMap:solver.stMap,reduced=False,dbg=0):
         linOp = stMap.A
         if self.matOpts.method == 'dense':
@@ -45,7 +51,7 @@ class matAssembler:
             
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
-            start = time.time()
+            
             if self.matOpts.tree:
                 tree0 = self.matOpts.tree
             else:
@@ -57,24 +63,26 @@ class matAssembler:
             s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
-            
+            start = time.time()
             Y = linOp@Om
             Z = linOp.T@Psi
+            timeRand = time.time()-start
+            self.stats.timeMatvecs=timeRand
+
             Y = torch.from_numpy(Y)
             Z = torch.from_numpy(Z)
             Om = torch.from_numpy(Om)
             Psi = torch.from_numpy(Psi)
-            timeTreeAndRand = time.time()-start
+            
             if dbg>0:
-                print("time tree & Om+Psi = ",timeTreeAndRand)
+                print("time tree & Om+Psi = ",self.stats.timeMatvecs)
             start = time.time()
             hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10,reduced)
             timeHBS = time.time()-start
+            self.stats.timeHBS=timeHBS
             if dbg>0:
-                print("time HBS construction = ",timeHBS)
-            self.nbytes = hbsMat.nbytes
-            #stop=time.time()
-            #print("time compress = ",stop-start)
+                print("time HBS construction = ",self.stats.timeHBS)
+            self.stats.nbytes = hbsMat.nbytes
             def matmat(v,transpose=False):
                 if transpose:
                     return hbsMat.matvecT(v.astype('float64'))

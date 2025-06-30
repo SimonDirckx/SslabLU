@@ -153,112 +153,145 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),(i+1)]]
 period = 0.
 
-p = 12
-a = [H/2.,1/16,1/16]
 
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
+plist = [6,8,10,12,14,16]
+totalDofs = []
+slabDofs = []
+timingsMatvec=[]
+timingsConstruct=[]
+timingsHBS=[]
+for p in plist:
 
-slabInd = 0
-geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
-solver  = solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz)
-print("solver done")
+    a = [H/2.,1/16,1/16]
 
-XX = solver.XX
-XXb = XX[solver.Ib,:]
-XXi = XX[solver.Ii,:]
-xl = geom[0][0]
-xr = geom[1][0]
-xc=(xl+xr)/2.
+    opts = solverWrap.solverOptions('hps',[p,p,p],a)
 
-Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
-Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
-Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
-Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
-print('ndofs = ',len(Ic))
-
-
-ndim = XX.shape[1]
-if ndim == 2:
-    leaf_size = p
-    XXI = XXi[Ic,:]
-    XXB = XXb[Ir,:]
-elif ndim == 3:
-    leaf_size = p*p
-    XXI = XXi[Ic,1:3]
-    XXB = XXb[Ir,1:3]
-else:
-    ValueError("ndim must be 2 or 3")
-
-
-
-c0,L0 = compute_c0_L0(XXI)
-binary = False
-if binary:
-    tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
-else:
-    tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
-
-reduced = False
-print("nlevels = ",tree0.nlevels)
-for lvl in range(tree0.nlevels):
-    print(tree0.get_boxes_level(lvl))
-print("nleaves = ",len(tree0.get_leaves()))
-
-st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-assembler = mA.rkHMatAssembler(p*p,150,tree0)
-tic = time.time()
-Sr_rk = assembler.assemble(st_r,reduced,1)
-tS = time.time()-tic
-print("assembler time (s) = ",tS)
-print("assembler data (GB) = ",assembler.nbytes/1e9)
-print("assembler data per dof = ",assembler.nbytes/st_r.A.shape[0])
-print("assembler compression = ",assembler.nbytes/(8*st_r.A.shape[0]*st_r.A.shape[1]))
-print("Sr_rk shape = ",Sr_rk.shape)
-print("Sr shape = ",st_r.A.shape)
-
-
-'''
-def sink(XY,k1,k2):
-    return np.sin(np.pi*k1*XY[:,0])*np.sin(np.pi*k2*XY[:,1])
-
-
-nc1=5
-nc2=5
-coeff1 = np.random.standard_normal(size=(nc1,))
-coeff2 = np.random.standard_normal(size=(nc2,))
-
-v=np.zeros(shape=(XXB.shape[0],))
-for i1 in range(1,nc1+1):
-    for i2 in range(1,nc2+1):
-        v+=coeff1[i1-1]*coeff2[i2-1]*sink(XXB,i1,i2)
-
-nc1=5
-nc2=5
-coeff1 = np.random.standard_normal(size=(nc1,))
-coeff2 = np.random.standard_normal(size=(nc2,))
-
-w=np.zeros(shape=(XXB.shape[0],))
-for i1 in range(1,nc1+1):
-    for i2 in range(1,nc2+1):
-        w+=coeff1[i1-1]*coeff2[i2-1]*sink(XXB,i1,i2)
-
-'''
-
-v = np.random.standard_normal(size=(Sr_rk.shape[1],))
-w = np.random.standard_normal(size=(Sr_rk.shape[1],))
-for i in range(20):
-    v/=np.linalg.norm(v)
-    w/=np.linalg.norm(w)
-    v=(st_r.A@v-Sr_rk@v)
-    v=st_r.A.T@v-Sr_rk.T@v
-    w=st_r.A@w
-    w=st_r.A.T@w
-err = np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
+    slabInd = 0
+    geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+    slab_i  = oms.slab(geom,gb)
+    solver  = solverWrap.solverWrapper(opts)
+    tic= time.time()
+    solver.construct(geom,helmholtz)
+    timingsConstruct+=[time.time()-tic]
+    totalDofs+=[solver.solver_ii.shape[0]]
+    XX = solver.XX
     
+    XXb = XX[solver.Ib,:]
+    XXi = XX[solver.Ii,:]
+    xl = geom[0][0]
+    xr = geom[1][0]
+    xc=(xl+xr)/2.
 
-print("S err = ",err)
+    Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
+    Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
+    Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
+    Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
+    slabDofs+=[len(Ic)]
+
+
+    ndim = XX.shape[1]
+    if ndim == 2:
+        leaf_size = p
+        XXI = XXi[Ic,:]
+        XXB = XXb[Ir,:]
+    elif ndim == 3:
+        leaf_size = p*p
+        XXI = XXi[Ic,1:3]
+        XXB = XXb[Ir,1:3]
+    else:
+        ValueError("ndim must be 2 or 3")
+
+
+
+    c0,L0 = compute_c0_L0(XXI)
+    binary = False
+    if binary:
+        tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
+    else:
+        tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
+
+    reduced = False
+    st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+    assembler = mA.rkHMatAssembler(p*p,150,tree0)
+    tic = time.time()
+    Sr_rk = assembler.assemble(st_r,reduced)
+    tS = time.time()-tic
+
+    timingsMatvec+=[assembler.stats.timeMatvecs]
+    timingsHBS+=[assembler.stats.timeHBS]
+
+    print("assembler data (GB) = ",assembler.stats.nbytes/1e9)
+    print("assembler data per dof = ",assembler.stats.nbytes/st_r.A.shape[0])
+    print("assembler compression = ",assembler.stats.nbytes/(8*st_r.A.shape[0]*st_r.A.shape[1]))
+
+
+    '''
+    def sink(XY,k1,k2):
+        return np.sin(np.pi*k1*XY[:,0])*np.sin(np.pi*k2*XY[:,1])
+
+
+    nc1=5
+    nc2=5
+    coeff1 = np.random.standard_normal(size=(nc1,))
+    coeff2 = np.random.standard_normal(size=(nc2,))
+
+    v=np.zeros(shape=(XXB.shape[0],))
+    for i1 in range(1,nc1+1):
+        for i2 in range(1,nc2+1):
+            v+=coeff1[i1-1]*coeff2[i2-1]*sink(XXB,i1,i2)
+
+    nc1=5
+    nc2=5
+    coeff1 = np.random.standard_normal(size=(nc1,))
+    coeff2 = np.random.standard_normal(size=(nc2,))
+
+    w=np.zeros(shape=(XXB.shape[0],))
+    for i1 in range(1,nc1+1):
+        for i2 in range(1,nc2+1):
+            w+=coeff1[i1-1]*coeff2[i2-1]*sink(XXB,i1,i2)
+
+    '''
+
+    v = np.random.standard_normal(size=(Sr_rk.shape[1],))
+    w = np.random.standard_normal(size=(Sr_rk.shape[1],))
+    for i in range(20):
+        v/=np.linalg.norm(v)
+        w/=np.linalg.norm(w)
+        v=(st_r.A@v-Sr_rk@v)
+        v=st_r.A.T@v-Sr_rk.T@v
+        w=st_r.A@w
+        w=st_r.A.T@w
+    err = np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
+        
+
+    print("S err = ",err)
+
+
+def genloglog(Nvec,tvec,i,title_str,pows):
+    Nvec = np.array(Nvec)
+    tvec = np.array(tvec)
+    lN = np.log(np.array(Nvec))
+    lt = np.log(np.array(tvec))
+    plt.figure(i)
+    plt.loglog(Nvec,tvec)
+    for pw in pows:
+        xi = pw*lN-lt
+        b = -np.sum(xi)/len(lt)
+        plt.loglog(Nvec,np.exp(b)*(Nvec**(pw)),linestyle='dashed',label=pw)
+    plt.legend()
+    plt.title(title_str)
+
+
+
+genloglog(totalDofs,timingsMatvec,1,'Matvec over total DOFs',[1.5,2])
+genloglog(slabDofs,timingsMatvec,2,'Matvec over slab DOFs',[1.5,2])
+genloglog(totalDofs,timingsConstruct,3,'construction over total DOFs',[1.5,2,2.5,3])
+genloglog(slabDofs,timingsConstruct,4,'construction over total DOFs',[1.5,2,2.5,3])
+genloglog(totalDofs,timingsHBS,5,'HBS over total DOFs',[1,1.5])
+genloglog(slabDofs,timingsHBS,6,'HBS over total DOFs',[1,1.5])
+
+plt.show()
+
 '''
 def compute_ancestor(box,lvl):
     parent = box
