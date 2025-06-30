@@ -34,7 +34,7 @@ class matAssembler:
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
         self.nbytes       = 0
-    def assemble(self,stMap:solver.stMap,dbg=0):
+    def assemble(self,stMap:solver.stMap,reduced=False,dbg=0):
         linOp = stMap.A
         if self.matOpts.method == 'dense':
             M=linOp@np.identity(linOp.shape[1])
@@ -46,8 +46,11 @@ class matAssembler:
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
             start = time.time()
-            c0,L0 = compute_c0_L0(stMap.XXI)
-            tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
+            if self.matOpts.tree:
+                tree0 = self.matOpts.tree
+            else:
+                c0,L0 = compute_c0_L0(stMap.XXI)
+                tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
             m=linOp.shape[0]
             n=linOp.shape[1]
             s=6*(self.matOpts.maxRank+10)
@@ -65,7 +68,7 @@ class matAssembler:
             if dbg>0:
                 print("time tree & Om+Psi = ",timeTreeAndRand)
             start = time.time()
-            hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10)
+            hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10,reduced)
             timeHBS = time.time()-start
             if dbg>0:
                 print("time HBS construction = ",timeHBS)
@@ -92,8 +95,8 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,leaf_size,rk):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk))
+    def __init__(self,leaf_size,rk,tree=None):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree))
 
 class tolHMatAssembler(matAssembler):
     def __init__(self,tol,leaf_size,rk):

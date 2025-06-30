@@ -17,9 +17,15 @@ def qr_torch(x):
     return q , r
 
 
-def qr_col_torch(x,k):
+def qr_col_torch(x,k,reduce=False):
+    k0 = k
     q,r= tla.qr(x)
-    return q[:,0:k]
+    if reduce:
+        [U,s,_] = tla.svd(r[:k,:k])
+        k0 = sum(s>1e-8)
+        q = q[:,:k]@U[:,:k0]
+    return q[:,:k0]
+
 def qr_col_torch_full(x):
     q,r= tla.qr(x,mode='reduced')
     return q,r
@@ -33,19 +39,19 @@ def null_torch(x,k):
 
 class HBSMAT:
 
-    def __init__(self,tree,Om,Psi,Y,Z,rk):
+    def __init__(self,tree,Om,Psi,Y,Z,rk,reduced=False):
         self.U_list  = [[] for _ in range(tree.nlevels)]
         self.V_list  = [[] for _ in range(tree.nlevels)]
         self.D_list  = [[] for _ in range(tree.nlevels)]
         self.perm = []
         for leaf in tree.get_leaves():
             self.perm += tree.get_box_inds(leaf).tolist()
-        self.construct(tree,Om,Psi,Y,Z,rk)
+        self.construct(tree,Om,Psi,Y,Z,rk,reduced)
         self.nbytes=sum([sum([U.nbytes for U in self.U_list[i]]) for i in range(len(self.U_list))])+\
                     sum([sum([V.nbytes for V in self.V_list[i]]) for i in range(len(self.V_list))])+\
                     sum([sum([D.nbytes for D in self.D_list[i]]) for i in range(len(self.D_list))])       
     
-    def construct(self,t,Om,Psi,Y,Z,rk):
+    def construct(self,t,Om,Psi,Y,Z,rk,reduce=False):
         s = Om.shape[1]
         Om_list_new=[]
         Psi_list_new=[]
@@ -88,22 +94,25 @@ class HBSMAT:
                 Z_list_new+=[Ztau]
                 if level>0:
                     rk0 = rk
+                    #if level==t.nlevels-1:
+                    #    rk0 = len(t.get_box_inds(box))                    
+                    Ptau = null_torch(Omtau,rk0)
+                    Qtau = null_torch(Psitau,rk0)
+                    Utau = qr_col_torch(Ytau@Ptau,rk0)
+                    Vtau = qr_col_torch(Ztau@Qtau,rk0)
                     
-                    #Ptau = null_torch(Omtau,rk0)
-                    #Qtau = null_torch(Psitau,rk0)
-                    #Utau = qr_col_torch(Ytau@Ptau,rk0)
-                    #Vtau = qr_col_torch(Ztau@Qtau,rk0)
-                    
-                    PP,RP = qr_col_torch_full(Omtau.T)
-                    QQ,RQ = qr_col_torch_full(Psitau.T)
-                    YP = Ytau@PP
-                    ZQ = Ztau@QQ
-                    Utau = qr_col_torch(Ytau-YP@PP.T,rk0)
-                    Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0)
+                    #PP,RP = qr_col_torch_full(Omtau.T)
+                    #QQ,RQ = qr_col_torch_full(Psitau.T)
+                    #YP = Ytau@PP
+                    #ZQ = Ztau@QQ
+                    #Utau = qr_col_torch(Ytau-YP@PP.T,rk0,reduce)
+                    #Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0,reduce)
 
 
-                    YO=tla.lstsq(RP,YP.T)[0].T
-                    ZP = tla.lstsq(RQ,ZQ.T)[0].T
+                    #YO=tla.lstsq(RP,YP.T)[0].T
+                    #ZP = tla.lstsq(RQ,ZQ.T)[0].T
+                    YO=Ytau@tla.pinv(Omtau)
+                    ZP=Ztau@tla.pinv(Psitau)
                     Dtau = (YO-Utau@(Utau.T@YO))\
                         +Utau@(Utau.T@((ZP-Vtau@(Vtau.T@ZP)).T))
                     self.U_list[level]+=[Utau]
@@ -128,7 +137,7 @@ class HBSMAT:
         qhat_list = [[] for _ in range(nlevels)]
         uhat_list = [[] for _ in range(nlevels)]
         if v.ndim == 1:
-            vperm = v[:,np.newaxis]
+            vperm = v[self.perm,np.newaxis]
         else:
             vperm = v[self.perm,:]
         vperm = torch.from_numpy(vperm)
@@ -209,7 +218,7 @@ class HBSMAT:
         qhat_list = [[] for _ in range(nlevels)]
         uhat_list = [[] for _ in range(nlevels)]
         if v.ndim == 1:
-            vperm = v[:,np.newaxis]
+            vperm = v[self.perm,np.newaxis]
         else:
             vperm = v[self.perm,:]
         vperm = torch.from_numpy(vperm)
