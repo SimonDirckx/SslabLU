@@ -81,7 +81,7 @@ class solverWrapper:
             self.solver_ii = self.solver.solver_ii
         if self.type=='hps':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0])
+            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=True)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver

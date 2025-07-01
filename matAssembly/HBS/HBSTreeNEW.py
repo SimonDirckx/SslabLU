@@ -100,12 +100,14 @@ class HBSMAT:
                     #    rk0 = len(t.get_box_inds(box))                    
                     #Ptau = null_torch(Omtau,rk0)
                     #Qtau = null_torch(Psitau,rk0)
-                    qom,rom = tla.qr(Omtau.T)
-                    qpsi,rpsi = tla.qr(Psitau.T)
+                    
+                    qom,rom = tla.qr(Omtau.T,mode='reduced')
+                    qpsi,rpsi = tla.qr(Psitau.T,mode='reduced')
+                    YP = (Ytau@qom)
+                    ZQ = (Ztau@qpsi)
 
-
-                    Utau = qr_col_torch(Ytau-(Ytau@qom)@qom.T,rk0)
-                    Vtau = qr_col_torch(Ztau-(Ztau@qpsi)@qpsi.T,rk0)
+                    Utau = qr_col_torch(Ytau-YP@qom.T,rk0)
+                    Vtau = qr_col_torch(Ztau-ZQ@qpsi.T,rk0)
                     
                     #PP,RP = qr_col_torch_full(Omtau.T)
                     #QQ,RQ = qr_col_torch_full(Psitau.T)
@@ -115,8 +117,8 @@ class HBSMAT:
                     #Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0,reduce)
 
 
-                    YO=tla.lstsq(rom,(Ytau@qom).T)[0].T
-                    ZP = tla.lstsq(rpsi,(Ztau@qpsi).T)[0].T
+                    YO  =   tla.lstsq(rom,YP.T,rcond=1e-8)[0].T
+                    ZP  =   tla.lstsq(rpsi,ZQ.T,rcond=1e-8)[0].T
                     #YO=Ytau@tla.pinv(Omtau)
                     #ZP=Ztau@tla.pinv(Psitau)
                     Dtau = (YO-Utau@(Utau.T@YO))\
@@ -125,7 +127,7 @@ class HBSMAT:
                     self.V_list[level]+=[Vtau]
                     self.D_list[level]+=[Dtau]
                 else:
-                    Dtau=Ytau@tla.pinv(Omtau)
+                    Dtau=Ytau@tla.pinv(Omtau,rtol=1e-8)
                     self.D_list[level]+=[Dtau]
             Om_list=Om_list_new
             Om_list_new=[]
