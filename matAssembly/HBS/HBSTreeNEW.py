@@ -31,9 +31,11 @@ def qr_col_torch_full(x):
     return q,r
 
 def null_torch(x,k):
-    q,r= tla.qr(x.T,mode='complete')
+    q,r= tla.qr(x.T,mode='reduced')
     n = q.shape[1]
-    return q[:,n-k:n]
+    m=q.shape[0]
+
+    return torch.eye(m)-q@q.T
 
 
 
@@ -96,10 +98,14 @@ class HBSMAT:
                     rk0 = rk
                     #if level==t.nlevels-1:
                     #    rk0 = len(t.get_box_inds(box))                    
-                    Ptau = null_torch(Omtau,rk0)
-                    Qtau = null_torch(Psitau,rk0)
-                    Utau = qr_col_torch(Ytau@Ptau,rk0)
-                    Vtau = qr_col_torch(Ztau@Qtau,rk0)
+                    #Ptau = null_torch(Omtau,rk0)
+                    #Qtau = null_torch(Psitau,rk0)
+                    qom,rom = tla.qr(Omtau.T)
+                    qpsi,rpsi = tla.qr(Psitau.T)
+
+
+                    Utau = qr_col_torch(Ytau-(Ytau@qom)@qom.T,rk0)
+                    Vtau = qr_col_torch(Ztau-(Ztau@qpsi)@qpsi.T,rk0)
                     
                     #PP,RP = qr_col_torch_full(Omtau.T)
                     #QQ,RQ = qr_col_torch_full(Psitau.T)
@@ -109,18 +115,17 @@ class HBSMAT:
                     #Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0,reduce)
 
 
-                    #YO=tla.lstsq(RP,YP.T)[0].T
-                    #ZP = tla.lstsq(RQ,ZQ.T)[0].T
-                    YO=Ytau@tla.pinv(Omtau)
-                    ZP=Ztau@tla.pinv(Psitau)
+                    YO=tla.lstsq(rom,(Ytau@qom).T)[0].T
+                    ZP = tla.lstsq(rpsi,(Ztau@qpsi).T)[0].T
+                    #YO=Ytau@tla.pinv(Omtau)
+                    #ZP=Ztau@tla.pinv(Psitau)
                     Dtau = (YO-Utau@(Utau.T@YO))\
                         +Utau@(Utau.T@((ZP-Vtau@(Vtau.T@ZP)).T))
                     self.U_list[level]+=[Utau]
                     self.V_list[level]+=[Vtau]
                     self.D_list[level]+=[Dtau]
                 else:
-                    Q,R = qr_col_torch_full(Omtau.T)
-                    Dtau=tla.lstsq(R,Q.T@Ytau.T)[0].T
+                    Dtau=Ytau@tla.pinv(Omtau)
                     self.D_list[level]+=[Dtau]
             Om_list=Om_list_new
             Om_list_new=[]

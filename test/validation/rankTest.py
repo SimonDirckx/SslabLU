@@ -218,7 +218,7 @@ for ii in range(20):
 
         reduced = False
         st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-        assembler = mA.rkHMatAssembler(p*p,75,tree0)
+        assembler = mA.rkHMatAssembler(p*p,150,tree0)
         tic = time.time()
         Sr_rk = assembler.assemble(st_r,reduced)
         tS = time.time()-tic
