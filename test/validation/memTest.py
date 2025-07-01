@@ -158,32 +158,20 @@ period = 0.
 
 plist = [int(sys.argv[1])]
 for ii in range(20):
-    time.sleep(5)
-    totalDofs = []
-    slabDofs = []
-    timingsMatvec=[]
-    timingsConstruct=[]
-    timingsHBS=[]
     ind=0
     for p in plist:
         print("p_loop start")
-
         a = [H/2.,1/16,1/16]
-
         opts = solverWrap.solverOptions('hps',[p,p,p],a)
-
         slabInd = 0
         geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
         slab_i  = oms.slab(geom,gb)
         solver  = solverWrap.solverWrapper(opts)
-        tic= time.time()
         solver.construct(geom,helmholtz)
-        timingsConstruct+=[time.time()-tic]
-        totalDofs+=[solver.solver_ii.shape[0]]
         XX = solver.XX
         
         XXb = XX[solver.Ib,:]
-        XXi = XX[solver.Ii,:]
+        XXi = XX[solver.Ii,:].copy()
         xl = geom[0][0]
         xr = geom[1][0]
         xc=(xl+xr)/2.
@@ -192,9 +180,7 @@ for ii in range(20):
         Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
         Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
         Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
-        slabDofs+=[len(Ic)]
-
-
+        
         ndim = XX.shape[1]
         if ndim == 2:
             leaf_size = p
@@ -207,8 +193,6 @@ for ii in range(20):
         else:
             ValueError("ndim must be 2 or 3")
 
-
-
         c0,L0 = compute_c0_L0(XXI)
         binary = False
         if binary:
@@ -219,13 +203,7 @@ for ii in range(20):
         reduced = False
         st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
         assembler = mA.rkHMatAssembler(p*p,75,tree0)
-        tic = time.time()
         Sr_rk = assembler.assemble(st_r,reduced)
-        tS = time.time()-tic
-        timingsMatvec+=[assembler.stats.timeMatvecs]
-        timingsHBS+=[assembler.stats.timeHBS]
-
-
         v = np.random.standard_normal(size=(Sr_rk.shape[1],))
         w = np.random.standard_normal(size=(Sr_rk.shape[1],))
         for i in range(20):
@@ -236,88 +214,9 @@ for ii in range(20):
             w=st_r.A@w
             w=st_r.A.T@w
         err = np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
-        print("================SUMMARY================")
-        print("p                = ",p)
-        print("time construct   = ",timingsConstruct[ind])
-        print("time PSI&OM      = ",timingsMatvec[ind])
-        print("time HBS         = ",timingsHBS[ind])
-        print("slab dofs        = ",Sr_rk.shape[0])
-        print("total dofs       = ",st_r.A.shape[0])
-        print("assembler data (GB)      = ",assembler.stats.nbytes/1e9)
-        print("assembler data per dof   = ",assembler.stats.nbytes/st_r.A.shape[0])
-        print("assembler compression    = ",assembler.stats.nbytes/(8*st_r.A.shape[0]*st_r.A.shape[1]))
-        print("S err            = ",err)
-        print("=======================================")
-        ind+=1
+
         del st_l,st_r,solver
         gc.collect()
-
-def genloglog(Nvec,tvec,i,title_str,pows):
-    Nvec = np.array(Nvec)
-    tvec = np.array(tvec)
-    lN = np.log(np.array(Nvec))
-    lt = np.log(np.array(tvec))
-    plt.figure(i)
-    plt.loglog(Nvec,tvec)
-    for pw in pows:
-        xi = pw*lN-lt
-        b = -np.sum(xi)/len(lt)
-        plt.loglog(Nvec,np.exp(b)*(Nvec**(pw)),linestyle='dashed',label=pw)
-    plt.legend()
-    plt.title(title_str)
-    plt.savefig(title_str+".png")
+        
 
 
-genloglog(totalDofs,timingsMatvec,1,'Matvec_over_total DOFs',[1.5,2])
-genloglog(slabDofs,timingsMatvec,2,'Matvec_over_slab DOFs',[1.5,2])
-genloglog(totalDofs,timingsConstruct,3,'construction_over_total DOFs',[1.5,2,2.5,3])
-genloglog(slabDofs,timingsConstruct,4,'construction_over_slab_DOFs',[1.5,2,2.5,3])
-genloglog(totalDofs,timingsHBS,5,'HBS_over_total_DOFs',[1,1.5])
-genloglog(slabDofs,timingsHBS,6,'HBS_over_slab_DOFs',[1,1.5])
-
-plt.show()
-
-'''
-def compute_ancestor(box,lvl):
-    parent = box
-    lvl0 = lvl
-    while lvl0>1:
-        parent = tree0.get_box_parent(parent)
-        lvl0-=1
-    return parent
-
-def near(box0,box1):
-    c0 = tree0.get_box_center(box0)
-    L = tree0.get_box_length(box0)
-    c1 = tree0.get_box_center(box1)
-    return np.linalg.norm(c0-c1)<np.sqrt(L[0]**2+L[1]**2)+1e-5
-
-def far(box0,box1):
-    return not near(box0,box1)
-
-
-
-
-boxes = tree0.get_leaves()
-Itot = np.zeros(shape=(0,),dtype = np.int64)
-for box in boxes:
-    Itot=np.append(Itot,tree0.get_box_inds(box))
-
-for box in boxes:
-    Ibox = tree0.get_box_inds(box)
-    boxes_near = [box0 for box0 in boxes if near(box,box0) and not box0==box]
-    boxes_far = [box0 for box0 in boxes if  far(box,box0)]
-    I_near = np.zeros(shape=(0,),dtype = Ibox[0].dtype)
-    I_far = np.zeros(shape=(0,),dtype = Ibox[0].dtype)
-    I_c = np.array([i for i in Itot if i not in Ibox])
-    for box_near in boxes_near:
-        I_near=np.append(I_near,tree0.get_box_inds(box_near))
-    for box_far in boxes_far:
-        I_far=np.append(I_far,tree0.get_box_inds(box_far))
-    S_far = Sr[Ibox,:][:,I_far]
-    S_near = Sr[Ibox,:][:,I_near]
-    S_c = Sr[Ibox,:][:,I_c]
-    print("far  shape//rk = ",S_far.shape,"//",np.linalg.matrix_rank(S_far,1e-5))
-    print("near shape//rk = ",S_near.shape,"//",np.linalg.matrix_rank(S_near,1e-5))
-    print("c    shape//rk = ",S_c.shape,"//",np.linalg.matrix_rank(S_c,1e-5))
-'''

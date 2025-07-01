@@ -58,6 +58,8 @@ class solverWrapper:
         self.type = opts.type
         self.constructed = False
         self.opts=opts
+    def __del__(self):
+        print("solverWrap deleted")
 
     def construct(self,geom,PDE:pdo):
         """
