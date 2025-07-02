@@ -157,7 +157,7 @@ for i in range(N-1):
 period = 0.
 
 
-p=6
+p=10
 
 a = [H/2.,1/32,1/32]
 print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)

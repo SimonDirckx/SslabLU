@@ -15,7 +15,7 @@ from hps.geom              import ParametrizedGeometry3D
 import time
 from scipy.sparse.linalg import gmres
 import solver.HPSInterp3D as interp
-
+import matplotlib.pyplot as plt
 
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -41,7 +41,7 @@ class gmres_info(object):
 
 jax_avail = True
 if jax_avail:
-    const_theta = 1/(2.*np.pi)
+    const_theta = 1./(2.*np.pi)
     r           = lambda zz: (zz[...,0]**2 + zz[...,1]**2)**0.5
 
     z1 = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.cos(zz[...,0]/const_theta) )
@@ -49,7 +49,7 @@ if jax_avail:
     z3 = lambda zz: zz[...,2]
 
 
-    y1 = lambda zz: const_theta* jnp.atan2(zz[...,1],zz[...,0])
+    y1 = lambda zz: const_theta*jnp.atan2(zz[...,1],zz[...,0])
     y2 = lambda zz: r(zz) - 1
     y3 = lambda zz: zz[...,2]
 
@@ -163,7 +163,7 @@ def u_exact(p):
 ##############################################################################################
 
 
-H = 1./8.
+H = 1./16.
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -191,17 +191,19 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 8
-a = [H/4.,1/8,1/8]
-assembler = mA.rkHMatAssembler((p+2)*(p+2),160)
+p = 10
+a = [H/2.,1/32,1/32]
+assembler = mA.rkHMatAssembler(p*p,160)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")
 #################################################################
-
-
+#E = np.identity(Stot.shape[1])
+#S00 = Stot@E
+#S00T = Stot.T@E
+#print("T err = ",np.linalg.norm(S00.T-S00T))
 #Finally, solve
 
 gInfo = gmres_info()
@@ -221,12 +223,6 @@ print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p)
 print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
-#print("constuction time rk.     = ",trk)
-#print("par. constuction time rk.= ",trk/(N-1))
-#print("solve time               = ",(stop_solve-start_solve))
-#print("par. solve time          = ",(stop_solve-start_solve)/(N-1))
-#print("data (MB)                = ",data/1e6)
-#print("data orig (MB)           = ",(8*Ntot+8*(nc*nc)*2.*(N-1))/1e6)
 print("==================================")
 
 uitot = np.zeros(shape=(0,))
@@ -234,30 +230,50 @@ XXtot = np.zeros(shape=(0,3))
 dofs = 0
 glob_target_dofs=OMS.glob_target_dofs
 glob_source_dofs=OMS.glob_source_dofs
-
+nc = OMS.nc
 del OMS
 
+
+
+
+
+
+
+
 # check err.
+print("uhat shape = ",uhat.shape)
+print("uhat type = ",type(uhat))
+print("nc = ",nc)
+
+fig = plt.figure(1)
+slabInd = 0
+geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+slab_i  = oms.slab(geom,gb)
+solver  = oms.solverWrap.solverWrapper(opts)
+solver.construct(geom,pdo_mod)
+Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+
+z1i = np.array(z1(XXi))
+u_known = np.sin(kh*z1i[Ic])
+ull = uhat[len(uhat)-nc:]
+ul = uhat[:nc]
+ur = uhat[nc:2*nc]
+urr = uhat[2*nc:3*nc]
+print("err ll = ",np.linalg.norm(ull-u_known)/np.linalg.norm(u_known))
+print("err l = ",np.linalg.norm(ul-u_known)/np.linalg.norm(u_known))
+print("err r = ",np.linalg.norm(ur-u_known)/np.linalg.norm(u_known))
+print("err rr = ",np.linalg.norm(urr-u_known)/np.linalg.norm(u_known))
+plt.figure(1)
+plt.plot(ul)
+plt.plot(ur)
+plt.legend(['ul','ur'])
+plt.figure(2)
+plt.plot(u_known)
+plt.show()
+'''
 for i in range(len(slabs)):
     slab = slabs[i]
     ul = uhat[glob_target_dofs[i]]
     ur = uhat[glob_source_dofs[i][1]]
     interp.check_err(slab,ul,ur,a,p,pdo_mod,gb,bc,u_exact)
-
-
-'''
-XXtot,I=np.unique(XXtot,axis=0,return_index=True)
-ui_exact = u_exact(XXtot)
-uitot=uitot[I]
-print('total u err inf = ',np.linalg.norm(ui_exact-uitot,ord=np.inf))
-ZZ = np.zeros(shape = XXtot.shape)
-ZZ[:,0] = z1(XXtot)
-ZZ[:,1] = z2(XXtot)
-ZZ[:,2] = z3(XXtot)
-tri = Delaunay(XXtot[:,0:2])
-plt.figure(0)
-plt.tripcolor(ZZ[:,0],ZZ[:,1],uitot,triangles = tri.simplices.copy(),cmap='jet',shading='gouraud',antialiased=False,linewidth=0)
-plt.colorbar()
-plt.axis('equal')
-plt.show()
 '''

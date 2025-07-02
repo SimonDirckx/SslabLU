@@ -183,6 +183,7 @@ class oms:
                 print("discretization time = ",tDisc)
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
             nc = len(Ic)
+            self.nc = nc
             Ntot += nc
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
             startCentral += nc

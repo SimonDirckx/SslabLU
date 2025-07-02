@@ -18,13 +18,14 @@ class matAssemblerOptions:
     """
     Options for matrix constuction
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,reduced=False):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
         self.maxRank    = maxRank
         self.tree       = tree
         self.leaf_size  = leaf_size
+        self.reduced    = reduced
 class matAssemblerStats:
     def __init__(self):
         self.timeMatvecs    = 0
@@ -40,7 +41,8 @@ class matAssembler:
         self.matOpts    = matOpts
         self.nbytes       = 0
         self.stats = matAssemblerStats()
-    def assemble(self,stMap:solver.stMap,reduced=False,dbg=0):
+    def assemble(self,stMap:solver.stMap,dbg=0):
+        reduced = self.matOpts.reduced
         linOp = stMap.A
         if self.matOpts.method == 'dense':
             M=linOp@np.identity(linOp.shape[1])
