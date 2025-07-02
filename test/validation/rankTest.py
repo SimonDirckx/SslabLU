@@ -113,7 +113,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-nwaves = 5.24
+nwaves = 2.24
 kh = (nwaves/4)*2.*np.pi
 print("kappa = ",kh)
 def c11(p):
@@ -157,10 +157,11 @@ for i in range(N-1):
 period = 0.
 
 
-p=10
+p=6
 
 a = [H/2.,1/32,1/32]
-
+print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
+print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 
 slabInd = 0
@@ -175,11 +176,14 @@ XXi = XX[solver.Ii,:]
 xl = geom[0][0]
 xr = geom[1][0]
 xc=(xl+xr)/2.
+print("xl,xc,xr=",xl,",",xc,",",xr)
 
 Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
 Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
 Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
 Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
+
+print("#slab dofs = ",len(Ic))
 
 st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 n=len(Ic)
@@ -265,7 +269,7 @@ print("E formed")
 
 Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>1e-8)
+rk1 = sum(s>s[0]*1e-8)
 print("shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
 
 #########################
@@ -273,7 +277,7 @@ print("shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
 #########################
 Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>1e-8)
+rk1 = sum(s>s[0]*1e-8)
 print("shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
 
 
@@ -282,7 +286,7 @@ print("shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
 #########################
 Sl = E[:,I2].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>1e-8)
+rk1 = sum(s>s[0]*1e-8)
 print("shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
 
 
@@ -291,7 +295,7 @@ print("shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
 #########################
 Sl = E[:,I3].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>1e-8)
+rk1 = sum(s>s[0]*1e-8)
 print("shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
 
 
@@ -300,7 +304,7 @@ print("shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
 #########################
 Sl = E[:,I4].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>1e-8)
+rk1 = sum(s>s[0]*1e-8)
 print("shape//rk 4 = (",len(Ibox),",",len(I4),")","//",rk1)
 
 
