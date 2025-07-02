@@ -7,6 +7,8 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
 import jax.numpy as jnp
+
+from time import time
 """
     This header takes care of the Solver Wrapper class
     Recipe:
@@ -92,7 +94,10 @@ class solverWrapper:
             self.Aib = solver.Aix
             self.Abi = solver.Axi
             self.Abb = solver.Axx
+            tic      = time()
             self.solver_ii = solver.solver_Aii
+            toc      = time() - tic
+            print("\t Toc construct Aii inverse %5.2f s" % toc)
         if self.type=='spectral':
             self.solver = spectral(PDE, geom, self.ord)
             self.constructed=True
