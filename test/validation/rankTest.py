@@ -178,13 +178,35 @@ xr = geom[1][0]
 xc=(xl+xr)/2.
 print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
 
+####################### Slow list comprehensions ####################
 tic = time()
 Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
 Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
 Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
 Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
 toc = time() - tic
-print("\t Toc index computations %5.2f s" % toc)
+print("\t Toc slow index computations %5.2f s" % toc)
+
+####################### Fast vectorized operations ####################
+def gb_vec(P):
+    # P is (N, 2)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)
+    )
+
+tic = time()
+Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
+Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
+Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+Igb = np.where(gb_vec(XXb))[0]
+toc = time() - tic
+print("\t Toc fast index computations %5.2f s" % toc)
+
+
+
 
 print("\t SLAB dofs = ",len(Ic))
 
