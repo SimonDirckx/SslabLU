@@ -32,7 +32,7 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
                 v_tmp = v
 
             if (not transpose):
-                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I,:]
+                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I]
             else:
                 result      = np.zeros(shape=(len(solver.Ii),v_tmp.shape[1]))
                 result[I,:] = v_tmp
@@ -113,9 +113,8 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-nwaves = 2.24
+nwaves = 5.24
 kh = (nwaves/4)*2.*np.pi
-print("kappa = ",kh)
 def c11(p):
     return jnp.ones_like(p[...,0])
 def c22(p):
@@ -123,7 +122,7 @@ def c22(p):
 def c33(p):
     return jnp.ones_like(p[...,0])
 def bfield(p):
-    return -kh*kh*jnp.ones_like(p[...,0])
+    return kh*kh*jnp.ones_like(p[...,0])
 helmholtz = pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=pdo.const(-kh*kh))
 
 bnds = [[0.,0.,0.],[1.,1.,1.]]
@@ -134,7 +133,7 @@ def gb(p):
 def bc(p):
     return jnp.ones_like(p[...,0])
 
-H = 1./8.
+H = 1./4.
 N = (int)(1./H)
 
 slabs = []
@@ -157,59 +156,127 @@ for i in range(N-1):
 period = 0.
 
 
-p=6
+plist = [10]
+totalDofs = []
+slabDofs = []
+timingsMatvec=[]
+timingsConstruct=[]
+timingsHBS=[]
+ind=0
+for p in plist:
+    print("p_loop start")
 
-a = [H/2.,1/32,1/32]
-print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
-print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
+    a = [H/2.,1/32,1/32]
 
-slabInd = 0
-geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
-solver  = solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz)
+    opts = solverWrap.solverOptions('hps',[p,p,p],a)
 
-XX = solver.XX
-XXb = XX[solver.Ib,:]
-XXi = XX[solver.Ii,:]
-xl = geom[0][0]
-xr = geom[1][0]
-xc=(xl+xr)/2.
-print("xl,xc,xr=",xl,",",xc,",",xr)
+    slabInd = 0
+    geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+    slab_i  = oms.slab(geom,gb)
+    solver  = solverWrap.solverWrapper(opts)
+    tic= time.time()
+    solver.construct(geom,helmholtz)
+    print("solver done")
+    timingsConstruct+=[time.time()-tic]
+    totalDofs+=[solver.solver_ii.shape[0]]
+    XX = solver.XX
+    
+    XXb = XX[solver.Ib,:]
+    XXi = XX[solver.Ii,:]
+    xl = geom[0][0]
+    xr = geom[1][0]
+    xc=(xl+xr)/2.
 
-Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
-Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
-Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
-Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
-
-print("#slab dofs = ",len(Ic))
-
-st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-n=len(Ic)
-
-ndim = XX.shape[1]
-if ndim == 2:
-    leaf_size = p
-    XXI = XXi[Ic,:]
-    XXB = XXb[Ir,:]
-elif ndim == 3:
-    leaf_size = p*p
-    XXI = XXi[Ic,1:3]
-    XXB = XXb[Ir,1:3]
-else:
-    ValueError("ndim must be 2 or 3")
+    Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
+    Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
+    Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
+    Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
+    slabDofs+=[len(Ic)]
 
 
+    ndim = XX.shape[1]
+    if ndim == 2:
+        leaf_size = p
+        XXI = XXi[Ic,:]
+        XXB = XXb[Ir,:]
+    elif ndim == 3:
+        leaf_size = p*p
+        XXI = XXi[Ic,1:3]
+        XXB = XXb[Ir,1:3]
+    else:
+        ValueError("ndim must be 2 or 3")
 
-c0,L0 = compute_c0_L0(XXI)
-binary = False
 
-if binary:
-    tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
-else:
-    tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
 
+    c0,L0 = compute_c0_L0(XXI)
+    binary = True
+    if binary:
+        tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
+    else:
+        tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
+
+    reduced = False
+    st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+    assembler = mA.rkHMatAssembler(p*p,4*p*p,tree0)
+    tic = time.time()
+    Sr_rk = assembler.assemble(st_r,reduced)
+    tS = time.time()-tic
+    timingsMatvec+=[assembler.stats.timeMatvecs]
+    timingsHBS+=[assembler.stats.timeHBS]
+
+
+    v = np.random.standard_normal(size=(Sr_rk.shape[1],))
+    w = np.random.standard_normal(size=(Sr_rk.shape[1],))
+    for i in range(100):
+        v/=np.linalg.norm(v)
+        w/=np.linalg.norm(w)
+        v=(st_r.A@v-Sr_rk@v)
+        v=st_r.A.T@v-Sr_rk.T@v
+        w=st_r.A@w
+        w=st_r.A.T@w
+    err = np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
+    print("================SUMMARY================")
+    print("p                = ",p)
+    print("time construct   = ",timingsConstruct[ind])
+    print("time PSI&OM      = ",timingsMatvec[ind])
+    print("time HBS         = ",timingsHBS[ind])
+    print("slab dofs        = ",Sr_rk.shape[0])
+    print("total dofs       = ",totalDofs[ind])
+    print("assembler data (GB)      = ",assembler.stats.nbytes/1e9)
+    print("assembler data per dof   = ",assembler.stats.nbytes/st_r.A.shape[0])
+    print("assembler compression    = ",assembler.stats.nbytes/(8*st_r.A.shape[0]*st_r.A.shape[1]))
+    print("S err            = ",err)
+    print("=======================================")
+    ind+=1
+    del st_l,st_r,solver
+    gc.collect()
+
+def genloglog(Nvec,tvec,i,title_str,pows):
+    Nvec = np.array(Nvec)
+    tvec = np.array(tvec)
+    lN = np.log(np.array(Nvec))
+    lt = np.log(np.array(tvec))
+    plt.figure(i)
+    plt.loglog(Nvec,tvec)
+    for pw in pows:
+        xi = pw*lN-lt
+        b = -np.sum(xi)/len(lt)
+        plt.loglog(Nvec,np.exp(b)*(Nvec**(pw)),linestyle='dashed',label=pw)
+    plt.legend()
+    plt.title(title_str)
+    plt.savefig(title_str+".png")
+
+
+genloglog(totalDofs,timingsMatvec,1,'Matvec_over_total DOFs',[1.5,2])
+genloglog(slabDofs,timingsMatvec,2,'Matvec_over_slab DOFs',[1.5,2])
+genloglog(totalDofs,timingsConstruct,3,'construction_over_total DOFs',[1.5,2,2.5,3])
+genloglog(slabDofs,timingsConstruct,4,'construction_over_slab_DOFs',[1.5,2,2.5,3])
+genloglog(totalDofs,timingsHBS,5,'HBS_over_total_DOFs',[1,1.5])
+genloglog(slabDofs,timingsHBS,6,'HBS_over_slab_DOFs',[1,1.5])
+
+plt.show()
+
+'''
 def compute_ancestor(box,lvl):
     parent = box
     lvl0 = lvl
@@ -229,112 +296,27 @@ def far(box0,box1):
 
 
 
-lvl = tree0.nlevels-2
-boxes = tree0.get_boxes_level(lvl)
 
-box0 = boxes[0]
-Ibox = tree0.get_box_inds(box0)
-print("ancestor = ",compute_ancestor(box0,lvl))
+boxes = tree0.get_leaves()
+Itot = np.zeros(shape=(0,),dtype = np.int64)
+for box in boxes:
+    Itot=np.append(Itot,tree0.get_box_inds(box))
 
-boxesc = [box for box in boxes if box!=box0]
-Ic = np.zeros(shape=(0,),dtype = np.int64)
-for box in boxesc:
-    Ic=np.append(Ic,tree0.get_box_inds(box))
-
-boxes_far = [box for box in boxes if compute_ancestor(box,lvl)!=compute_ancestor(box0,lvl)]
-Ifar = np.zeros(shape=(0,),dtype = np.int64)
-for box in boxes_far:
-    Ifar=np.append(Ifar,tree0.get_box_inds(box))
-
-boxes_2 = [box for box in boxes if compute_ancestor(box,lvl)==2]
-boxes_3 = [box for box in boxes if compute_ancestor(box,lvl)==3]
-boxes_4 = [box for box in boxes if compute_ancestor(box,lvl)==4]
-I2 = np.zeros(shape=(0,),dtype = np.int64)
-I3 = np.zeros(shape=(0,),dtype = np.int64)
-I4 = np.zeros(shape=(0,),dtype = np.int64)
-
-for box in boxes_2:
-    I2=np.append(I2,tree0.get_box_inds(box))
-for box in boxes_3:
-    I3=np.append(I3,tree0.get_box_inds(box))
-for box in boxes_4:
-    I4=np.append(I4,tree0.get_box_inds(box))
-
-E = np.identity(n)
-print("E formed")
-
-#########################
-#       c ranks
-#########################
-
-Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
-
-#########################
-#       far ranks
-#########################
-Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
-
-
-#########################
-#       2 ranks
-#########################
-Sl = E[:,I2].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
-
-
-#########################
-#       3 ranks
-#########################
-Sl = E[:,I3].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
-
-
-#########################
-#       4 ranks
-#########################
-Sl = E[:,I4].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 4 = (",len(Ibox),",",len(I4),")","//",rk1)
-
-
-plt.figure(0)
-plt.scatter(XXI[Ic,0],XXI[Ic,1],label='c')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(1)
-plt.scatter(XXI[Ifar,0],XXI[Ifar,1],label='far')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(2)
-plt.scatter(XXI[I2,0],XXI[I2,1],label='2')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(3)
-plt.scatter(XXI[I3,0],XXI[I3,1],label='3')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(4)
-plt.scatter(XXI[I4,0],XXI[I4,1],label='4')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-plt.show()
+for box in boxes:
+    Ibox = tree0.get_box_inds(box)
+    boxes_near = [box0 for box0 in boxes if near(box,box0) and not box0==box]
+    boxes_far = [box0 for box0 in boxes if  far(box,box0)]
+    I_near = np.zeros(shape=(0,),dtype = Ibox[0].dtype)
+    I_far = np.zeros(shape=(0,),dtype = Ibox[0].dtype)
+    I_c = np.array([i for i in Itot if i not in Ibox])
+    for box_near in boxes_near:
+        I_near=np.append(I_near,tree0.get_box_inds(box_near))
+    for box_far in boxes_far:
+        I_far=np.append(I_far,tree0.get_box_inds(box_far))
+    S_far = Sr[Ibox,:][:,I_far]
+    S_near = Sr[Ibox,:][:,I_near]
+    S_c = Sr[Ibox,:][:,I_c]
+    print("far  shape//rk = ",S_far.shape,"//",np.linalg.matrix_rank(S_far,1e-5))
+    print("near shape//rk = ",S_near.shape,"//",np.linalg.matrix_rank(S_near,1e-5))
+    print("c    shape//rk = ",S_c.shape,"//",np.linalg.matrix_rank(S_c,1e-5))
+'''

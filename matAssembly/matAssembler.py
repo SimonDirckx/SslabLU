@@ -77,7 +77,7 @@ class matAssembler:
             if dbg>0:
                 print("time tree & Om+Psi = ",self.stats.timeMatvecs)
             start = time.time()
-            hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank+10,reduced)
+            hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank,reduced)
             timeHBS = time.time()-start
             self.stats.timeHBS=timeHBS
             if dbg>0:

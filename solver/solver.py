@@ -58,6 +58,8 @@ class solverWrapper:
         self.type = opts.type
         self.constructed = False
         self.opts=opts
+    def __del__(self):
+        print("solverWrap deleted")
 
     def construct(self,geom,PDE:pdo):
         """
@@ -79,7 +81,7 @@ class solverWrapper:
             self.solver_ii = self.solver.solver_ii
         if self.type=='hps':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0])
+            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=True)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
@@ -109,5 +111,5 @@ class solverWrapper:
         self.XXi = solver.XX[self.Ii,:]
         self.XXb = solver.XX[self.Ib,:]
         self.ndofs = solver.XX.shape[0]
-        del solver
+        #del solver
         #self.constructMapIdxs()
