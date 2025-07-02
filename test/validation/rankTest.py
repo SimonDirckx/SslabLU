@@ -13,7 +13,7 @@ import matAssembly.matAssembler as mA
 import multislab.oms as oms
 from scipy.sparse.linalg import gmres
 from matAssembly.HBS.simpleoctree import simpletree as tree
-import time
+from time import time
 import gc
 
 
@@ -168,7 +168,7 @@ slabInd = 0
 geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
 slab_i  = oms.slab(geom,gb)
 solver  = solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz)
+solver.construct(geom,helmholtz,verbose=True)
 
 XX = solver.XX
 XXb = XX[solver.Ib,:]
@@ -176,14 +176,39 @@ XXi = XX[solver.Ii,:]
 xl = geom[0][0]
 xr = geom[1][0]
 xc=(xl+xr)/2.
-print("xl,xc,xr=",xl,",",xc,",",xr)
+print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
 
+####################### Slow list comprehensions ####################
+tic = time()
 Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
 Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
 Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
 Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
+toc = time() - tic
+print("\t Toc slow index computations %5.2f s" % toc)
 
-print("#slab dofs = ",len(Ic))
+####################### Fast vectorized operations ####################
+def gb_vec(P):
+    # P is (N, 2)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)
+    )
+
+tic = time()
+Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
+Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
+Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+Igb = np.where(gb_vec(XXb))[0]
+toc = time() - tic
+print("\t Toc fast index computations %5.2f s" % toc)
+
+
+
+
+print("\t SLAB dofs = ",len(Ic))
 
 st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 n=len(Ic)
@@ -205,10 +230,13 @@ else:
 c0,L0 = compute_c0_L0(XXI)
 binary = False
 
+tic = time()
 if binary:
     tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
 else:
     tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
+toc = time() - tic
+print("\t Toc tree construction %5.2f s" % toc)
 
 def compute_ancestor(box,lvl):
     parent = box
@@ -234,7 +262,7 @@ boxes = tree0.get_boxes_level(lvl)
 
 box0 = boxes[0]
 Ibox = tree0.get_box_inds(box0)
-print("ancestor = ",compute_ancestor(box0,lvl))
+print("\t box0=%d ancestor = %d" %(box0,compute_ancestor(box0,lvl)))
 
 boxesc = [box for box in boxes if box!=box0]
 Ic = np.zeros(shape=(0,),dtype = np.int64)
@@ -261,16 +289,21 @@ for box in boxes_4:
     I4=np.append(I4,tree0.get_box_inds(box))
 
 E = np.identity(n)
-print("E formed")
+
+tic = time()
+tmp = np.random.randn(n,100)
+st_l.A @ tmp
+toc = time() - tic
+print("\t Toc solve PDE on double slab for %d rhs %5.2f s" % (tmp.shape[-1],toc))
 
 #########################
 #       c ranks
 #########################
-
+print("RANK RESULTS")
 Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
 rk1 = sum(s>s[0]*1e-8)
-print("shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
+print("\t shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
 
 #########################
 #       far ranks
@@ -278,7 +311,7 @@ print("shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
 Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
 rk1 = sum(s>s[0]*1e-8)
-print("shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
+print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
 
 
 #########################
@@ -287,7 +320,7 @@ print("shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
 Sl = E[:,I2].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
 rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
+print("\t shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
 
 
 #########################
@@ -296,7 +329,7 @@ print("shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
 Sl = E[:,I3].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
 rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
+print("\t shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
 
 
 #########################
@@ -305,7 +338,7 @@ print("shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
 Sl = E[:,I4].T@((st_l.A)@E[:,Ibox])
 [_,s,_] = np.linalg.svd(Sl)
 rk1 = sum(s>s[0]*1e-8)
-print("shape//rk 4 = (",len(Ibox),",",len(I4),")","//",rk1)
+print("\t shape//rk 4 = (",len(Ibox),",",len(I4),")","//",rk1)
 
 
 plt.figure(0)
