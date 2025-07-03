@@ -109,17 +109,11 @@ else:
                         y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
-def gb_vec(P):
-    # P is (N, 3)
-    return (
-        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
-        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14) | 
-        (np.abs(P[:, 2] - bnds[0][2]) < 1e-14) | 
-        (np.abs(P[:, 2] - bnds[1][2]) < 1e-14)
-    )
-
+    
+def gb(p):
+    return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
+def gb_np(p):
+    return np.abs(p[:,1]-bnds[0][1])<1e-14 or np.abs(p[:,1]-bnds[1][1])<1e-14 or np.abs(p[:,2]-bnds[0][2])<1e-14 or np.abs(p[:,2]-bnds[1][2])<1e-14
 
 #########################################################################################################
 
@@ -150,11 +144,11 @@ pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 def bc(p):
     z=z1(p)
-    return jnp.sin(kh*z)
+    return np.sin(kh*z)
 
 def u_exact(p):
     z=z1(p)
-    return jnp.sin(kh*z)
+    return np.sin(kh*z)
 
 ################################################################
 
@@ -199,11 +193,11 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 6
-a = [H/4.,1/16,1/16]
-assembler = mA.rkHMatAssembler(p*p,150)
+p = 8
+a = [H/2.,1/32,1/32]
+assembler = mA.rkHMatAssembler(p*p,200)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,gb_vec,opts,connectivity,if_connectivity,1.)
+OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")
@@ -218,9 +212,9 @@ gInfo = gmres_info()
 stol = 1e-10*H*H
 
 if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=150,restart=150)
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
 else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=150,restart=150)
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot
@@ -256,7 +250,7 @@ print("nc = ",nc)
 fig = plt.figure(1)
 slabInd = 0
 geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb_vec)
+slab_i  = oms.slab(geom,gb)
 solver  = oms.solverWrap.solverWrapper(opts)
 solver.construct(geom,pdo_mod)
 Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)

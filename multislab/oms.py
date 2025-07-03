@@ -205,12 +205,16 @@ class oms:
 
             start = time.time()
             rkMat_r = assembler.assemble(st_r,dbg=dbg)
-            self.nbytes+=assembler.nbytes
+            self.nbytes+=assembler.stats.nbytes
+            compression_r = assembler.stats.nbytes
             rkMat_l = assembler.assemble(st_l,dbg=dbg)
-            self.nbytes+=assembler.nbytes
+            compression_l = assembler.stats.nbytes
+            self.nbytes+=assembler.stats.nbytes
             
             self.densebytes+=np.prod(st_l.A.shape)*8
+            compression_l/=np.prod(st_l.A.shape)*8
             self.densebytes+=np.prod(st_r.A.shape)*8
+            compression_r/=np.prod(st_r.A.shape)*8
             tCompress=time.time()-start
             compressTime += tCompress
             shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
@@ -226,6 +230,7 @@ class oms:
             if dbg>1:
                 print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
                 print("SLAB %d error = %5.2e // %5.2e\n" % (slabInd,relerrl,relerrr))
+                print("SLAB %d compression = %5.3e // %5.3e\n" % (slabInd,compression_l,compression_r))
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
             
             
