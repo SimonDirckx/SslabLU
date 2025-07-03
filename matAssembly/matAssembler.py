@@ -44,6 +44,8 @@ class matAssembler:
     def assemble(self,stMap:solver.stMap,dbg=0):
         reduced = self.matOpts.reduced
         linOp = stMap.A
+
+        print("MAT ASSEMBLER METHOD=%s" % self.matOpts.method) if dbg > 0 else None
         if self.matOpts.method == 'dense':
             M=linOp@np.identity(linOp.shape[1])
             self.nbytes = M.nbytes
@@ -53,12 +55,15 @@ class matAssembler:
             
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
-            
+            start = time.time()
             if self.matOpts.tree:
                 tree0 = self.matOpts.tree
             else:
                 c0,L0 = compute_c0_L0(stMap.XXI)
                 tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
+            toc_tree  = time.time() - start
+
+            start = time.time()
             m=linOp.shape[0]
             n=linOp.shape[1]
             s=6*(self.matOpts.maxRank+10)
@@ -77,13 +82,13 @@ class matAssembler:
             Psi = torch.from_numpy(Psi)
             
             if dbg>0:
-                print("time tree & Om+Psi = ",self.stats.timeMatvecs)
+                print("\t Toc tree %5.2f s, toc solve %d random pdes %5.2f s" %(toc_tree, s, self.stats.timeMatvecs))
             start = time.time()
             hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank,reduced)
             timeHBS = time.time()-start
             self.stats.timeHBS=timeHBS
             if dbg>0:
-                print("time HBS construction = ",self.stats.timeHBS)
+                print("\t Toc HBS construction %5.2f s"%self.stats.timeHBS)
             self.stats.nbytes = hbsMat.nbytes
             def matmat(v,transpose=False):
                 if transpose:

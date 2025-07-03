@@ -36,9 +36,18 @@ if jax_avail:
 else:
     bnds = [[0.,0.,0.],[1.,1.,1.]]
     box_geom   = np.array(bnds)
-    
-def gb(p):
-    return np.abs(p[0]-bnds[0][0])<1e-14 or np.abs(p[0]-bnds[1][0])<1e-14 or np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14 or np.abs(p[2]-bnds[0][2])<1e-14 or np.abs(p[2]-bnds[1][2])<1e-14
+
+
+def gb_vec(P):
+    # P is (N, 3)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14) | 
+        (np.abs(P[:, 2] - bnds[0][2]) < 1e-14) | 
+        (np.abs(P[:, 2] - bnds[1][2]) < 1e-14)
+    )
 
 #########################################################################################################
 
@@ -121,7 +130,7 @@ p = 8
 a = [H/2.,1/16,1/16]
 assembler = mA.denseMatAssembler()#mA.rkHMatAssembler(p*p,160)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,helmholtz,gb,opts,connectivity,if_connectivity)
+OMS = oms.oms(slabs,helmholtz,gb_vec,opts,connectivity,if_connectivity)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")

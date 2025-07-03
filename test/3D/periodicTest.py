@@ -109,11 +109,17 @@ else:
                         y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
-    
-def gb(p):
-    return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
-def gb_np(p):
-    return np.abs(p[:,1]-bnds[0][1])<1e-14 or np.abs(p[:,1]-bnds[1][1])<1e-14 or np.abs(p[:,2]-bnds[0][2])<1e-14 or np.abs(p[:,2]-bnds[1][2])<1e-14
+def gb_vec(P):
+    # P is (N, 3)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14) | 
+        (np.abs(P[:, 2] - bnds[0][2]) < 1e-14) | 
+        (np.abs(P[:, 2] - bnds[1][2]) < 1e-14)
+    )
+
 
 #########################################################################################################
 
@@ -197,7 +203,7 @@ p = 6
 a = [H/4.,1/16,1/16]
 assembler = mA.rkHMatAssembler(p*p,150)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
+OMS = oms.oms(slabs,pdo_mod,gb_vec,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")
@@ -250,7 +256,7 @@ print("nc = ",nc)
 fig = plt.figure(1)
 slabInd = 0
 geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
+slab_i  = oms.slab(geom,gb_vec)
 solver  = oms.solverWrap.solverWrapper(opts)
 solver.construct(geom,pdo_mod)
 Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)

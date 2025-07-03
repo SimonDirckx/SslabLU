@@ -131,8 +131,16 @@ def bc(p):
     return np.ones_like(p[:,0])
 bnds = [[0.,0.],[1.,1.]]
 Om=stdGeom.Box(bnds)
-def gb(p):
-    return np.abs(p[0]-bnds[0][0])<1e-10 or np.abs(p[0]-bnds[1][0])<1e-14 or np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14
+
+def gb_vec(P):
+    # P is (N, 2)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)  
+    )
+
 
 H = 1./16.
 N = (int)(1./H)
@@ -170,7 +178,7 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),(i+1)]]
 opts = solverWrap.solverOptions('hps',[p,p],a)
 #assembler = mA.denseMatAssembler()#((p+2)*(p+2),50)
-OMS = oms.oms(slabs,Lapl,gb,opts,connectivity,if_connectivity)
+OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,True)
 print("done")
