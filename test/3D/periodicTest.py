@@ -256,7 +256,7 @@ print("nc = ",nc)
 fig = plt.figure(1)
 slabInd = 0
 geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
+slab_i  = oms.slab(geom,gb_vec)
 solver  = oms.solverWrap.solverWrapper(opts)
 solver.construct(geom,pdo_mod)
 Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
