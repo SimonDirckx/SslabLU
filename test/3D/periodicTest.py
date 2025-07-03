@@ -111,7 +111,9 @@ else:
                         y3_d3=y3_d3)
     
 def gb(p):
-    return np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14 or np.abs(p[2]-bnds[0][2])<1e-14 or np.abs(p[2]-bnds[1][2])<1e-14
+    return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
+def gb_np(p):
+    return np.abs(p[:,1]-bnds[0][1])<1e-14 or np.abs(p[:,1]-bnds[1][1])<1e-14 or np.abs(p[:,2]-bnds[0][2])<1e-14 or np.abs(p[:,2]-bnds[1][2])<1e-14
 
 #########################################################################################################
 
@@ -142,11 +144,11 @@ pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 def bc(p):
     z=z1(p)
-    return np.sin(kh*z)
+    return jnp.sin(kh*z)
 
 def u_exact(p):
     z=z1(p)
-    return np.sin(kh*z)
+    return jnp.sin(kh*z)
 
 ################################################################
 
@@ -191,9 +193,9 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10
-a = [H/2.,1/32,1/32]
-assembler = mA.rkHMatAssembler(p*p,160)
+p = 6
+a = [H/4.,1/16,1/16]
+assembler = mA.rkHMatAssembler(p*p,150)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
@@ -210,9 +212,9 @@ gInfo = gmres_info()
 stol = 1e-10*H*H
 
 if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=150,restart=150)
 else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=150,restart=150)
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot

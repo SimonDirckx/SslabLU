@@ -8,6 +8,7 @@ from scipy.sparse.linalg   import LinearOperator
 from solver.solver import stMap
 import time
 import sys
+import jax.numpy as jnp
 #import gc
 
 
@@ -70,15 +71,17 @@ class slab:
 
     def compute_idxs_and_pts(self,solver):
         XX = solver.XX
-        XXb = XX[solver.Ib,:]
-        XXi = XX[solver.Ii,:]
+        XXb = XX[solver.Ib,...]
+        XXi = XX[solver.Ii,...]
         xl = self.geom[0][0]
         xr = self.geom[1][0]
         xc=(xl+xr)/2.
-        Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-        Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-        Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
-        Igb = [i for i in range(len(solver.Ib)) if self.gb(XXb[i,:])]
+        gb = self.gb(XXb)
+        
+        Il = jnp.where( (jnp.abs(XXb[...,0]-xl)<1e-14)& ~gb)[0] #[i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
+        Ir = jnp.where((jnp.abs(XXb[...,0]-xr)<1e-14) & ~gb)[0] #[i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
+        Ic = jnp.where((jnp.abs(XXi[...,0]-xc)<1e-14))[0]       #[i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
+        Igb = jnp.where(gb)[0]                                  #[i for i in range(len(solver.Ib)) if self.gb(XXb[i,:])]
         return Il,Ir,Ic,Igb,XXi,XXb
 
 
@@ -116,16 +119,16 @@ class oms:
         A_solver = solver.solver_ii    
         def smatmat(v,I,J,transpose=False):
             if (v.ndim == 1):
-                v_tmp = v[:,np.newaxis]
+                v_tmp = v[...,np.newaxis]
             else:
                 v_tmp = v
 
             if (not transpose):
-                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I]
+                result = (A_solver@(solver.Aib[...,J]@v_tmp))[I,...]
             else:
                 result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
                 result[I,:] = v_tmp
-                result      = solver.Aib[:,J].T @ (A_solver.T@(result))
+                result      = solver.Aib[...,J].T @ (A_solver.T@(result))
             if (v.ndim == 1):
                 result = result.flatten()
             return result
@@ -137,8 +140,8 @@ class oms:
             matvec = lambda v:smatmat(v,Ic,Il), rmatvec = lambda v:smatmat(v,Ic,Il,transpose=True),\
             matmat = lambda v:smatmat(v,Ic,Il), rmatmat = lambda v:smatmat(v,Ic,Il,transpose=True))
         
-        st_r = stMap(Linop_r,XXb[Ir,:],XXi[Ic,:])
-        st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
+        st_r = stMap(Linop_r,XXb[Ir,...],XXi[Ic,...])
+        st_l = stMap(Linop_l,XXb[Il,...],XXi[Ic,...])
         return st_l,st_r
 
     def construct_Stot_and_rhstot(self,bc,assembler,dbg=0):
@@ -188,18 +191,18 @@ class oms:
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
             startCentral += nc
             
-            fgb = bc(XXb[Igb,:])
+            fgb = bc(XXb[Igb,...])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
+            rhs = solver.solver_ii@(solver.Aib[...,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
             start = time.time()
             
             rkMat_r = assembler.assemble(st_r,dbg)
-            self.nbytes+=assembler.nbytes
+            self.nbytes+=assembler.stats.nbytes
             rkMat_l = assembler.assemble(st_l,dbg)
-            self.nbytes+=assembler.nbytes
+            self.nbytes+=assembler.stats.nbytes
             
             self.densebytes+=np.prod(st_l.A.shape)*8
             self.densebytes+=np.prod(st_r.A.shape)*8
@@ -217,6 +220,7 @@ class oms:
                 relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
             if dbg>1:
                 print("compression time = ",tCompress)
+                print("compression rate = ",self.nbytes/self.densebytes)
                 print("error = ",relerrl,"//",relerrr)
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
             
@@ -246,7 +250,7 @@ class oms:
 
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
-                v_tmp = v[:,np.newaxis].astype('float64')
+                v_tmp = v[...,jnp.newaxis].astype('float64')
             else:
                 v_tmp = v.astype('float64')
             result  = v_tmp.copy()
