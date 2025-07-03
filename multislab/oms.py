@@ -63,10 +63,16 @@ def join_geom(slab1,slab2,period=None):
 
 
 class slab:
-    def __init__(self,geom,gb,transform=None):
+    def __init__(self,geom,gb_vec,transform=None):
         self.geom       =   geom
         self.transform  =   transform
-        self.gb         =   gb
+        self.gb_vec     =   gb_vec
+        try:
+            ndim = self.geom.shape[-1]
+            res  = gb_vec(np.random.randn(5,ndim))
+            assert res.ndim == 1 and res.shape[0] == 5
+        except:
+            raise ValueError ("Input gb needs to accept inputs of size numpoints x ndim") 
 
     def compute_idxs_and_pts(self,solver):
         XX = solver.XX
@@ -75,13 +81,13 @@ class slab:
         xl = self.geom[0][0]
         xr = self.geom[1][0]
         xc=(xl+xr)/2.
-        Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-        Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 and XXb[i,1]>1e-14 and XXb[i,1]<1-1e-14]
-        Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
-        Igb = [i for i in range(len(solver.Ib)) if self.gb(XXb[i,:])]
+
+        Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
+        Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
+        Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+        Igb = np.where(self.gb_vec(XXb))[0]    
+
         return Il,Ir,Ic,Igb,XXi,XXb
-
-
 
 class oms:
     def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity,if_connectivity,period = 0.):
@@ -176,11 +182,11 @@ class oms:
             slab_i = slab(geom,self.gb)
             start = time.time()
             solver = solverWrap.solverWrapper(opts)
-            solver.construct(geom,pdo)
+            solver.construct(geom,pdo,verbose=dbg)
             tDisc = time.time()-start
             discrTime += tDisc
             if dbg>1:
-                print("discretization time = ",tDisc)
+                print("SLAB %2.0d discretization time = %5.2f s" % (slabInd,tDisc))
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
             nc = len(Ic)
             self.nc = nc
@@ -191,14 +197,15 @@ class oms:
             fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+
             rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
+
             start = time.time()
-            
-            rkMat_r = assembler.assemble(st_r,dbg)
+            rkMat_r = assembler.assemble(st_r,dbg=dbg)
             self.nbytes+=assembler.nbytes
-            rkMat_l = assembler.assemble(st_l,dbg)
+            rkMat_l = assembler.assemble(st_l,dbg=dbg)
             self.nbytes+=assembler.nbytes
             
             self.densebytes+=np.prod(st_l.A.shape)*8
@@ -216,8 +223,8 @@ class oms:
                 relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
                 relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
             if dbg>1:
-                print("compression time = ",tCompress)
-                print("error = ",relerrl,"//",relerrr)
+                print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
+                print("SLAB %d error = %5.2e // %5.2e\n" % (slabInd,relerrl,relerrr))
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
             
             
