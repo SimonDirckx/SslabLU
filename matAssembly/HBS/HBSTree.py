@@ -1,381 +1,303 @@
 import numpy as np
-from collections import deque
+import matAssembly.HBS.simpleoctree.simpletree as tree
+import matplotlib.pyplot as plt
 from scipy.linalg import qr
-from matAssembly.HBS.simpleoctree import simpletree as tree
-
-def qr_null(A, rnk0:int):
-    Q, R, P = qr(A.T, mode='full', pivoting=True)
-    tol = 1e-8#np.finfo(R.dtype).eps if tol is None else tol
-    tol*=np.linalg.norm(np.diag(R))
-    rnk = min(A.shape) - np.abs(np.diag(R))[::-1].searchsorted(tol)
-    return Q[:, rnk:(rnk+rnk0)]
-def qr_col(A, rnk:int):
-    Q, R, P = qr(A, mode='full', pivoting=True)
-    return Q[:, 0:rnk]
-def qr_col_eps(A,B, eps):
-    QA, RA, PA = qr(A, mode='full', pivoting=True)
-    QB, RB, PB = qr(B, mode='full', pivoting=True)
-    tol=.1*eps*min(np.linalg.norm(np.diag(RA)),np.linalg.norm(np.diag(RB)))
-    rnkA = min(A.shape) - np.abs(np.diag(RA))[::-1].searchsorted(tol)
-    rnkB = min(B.shape) - np.abs(np.diag(RB))[::-1].searchsorted(tol)
-    rnk=max(rnkA,rnkB)
-    return QA[:, 0:rnk],QB[:, 0:rnk]
+from scipy.linalg import block_diag
+from scipy.spatial import distance_matrix
+from scipy.linalg import lstsq
+import scipy.linalg
+import time
+import torch
+import torch.linalg as tla
 
 
-'''
-implements HBSTree
-'''
 
-class HBSTree:
+def qr_torch(x):
+    q,r = tla.qr(x)
+    return q , r
+
+
+def qr_col_torch(x,k,reduce=False):
+    k0 = k
+    q,r= tla.qr(x)
+    if reduce:
+        [U,s,_] = tla.svd(r[:k,:k])
+        k0 = sum(s>1e-8)
+        q = q[:,:k]@U[:,:k0]
+    return q[:,:k0]
+
+def qr_col_torch_full(x):
+    q,r= tla.qr(x,mode='reduced')
+    return q,r
+
+def null_torch(x,k):
+    q,r= tla.qr(x.T,mode='reduced')
+    n = q.shape[1]
+    m=q.shape[0]
+
+    return torch.eye(m)-q@q.T
+
+
+
+class HBSMAT:
+
+    def __init__(self,tree,Om,Psi,Y,Z,rk,reduced=False):
+        self.U_list  = [[] for _ in range(tree.nlevels)]
+        self.V_list  = [[] for _ in range(tree.nlevels)]
+        self.D_list  = [[] for _ in range(tree.nlevels)]
+        self.perm = []
+        for leaf in tree.get_leaves():
+            self.perm += tree.get_box_inds(leaf).tolist()
+        self.construct(tree,Om,Psi,Y,Z,rk,1e-7)
+        self.nbytes=sum([sum([U.nbytes for U in self.U_list[i]]) for i in range(len(self.U_list))])+\
+                    sum([sum([V.nbytes for V in self.V_list[i]]) for i in range(len(self.V_list))])+\
+                    sum([sum([D.nbytes for D in self.D_list[i]]) for i in range(len(self.D_list))])       
     
-    def __init__(self, idxs=0, children=None):
-        self.children   =   []
-        self.idxs       =   idxs
-        self.local_idxs =   np.zeros(shape=idxs.shape,dtype=int)
-        self.level      =   0
-        self.is_leaf    =   True
-        self.depth      =   0
-        self.number_of_children = 0
-        self.child_index = 0
-        self.local_data = 0.
-        self.qhat = np.zeros(shape=(0,0))
-        if children is not None:
-            for child in children:
-                self.add_child(child)
-    
-    def add_child(self, node):
-        assert isinstance(node, HBSTree)
-        node.set_level(self.level+1)
-        node.child_index = self.number_of_children
-        self.children.append(node)
-        self.number_of_children += 1
-        self.is_leaf=False
-        node_idxs = node.idxs
-        
-        for i in range(len(node_idxs)):
-            a=(np.where(self.idxs==node_idxs[i]))[0]
-            node.set_local_idx(i,a)
+    def construct(self,t,Om,Psi,Y,Z,rk,eps=0.):
+        s = Om.shape[1]
+        Om_list_new=[]
+        Psi_list_new=[]
+        Y_list_new=[]
+        Z_list_new=[]
+        data_type = Om.dtype
+        for level in range(t.nlevels-1,-1,-1):
+            boxes = t.get_boxes_level(level)
+            shift = boxes[-1]+1
+            for box in boxes:
+                if level ==t.nlevels-1:
+                    idxs    = t.get_box_inds(box)
+                    Omtau   = Om[idxs,:]
+                    Psitau  = Psi[idxs,:]
+                    Ytau    = Y[idxs,:]
+                    Ztau    = Z[idxs,:]
+                else:
+                    children= t.get_box_children(box)
+                    Omtau   = torch.zeros((0,s),dtype=data_type)
+                    Psitau  = torch.zeros((0,s),dtype=data_type)
+                    Ytau    = torch.zeros((0,s),dtype=data_type)
+                    Ztau    = torch.zeros((0,s),dtype=data_type)
+                    for child in children:
+                        Omchild = Om_list[child-shift]
+                        Psichild = Psi_list[child-shift]
+                        Ychild = Y_list[child-shift]
+                        Zchild = Z_list[child-shift]
+                        Uchild = self.U_list[level+1][child-shift]
+                        Vchild = self.V_list[level+1][child-shift]
+                        Dchild = self.D_list[level+1][child-shift]
 
-    def set_local_idx(self,i,a):
-        self.local_idxs[i] = int(a)
+                        Omtau=torch.cat((Omtau,Vchild.T@Omchild),dim=0)
+                        Psitau=torch.cat((Psitau,Uchild.T@Psichild),dim=0)
 
-    def set_idxs(self,idxs):
-        self.idxs = idxs
+                        Ytau=torch.cat((Ytau,Uchild.T@(Ychild-Dchild@Omchild)),dim=0)
+                        Ztau=torch.cat((Ztau,Vchild.T@(Zchild-Dchild.T@Psichild)),dim=0)
+                Om_list_new+=[Omtau]
+                Psi_list_new+=[Psitau]
+                Y_list_new+=[Ytau]
+                Z_list_new+=[Ztau]
+                if level>0:
+                    rk0 = rk
+                    #if level==t.nlevels-1:
+                    #    rk0 = len(t.get_box_inds(box))                    
+                    #Ptau = null_torch(Omtau,rk0)
+                    #Qtau = null_torch(Psitau,rk0)
+                    
+                    qom,rom = tla.qr(Omtau.T,mode='reduced')
+                    qpsi,rpsi = tla.qr(Psitau.T,mode='reduced')
+                    YP = (Ytau@qom)
+                    ZQ = (Ztau@qpsi)
+                    
+                    Utau = qr_col_torch(Ytau-YP@qom.T,rk0)
+                    Vtau = qr_col_torch(Ztau-ZQ@qpsi.T,rk0)
+                    
+                    #PP,RP = qr_col_torch_full(Omtau.T)
+                    #QQ,RQ = qr_col_torch_full(Psitau.T)
+                    #YP = Ytau@PP
+                    #ZQ = Ztau@QQ
+                    #Utau = qr_col_torch(Ytau-YP@PP.T,rk0,reduce)
+                    #Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0,reduce)
 
-    def set_qhat(self,q):
-        self.qhat = q
 
-    def set_uhat(self,u):
-        self.uhat = u
+                    YO  =   tla.lstsq(rom,YP.T)[0].T
+                    ZP  =   tla.lstsq(rpsi,ZQ.T)[0].T
+                    #YO=Ytau@tla.pinv(Omtau)
+                    #ZP=Ztau@tla.pinv(Psitau)
+                    Dtau = (YO-Utau@(Utau.T@YO))\
+                        +Utau@(Utau.T@((ZP-Vtau@(Vtau.T@ZP)).T))
+                    self.U_list[level]+=[Utau]
+                    self.V_list[level]+=[Vtau]
+                    self.D_list[level]+=[Dtau]
+                else:
+                    Dtau=Ytau@tla.pinv(Omtau)
+                    self.D_list[level]+=[Dtau]
+            Om_list=Om_list_new
+            Om_list_new=[]
+            Psi_list=Psi_list_new
+            Psi_list_new=[]
+            Y_list=Y_list_new
+            Y_list_new=[]
+            Z_list=Z_list_new
+            Z_list_new=[]
+        del Om_list,Om_list_new,Psi_list,Psi_list_new,Y_list,Y_list_new,Z_list,Z_list_new
 
-    def set_UDV(self,U,D,V):
-        assert U.shape[1]==V.shape[1]
-        assert D.shape[0]==D.shape[1]
-        assert D.shape[0]==V.shape[0]
-        self.U          = U
-        self.V          = V
-        self.D          = D
-        self.rnk        = U.shape[1]
-        self.local_data += U.data.nbytes+V.data.nbytes+D.data.nbytes
-        #self.local_data += U.shape[1]*U.shape[0]+V.shape[1]*V.shape[0]+D.shape[1]*D.shape[0]#+D.data.nbytes
-    
-    def set_D(self,D):
-        self.D = D
-        self.local_data += D.data.nbytes
-        #self.local_data += D.shape[1]*D.shape[0]
-    
-    def set_OmPsiYZ(self,Om,Psi,Y,Z):
-        self.Om=Om
-        self.Psi=Psi
-        self.Y=Y
-        self.Z=Z
-
-    def print(self):
-        print(len(self.idxs),',',self.level,',',self.is_leaf)
-        for child in self.children:
-            child.print()
-    
-    def set_level(self,i):
-        self.level = i
-    
-    
-    def breadth_first_iter(self):
-        
-        queue = deque([self])
-
-        while queue:
-            node = queue.popleft()
-            print(node.level,',',node.local_data,',',node.qhat.shape)
-            for child in node.children:
-                queue.append(child)
-    
-    def total_bytes(self):
-        nB = self.local_data
-        for child in self.children:
-            nB+=child.total_bytes()
-        return nB
-
-    
-    def get_level_nodes(self,l):
-        #if l>L:
-        #    raise ValueError('l exceeds tree depth')
-        if self.level == l:
-            print(self.idxs)
+    def matvec(self,v):
+        nlevels = len(self.D_list)
+        qhat_list = [[] for _ in range(nlevels)]
+        uhat_list = [[] for _ in range(nlevels)]
+        if v.ndim == 1:
+            vperm = v[self.perm,np.newaxis]
         else:
-            for child in self.children:
-                child.get_level_nodes(l)
-
-
-###############################
-#           METHODS
-###############################
-
-
-def copy_tree_to_HBS(tree,m=0,T=None):
-    if m==0:
-        T=HBSTree(np.sort(tree.get_box_inds(0)))
-    for child in tree.get_box_children(m):
-        node = HBSTree(np.sort(tree.get_box_inds(child)))
-        T.add_child(node)
-        copy_tree_to_HBS(tree,child,node)
-    return T
-def HBS_tree_from_points(XX,nl=8):
-    t =  tree.BalancedTree(XX,nl)
-    return copy_tree_to_HBS(t)       
-
-
-
-def compress_HBS(T:HBSTree,OMEGA,PSI,Y,Z,rnk,s):
-    if T.is_leaf:
-        idxs=T.idxs
-        Om  = OMEGA[idxs,:]
-        Psi = PSI[idxs,:]
-        Yt  = Y[idxs,:]
-        Zt  = Z[idxs,:]
-        n=len(idxs)
-        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
-        P = qr_null(Om,rnk)
-        Q = qr_null(Psi,rnk)
-        U = qr_col(Yt@P,min(rnk,n))
-        V = qr_col(Zt@Q,min(rnk,n))
-        D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
-        T.set_UDV(U,D,V)
-    else:
-        n=0
-        for child in T.children:
-            compress_HBS(child,OMEGA,PSI,Y,Z,rnk,s)
-            n+= child.rnk
-        Om  = np.zeros(shape=(n,s))
-        Psi = np.zeros(shape=(n,s))
-        Yt  = np.zeros(shape=(n,s))
-        Zt  = np.zeros(shape=(n,s))
+            vperm = v[self.perm,:]
+        vperm = torch.from_numpy(vperm)
         n0 = 0
-        for child in T.children:
-            Om[n0:n0+child.rnk,:]     = child.V.T@child.Om
-            Psi[n0:n0+child.rnk,:]    = child.U.T@child.Psi
-            Yt[n0:n0+child.rnk,:]     = child.U.T@(child.Y - child.D@child.Om)
-            Zt[n0:n0+child.rnk,:]     = child.V.T@(child.Z - child.D.T@child.Psi)
-            n0  +=   child.rnk
-        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
-        if T.level>0:
-            P = qr_null(Om,rnk)
-            Q = qr_null(Psi,rnk)
-            U = qr_col(Yt@P,rnk)
-            V = qr_col(Zt@Q,rnk)
-            D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
-            T.set_UDV(U,D,V)
+        qhat = torch.zeros((0,vperm.shape[1]),dtype = vperm.dtype)
+        
+        #########################
+        #       UPWARD PASS
+        #########################
+        for V in self.V_list[nlevels-1]:
+            step = V.shape[0]
+            qhat=torch.cat((qhat,V.T@vperm[n0:n0+step,:]),dim=0)
+            n0+=step
+        qhat_list[nlevels-1]=qhat
+
+        for level in range(nlevels-2,0,-1):
+            n0 = 0
+            qhat = torch.zeros(0,vperm.shape[1])
+            for V in self.V_list[level]:
+                step = V.shape[0]
+                qhat=torch.cat((qhat,V.T@qhat_list[level+1][n0:n0+step,:]),dim=0)
+                n0+=step
+            qhat_list[level]=qhat
+
             
+        #########################
+        #       DOWNWARD PASS
+        #########################
+
+        uperm = torch.zeros((vperm.shape[0],vperm.shape[1]),dtype=vperm.dtype)
+
+        for level in range(0,nlevels):
+            n0 = 0
+            if level==0:
+                uhat=self.D_list[0][0]@qhat_list[1]
+                uhat_list[0]=uhat
+            elif level<nlevels-1:
+                uhat = torch.zeros(0,vperm.shape[1])
+                n0 = 0
+                for U in self.U_list[level]:
+                    step = U.shape[1]
+                    uhat=torch.cat((uhat,U@uhat_list[level-1][n0:n0+step,:]),dim=0)
+                    n0+=step
+                n0l = 0
+                stepl = 0
+                n0r = 0
+                stepr = 0
+                for D in self.D_list[level]:
+                    stepl = D.shape[0]
+                    stepr = D.shape[1]
+                    uhat[n0l:n0l+stepl,:]+=D@qhat_list[level+1][n0r:n0r+stepr,:]
+                    n0r+=stepr
+                    n0l+=stepl
+                uhat_list[level]=uhat
+            else:
+                n0l=0
+                n0r=0
+                for U in self.U_list[level]:
+                    stepl=U.shape[0]
+                    stepr=U.shape[1]
+                    uperm[n0l:n0l+stepl,:] = U@uhat_list[level-1][n0r:n0r+stepr,:]
+                    n0l+=stepl
+                    n0r+=stepr
+                n0l=0
+                n0r=0
+                for D in self.D_list[level]:
+                    stepl = D.shape[0]
+                    stepr = D.shape[1]
+                    uperm[n0l:n0l+stepl,:]+=D@vperm[n0r:n0r+stepr,:]
+                    n0r+=stepr
+                    n0l+=stepl
+        u = uperm.clone()
+        u[self.perm,:] = uperm
+        u = u.detach().cpu().numpy()
+        return u
+    def matvecT(self,v):
+        nlevels = len(self.D_list)
+        qhat_list = [[] for _ in range(nlevels)]
+        uhat_list = [[] for _ in range(nlevels)]
+        if v.ndim == 1:
+            vperm = v[self.perm,np.newaxis]
         else:
-            D = Yt@np.linalg.pinv(Om)
-            T.set_D(D)
-def compress_HBS_eps(T:HBSTree,OMEGA,PSI,Y,Z,rnk,s,eps):
-    if T.is_leaf:
-        idxs=T.idxs
-        Om  = OMEGA[idxs,:]
-        Psi = PSI[idxs,:]
-        Yt  = Y[idxs,:]
-        Zt  = Z[idxs,:]
-        n=len(idxs)
-        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
-        P = qr_null(Om,rnk)
-        Q = qr_null(Psi,rnk)
-        #U = qr_col(Yt@P,min(rnk,n))
-        #V = qr_col(Zt@Q,min(rnk,n))
-        U,V = qr_col_eps(Yt@P,Zt@Q,eps)
-        D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
-        T.set_UDV(U,D,V)
-    else:
-        n=0
-        for child in T.children:
-            compress_HBS_eps(child,OMEGA,PSI,Y,Z,rnk,s,eps)
-            n+= child.rnk
-        Om  = np.zeros(shape=(n,s))
-        Psi = np.zeros(shape=(n,s))
-        Yt  = np.zeros(shape=(n,s))
-        Zt  = np.zeros(shape=(n,s))
+            vperm = v[self.perm,:]
+        vperm = torch.from_numpy(vperm)
+        
         n0 = 0
-        for child in T.children:
-            Om[n0:n0+child.rnk,:]     = child.V.T@child.Om
-            Psi[n0:n0+child.rnk,:]    = child.U.T@child.Psi
-            Yt[n0:n0+child.rnk,:]     = child.U.T@(child.Y - child.D@child.Om)
-            Zt[n0:n0+child.rnk,:]     = child.V.T@(child.Z - child.D.T@child.Psi)
-            n0  +=   child.rnk
-        T.set_OmPsiYZ(Om,Psi,Yt,Zt)
-        if T.level>0:
-            P = qr_null(Om,rnk)
-            Q = qr_null(Psi,rnk)
-            U,V=qr_col_eps(Yt@P,Zt@Q,eps)
-            D = (np.identity(n)-U@U.T)@Yt@np.linalg.pinv(Om)+U@U.T@(((np.identity(n)-V@V.T)@Zt@np.linalg.pinv(Psi)).T)
-            T.set_UDV(U,D,V)
+        qhat = torch.zeros((0,vperm.shape[1]),dtype=vperm.dtype)
+        #########################
+        #       UPWARD PASS
+        #########################
+        for U in self.U_list[nlevels-1]:
+            step = U.shape[0]
+            qhat=torch.cat((qhat,U.T@vperm[n0:n0+step,:]),dim=0)
+            n0+=step
+        qhat_list[nlevels-1]=qhat
+
+        for level in range(nlevels-2,0,-1):
+            n0 = 0
+            qhat = torch.zeros(0,vperm.shape[1])
+            for U in self.U_list[level]:
+                step = U.shape[0]
+                qhat=torch.cat((qhat,U.T@qhat_list[level+1][n0:n0+step,:]),dim=0)
+                n0+=step
+            qhat_list[level]=qhat
+
             
-        else:
-            D = Yt@np.linalg.pinv(Om)
-            T.set_D(D)
+        #########################
+        #       DOWNWARD PASS
+        #########################
 
-def random_compression_HBS(tree,OMEGA,PSI,Y,Z,rnk,s):
-    T=copy_tree_to_HBS(tree)
-    compress_HBS(T,OMEGA,PSI,Y,Z,rnk,s)
-    return T
-def random_compression_HBS_eps(tree,OMEGA,PSI,Y,Z,rnk,s,eps):
-    T=copy_tree_to_HBS(tree)
-    compress_HBS_eps(T,OMEGA,PSI,Y,Z,rnk,s,eps)
-    return T
+        uperm = torch.zeros((vperm.shape[0],vperm.shape[1]),dtype=vperm.dtype)
 
-
-def apply_HBS_upward(HBSMat:HBSTree,q,transpose=False):
-    #upward pass
-    m00 = q.shape[1]
-    if not transpose:
-        if HBSMat.is_leaf:
-            qhat = HBSMat.V.T@q[HBSMat.idxs,:]
-            HBSMat.set_qhat(qhat)
-        elif HBSMat.level>0:
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
+        for level in range(0,nlevels):
             n0 = 0
-            for child in HBSMat.children:
-                apply_HBS_upward(child,q)
-                qhat[n0:n0+child.rnk,:]=child.qhat
-                n0+=child.rnk
-            qhat = HBSMat.V.T@qhat
-            HBSMat.set_qhat(qhat)
-        else:
-            for child in HBSMat.children:
-                apply_HBS_upward(child,q)
-    else:
-        if HBSMat.is_leaf:
-            qhat = HBSMat.U.T@q[HBSMat.idxs,:]
-            HBSMat.set_qhat(qhat)
-        elif HBSMat.level>0:
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
-            n0 = 0
-            for child in HBSMat.children:
-                apply_HBS_upward(child,q,transpose)
-                qhat[n0:n0+child.rnk,:]=child.qhat
-                n0+=child.rnk
-            qhat = HBSMat.U.T@qhat
-            HBSMat.set_qhat(qhat)
-        else:
-            for child in HBSMat.children:
-                apply_HBS_upward(child,q,transpose)
-
-def apply_HBS_downward(HBSMat:HBSTree,u,q,transpose=False):
-    m00 = q.shape[1]
-    if not transpose:
-        if HBSMat.level==0:
-            D=HBSMat.D
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
-            n0 = 0
-            for child in HBSMat.children:
-                qhat[n0:n0+child.rnk,:] = child.qhat
-                n0+=child.rnk
-            uhat = D@qhat
-            n0 = 0
-            for child in HBSMat.children:
-                child.set_uhat(uhat[n0:n0+child.rnk])
-                n0+=child.rnk
-                apply_HBS_downward(child,u,q)
-        elif not HBSMat.is_leaf:
-            U = HBSMat.U
-            D = HBSMat.D
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
-            n0 = 0
-            for child in HBSMat.children:
-                qhat[n0:n0+child.rnk,:] = child.qhat
-                n0+=child.rnk
-            uhat = U@HBSMat.uhat+D@qhat
-            n0=0
-            for child in HBSMat.children:
-                child.set_uhat(uhat[n0:n0+child.rnk,:])
-                n0+=child.rnk
-                apply_HBS_downward(child,u,q)
-        else:
-            U=HBSMat.U
-            D=HBSMat.D
-            u[HBSMat.idxs,:]=U@HBSMat.uhat+D@q[HBSMat.idxs,:]
-    else:
-        if HBSMat.level==0:
-            D=HBSMat.D
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
-            n0 = 0
-            for child in HBSMat.children:
-                qhat[n0:n0+child.rnk,:] = child.qhat
-                n0+=child.rnk
-            uhat = D.T@qhat
-            n0 = 0
-            for child in HBSMat.children:
-                child.set_uhat(uhat[n0:n0+child.rnk])
-                n0+=child.rnk
-                apply_HBS_downward(child,u,q,transpose)
-        elif not HBSMat.is_leaf:
-            V = HBSMat.V
-            D = HBSMat.D
-            n   = 0
-            for child in HBSMat.children:
-                n+=child.rnk
-            qhat = np.zeros(shape=(n,m00))
-            n0 = 0
-            for child in HBSMat.children:
-                qhat[n0:n0+child.rnk,:] = child.qhat
-                n0+=child.rnk
-            uhat = V@HBSMat.uhat+D.T@qhat
-            n0=0
-            for child in HBSMat.children:
-                child.set_uhat(uhat[n0:n0+child.rnk])
-                n0+=child.rnk
-                apply_HBS_downward(child,u,q,transpose)
-        else:
-            V=HBSMat.V
-            D=HBSMat.D
-            u[HBSMat.idxs,:]=V@HBSMat.uhat+D.T@q[HBSMat.idxs,:]
-
-
-def apply_HBS(HBSMat:HBSTree,q0,transpose=False):
-    if q0.ndim == 1:
-        q = q0[:,np.newaxis]
-    else:
-        q = q0
-    u=np.zeros(shape=q.shape)
-    apply_HBS_upward(HBSMat,q,transpose)
-    apply_HBS_downward(HBSMat,u,q,transpose)
-    if q0.ndim == 1:
-        u = u.flatten()
-    return u
-
-
-
-    
+            if level==0:
+                uhat=self.D_list[0][0].T@qhat_list[1]
+                uhat_list[0]=uhat
+            elif level<nlevels-1:
+                uhat = torch.zeros(0,vperm.shape[1])
+                n0 = 0
+                for V in self.V_list[level]:
+                    step = V.shape[1]
+                    uhat=torch.cat((uhat,V@uhat_list[level-1][n0:n0+step,:]),dim=0)
+                    n0+=step
+                n0l = 0
+                stepl = 0
+                n0r = 0
+                stepr = 0
+                for D in self.D_list[level]:
+                    stepl = D.shape[1]
+                    stepr = D.shape[0]
+                    uhat[n0l:n0l+stepl,:]+=D.T@qhat_list[level+1][n0r:n0r+stepr,:]
+                    n0r+=stepr
+                    n0l+=stepl
+                uhat_list[level]=uhat
+            else:
+                n0l=0
+                n0r=0
+                for V in self.V_list[level]:
+                    stepl=V.shape[0]
+                    stepr=V.shape[1]
+                    uperm[n0l:n0l+stepl,:] = V@uhat_list[level-1][n0r:n0r+stepr,:]
+                    n0l+=stepl
+                    n0r+=stepr
+                n0l=0
+                n0r=0
+                for D in self.D_list[level]:
+                    stepl = D.shape[1]
+                    stepr = D.shape[0]
+                    uperm[n0l:n0l+stepl,:]+=D.T@vperm[n0r:n0r+stepr,:]
+                    n0r+=stepr
+                    n0l+=stepl
+        u = uperm.clone()
+        u[self.perm,:] = uperm
+        u = u.detach().cpu().numpy()
+        return u
