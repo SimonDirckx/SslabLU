@@ -52,30 +52,66 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
         st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:])
         return st_l,st_r
 
-def compute_T(I,J,XXb,solver):
-        A_solver = solver.solver_ii    
-        def smatmat(v,I,J,transpose=False):
-            if (v.ndim == 1):
-                v_tmp = v[:,np.newaxis]
-            else:
-                v_tmp = v
 
-            if (not transpose):
-                result = (solver.Abb[I,:][:,J]@v_tmp)-(solver.Abi[I,:]@(A_solver@(solver.Aib[:,J]@v_tmp)))
-            else:
-                result      = ((solver.Abb[I,:][:,J]).T@v_tmp)-((solver.Aib[:,J]).T@(A_solver.T@((solver.Abi[I,:]).T@v_tmp)))
-            if (v.ndim == 1):
-                result = result.flatten()
-            return result
-
-        Linop_l = LinearOperator(shape=(len(J),len(I)),\
-            matvec = lambda v:smatmat(v,J,I), rmatvec = lambda v:smatmat(v,J,I,transpose=True),\
-            matmat = lambda v:smatmat(v,J,I), rmatmat = lambda v:smatmat(v,J,I,transpose=True))
+def join_geom(slab1,slab2,period=None):
+    ndim = len(slab1[0])
+    if ndim==2:
+        xl1 = slab1[0][0]
+        xr1 = slab1[1][0]
+        yl1 = slab1[0][1]
+        yr1 = slab1[1][1]
         
-        Tll = stMap(Linop_l,XXb[I,:],XXb[J,:])
-        return Tll
+        xl2 = slab2[0][0]
+        xr2 = slab2[1][0]
+        yl2 = slab2[0][1]
+        yr2 = slab2[1][1]
+        if(np.abs(xr1-xl2)>1e-10):
+            if period:
+                xl1 -= period
+                xr1 -= period
+                return join_geom([[xl1,yl1],[xr1,yr1]],slab2)
+            else:
+                ValueError("slab shift did not work (is your period correct?)")
+        else:
+            totalSlab = [[xl1, yl1],[xr2,yr2]]
+        return totalSlab
+    elif ndim==3:
+        xl1 = slab1[0][0]
+        xr1 = slab1[1][0]
+        yl1 = slab1[0][1]
+        yr1 = slab1[1][1]
+        zl1 = slab1[0][2]
+        zr1 = slab1[1][2]
 
+        xl2 = slab2[0][0]
+        xr2 = slab2[1][0]
+        yl2 = slab2[0][1]
+        yr2 = slab2[1][1]
+        zl2 = slab2[0][2]
+        zr2 = slab2[1][2]
+        if(np.abs(xr1-xl2)>1e-10):
+            if period:
+                xl1 -= period
+                xr1 -= period
+                return join_geom([[xl1,yl1,zl1],[xr1,yr1,zr1]],slab2)
+            else:
+                ValueError("slab shift did not work (is your period correct?)")
+        else:
+            totalSlab = [[xl1, yl1,zl1],[xr2,yr2,zr2]]
+        return totalSlab
+    else:
+        raise ValueError("ndim incorrect")
 
+class gmres_info(object):
+    def __init__(self, disp=False):
+        self._disp = disp
+        self.niter = 0
+        self.resList=[]
+    def __call__(self, rk=None):
+        self.niter += 1
+        self.resList+=[rk]
+        if self._disp:
+            print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
 nwaves = 2.24
 kh = (nwaves/4)*2.*np.pi
@@ -110,7 +146,7 @@ def gb_vec(P):
 def bc(p):
     return jnp.ones_like(p[...,0])
 
-H = 1./4.
+H = 1./8.
 N = (int)(1./H)
 
 slabs = []
@@ -133,7 +169,7 @@ for i in range(N-1):
 period = 0.
 binary = False
 pvec = [4,5,6,7,8]
-a = [H/4.,1/32,1/32]
+a = [H/2.,1/32,1/32]
 nlvl = int(np.log2(1/(2*a[1])))
 if binary:
     nlvl *=2
@@ -142,26 +178,19 @@ nlvl+=1
 rkWeak=np.zeros(shape=(len(pvec),nlvl-2),dtype = np.int64)
 rkStrong=np.zeros(shape=(len(pvec),nlvl-2),dtype=np.int64)
 
-#form = 'S' 
-form = 'T'
-
 for indp in range(len(pvec)):
     p = pvec[indp]
     
     print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
     print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
-    
     opts = solverWrap.solverOptions('hps',[p,p,p],a)
-    if form == 'S':
-        geom    = np.array([[0.,0.,0.],[2*H,1.,1.]])
-        solver  = solverWrap.solverWrapper(opts)
-        solver.construct(geom,helmholtz,verbose=True)
-    elif form == 'T':
-        geom    = np.array([[0.,0.,0.],[H,1.,1.]])
-        solver  = solverWrap.solverWrapper(opts)
-        solver.construct(geom,helmholtz,verbose=True)
-    else:
-        raise ValueError('form must be S or T')
+
+    slabInd = 0
+    geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+    slab_i  = oms.slab(geom,gb_vec)
+    solver  = solverWrap.solverWrapper(opts)
+    solver.construct(geom,helmholtz,verbose=True)
+
     XX = solver.XX
     XXb = XX[solver.Ib,:]
     XXi = XX[solver.Ii,:]
@@ -169,18 +198,20 @@ for indp in range(len(pvec)):
     xr = geom[1][0]
     xc=(xl+xr)/2.
     print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
-    
+
+    ####################### Fast vectorized operations ####################
+
+    tic = time()
     Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
     Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
     Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
     Igb = np.where(gb_vec(XXb))[0]
-    
+    toc = time() - tic
+    print("\t Toc fast index computations %5.2f s" % toc)
     print("\t SLAB dofs = ",len(Ic))
-    if form=='S':
-        st,_ = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-    else:
-        st = compute_T(Il,Ir,XXb,solver)
-    n=len(Il)
+
+    st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+    n=len(Ic)
 
     ndim = XX.shape[1]
     if ndim == 2:
@@ -221,9 +252,9 @@ for indp in range(len(pvec)):
             raise ValueError("tree not balanced")
 
     if binary:
-        tree0 = tree.BinaryTree(XXB,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
+        tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
     else:
-        tree0 = tree.BalancedTree(XXB,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
+        tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
 
     check_regularity(tree0,binary)
     print("actual nlvl = ",tree0.nlevels)
@@ -269,7 +300,7 @@ for indp in range(len(pvec)):
 
         tic = time()
         tmp = np.random.randn(n,100)
-        st.A @ tmp
+        st_l.A @ tmp
         toc = time() - tic
         print("\t Toc solve PDE on double slab for %d rhs %5.2f s" % (tmp.shape[-1],toc))
 
@@ -277,7 +308,7 @@ for indp in range(len(pvec)):
         #       c ranks
         #########################
         print("RANK RESULTS at tol %.2e" %(tol_rk))
-        Sl = E[:,Ic].T@((st.A)@E[:,Ibox])
+        Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
         [_,s,_] = np.linalg.svd(Sl)
         rk1 = sum(s>s[0]*tol_rk)
         print("\t shape//rk c   = (",len(Ibox),",",len(Ic),")","//",rk1)
@@ -286,7 +317,7 @@ for indp in range(len(pvec)):
         #########################
         #       far ranks
         #########################
-        Sl = E[:,Ifar].T@((st.A)@E[:,Ibox])
+        Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
         [_,s,_] = np.linalg.svd(Sl)
         rk1 = sum(s>s[0]*tol_rk)
         print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
@@ -294,11 +325,8 @@ for indp in range(len(pvec)):
 print("rkWeak = ",rkWeak)
 print("rkStrong = ",rkStrong)
 
-fileStrWeak = 'rkWeak'+form+'.out'
-fileStrStrong = 'rkStrong'+form+'.out'
-
-np.savetxt(fileStrWeak,rkWeak,delimiter=',',fmt='%d')
-np.savetxt(fileStrStrong,rkStrong,delimiter=',',fmt='%d')
+np.savetxt('rkWeak.out',rkWeak,delimiter=',',fmt='%d')
+np.savetxt('rkStrong.out',rkStrong,delimiter=',',fmt='%d')
 
 plt.figure(1)
 labelweak = []
@@ -312,37 +340,3 @@ plt.plot(pvec,rkStrong,label=labelstrong,linestyle='dashed')
 plt.legend()
 plt.xticks(pvec)
 plt.show()
-
-
-'''
-plt.figure(0)
-plt.scatter(XXI[Ic,0],XXI[Ic,1],label='c')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(1)
-plt.scatter(XXI[Ifar,0],XXI[Ifar,1],label='far')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(2)
-plt.scatter(XXI[I2,0],XXI[I2,1],label='2')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(3)
-plt.scatter(XXI[I3,0],XXI[I3,1],label='3')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-
-plt.figure(4)
-plt.scatter(XXI[I4,0],XXI[I4,1],label='4')
-plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
-plt.legend()
-plt.axis('equal')
-plt.show()
-'''
