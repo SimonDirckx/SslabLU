@@ -131,6 +131,18 @@ box_geom   = jnp.array(bnds)
 
 def gb(p):
     return np.abs(p[0]-bnds[0][0])<1e-14 or np.abs(p[0]-bnds[1][0])<1e-14 or np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14
+
+def gb_vec(P):
+    # P is (N, 2)
+    return (
+        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
+        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
+        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14) |
+        (np.abs(P[:, 2] - bnds[0][2]) < 1e-14) |
+        (np.abs(P[:, 2] - bnds[1][2]) < 1e-14)
+    )
+
 def bc(p):
     return jnp.ones_like(p[...,0])
 
@@ -155,192 +167,182 @@ for i in range(N-1):
     else:
         if_connectivity+=[[(i-1),(i+1)]]
 period = 0.
-
-
-p=10
-
-a = [H/2.,1/32,1/32]
-print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
-print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
-
-slabInd = 0
-geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
-solver  = solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz,verbose=True)
-
-XX = solver.XX
-XXb = XX[solver.Ib,:]
-XXi = XX[solver.Ii,:]
-xl = geom[0][0]
-xr = geom[1][0]
-xc=(xl+xr)/2.
-print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
-
-####################### Slow list comprehensions ####################
-tic = time()
-Il = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xl)<1e-14 ]
-Ir = [i for i in range(len(solver.Ib)) if np.abs(XXb[i,0]-xr)<1e-14 ]
-Ic = [i for i in range(len(solver.Ii)) if np.abs(XXi[i,0]-xc)<1e-14]
-Igb = [i for i in range(len(solver.Ib)) if gb(XXb[i,:])]
-toc = time() - tic
-print("\t Toc slow index computations %5.2f s" % toc)
-
-####################### Fast vectorized operations ####################
-def gb_vec(P):
-    # P is (N, 2)
-    return (
-        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
-        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)
-    )
-
-tic = time()
-Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
-Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
-Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
-Igb = np.where(gb_vec(XXb))[0]
-toc = time() - tic
-print("\t Toc fast index computations %5.2f s" % toc)
-
-
-
-
-print("\t SLAB dofs = ",len(Ic))
-
-st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-n=len(Ic)
-
-ndim = XX.shape[1]
-if ndim == 2:
-    leaf_size = p
-    XXI = XXi[Ic,:]
-    XXB = XXb[Ir,:]
-elif ndim == 3:
-    leaf_size = p*p
-    XXI = XXi[Ic,1:3]
-    XXB = XXb[Ir,1:3]
-else:
-    ValueError("ndim must be 2 or 3")
-
-
-
-c0,L0 = compute_c0_L0(XXI)
 binary = False
-
-tic = time()
+pvec = [4,5,6,7,8]
+a = [H/2.,1/32,1/32]
+nlvl = int(np.log2(1/(2*a[1])))
 if binary:
-    tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
-else:
-    tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.,1.]))
-toc = time() - tic
-print("\t Toc tree construction %5.2f s" % toc)
+    nlvl *=2
+nlvl+=1
 
-def compute_ancestor(box,lvl):
-    parent = box
-    lvl0 = lvl
-    while lvl0>1:
-        parent = tree0.get_box_parent(parent)
-        lvl0-=1
-    return parent
+rkWeak=np.zeros(shape=(len(pvec),nlvl-2),dtype = np.int64)
+rkStrong=np.zeros(shape=(len(pvec),nlvl-2),dtype=np.int64)
 
-def near(box0,box1):
-    c0 = tree0.get_box_center(box0)
-    L = tree0.get_box_length(box0)
-    c1 = tree0.get_box_center(box1)
-    return np.linalg.norm(c0-c1)<np.sqrt(L[0]**2+L[1]**2)+1e-5
+for indp in range(len(pvec)):
+    p = pvec[indp]
+    
+    print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
+    print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
+    opts = solverWrap.solverOptions('hps',[p,p,p],a)
 
-def far(box0,box1):
-    return not near(box0,box1)
+    slabInd = 0
+    geom    = np.array(join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+    slab_i  = oms.slab(geom,gb_vec)
+    solver  = solverWrap.solverWrapper(opts)
+    solver.construct(geom,helmholtz,verbose=True)
+
+    XX = solver.XX
+    XXb = XX[solver.Ib,:]
+    XXi = XX[solver.Ii,:]
+    xl = geom[0][0]
+    xr = geom[1][0]
+    xc=(xl+xr)/2.
+    print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
+
+    ####################### Fast vectorized operations ####################
+
+    tic = time()
+    Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
+    Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
+    Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+    Igb = np.where(gb_vec(XXb))[0]
+    toc = time() - tic
+    print("\t Toc fast index computations %5.2f s" % toc)
+    print("\t SLAB dofs = ",len(Ic))
+
+    st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+    n=len(Ic)
+
+    ndim = XX.shape[1]
+    if ndim == 2:
+        leaf_size = p
+        XXI = XXi[Ic,:]
+        XXB = XXb[Ir,:]
+    elif ndim == 3:
+        leaf_size = p*p
+        XXI = XXi[Ic,1:3]
+        XXB = XXb[Ir,1:3]
+    else:
+        ValueError("ndim must be 2 or 3")
+ 
+
+    tic = time()
+    def check_regularity(t,binary):
+        n=1
+        check=True
+        balance = True
+        start = 0
+        if binary:
+            n=2
+            start = 1
+        for lvl in range(start,t.nlevels):
+            l=len(t.get_boxes_level(lvl))
+            check = check and (l==n)
+            nI = len(t.get_box_inds(t.get_boxes_level(lvl)[0]))
+            for i in range(l):
+                len(t.get_box_inds(t.get_boxes_level(lvl)[i]))
+                balance = balance and (nI == len(t.get_box_inds(t.get_boxes_level(lvl)[i])))
+            if binary:
+                n*=2
+            else:
+                n*=4
+        if not check:
+            raise ValueError("tree structure incorrect")
+        if not balance:
+            raise ValueError("tree not balanced")
+
+    if binary:
+        tree0 = tree.BinaryTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
+    else:
+        tree0 = tree.BalancedTree(XXI,leaf_size,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))
+
+    check_regularity(tree0,binary)
+    print("actual nlvl = ",tree0.nlevels)
+    toc = time() - tic
+    print("\t Toc tree construction %5.2f s" % toc)
+
+    def compute_ancestor(box,lvl):
+        parent = box
+        lvl0 = lvl
+        while lvl0>1:
+            parent = tree0.get_box_parent(parent)
+            lvl0-=1
+        return parent
+
+    def near(box0,box1):
+        c0 = tree0.get_box_center(box0)
+        L = tree0.get_box_length(box0)
+        c1 = tree0.get_box_center(box1)
+        return np.linalg.norm(c0-c1)<np.sqrt(L[0]**2+L[1]**2)+1e-5
+
+    def far(box0,box1):
+        return not near(box0,box1)
+
+    tol_rk = 1e-6
+
+    for lvl in range(tree0.nlevels-1,1,-1):
+        print("=================lvl ",lvl,"=================")
+        boxes = tree0.get_boxes_level(lvl)
+        box0 = boxes[0]
+        Ibox = tree0.get_box_inds(box0)
+        print("\t box0=%d ancestor = %d" %(box0,compute_ancestor(box0,lvl)))
+
+        boxesc = [box for box in boxes if box!=box0]
+        Ic = np.zeros(shape=(0,),dtype = np.int64)
+        for box in boxesc:
+            Ic=np.append(Ic,tree0.get_box_inds(box))
+
+        boxes_far = [box for box in boxes if compute_ancestor(box,lvl)!=compute_ancestor(box0,lvl)]
+        Ifar = np.zeros(shape=(0,),dtype = np.int64)
+        for box in boxes_far:
+            Ifar=np.append(Ifar,tree0.get_box_inds(box))
+        E = np.identity(n)
+
+        tic = time()
+        tmp = np.random.randn(n,100)
+        st_l.A @ tmp
+        toc = time() - tic
+        print("\t Toc solve PDE on double slab for %d rhs %5.2f s" % (tmp.shape[-1],toc))
+
+        #########################
+        #       c ranks
+        #########################
+        print("RANK RESULTS at tol %.2e" %(tol_rk))
+        Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
+        [_,s,_] = np.linalg.svd(Sl)
+        rk1 = sum(s>s[0]*tol_rk)
+        print("\t shape//rk c   = (",len(Ibox),",",len(Ic),")","//",rk1)
+        rkWeak[indp,lvl-2] = rk1
+
+        #########################
+        #       far ranks
+        #########################
+        Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
+        [_,s,_] = np.linalg.svd(Sl)
+        rk1 = sum(s>s[0]*tol_rk)
+        print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
+        rkStrong[indp,lvl-2] = rk1
+print("rkWeak = ",rkWeak)
+print("rkStrong = ",rkStrong)
+
+np.savetxt('rkWeak.out',rkWeak,delimiter=',',fmt='%d')
+np.savetxt('rkStrong.out',rkStrong,delimiter=',',fmt='%d')
+
+plt.figure(1)
+labelweak = []
+labelstrong = []
+for i in range(2,nlvl):
+    labelweak+=["weak lvl "+str(i)]
+    labelstrong+=["strong lvl "+str(i)]
+plt.plot(pvec,rkWeak,label=labelweak)
+plt.gca().set_prop_cycle(None)
+plt.plot(pvec,rkStrong,label=labelstrong,linestyle='dashed')
+plt.legend()
+plt.xticks(pvec)
+plt.show()
 
 
-
-lvl = tree0.nlevels-2
-boxes = tree0.get_boxes_level(lvl)
-
-box0 = boxes[0]
-Ibox = tree0.get_box_inds(box0)
-print("\t box0=%d ancestor = %d" %(box0,compute_ancestor(box0,lvl)))
-
-boxesc = [box for box in boxes if box!=box0]
-Ic = np.zeros(shape=(0,),dtype = np.int64)
-for box in boxesc:
-    Ic=np.append(Ic,tree0.get_box_inds(box))
-
-boxes_far = [box for box in boxes if compute_ancestor(box,lvl)!=compute_ancestor(box0,lvl)]
-Ifar = np.zeros(shape=(0,),dtype = np.int64)
-for box in boxes_far:
-    Ifar=np.append(Ifar,tree0.get_box_inds(box))
-
-boxes_2 = [box for box in boxes if compute_ancestor(box,lvl)==2]
-boxes_3 = [box for box in boxes if compute_ancestor(box,lvl)==3]
-boxes_4 = [box for box in boxes if compute_ancestor(box,lvl)==4]
-I2 = np.zeros(shape=(0,),dtype = np.int64)
-I3 = np.zeros(shape=(0,),dtype = np.int64)
-I4 = np.zeros(shape=(0,),dtype = np.int64)
-
-for box in boxes_2:
-    I2=np.append(I2,tree0.get_box_inds(box))
-for box in boxes_3:
-    I3=np.append(I3,tree0.get_box_inds(box))
-for box in boxes_4:
-    I4=np.append(I4,tree0.get_box_inds(box))
-
-E = np.identity(n)
-
-tic = time()
-tmp = np.random.randn(n,100)
-st_l.A @ tmp
-toc = time() - tic
-print("\t Toc solve PDE on double slab for %d rhs %5.2f s" % (tmp.shape[-1],toc))
-
-#########################
-#       c ranks
-#########################
-print("RANK RESULTS")
-Sl = E[:,Ic].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("\t shape//rk c = (",len(Ibox),",",len(Ic),")","//",rk1)
-
-#########################
-#       far ranks
-#########################
-Sl = E[:,Ifar].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
-
-
-#########################
-#       2 ranks
-#########################
-Sl = E[:,I2].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("\t shape//rk 2 = (",len(Ibox),",",len(I2),")","//",rk1)
-
-
-#########################
-#       3 ranks
-#########################
-Sl = E[:,I3].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("\t shape//rk 3 = (",len(Ibox),",",len(I3),")","//",rk1)
-
-
-#########################
-#       4 ranks
-#########################
-Sl = E[:,I4].T@((st_l.A)@E[:,Ibox])
-[_,s,_] = np.linalg.svd(Sl)
-rk1 = sum(s>s[0]*1e-8)
-print("\t shape//rk 4 = (",len(Ibox),",",len(I4),")","//",rk1)
-
-
+'''
 plt.figure(0)
 plt.scatter(XXI[Ic,0],XXI[Ic,1],label='c')
 plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
@@ -371,3 +373,4 @@ plt.scatter(XXI[Ibox,0],XXI[Ibox,1],label='box')
 plt.legend()
 plt.axis('equal')
 plt.show()
+'''

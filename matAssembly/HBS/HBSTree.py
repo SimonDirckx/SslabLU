@@ -97,7 +97,7 @@ class HBSMAT:
                 if level>0:
                     rk0 = rk
                     #if level==t.nlevels-1:
-                    #    rk0 = len(t.get_box_inds(box))                    
+                    #   rk0 = len(t.get_box_inds(box))                    
                     #Ptau = null_torch(Omtau,rk0)
                     #Qtau = null_torch(Psitau,rk0)
                     
@@ -219,6 +219,8 @@ class HBSMAT:
         u = uperm.clone()
         u[self.perm,:] = uperm
         u = u.detach().cpu().numpy()
+        if v.ndim==1:
+            u = u.flatten()
         return u
     def matvecT(self,v):
         nlevels = len(self.D_list)
@@ -300,4 +302,6 @@ class HBSMAT:
         u = uperm.clone()
         u[self.perm,:] = uperm
         u = u.detach().cpu().numpy()
+        if v.ndim==1:
+            u = u.flatten()
         return u

@@ -3,7 +3,7 @@
 
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
-from matAssembly.HBS import HBSTreeNEW as HBS
+from matAssembly.HBS import HBSTree as HBS
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
@@ -66,7 +66,7 @@ class matAssembler:
             start = time.time()
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=10*(self.matOpts.maxRank+10)
+            s=6*(self.matOpts.maxRank+10)
             s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))

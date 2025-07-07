@@ -95,7 +95,9 @@ class solverWrapper:
             self.Abi = solver.Axi
             self.Abb = solver.Axx
             tic      = time()
+            print("start solver")
             self.solver_ii = solver.solver_Aii
+            print("solver done")
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='spectral':
