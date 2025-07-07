@@ -193,7 +193,7 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 8
+p = 10
 a = [H/2.,1/32,1/32]
 assembler = mA.rkHMatAssembler(p*p,200)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)

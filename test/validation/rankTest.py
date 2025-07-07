@@ -132,7 +132,7 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),(i+1)]]
 period = 0.
 binary = False
-pvec = [4,5,6,7,8]
+pvec = [4,6,8,10,12]
 a = [H/4.,1/32,1/32]
 nlvl = int(np.log2(1/(2*a[1])))
 if binary:
@@ -142,8 +142,8 @@ nlvl+=1
 rkWeak=np.zeros(shape=(len(pvec),nlvl-2),dtype = np.int64)
 rkStrong=np.zeros(shape=(len(pvec),nlvl-2),dtype=np.int64)
 
-#form = 'S' 
-form = 'T'
+form = 'S' 
+#form = 'T'
 
 for indp in range(len(pvec)):
     p = pvec[indp]
@@ -252,7 +252,11 @@ for indp in range(len(pvec)):
     for lvl in range(tree0.nlevels-1,1,-1):
         print("=================lvl ",lvl,"=================")
         boxes = tree0.get_boxes_level(lvl)
-        box0 = boxes[0]
+        indBox=0
+        while compute_ancestor(boxes[indBox],lvl)==1:
+            indBox+=1
+        indBox -=1
+        box0 = boxes[indBox]
         Ibox = tree0.get_box_inds(box0)
         print("\t box0=%d ancestor = %d" %(box0,compute_ancestor(box0,lvl)))
 
@@ -261,23 +265,21 @@ for indp in range(len(pvec)):
         for box in boxesc:
             Ic=np.append(Ic,tree0.get_box_inds(box))
 
-        boxes_far = [box for box in boxes if compute_ancestor(box,lvl)!=compute_ancestor(box0,lvl)]
+        boxes_far = [box for box in boxes if far(box0,box)]
         Ifar = np.zeros(shape=(0,),dtype = np.int64)
         for box in boxes_far:
             Ifar=np.append(Ifar,tree0.get_box_inds(box))
         E = np.identity(n)
-
         tic = time()
         tmp = np.random.randn(n,100)
         st.A @ tmp
         toc = time() - tic
         print("\t Toc solve PDE on double slab for %d rhs %5.2f s" % (tmp.shape[-1],toc))
-
         #########################
         #       c ranks
         #########################
         print("RANK RESULTS at tol %.2e" %(tol_rk))
-        Sl = E[:,Ic].T@((st.A)@E[:,Ibox])
+        Sl = ((st.A)@E[:,Ibox])[Ic,:]
         [_,s,_] = np.linalg.svd(Sl)
         rk1 = sum(s>s[0]*tol_rk)
         print("\t shape//rk c   = (",len(Ibox),",",len(Ic),")","//",rk1)
@@ -286,7 +288,7 @@ for indp in range(len(pvec)):
         #########################
         #       far ranks
         #########################
-        Sl = E[:,Ifar].T@((st.A)@E[:,Ibox])
+        Sl = ((st.A)@E[:,Ibox])[Ifar,:]
         [_,s,_] = np.linalg.svd(Sl)
         rk1 = sum(s>s[0]*tol_rk)
         print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
