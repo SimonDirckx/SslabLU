@@ -56,13 +56,14 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
 ##################################################################################################################
 
 parser = argparse.ArgumentParser(description="A simple script that takes in 'p' and 'pickle_loc'.")
-parser.add_argument('--p', type=int, required=True, default = 6, help="The value for parameter p.")
+parser.add_argument('--p', type=int, required=False, default = 6, help="The value for parameter p.")
+parser.add_argument('--Horder', type=int, required=False, default = 2, help="The value for parameter Horder.")
 parser.add_argument('--pickle_loc', type=str, required=True, help="Path to the pickle file location.")
 
 args = parser.parse_args()
 
 kh = 9.80177
-print("kappa = %5.10f, p = %d" % (kh,args.p))
+print("kappa = %5.10f, p = %d, Horder=%d" % (kh,args.p,args.Horder))
 def c11(p):
     return jnp.ones_like(p[...,0])
 def c22(p):
@@ -92,7 +93,7 @@ def bc(p):
 
 ##################################################################################################################
 
-H = 1./4.
+H = 1./(2.0**args.Horder)
 N = (int)(1./H)
 a = [H/4.,1/32,1/32]
 
@@ -137,7 +138,7 @@ A_full = np.hstack(chunks)
 # Now do the full SVD
 s = np.linalg.svd(A_full, compute_uv=False)
 
-d = {'svd':s,'p':p,'kh':kh}
+d = {'svd':s,'p':p,'kh':kh,'Horder':args.Horder}
 with open(args.pickle_loc, 'wb') as f:
     pickle.dump(d, f)
 
