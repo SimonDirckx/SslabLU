@@ -122,7 +122,20 @@ st,_ = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 n=len(Il)
 
 E = np.identity(n)
-s = np.linalg.svd(st.A @ E,compute_uv=False)
+
+chunk_size = 10
+chunks = []
+
+for i in range(0, n, chunk_size):
+    E_chunk = E[:, i:i+chunk_size]  # Select 10 identity columns
+    A_chunk = st.A @ E_chunk                     # Get corresponding columns of A
+    chunks.append(A_chunk)                       # Store the chunk
+
+# Concatenate all the chunks horizontally to rebuild st.A
+A_full = np.hstack(chunks)
+
+# Now do the full SVD
+s = np.linalg.svd(A_full, compute_uv=False)
 
 d = {'svd':s,'p':p,'kh':kh}
 with open(args.pickle_loc, 'wb') as f:
