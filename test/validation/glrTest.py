@@ -63,7 +63,6 @@ parser.add_argument('--pickle_loc', type=str, required=True, help="Path to the p
 args = parser.parse_args()
 
 kh = 9.80177
-print("kappa = %5.10f, p = %d, Horder=%d" % (kh,args.p,args.Horder))
 def c11(p):
     return jnp.ones_like(p[...,0])
 def c22(p):
@@ -96,6 +95,7 @@ def bc(p):
 H = 1./(2.0**args.Horder)
 N = (int)(1./H)
 a = [H/4.,1/32,1/32]
+print("kappa = %5.10f, p = %d, Horder=%d, H=%5.10f" % (kh,args.p,args.Horder,H))
 
 p = args.p
 
