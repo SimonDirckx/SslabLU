@@ -72,12 +72,12 @@ def compute_T(I,J,XXb,solver):
             matvec = lambda v:smatmat(v,J,I), rmatvec = lambda v:smatmat(v,J,I,transpose=True),\
             matmat = lambda v:smatmat(v,J,I), rmatmat = lambda v:smatmat(v,J,I,transpose=True))
         
-        Tll = stMap(Linop_l,XXb[I,:],XXb[J,:])
-        return Tll
+        T = stMap(Linop_l,XXb[I,:],XXb[J,:])
+        return T
 
 
 
-nwaves = 2.24
+nwaves = 6.24
 kh = (nwaves/4)*2.*np.pi
 print("kappa = ",kh)
 def c11(p):
@@ -132,24 +132,36 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),(i+1)]]
 period = 0.
 binary = False
-pvec = [4,6,8,10,12]
+pvec = [6,8,10,12]
 a = [H/4.,1/32,1/32]
 nlvl = int(np.log2(1/(2*a[1])))
 if binary:
     nlvl *=2
 nlvl+=1
-
-rkWeak=np.zeros(shape=(len(pvec),nlvl-2),dtype = np.int64)
-rkStrong=np.zeros(shape=(len(pvec),nlvl-2),dtype=np.int64)
-
-form = 'S' 
-#form = 'T'
-
-for indp in range(len(pvec)):
-    p = pvec[indp]
-    
-    print("ppw = ",np.array( [ p/H , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
-    print("ppw = ",min([p/H,p*(2/a[1]),p*(2/a[2])])/nwaves)
+Hvec = [.25,.125,.0625,.03125]
+coarsestLevel=3
+mode = 'p'
+if mode == 'H':
+    rkWeak=np.zeros(shape=(len(Hvec),nlvl-coarsestLevel),dtype = np.int64)
+    rkStrong=np.zeros(shape=(len(Hvec),nlvl-coarsestLevel),dtype=np.int64)
+    indvec = Hvec
+else:
+    rkWeak=np.zeros(shape=(len(pvec),nlvl-coarsestLevel),dtype = np.int64)
+    rkStrong=np.zeros(shape=(len(pvec),nlvl-coarsestLevel),dtype=np.int64)
+    indvec=pvec
+#form = 'S'
+form = 'T'
+ll = False
+lr = not ll
+p=12
+H=1/8 
+for ind in range(len(indvec)):
+    if mode=='p':
+        p = pvec[ind]
+    else:
+        H=Hvec[ind]
+    a= [H/8.,1/32,1/32]
+    print("ppw = ",np.array( [p/a[0] , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
     
     opts = solverWrap.solverOptions('hps',[p,p,p],a)
     if form == 'S':
@@ -165,21 +177,26 @@ for indp in range(len(pvec)):
     XX = solver.XX
     XXb = XX[solver.Ib,:]
     XXi = XX[solver.Ii,:]
+    delta = np.abs(XX[0,0]-XX[2*p*p,0])
     xl = geom[0][0]
     xr = geom[1][0]
     xc=(xl+xr)/2.
     print("\t SLAB BOUNDS xl,xc,xr=",xl,",",xc,",",xr)
-    
-    Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
-    Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
-    Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+    print("\t delta = ",delta)
+    delta = 2e-14
+    Il = np.where(np.abs(XXb[:, 0] - xl) < delta/2)[0]
+    Ir = np.where(np.abs(XXb[:, 0] - xr) < delta/2)[0]
+    Ic = np.where(np.abs(XXi[:, 0] - xc) < delta/2)[0]
     Igb = np.where(gb_vec(XXb))[0]
     
     print("\t SLAB dofs = ",len(Ic))
     if form=='S':
         st,_ = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
     else:
-        st = compute_T(Il,Ir,XXb,solver)
+        if ll:
+            st = compute_T(Il,Il,XXb,solver)
+        if lr:
+            st = compute_T(Il,Ir,XXb,solver)
     n=len(Il)
 
     ndim = XX.shape[1]
@@ -247,9 +264,9 @@ for indp in range(len(pvec)):
     def far(box0,box1):
         return not near(box0,box1)
 
-    tol_rk = 1e-6
+    tol_rk = 1e-5
 
-    for lvl in range(tree0.nlevels-1,1,-1):
+    for lvl in range(tree0.nlevels-1,coarsestLevel-1,-1):
         print("=================lvl ",lvl,"=================")
         boxes = tree0.get_boxes_level(lvl)
         indBox=0
@@ -280,41 +297,63 @@ for indp in range(len(pvec)):
         #########################
         print("RANK RESULTS at tol %.2e" %(tol_rk))
         Sl = ((st.A)@E[:,Ibox])[Ic,:]
-        [_,s,_] = np.linalg.svd(Sl)
-        rk1 = sum(s>s[0]*tol_rk)
-        print("\t shape//rk c   = (",len(Ibox),",",len(Ic),")","//",rk1)
-        rkWeak[indp,lvl-2] = rk1
+        #[_,s,_] = np.linalg.svd(Sl)
+        #rk1 = sum(s>s[0]*tol_rk)
+        rk1 = np.linalg.matrix_rank(Sl,1e-5)
+        print("\t shape//rk c   = ",Sl.shape,"//",rk1)
+        rkWeak[ind,lvl-coarsestLevel] = rk1
 
         #########################
         #       far ranks
         #########################
         Sl = ((st.A)@E[:,Ibox])[Ifar,:]
-        [_,s,_] = np.linalg.svd(Sl)
-        rk1 = sum(s>s[0]*tol_rk)
-        print("\t shape//rk far = (",len(Ibox),",",len(Ifar),")","//",rk1)
-        rkStrong[indp,lvl-2] = rk1
+        #[_,s,_] = np.linalg.svd(Sl)
+        #rk1 = sum(s>s[0]*tol_rk)
+        rk1 = np.linalg.matrix_rank(Sl,1e-5)
+        print("\t shape//rk far = ",Sl.shape,"//",rk1)
+        rkStrong[ind,lvl-coarsestLevel] = rk1
 print("rkWeak = ",rkWeak)
 print("rkStrong = ",rkStrong)
 
-fileStrWeak = 'rkWeak'+form+'.out'
-fileStrStrong = 'rkStrong'+form+'.out'
-
-np.savetxt(fileStrWeak,rkWeak,delimiter=',',fmt='%d')
-np.savetxt(fileStrStrong,rkStrong,delimiter=',',fmt='%d')
-
+if mode == 'H':
+    rkWeak = np.append(np.reshape(Hvec,shape=(len(Hvec),1)),rkWeak,axis=1)
+    rkStrong=np.append(np.reshape(Hvec,shape=(len(Hvec),1)),rkStrong,axis=1)
+else:
+    rkWeak=np.append(np.reshape(pvec,shape=(len(pvec),1)),rkWeak,axis=1)
+    rkStrong=np.append(np.reshape(pvec,shape=(len(pvec),1)),rkStrong,axis=1)
+fileStrWeak = 'rkWeak'+form
+fileStrStrong='rkStrong'+form
+if ll and form=='T':
+    fileStrWeak+='ll'
+    fileStrStrong+='ll'
+if lr and form=='T':
+    fileStrWeak+='lr'
+    fileStrStrong+='lr'
+fileStrWeak+=mode+'.csv'
+fileStrStrong+=mode+'.csv'
+header = mode
+for i in range(coarsestLevel,tree0.nlevels):
+    header+=',lvl'+str(i)
+with open(fileStrWeak,'w') as fweak:
+    fweak.write(header+'\n')
+    np.savetxt(fweak,rkWeak,delimiter=',',fmt='%d')
+with open(fileStrStrong,'w') as fstrong:
+    fstrong.write(header+'\n')
+    np.savetxt(fstrong,rkStrong,delimiter=',',fmt='%d')
+'''
 plt.figure(1)
 labelweak = []
 labelstrong = []
 for i in range(2,nlvl):
     labelweak+=["weak lvl "+str(i)]
     labelstrong+=["strong lvl "+str(i)]
-plt.plot(pvec,rkWeak,label=labelweak)
+plt.plot(Hvec,rkWeak,label=labelweak)
 plt.gca().set_prop_cycle(None)
-plt.plot(pvec,rkStrong,label=labelstrong,linestyle='dashed')
+plt.plot(Hvec,rkStrong,label=labelstrong,linestyle='dashed')
 plt.legend()
 plt.xticks(pvec)
 plt.show()
-
+'''
 
 '''
 plt.figure(0)

@@ -14,7 +14,7 @@ from hps.geom              import ParametrizedGeometry3D
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
-import solver.HPSInterp3D as interp
+#import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 
 class gmres_info(object):
@@ -194,8 +194,8 @@ period = 1.
 
 tol = 1e-5
 p = 10
-a = [H/2.,1/32,1/32]
-assembler = mA.rkHMatAssembler(p*p,200)
+a = [H/8.,1/32,1/32]
+assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")

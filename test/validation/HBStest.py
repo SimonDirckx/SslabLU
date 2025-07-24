@@ -42,10 +42,7 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
     return st_l,st_r
 
 
-
-nwaves = 1.117#5.24
-wavelength = 4/nwaves
-kh = (nwaves/4)*2.*np.pi
+kh = 9.80177
 
 def c11(p):
     return jnp.ones_like(p[...,0])
@@ -68,74 +65,53 @@ def gb_vec(P):
     )
 
 helmholtz = pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=pdo.const(-kh*kh))
-
-p = int(sys.argv[1])
-a = [H/6.,1/32,1/32]
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
-geom = np.array(bnds)
-slab_i = oms.slab(geom,gb_vec)
+pvec = [6,8,10,12]
+rkvec = [50,75,100,125,150,175]
+errMat = np.zeros(shape=(len(pvec),len(rkvec)))
+for indp in range(len(pvec)):
+    p=pvec[indp]
+    a = [H/8.,1/32,1/32]
+    opts = solverWrap.solverOptions('hps',[p,p,p],a)
+    geom = np.array(bnds)
+    slab_i = oms.slab(geom,gb_vec)
             
-solver = solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz)
-print("solver done")
-Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-tree0 = mA.HBS.tree.BalancedTree(XXi[Ic,1:3],p*p,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))            
-st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-m =st_l.A.shape[0]
-n =st_l.A.shape[1]
-print("form S")
-#E = np.identity(n)
-#S = st_l.A@E
-#print("done")
-rk = 100
-s=6*rk
-s=max(s,p*p+10)
+    solver = solverWrap.solverWrapper(opts)
+    solver.construct(geom,helmholtz)
+    print("solver done")
+    Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+    tree0 = mA.HBS.tree.BalancedTree(XXi[Ic,1:3],p*p,np.array([.5,.5]),np.array([1.+1e-5,1.+1e-5]))            
+    st_l,st_r = compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+    m =st_l.A.shape[0]
+    n =st_l.A.shape[1]
 
+    for indrk in range(len(rkvec)):
+        rk = rkvec[indrk]
+        print("compression at rank ",rk)
+        s=5*(rk+10)
+        s=max(s,p*p+10)
+        err = 0.
+        nexp=5
+        for j in range(nexp):
+            Om  = np.random.standard_normal(size=(n,s))
+            Psi = np.random.standard_normal(size=(m,s))
+            Y = st_l.A@Om
+            Z = st_l.A.T@Psi
+            print("random sample done")
+            mat = HBS.HBSMAT(tree0,torch.from_numpy(Om),torch.from_numpy(Psi),torch.from_numpy(Y),torch.from_numpy(Z),rk)
 
-
-'''
-def near(box0,box1):
-    c0 = tree0.get_box_center(box0)
-    L = tree0.get_box_length(box0)
-    c1 = tree0.get_box_center(box1)
-    return np.linalg.norm(c0-c1)<np.sqrt(L[0]**2+L[1]**2)+1e-5
-
-leaves = tree0.get_leaves()
-for leaf in leaves:
-    Indleaf = tree0.get_box_inds(leaf)
-    Ic = np.zeros(shape = (0,),dtype=Indleaf.dtype)
-    for leaf0 in leaves:
-        Indleaf0 = tree0.get_box_inds(leaf0)
-        if near(leaf,leaf0):
-            for i in range(len(Indleaf)):
-                for j in range(len(Indleaf0)):
-                    S[Indleaf[i],Indleaf0[j]]=0.
-                    S[Indleaf0[j],Indleaf[i]]=0.
-        else:
-            Ic=np.append(Ic,tree0.get_box_inds(leaf0))
-    print("rank far = ",np.linalg.matrix_rank(S[Indleaf,:][:,Ic]))
-plt.figure(1)
-plt.spy(S)
-plt.show()         
-'''
-
-
-Om  = np.random.standard_normal(size=(n,s))
-Psi = np.random.standard_normal(size=(m,s))
-Y = st_l.A@Om
-Z = st_l.A.T@Psi
-mat = HBS.HBSMAT(tree0,torch.from_numpy(Om),torch.from_numpy(Psi),torch.from_numpy(Y),torch.from_numpy(Z),rk)
-
-print("compression rate = ",mat.nbytes/(8*np.prod(st_l.A.shape)))
-v=np.random.standard_normal(size=(st_l.A.shape[1],))
-w=v.copy()
-
-for i in range(50):
-    v=v/np.linalg.norm(v)
-    w=w/np.linalg.norm(w)
-    v=mat.matvec(v)-st_l.A@v
-    v=mat.matvecT(v)-st_l.A.T@v
-    w=st_l.A.T@(st_l.A@w)
-err = np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
-print("err = ",err)
+            print("compression rate = ",mat.nbytes/(8*np.prod(st_l.A.shape)))
+            v=np.random.standard_normal(size=(st_l.A.shape[1],))
+            w=v.copy()
+     
+            for i in range(20):
+                v=v/np.linalg.norm(v)
+                w=w/np.linalg.norm(w)
+                v=mat.matvec(v)-st_l.A@v
+                v=mat.matvecT(v)-st_l.A.T@v
+                w=st_l.A.T@(st_l.A@w)
+            err += np.sqrt(np.linalg.norm(v)/np.linalg.norm(w))
+        err/=nexp
+        print("avg. err at (p,rk)=(",p,",",rk,") = ",err)
+        errMat[indp,indrk]=err
+print("errMat = ",errMat)
 
