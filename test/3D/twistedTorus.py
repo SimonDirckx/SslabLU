@@ -1,27 +1,27 @@
 import numpy as np
 import pdo.pdo as pdo
 import solver.solver as solverWrap
-import multiSlab as MS
-import matAssembly.matAssembler as mA
+#import multiSlab as MS
+#import matAssembly.matAssembler as mA
 import matplotlib.pyplot as plt
-import geometry.standardGeometries as stdGeom
-import geometry.skeleton as skelTon
-import time
-import hps.hps_multidomain as HPS
-import hps.geom as hpsGeom
-from scipy.sparse        import block_diag
-import scipy.sparse as sparse
-import scipy.sparse.linalg as splinalg
-from scipy import interpolate
-from scipy.interpolate import griddata
-from scipy.sparse.linalg   import LinearOperator
-from scipy.sparse.linalg import gmres
-from solver.solver import stMap
-import matAssembly.matAssembler as mA
-from matplotlib.patches import Polygon
-from hps.geom              import BoxGeometry, ParametrizedGeometry2D,ParametrizedGeometry3D
-import matplotlib as mpl
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+#import geometry.standardGeometries as stdGeom
+#import geometry.skeleton as skelTon
+#import time
+#import hps.hps_multidomain as HPS
+#import hps.geom as hpsGeom
+#from scipy.sparse        import block_diag
+#import scipy.sparse as sparse
+#import scipy.sparse.linalg as splinalg
+#from scipy import interpolate
+#from scipy.interpolate import griddata
+#from scipy.sparse.linalg   import LinearOperator
+#from scipy.sparse.linalg import gmres
+#from solver.solver import stMap
+#import matAssembly.matAssembler as mA
+#from matplotlib.patches import Polygon
+#from hps.geom              import BoxGeometry, ParametrizedGeometry2D,ParametrizedGeometry3D
+#import matplotlib as mpl
+#from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.spatial import Delaunay
 from matplotlib import cm
 import matplotlib.tri as tri
@@ -94,7 +94,7 @@ def y3(p):
     return q
 
 
-n=50
+n=100
 R = 1.5
 xpts = np.linspace(-1,1,n)
 ypts = np.linspace(-1,1,4*n)
@@ -202,7 +202,7 @@ ax.plot_trisurf(
 )
 plt.axis('equal')
 plt.axis('off')
-
+plt.savefig('twistedTorus.png',transparent=True,dpi=300)
 fig = plt.figure(1)
 ax = fig.add_subplot(projection='3d')
 ax.scatter(YYtotx, YYtoty, YYtotz)
@@ -216,5 +216,4 @@ ax = fig.add_subplot()
 #ax.tripcolor(tricross, np.ones(shape=(cross.shape[0],)), shading='gouraud')
 ax.tripcolor(tricross, np.cos(3*np.arctan2(cross[:,1],cross[:,0])),shading='gouraud')
 plt.axis('equal')
-
 plt.show()
