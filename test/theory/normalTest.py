@@ -7,16 +7,20 @@ import solver.spectralmultidomain.hps.geom as hpsGeom
 import multislab.oms as oms
 import matAssembly.matAssembler as mA
 import solver.solver as solverWrap
+import clenshawCurtis as cc
 
+kh = 10.
 def c11(p):
-    return jnp.ones_like(p[...,0])
+    return jnp.ones_like(p[...,0])+jnp.sin(5.*jnp.pi*p[...,0])**2
 def c22(p):
-    return jnp.ones_like(p[...,0])
-Lapl = pdo.PDO2d(c11,c22)
+    return jnp.ones_like(p[...,0])+jnp.cos(20.*jnp.pi*p[...,0])**2
+def c(p):
+    return -kh*jnp.ones_like(p[...,0])
+Helmholtz = pdo.PDO2d(c11=c11,c22=c22,c=c)
 
-H = 1./3.
-a=[H/4,1/8]
-p=20
+H = 1./8.
+a=[H/8,1/8]
+p=40
 
 
 
@@ -62,25 +66,6 @@ for i in range(N-1):
 
 
 
-######################################
-#       set up Psi1
-######################################
-
-Psi1 = hpsGeom.BoxGeometry(jnp.array([[0,0],[2*H,1.]]))
-
-discr1 = hps.HPSMultidomain(Lapl, Psi1, a, p)
-XX1 = discr1._XX
-
-
-######################################
-#       set up Psi2
-######################################
-
-Psi2 = hpsGeom.BoxGeometry(jnp.array([[H,0],[1.,1.]]))
-discr2 = hps.HPSMultidomain(Lapl, Psi2, a, p)
-XX2 = discr2._XX
-
-
 
 ######################################
 #               OMS
@@ -89,30 +74,70 @@ XX2 = discr2._XX
 
 assembler = mA.denseMatAssembler()
 opts = solverWrap.solverOptions('hps',[p,p],a)
-OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
+OMS = oms.oms(slabs,Helmholtz,gb_vec,opts,connectivity,if_connectivity)
 print("computing Stot & rhstot...")
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
+Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler)
 print("done")
 
 
 E = np.identity(Stot.shape[0])
 K = Stot@E
-print('nrml err (no weighting) = ',np.linalg.norm(K@K.T-K.T@K)/np.linalg.norm(K@K.T))
 
-[e,V] = np.linalg.eig(K)
+
+
+
+x,w = cc.clenshaw_curtis_compute(p+2)
+x = (1.+x)/2.
+w*=2*a[1]
+
+
+#w = np.pi*np.sqrt(x-x**2)/(2*(p+2))
+wi = w[1:-1]
+#wi[0]+=w[0]
+#wi[-1]+=w[-1]
+ni = len(wi)
+
+nboxes = (int)(.5/a[1])
+
+W = np.zeros(shape=(nboxes*ni,nboxes*ni))
+
+for i in range(nboxes):
+    W[i*ni:(i+1)*ni,:][:,i*ni:(i+1)*ni] = np.diag(wi)
+
+Wtot = np.zeros(shape=((N-1)*W.shape[0],(N-1)*W.shape[0]))
+for i in range(N-1):
+    Wtot[i*W.shape[0]:(i+1)*W.shape[0],:][:,i*W.shape[0]:(i+1)*W.shape[0]] = W
+
+
+K = np.sqrt(Wtot)@K@np.linalg.inv(np.sqrt(Wtot))
+
+S12 = K[0:OMS.nc,:][:,OMS.nc:2*OMS.nc]
+S21 = K[OMS.nc:2*OMS.nc,:][:,0:OMS.nc]
+M=S12@S12.T-S21.T@S21
+print("block normality : ",np.linalg.norm(M,ord=2))
+
+v = np.random.standard_normal(size=(S12.shape[0],))
+v=v/np.linalg.norm(v)
+
+print("ip normality : ",np.linalg.norm(S12@v,ord=2)-np.linalg.norm(S21.T@v,ord=2))
+
+
+v=np.random.standard_normal(size=(K.shape[0],))+1j*np.random.standard_normal(size=(K.shape[0],))
+v=v/np.linalg.norm(v)
+ip = np.conj(v).T@K@v
+print(ip)
+
+ip = np.conj(v).T@(K.T@K)@v
+print(ip)
+
+e = np.linalg.eigvals(K.astype(np.complex128))
 ae = np.abs(e)
 
 [_,s,_] = np.linalg.svd(K)
-
-
-
-print(np.linalg.norm(V-np.conj(V).T,ord=2)/np.linalg.norm(V))
-print(np.linalg.norm(np.linalg.inv(V)-np.conj(V).T,ord=2)/np.linalg.norm(V))
-print(np.linalg.norm(np.conj(V).T@V-np.identity(V.shape[0]),ord=2))
-print('smallest eig err = ',min(ae)-min(s))
+print("normality error = ",np.linalg.norm(np.sort(ae)-np.sort(s),ord=np.inf))
+plt.figure(0)
+plt.scatter(np.real(e),np.imag(e))
 plt.figure(1)
 plt.scatter(np.real(ae),np.imag(ae))
 plt.scatter(np.real(s),np.imag(s))
-plt.legend(['ae','s'])
 plt.show()
-

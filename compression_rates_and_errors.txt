@@ -1,0 +1,23 @@
+compression rate =  0.024284268602912808
+err =  0.0004057356647944446
+compression at rank  150
+random sample done
+compression rate =  0.04369396633572049
+err =  0.00013840697824162861
+compression at rank  200
+random sample done
+compression rate =  0.05279390311535494
+err =  6.260892110968697e-05
+compression at rank  250
+random sample done
+compression rate =  0.06371877222885321
+err =  3.632423008153788e-05
+compression at rank  300
+random sample done
+compression rate =  0.07646857367621528
+err =  2.357024698771546e-05
+compression at rank  350
+random sample done
+compression rate =  0.09104330745744116
+err =  1.624390280730579e-05
+
