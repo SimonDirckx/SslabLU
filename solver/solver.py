@@ -7,6 +7,8 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
 import jax.numpy as jnp
+import HPSInterp
+
 
 from time import time
 """
@@ -67,6 +69,7 @@ class solverWrapper:
         """
         Actual construction of the local solver
         """
+        self.ndim = geom.box_geom.shape[1]
         if self.type=='stencil':
             self.solver = stencil(PDE, geom, self.ord)
             self.constructed=True
@@ -120,3 +123,12 @@ class solverWrapper:
         self.ndofs = solver.XX.shape[0]
         #del solver
         #self.constructMapIdxs()
+    
+    #given values f on the full solver grid, interpolate f to the points x
+    def interp(self,p,f):
+        assert f.shape[0] == self.solver._XX.shape[0]
+        if self.type=='hps':
+            return HPSInterp.interp(self.solver,p,f)
+        else:
+            raise ValueError("interp not implemented yet")
+

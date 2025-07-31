@@ -14,12 +14,16 @@ def c11(p):
     return jnp.ones_like(p[...,0])+jnp.sin(5.*jnp.pi*p[...,0])**2
 def c22(p):
     return jnp.ones_like(p[...,0])+jnp.cos(20.*jnp.pi*p[...,0])**2
+def c12(p):
+    return .1*jnp.ones_like(p[...,0])
+def c1(p):
+    return -5.*(jnp.ones_like(p[...,0])+jnp.sin(10.*jnp.pi*p[...,1])**2)
 def c(p):
     return -kh*jnp.ones_like(p[...,0])
-Helmholtz = pdo.PDO2d(c11=c11,c22=c22,c=c)
+Helmholtz = pdo.PDO2d(c11=c11,c22=c22,c12=c12)
 
-H = 1./8.
-a=[H/8,1/8]
+H = 1./3.
+a=[H/8,1/2]
 p=40
 
 
@@ -81,7 +85,7 @@ print("done")
 
 
 E = np.identity(Stot.shape[0])
-K = Stot@E
+K = E-Stot@E
 
 
 
@@ -110,25 +114,9 @@ for i in range(N-1):
 
 
 K = np.sqrt(Wtot)@K@np.linalg.inv(np.sqrt(Wtot))
+print("symmetry:",np.linalg.norm(K-K.T,ord=2)/np.linalg.norm(K,ord=2))
+print("normality:",np.linalg.norm(K@K.T-K.T@K,ord=2)/np.linalg.norm(K.T@K,ord=2))
 
-S12 = K[0:OMS.nc,:][:,OMS.nc:2*OMS.nc]
-S21 = K[OMS.nc:2*OMS.nc,:][:,0:OMS.nc]
-M=S12@S12.T-S21.T@S21
-print("block normality : ",np.linalg.norm(M,ord=2))
-
-v = np.random.standard_normal(size=(S12.shape[0],))
-v=v/np.linalg.norm(v)
-
-print("ip normality : ",np.linalg.norm(S12@v,ord=2)-np.linalg.norm(S21.T@v,ord=2))
-
-
-v=np.random.standard_normal(size=(K.shape[0],))+1j*np.random.standard_normal(size=(K.shape[0],))
-v=v/np.linalg.norm(v)
-ip = np.conj(v).T@K@v
-print(ip)
-
-ip = np.conj(v).T@(K.T@K)@v
-print(ip)
 
 e = np.linalg.eigvals(K.astype(np.complex128))
 ae = np.abs(e)

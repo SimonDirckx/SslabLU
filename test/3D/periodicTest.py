@@ -165,7 +165,7 @@ def u_exact(p):
 ##############################################################################################
 
 
-H = 1./16.
+H = 1./8.
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -193,9 +193,9 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10
-a = [H/8.,1/32,1/32]
-assembler = mA.rkHMatAssembler(p*p,100)
+p = 8
+a = [H/8.,1/16,1/16]
+assembler = mA.rkHMatAssembler(p*p,75)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
@@ -248,34 +248,14 @@ print("uhat type = ",type(uhat))
 print("nc = ",nc)
 
 fig = plt.figure(1)
-slabInd = 0
-geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-slab_i  = oms.slab(geom,gb)
-solver  = oms.solverWrap.solverWrapper(opts)
-solver.construct(geom,pdo_mod)
-Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+for slabInd in range(len(connectivity)):
+    geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
+    slab_i  = oms.slab(geom,gb)
+    solver  = oms.solverWrap.solverWrapper(opts)
+    solver.construct(geom,pdo_mod)
+    Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+    z1i = np.array(z1(XXi))
+    u_known = np.sin(kh*z1i[Ic])
+    ul = uhat[slabInd*nc:(slabInd+1)*nc]
+    print("err l = ",np.linalg.norm(ul-u_known,ord=np.inf))
 
-z1i = np.array(z1(XXi))
-u_known = np.sin(kh*z1i[Ic])
-ull = uhat[len(uhat)-nc:]
-ul = uhat[:nc]
-ur = uhat[nc:2*nc]
-urr = uhat[2*nc:3*nc]
-print("err ll = ",np.linalg.norm(ull-u_known)/np.linalg.norm(u_known))
-print("err l = ",np.linalg.norm(ul-u_known)/np.linalg.norm(u_known))
-print("err r = ",np.linalg.norm(ur-u_known)/np.linalg.norm(u_known))
-print("err rr = ",np.linalg.norm(urr-u_known)/np.linalg.norm(u_known))
-plt.figure(1)
-plt.plot(ul)
-plt.plot(ur)
-plt.legend(['ul','ur'])
-plt.figure(2)
-plt.plot(u_known)
-plt.show()
-'''
-for i in range(len(slabs)):
-    slab = slabs[i]
-    ul = uhat[glob_target_dofs[i]]
-    ur = uhat[glob_source_dofs[i][1]]
-    interp.check_err(slab,ul,ur,a,p,pdo_mod,gb,bc,u_exact)
-'''
