@@ -129,7 +129,7 @@ def gb_np(p):
 #
 ################################################################
 
-nwaves = 5.24
+nwaves = 10.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
@@ -193,8 +193,8 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 8
-a = [H/8.,1/16,1/16]
+p = 10
+a = [H/8.,1/8,1/8]
 assembler = mA.rkHMatAssembler(p*p,75)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
@@ -248,14 +248,32 @@ print("uhat type = ",type(uhat))
 print("nc = ",nc)
 
 fig = plt.figure(1)
+N=len(connectivity)
+errInf = 0.
 for slabInd in range(len(connectivity)):
     geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
     slab_i  = oms.slab(geom,gb)
     solver  = oms.solverWrap.solverWrapper(opts)
     solver.construct(geom,pdo_mod)
+    
     Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-    z1i = np.array(z1(XXi))
-    u_known = np.sin(kh*z1i[Ic])
-    ul = uhat[slabInd*nc:(slabInd+1)*nc]
-    print("err l = ",np.linalg.norm(ul-u_known,ord=np.inf))
+
+    startL = ((slabInd-1)%N)
+    startR = ((slabInd+1)%N)
+    ul = uhat[startL*nc:(startL+1)*nc]
+    ur = uhat[startR*nc:(startR+1)*nc]
+    u0l = bc(XXb[Il,:])
+    u0r = bc(XXb[Ir,:])
+    g = np.zeros(shape=(XXb.shape[0],))
+    g[Il]=ul
+    g[Ir]=ur
+    g[Igb] = bc(XXb[Igb,:])
+    g=g[:,np.newaxis]
+    uu = solver.solver.solve_dir_full(g)
+    uu0 = bc(solver.XXfull)
+    uu=uu.flatten()
+    errI=np.linalg.norm(uu-uu0,ord=np.inf)
+    errInf = np.max([errInf,errI])
+    print(errI)
+print("sup norm error = ",errInf)
 

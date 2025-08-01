@@ -7,7 +7,7 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
 import jax.numpy as jnp
-import HPSInterp
+import solver.HPSInterp as interp
 
 
 from time import time
@@ -69,29 +69,31 @@ class solverWrapper:
         """
         Actual construction of the local solver
         """
-        self.ndim = geom.box_geom.shape[1]
+        self.ndim = geom.shape[1]
         if self.type=='stencil':
-            self.solver = stencil(PDE, geom, self.ord)
-            self.constructed=True
-            '''
-            adapt these to fit the notation of custom solver
-            '''
-            self.XX = self.solver.XX
-            self.Ii = self.solver._Ji
-            self.Ib = self.solver._Jb
-            
-            self.Aib = self.solver.Aib
-            self.Abi = self.solver.Abi
-            self.Abb = self.solver.Abb
-            self.solver_ii = self.solver.solver_ii
-        if self.type=='hps':
-            geomHPS = convertGeom(self.opts,geom)
-            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
+            solver = stencil(PDE, geom, self.ord)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
             '''
             self.XX = solver.XX
+            self.Ii = solver._Ji
+            self.Ib = solver._Jb
+            
+            self.Aib = solver.Aib
+            self.Abi = solver.Abi
+            self.Abb = solver.Abb
+            self.solver_ii = solver.solver_ii
+        if self.type=='hps':
+            geomHPS = convertGeom(self.opts,geom)
+            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
+            self.solver=solver
+            self.constructed=True
+            '''
+            adapt these to fit the notation of custom solver
+            '''
+            self.XX = solver.XX
+            self.XXfull = solver._XXfull
             self.Ii = solver._Ji
             self.Ib = solver._Jx
             self.Aib = solver.Aix
@@ -125,10 +127,9 @@ class solverWrapper:
         #self.constructMapIdxs()
     
     #given values f on the full solver grid, interpolate f to the points x
-    def interp(self,p,f):
-        assert f.shape[0] == self.solver._XX.shape[0]
+    def interp(self,pts,f):
         if self.type=='hps':
-            return HPSInterp.interp(self.solver,p,f)
+            return interp.interp(self.solver,pts,f)
         else:
             raise ValueError("interp not implemented yet")
 

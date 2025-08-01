@@ -17,16 +17,17 @@ def interp(solver,p,f):
 def interp_2d(solver,x,f):
     return 0
 
-def interp_3d(solver,p,f):
-    g = np.zeros(shape=(p.shape[0],f.shape[1]))
+def interp_3d(solver,pts,f):
+    g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_3d(npan_dim,solver.geom)
-    
+    ord=[solver._p,solver._p,solver._p]
     for box in boxes:
-        I = idxs_3d(p,box)
+        I = idxs_3d(pts,box)
         J = idxs_3d(solver._XXfull,box)
-        XX = solver._XXfull[:,J]
-        g[I,:] = local_interp_3d(p[I,:],f[J],XX,box,solver.ord)
+        XX = solver._XXfull[J,:]
+        g[I] = local_interp_3d(pts[I,:],f[J],XX,box,ord)
+    return g
         
 def construct_boxes_3d(npan_dim,geom):
     box = geom.box_geom
@@ -39,14 +40,9 @@ def construct_boxes_3d(npan_dim,geom):
     zmin = box[0][2]
     zmax = box[1][2]
 
-    print("xmin = ",type(xmin))
-    print("xmax = ",xmax)
-
     nx = npan_dim[0]
     ny = npan_dim[1]
     nz = npan_dim[2]
-
-    print("nx=",nx)
 
     dx = (xmax-xmin)/nx
     dy = (ymax-ymin)/ny
@@ -77,9 +73,9 @@ def tucker_tol(Tens,tol):
     T1 = tl.unfold(Tens,1)
     T2 = tl.unfold(Tens,2)
 
-    U0,s0,V0h = np.linalg.svd(T0)
-    U1,s1,V1h = np.linalg.svd(T1)
-    U2,s2,V2h = np.linalg.svd(T2)
+    U0,s0,_ = np.linalg.svd(T0)
+    U1,s1,_ = np.linalg.svd(T1)
+    U2,s2,_ = np.linalg.svd(T2)
 
     k0 = sum(s0>tol)
     k1 = sum(s1>tol)
@@ -108,22 +104,26 @@ def chebInterpFromSamples(xpts,ff,targetpts):
     coeffs[-1,:]  /= 2
     return np.polynomial.chebyshev.chebval(aT(targetpts), coeffs)
 
-def local_interp_3d(p,f,XX,box,ord):
-    XX0,I0  = np.unique(XX,axis=0,return_index=True)
+def local_interp_3d(pts,f,XX,box,ord0):
+    ord = [ord0[0]+2,ord0[1]+2,ord0[2]+2]
+    _,I0  = np.unique(XX,axis=0,return_index=True)
     f0      = f[I0]
-    F = np.reshape(f0,shape=ord)
+    F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
+    
     core,U0,U1,U2 = tucker_tol(F,1e-12)
-    F_approx = np.zeros(shape =(p.shape[0],f.shape[1]))
+    F_approx = np.zeros(shape =(pts.shape[0],))
+    
+    xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
+    ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
+    zpts = ((cheb.cheb(ord[2])[0]+1)/2.)*(box[1][2]-box[0][2])+box[0][2]
 
-    xpts = ((cheb.cheb(ord[0]+2)[0]+1)/2.)*(box[0][1]-box[0][0])+box[0][0]
-    ypts = ((cheb.cheb(ord[1]+2)[0]+1)/2.)*(box[0][1]-box[0][0])+box[0][0]
-    zpts = ((cheb.cheb(ord[2]+2)[0]+1)/2.)*(box[0][1]-box[0][0])+box[0][0]
 
-    cx = chebInterpFromSamples(xpts,U0,p[:,0])
-    cy = chebInterpFromSamples(ypts,U1,p[:,1])
-    cz = chebInterpFromSamples(zpts,U2,p[:,2])
+    cx = chebInterpFromSamples(xpts,U0,pts[:,0]).T
+    cy = chebInterpFromSamples(ypts,U1,pts[:,1]).T
+    cz = chebInterpFromSamples(zpts,U2,pts[:,2]).T
+    
     for k0 in range(core.shape[0]):
         for k1 in range(core.shape[1]):
             for k2 in range(core.shape[2]):
-                F_approx+=core[k0,k1,k2]*cx[k0,:]*cy[k1,:]*cz[k2,:]
+                F_approx+=core[k0,k1,k2]*cx[:,k0]*cy[:,k1]*cz[:,k2]
     return F_approx
