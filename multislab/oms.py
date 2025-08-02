@@ -9,6 +9,7 @@ from solver.solver import stMap
 import time
 import sys
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 #import gc
 
 
@@ -83,8 +84,8 @@ class slab:
         xr = self.geom[1][0]
         xc=(xl+xr)/2.
 
-        Il = np.where(np.abs(XXb[:, 0] - xl) < 1e-14)[0]
-        Ir = np.where(np.abs(XXb[:, 0] - xr) < 1e-14)[0]
+        Il = np.where((np.abs(XXb[:, 0] - xl) < 1e-14) & ~(self.gb_vec(XXb)))[0]
+        Ir = np.where((np.abs(XXb[:, 0] - xr) < 1e-14) & ~(self.gb_vec(XXb)))[0]
         Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
         Igb = np.where(self.gb_vec(XXb))[0]    
 
@@ -202,14 +203,19 @@ class oms:
             rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = rhs[Ic]
             rhs_list+=[rhs]
-
+            bool_r = len(Ir)>0
+            bool_l = len(Il)>0
             start = time.time()
-            rkMat_r = assembler.assemble(st_r,dbg=dbg)
-            self.nbytes+=assembler.stats.nbytes
-            compression_r = assembler.stats.nbytes
-            rkMat_l = assembler.assemble(st_l,dbg=dbg)
-            compression_l = assembler.stats.nbytes
-            self.nbytes+=assembler.stats.nbytes
+            compression_l = 0
+            compression_r = 0
+            if bool_r:
+                rkMat_r = assembler.assemble(st_r,dbg=dbg)
+                self.nbytes+=assembler.stats.nbytes
+                compression_r = assembler.stats.nbytes
+            if bool_l:
+                rkMat_l = assembler.assemble(st_l,dbg=dbg)
+                compression_l = assembler.stats.nbytes
+                self.nbytes+=assembler.stats.nbytes
             
             self.densebytes+=np.prod(st_l.A.shape)*8
             compression_l/=np.prod(st_l.A.shape)*8
@@ -217,7 +223,7 @@ class oms:
             compression_r/=np.prod(st_r.A.shape)*8
             tCompress=time.time()-start
             compressTime += tCompress
-            shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
+            #shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
             if dbg>0:
                 Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                 Vr=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))

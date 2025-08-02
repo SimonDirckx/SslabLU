@@ -6,6 +6,7 @@ from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
+import solver.stencil.geom as stencilGeom
 import jax.numpy as jnp
 import solver.HPSInterp as interp
 
@@ -47,6 +48,8 @@ class solverOptions:
 def convertGeom(opts,geom):
     if opts.type=='hps':
         return hpsGeom.BoxGeometry(jnp.array(geom))
+    if opts.type=='stencil':
+        return stencilGeom.BoxGeometry(np.array(geom))
 
 
 class solverWrapper:
@@ -71,19 +74,20 @@ class solverWrapper:
         """
         self.ndim = geom.shape[1]
         if self.type=='stencil':
-            solver = stencil(PDE, geom, self.ord)
+            geomStencil = convertGeom(self.opts,geom)
+            solver = stencil(PDE, geomStencil, self.ord)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
             '''
             self.XX = solver.XX
             self.Ii = solver._Ji
-            self.Ib = solver._Jb
+            self.Ib = solver._Jx
             
-            self.Aib = solver.Aib
-            self.Abi = solver.Abi
-            self.Abb = solver.Abb
-            self.solver_ii = solver.solver_ii
+            self.Aib = solver.Aix
+            self.Abi = solver.Axi
+            self.Abb = solver.Axx
+            self.solver_ii = solver.solver_Aii
         if self.type=='hps':
             geomHPS = convertGeom(self.opts,geom)
             solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
