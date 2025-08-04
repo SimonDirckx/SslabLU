@@ -51,9 +51,9 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
 
 
 def c11(p):
-    return np.ones_like(p[:,0])+.1*np.cos(2.*np.pi*p[:,0])
+    return np.ones_like(p[:,0])+.5*np.cos(2.*np.pi*p[:,0])
 def c22(p):
-    return np.ones_like(p[:,1])+.1*np.sin(2.*np.pi*p[:,1])*(p[:,0]**2)
+    return np.ones_like(p[:,1])+.5*np.sin(2.*np.pi*p[:,1])*(p[:,0]**2)
 def c12(p):
     return .1*np.ones_like(p[:,1])+.1*p[:,1]*np.sin(3.*np.pi*p[:,0])
 
@@ -79,7 +79,7 @@ cond_eig = np.zeros(shape=(len(kvec),))
 cond_svd = np.zeros(shape=(len(kvec),))
 Hvec = np.zeros(shape=(len(kvec),))
 
-method = 'spectral'
+method = 'stencil'
 
 for indk in range(len(kvec)):
     k = kvec[indk]
@@ -87,10 +87,16 @@ for indk in range(len(kvec)):
     print("H = ",H)
     print("H = ",H)
     Hvec[indk] = H
-    ordy = 100
+    if method =='spectral':
+        ordy = 100
+    if method =='stencil':
+        ordy = 200
     ordx = int(np.round(2*ordy*H))
     if method == 'spectral':
         if ordx%2:
+            ordx += 1
+    if method == 'stencil':
+        if not ordx%2:
             ordx += 1
     ord = [ordx,ordy]
 
@@ -115,20 +121,22 @@ for indk in range(len(kvec)):
             if_connectivity+=[[(i-1),(i+1)]]
 
     assembler = mA.denseMatAssembler()
-    opts = solverWrap.solverOptions('spectral',ord)
+    opts = solverWrap.solverOptions(method,ord)
     OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
     S_op,rhs = OMS.construct_Stot_and_rhstot(bc,assembler)
     print("S_op done")
     E = np.identity(S_op.shape[0])
     S = S_op@E
     print("S done")
-    cc= spectral.clenshaw_curtis_compute(ordy+1)[1]
-    w = np.sqrt(cc[1:ordy])
-    W = np.diag(w)
-    SW = np.kron(np.identity(N-1),W)@S@np.kron(np.identity(N-1),np.linalg.inv(W))
-    e = np.linalg.eigvals(SW)
+    if method=='spectral':
+        cc= spectral.clenshaw_curtis_compute(ordy+1)[1]
+        w = np.sqrt(cc[1:ordy])
+        W = np.diag(w)
+        S = np.kron(np.identity(N-1),W)@S@np.kron(np.identity(N-1),np.linalg.inv(W))
+    
+    e = np.linalg.eigvals(S)
     ae = np.abs(e)
-    s = np.linalg.svdvals(SW)
+    s = np.linalg.svdvals(S)
     ae = np.sort(ae)
     s = np.sort(s)
     errInf[indk] = np.linalg.norm(ae-s,ord=np.inf)
@@ -137,7 +145,7 @@ for indk in range(len(kvec)):
     print(cond_svd[indk])
     print(cond_eig[indk])
 
-fileName = 'err_svd_eig.csv'
+fileName = 'err_svd_eig_'+method+'.csv'
 errMat = np.zeros(shape=(len(kvec),4))
 errMat[:,0] = Hvec
 errMat[:,1] = errInf

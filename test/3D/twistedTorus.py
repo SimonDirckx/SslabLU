@@ -93,6 +93,66 @@ def y3(p):
     q = -np.multiply(p[:,0],cs)-np.multiply(p[:,1],s2)+(R+1)*s+np.multiply(c,p[:,2])
     return q
 
+def y1_d1(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]*p[:,1] - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
+    return (c2t+1)/2. + A/r2
+
+def y1_d2(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
+    return s2t/2. +A/r2
+
+def y1_d3(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    return np.sin(th)
+
+
+def y2_d1(p):
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return -(p[:,1]/r2)/np.pi
+
+def y2_d2(p):
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return (p[:,0]/r2)/np.pi
+
+
+def y3_d1(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (c2t*p[:,0]*p[:,1] + s2t*p[:,0]*p[:,0] - (R+1)*c*p[:,1] + p[:,2]*p[:,1]*s)
+    return -s2t/2. + A/r2
+
+def y3_d2(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] + c2t*p[:,0]*p[:,0] - (R+1)*c*p[:,0] + p[:,2]*p[:,0]*s)
+    return (c2t-1)/2. - A/r2
+
+def y3_d3(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    return np.cos(th)
+
+
+
 
 n=100
 R = 1.5
