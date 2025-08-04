@@ -161,25 +161,16 @@ def spectralD2(xpts):
 
 def constructPDO2D(pdo,xpts,ypts,XX,geom):
     N=XX.shape[0]
-    C11 = -sparse.spdiags(pdo.c11(geom.l2g(XX)),[0],N,N)
-    C22 = -sparse.spdiags(pdo.c22(geom.l2g(XX)),[0],N,N)
+    C11 = -sparse.spdiags(pdo.c11(XX),[0],N,N)
+    C22 = -sparse.spdiags(pdo.c22(XX),[0],N,N)
     L   =  C11@sparse.kron(spectralD2(xpts),np.identity(len(ypts)))
     L   += C22@sparse.kron(np.identity(len(xpts)),spectralD2(ypts))
-    print("Lapl sym = ",splinalg.norm(L-L.T))
-    print("Lapl shape = ",L.shape)
     if pdo.c1:
-        C1 = sparse.spdiags(pdo.c1(geom.l2g(XX)),[0],N,N)
-        print(np.max(pdo.c1(geom.l2g(XX))))
-        print(np.min(pdo.c1(geom.l2g(XX))))
+        C1 = sparse.spdiags(pdo.c1(XX),[0],N,N)
         L   += C1@sparse.kron(np.identity(len(xpts)),spectralD(ypts))
     if pdo.c:
-        C = sparse.spdiags(pdo.c(geom.l2g(XX)),[0],N,N)
+        C = sparse.spdiags(pdo.c(XX),[0],N,N)
         L   += C
-    x,wx=clenshaw_curtis_compute(len(xpts))
-    y,wy=clenshaw_curtis_compute(len(ypts))
-    wx=1./np.sqrt(wx)
-    wy=1./np.sqrt(wy)
-    W = sparse.kron(np.identity(len(xpts)),np.diag(wy))
     return L
 
 def constructPDO3D(pdo,xpts,ypts,zpts,XX,geom):
@@ -216,9 +207,9 @@ class spectralSolver(AbstractPDESolver):
         """
 
         self._box_geom = geom.bounds
-        
+        ndim = geom.bounds.shape[-1]
         self._geom     = geom
-        if  (self.ndim() == 2):
+        if  (ndim == 2):
             xmin = self._box_geom[0][0]
             xmax = self._box_geom[1][0]
             ordx = ord[0]
@@ -231,7 +222,9 @@ class spectralSolver(AbstractPDESolver):
             ypts = ((cheb0-cheb0[0])*(ymax-ymin)/(cheb0[len(cheb0)-1]-cheb0[0])) + ymin
             self._XX    = np.vstack([np.concatenate((np.tile(x,ypts.shape)[:,np.newaxis],ypts[:,np.newaxis]),axis=1) for x in xpts])
             self._A      = constructPDO2D(pdo,xpts,ypts,self._XX,self.geom).tocsr()
-        elif (self.ndim() == 3):
+            self._Ji=np.where( (self._box_geom[0][0]<self._XX[:,0])     & (self._box_geom[1][0]>self._XX[:,0]) & (self._box_geom[0][1]<self._XX[:,1]) & (self._box_geom[1][1]>self._XX[:,1]))[0]
+            self._Jx=np.where( (self._box_geom[0][0]==self._XX[:,0])    | (self._box_geom[1][0]==self._XX[:,0]) | (self._box_geom[0][1]==self._XX[:,1]) | (self._box_geom[1][1]==self._XX[:,1]))[0] 
+        elif (ndim == 3):
             xpts        = np.linspace(self._box_geom[0][0],self._box_geom[1][0],ord[0])
             ypts        = np.linspace(self._box_geom[0][1],self._box_geom[1][1],ord[1])
             zpts        = np.linspace(self._box_geom[0][2],self._box_geom[1][2],ord[2])
@@ -240,15 +233,12 @@ class spectralSolver(AbstractPDESolver):
             self._A      = constructPDO3D(pdo,xpts,ypts,zpts,self._XX,self.geom)
         else:
             raise ValueError
-        self._Ji=[i for i in range(self._XX.shape[0]) if not self.geom.isLocalBoundary(self._XX[i,:])]
-        self._Jb=[i for i in range(self._XX.shape[0]) if self.geom.isLocalBoundary(self._XX[i,:])]
         self._XXi=self._XX[self._Ji,:]
-        self._XXb=self._XX[self._Jb,:]
+        self._XXb=self._XX[self._Jx,:]
         self._Aii = self._A[self._Ji][:,self._Ji]
-        self._Aib = self._A[self._Ji][:,self._Jb]
-        self._Abi = self._A[self._Jb][:,self._Ji]
-        self._Abb = self._A[self._Jb][:,self._Jb]
-        self.constructSolverii()
+        self._Aix = self._A[self._Ji][:,self._Jx]
+        self._Axi = self._A[self._Jx][:,self._Ji]
+        self._Axx = self._A[self._Jx][:,self._Jx]
     @property
     def npoints_dim(self):
         return self.npan_dim * self.p
@@ -272,24 +262,24 @@ class spectralSolver(AbstractPDESolver):
         return self._Ji
 
     @property
-    def Jb(self):
-        return self._Jb
+    def Jx(self):
+        return self._Jx
 
     @property
     def Aii(self):
         return self._Aii
     
     @property
-    def Aib(self):
-        return self._Aib
+    def Aix(self):
+        return self._Aix
 
     @property
-    def Abi(self):
-        return self._Abi
+    def Axi(self):
+        return self._Axi
     
     @property
-    def Abb(self):
-        return self._Abb
+    def Axx(self):
+        return self._Axx
 
     @property
     def p(self):

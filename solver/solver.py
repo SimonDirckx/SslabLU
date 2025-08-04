@@ -7,6 +7,7 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 from solver.spectralmultidomain.hps import hps_multidomain as hps
 import solver.spectralmultidomain.hps.geom as hpsGeom
 import solver.stencil.geom as stencilGeom
+import solver.spectral.geom as spectralGeom
 import jax.numpy as jnp
 import solver.HPSInterp as interp
 
@@ -50,6 +51,8 @@ def convertGeom(opts,geom):
         return hpsGeom.BoxGeometry(jnp.array(geom))
     if opts.type=='stencil':
         return stencilGeom.BoxGeometry(np.array(geom))
+    if opts.type=='spectral':
+        return spectralGeom.BoxGeometry(np.array(geom))
 
 
 class solverWrapper:
@@ -65,8 +68,6 @@ class solverWrapper:
         self.type = opts.type
         self.constructed = False
         self.opts=opts
-    def __del__(self):
-        print("solverWrap deleted")
 
     def construct(self,geom,PDE:pdo,verbose=False):
         """
@@ -110,25 +111,24 @@ class solverWrapper:
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='spectral':
-            self.solver = spectral(PDE, geom, self.ord)
+            geomSpectral = convertGeom(self.opts,geom)
+            solver = spectral(PDE, geomSpectral, self.ord)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
             '''
-            self.XX = self.solver.XX
-            self.Ii = self.solver._Ji
-            self.Ib = self.solver._Jb
+            self.XX = solver.XX
+            self.Ii = solver._Ji
+            self.Ib = solver._Jx
             
-            self.Aib = self.solver.Aib
-            self.Abi = self.solver.Abi
-            self.Abb = self.solver.Abb
-            self.solver_ii = self.solver.solver_ii
+            self.Aib = solver.Aix
+            self.Abi = solver.Axi
+            self.Abb = solver.Axx
+            self.solver_ii = solver.solver_Aii
         
         self.XXi = solver.XX[self.Ii,:]
         self.XXb = solver.XX[self.Ib,:]
         self.ndofs = solver.XX.shape[0]
-        #del solver
-        #self.constructMapIdxs()
     
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):

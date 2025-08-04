@@ -10,6 +10,9 @@ import solver.stencil.geom as stencilGeom
 from matplotlib import cm
 from multislab.oms import slab
 from scipy.sparse.linalg import LinearOperator
+from solver.spectral import spectralSolver as spectral
+
+
 
 class stMap:
     def __init__(self,A:LinearOperator,XXI,XXJ):
@@ -48,11 +51,11 @@ def compute_stmaps(Il,Ic,Ir,XXi,XXb,solver):
 
 
 def c11(p):
-    return np.ones_like(p[:,0])+.1*np.cos(5.*np.pi*p[:,0])
+    return np.ones_like(p[:,0])+.1*np.cos(2.*np.pi*p[:,0])
 def c22(p):
-    return np.ones_like(p[:,1])+.1*np.sin(10.*np.pi*p[:,1])*(p[:,0]**2)
+    return np.ones_like(p[:,1])+.1*np.sin(2.*np.pi*p[:,1])*(p[:,0]**2)
 def c12(p):
-    return .1*np.ones_like(p[:,1])+.1*p[:,1]*np.sin(9.*np.pi*p[:,0])
+    return .1*np.ones_like(p[:,1])+.1*p[:,1]*np.sin(3.*np.pi*p[:,0])
 
 Lapl = pdo.PDO2d(c11=c11,c22=c22,c12=c12)
 bnds = [[0,0],[1,1]]
@@ -72,17 +75,23 @@ Om = stencilGeom.BoxGeometry(np.array([[0,0],[1,1]]))
 
 kvec = [2,3,4,5,6,7]
 errInf = np.zeros(shape=(len(kvec),))
+cond_eig = np.zeros(shape=(len(kvec),))
+cond_svd = np.zeros(shape=(len(kvec),))
 Hvec = np.zeros(shape=(len(kvec),))
+
+method = 'spectral'
 
 for indk in range(len(kvec)):
     k = kvec[indk]
     H = 1./(2**k)
     print("H = ",H)
+    print("H = ",H)
     Hvec[indk] = H
-    ordy = 250
-    ordx = int(np.round(ordy*H))
-    if not ordx%2:
-        ordx += 1
+    ordy = 100
+    ordx = int(np.round(2*ordy*H))
+    if method == 'spectral':
+        if ordx%2:
+            ordx += 1
     ord = [ordx,ordy]
 
     N = (int)(1./H)
@@ -106,16 +115,51 @@ for indk in range(len(kvec)):
             if_connectivity+=[[(i-1),(i+1)]]
 
     assembler = mA.denseMatAssembler()
-    opts = solverWrap.solverOptions('stencil',ord)
+    opts = solverWrap.solverOptions('spectral',ord)
     OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
     S_op,rhs = OMS.construct_Stot_and_rhstot(bc,assembler)
+    print("S_op done")
     E = np.identity(S_op.shape[0])
     S = S_op@E
-    e = np.linalg.eigvals(S)
+    print("S done")
+    cc= spectral.clenshaw_curtis_compute(ordy+1)[1]
+    w = np.sqrt(cc[1:ordy])
+    W = np.diag(w)
+    SW = np.kron(np.identity(N-1),W)@S@np.kron(np.identity(N-1),np.linalg.inv(W))
+    e = np.linalg.eigvals(SW)
     ae = np.abs(e)
-    s = np.linalg.svdvals(S)
-    errInf[indk] = np.linalg.norm(np.sort(ae)-np.sort(s),ord=np.inf)
+    s = np.linalg.svdvals(SW)
+    ae = np.sort(ae)
+    s = np.sort(s)
+    errInf[indk] = np.linalg.norm(ae-s,ord=np.inf)
+    cond_eig[indk] = ae[-1]/ae[0]
+    cond_svd[indk] = s[-1]/s[0]
+    print(cond_svd[indk])
+    print(cond_eig[indk])
+
+fileName = 'err_svd_eig.csv'
+errMat = np.zeros(shape=(len(kvec),4))
+errMat[:,0] = Hvec
+errMat[:,1] = errInf
+errMat[:,2] = cond_svd
+errMat[:,3] = cond_eig
+with open(fileName,'w') as f:
+    f.write('H,err,cond_svd,cond_eig\n')
+    np.savetxt(f,errMat,fmt='%.8e',delimiter=',')
+
+
+cH = 1./(Hvec*Hvec)
+cH*=2*cond_svd[0]/cH[0]
 
 plt.figure(1)
 plt.loglog(Hvec,errInf)
+plt.figure(2)
+plt.loglog(Hvec,cond_svd)
+plt.loglog(Hvec,cond_eig)
+plt.loglog(Hvec,cH)
+plt.legend(['svd','eig','cH'])
+plt.figure(3)
+plt.loglog(Hvec,np.abs(cond_svd-cond_eig)/cond_svd)
+plt.figure(4)
+plt.loglog(Hvec,cond_svd/cond_eig)
 plt.show()
