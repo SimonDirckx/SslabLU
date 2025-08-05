@@ -152,6 +152,36 @@ def y3_d3(p):
     return np.cos(th)
 
 
+def y1_d1d1(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]*p[:,1] - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
+    dA = p[:,1]*s2t-(2*c2t*p[:,0]*p[:,1]**2+2*s2t*p[:,1]**3-(R+1)*c*p[:,1]**2 + p[:,2]*s*p[:,1]**2 )/r2
+    return (p[:,1]*s2t + dA - 2*A*p[:,0]/r2 )/r2
+
+def y1_d2d2(p):
+    th = np.arctan2(p[:,1],p[:,0])
+    c2t = np.cos(2*th)
+    s2t = np.sin(2*th)
+    s   = np.sin(th)
+    c   = np.cos(th)
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
+    dA  = p[:,0]*c2t-(2*s2t*p[:,1]*p[:,0]**2+2*p[:,1]*s2t*p[:,0]**3-(R+1)*c*p[:,0]**2+p[:,2]*s*p[:,0]**2)/r2
+    return (c2t*p[:,0] + dA - 2*A*p[:,1]/r2 )/r2
+
+def y2_d1d1(p):
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return (2*p[:,1]*p[:,0]/r2)/(r2*np.pi)
+
+def y2_d2d2(p):
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return -2*(p[:,0]*p[:,1]/r2)/(r2*np.pi)
+
 
 
 n=100
