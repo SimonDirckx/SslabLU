@@ -29,7 +29,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-nwaves = 1.24
+nwaves = 5.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
@@ -47,7 +47,7 @@ param_geom = twisted.param_geom(True)
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 
-H = 1./8.
+H = 1./32.
 N = (int)(1./H)
 slabs = []
 for n in range(N):
@@ -63,8 +63,8 @@ for i in range(N):
 
 period = 1.
 p = 8
-a = [H/8.,1/16,1/16]
-assembler = mA.rkHMatAssembler(p*p,200)
+a = [H/8.,1/32,1/32]
+assembler = mA.denseMatAssembler()#rkHMatAssembler(p*p,150)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 
 '''
