@@ -41,6 +41,45 @@ def bc(p):
     z=twisted.z1(p,True)
     return np.sin(kh*z)
 
+p=np.zeros(shape= (1,3))
+
+p[0,0] = .5
+p[0,1] = .3
+p[0,2] = .4
+
+
+z=np.zeros(shape= (1,3))
+z[0,0] = twisted.z1(p,False)
+z[0,1] = twisted.z2(p,False)
+z[0,2] = twisted.z3(p,False)
+print(z)
+
+dz = 1./32.
+
+zdz=np.zeros(shape= (1,3))
+zdz[0,0] = z[0,0]
+zdz[0,1] = z[0,1]
+zdz[0,2] = z[0,2]+dz
+
+
+y=np.zeros(shape= (1,3))
+y[0,0] = twisted.y1(z,False)
+y[0,1] = twisted.y2(z,False)
+y[0,2] = twisted.y3(z,False)
+
+ydy=np.zeros(shape= (1,3))
+ydy[0,0] = twisted.y1(zdz,False)
+ydy[0,1] = twisted.y2(zdz,False)
+ydy[0,2] = twisted.y3(zdz,False)
+
+diffy = twisted.y3_d3(z,False)
+#ddiffy = twisted.y3_d3d3(z,False)
+
+print(np.abs(ydy[0,2]-y[0,2]-diffy*dz))#-ddiffy*(dz*dz))[0])
+
+print("err y = ",np.linalg.norm(p-y))
+
+'''
 param_geom = twisted.param_geom(True)
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
@@ -64,6 +103,7 @@ p = 10
 a = [H/8.,1/16,1/16]
 assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
+'''
 
 '''
 OMS = oms.oms(slabs,pdo_mod,lambda p:twisted.gb(p,True),opts,connectivity,if_connectivity,1.)
@@ -111,6 +151,7 @@ print("uhat shape = ",uhat.shape)
 print("uhat type = ",type(uhat))
 print("nc = ",nc)
 '''
+'''
 fig = plt.figure(1)
 N=len(connectivity)
 errInf = 0.
@@ -141,3 +182,4 @@ for slabInd in range(len(connectivity)):
     print(errI)
 print("sup norm error = ",errInf)
 
+'''
