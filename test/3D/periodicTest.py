@@ -236,7 +236,7 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10
+p = 10 + 2 # There's a difference in standards between the hps implementations - for hpsmultidomain p is internal order and q is external, for spectralmultidomain it is opposite
 a = np.array([H/8.,1/8,1/8])
 assembler = mA.rkHMatAssembler(p*p,75)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
