@@ -11,8 +11,11 @@ from matAssembly.HBS.simpleoctree import simpletree as tree
 import torch
 def compute_c0_L0(XX):
     N,ndim = XX.shape
-    c0 = np.sum(XX,axis=0)/N
-    L0 = np.max(np.max(XX,axis=0)-np.min(XX,axis=0)) #too tight for some reason
+    XX_np = XX
+    if torch.is_tensor(XX):
+        XX_np = XX_np.detach().cpu().numpy()
+    c0 = np.sum(XX_np,axis=0)/N
+    L0 = np.max(np.max(XX_np,axis=0)-np.min(XX_np,axis=0)) #too tight for some reason
     return c0,L0+1e-5
 class matAssemblerOptions:
     """

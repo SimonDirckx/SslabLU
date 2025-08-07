@@ -4,12 +4,15 @@ import jax.numpy as jnp
 import scipy
 from packaging.version import Version
 
+import torch
+
 
 # oms packages
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-from hps.geom              import ParametrizedGeometry3D
+
+from hpsmultidomain.geom              import ParametrizedGeometry3D
 
 # validation&testing
 import time
@@ -39,7 +42,8 @@ class gmres_info(object):
 #
 #########################################################################################################
 
-jax_avail = True
+jax_avail = False
+torch_avail = True
 if jax_avail:
     const_theta = 1./(2.*np.pi)
     r           = lambda zz: (zz[...,0]**2 + zz[...,1]**2)**0.5
@@ -74,7 +78,40 @@ if jax_avail:
                         y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
+elif torch_avail:
+    const_theta = 1/(2.*torch.pi)
+    r           = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
+
+    z1 = lambda zz: torch.mul( 1 + 1 * zz[:,1], torch.cos(zz[:,0]/const_theta) )
+    z2 = lambda zz: torch.mul( 1 + 1 * zz[:,1], torch.sin(zz[:,0]/const_theta) )
+    z3 = lambda zz: zz[:,2]
+
+
+    y1 = lambda zz: const_theta* torch.atan2(zz[:,1],zz[:,0])
+    y2 = lambda zz: r(zz) - 1
+    y3 = lambda zz: zz[:,2]
+
+    y1_d1    = lambda zz: -const_theta     * torch.div(zz[:,1], r(zz)**2)
+    y1_d2    = lambda zz: +const_theta     * torch.div(zz[:,0], r(zz)**2)
+    y1_d1d1  = lambda zz: +2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r(zz)**4)
+    y1_d2d2  = lambda zz: -2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r(zz)**4)
+    y1_d1d1 = None; y1_d2d2 = None
+
+
+    y2_d1    = lambda zz: torch.div(zz[:,0], r(zz))
+    y2_d2    = lambda zz: torch.div(zz[:,1], r(zz))
+    y2_d1d1  = lambda zz: torch.div(zz[:,1]**2, r(zz)**3)
+    y2_d2d2  = lambda zz: torch.div(zz[:,0]**2, r(zz)**3)
+
+    y3_d3    = lambda zz: torch.ones(zz[:,2].shape)
+    bnds = [[0.,0.,0.],[1.,1.,1.]]
     
+    box_geom   = np.array(bnds)
+    param_geom = ParametrizedGeometry3D(box_geom,z1,z2,z3,y1,y2,y3,\
+                        y1_d1=y1_d1, y1_d2=y1_d2,\
+                        y1_d1d1=y1_d1d1, y1_d2d2=y1_d2d2,\
+                        y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
+                        y3_d3=y3_d3)
 else:
     const_theta = 1/(2.*np.pi)
     r           = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
@@ -110,10 +147,13 @@ else:
                         y2_d1=y2_d1, y2_d2=y2_d2, y2_d1d1=y2_d1d1, y2_d2d2=y2_d2d2,\
                         y3_d3=y3_d3)
     
+#def gb(p):
+#    return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
 def gb(p):
-    return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
-def gb_np(p):
-    return np.abs(p[:,1]-bnds[0][1])<1e-14 or np.abs(p[:,1]-bnds[1][1])<1e-14 or np.abs(p[:,2]-bnds[0][2])<1e-14 or np.abs(p[:,2]-bnds[1][2])<1e-14
+    return (np.abs(p[:,1]-bnds[0][1])<1e-14) | (np.abs(p[:,1]-bnds[1][1])<1e-14) | (np.abs(p[:,2]-bnds[0][2])<1e-14) | (np.abs(p[:,2]-bnds[1][2])<1e-14)
+
+#def gb_torch(p):
+#    return torch.abs(p[:,1]-bnds[0][1])<1e-14 or torch.abs(p[:,1]-bnds[1][1])<1e-14 or torch.abs(p[:,2]-bnds[0][2])<1e-14 or torch.abs(p[:,2]-bnds[1][2])<1e-14
 
 #########################################################################################################
 
@@ -136,6 +176,9 @@ kh = (nwaves/4)*2.*np.pi
 if jax_avail:
     def bfield(p,kh):
         return -kh*kh*jnp.ones_like(p[...,0])
+elif torch_avail:
+    def bfield(p,kh):
+        return -kh*kh*torch.ones(p.shape[0])
 else:
     def bfield(p,kh):
         return -kh*kh*np.ones(shape=(p.shape[0],))
@@ -194,7 +237,7 @@ period = 1.
 
 tol = 1e-5
 p = 10
-a = [H/8.,1/8,1/8]
+a = np.array([H/8.,1/8,1/8])
 assembler = mA.rkHMatAssembler(p*p,75)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)

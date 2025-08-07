@@ -4,11 +4,20 @@ import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
-from solver.spectralmultidomain.hps import hps_multidomain as hps
-import solver.spectralmultidomain.hps.geom as hpsGeom
+
+# Things we need to change:
+#from solver.spectralmultidomain.hps import hps_multidomain as hps
+#import solver.spectralmultidomain.hps.geom as hpsGeom
+
+from hpsmultidomain import domain_driver as hps
+import hpsmultidomain.geom as hpsGeom
+
+# No longer needed, replace with np / torch(?)
+import jax.numpy as jnp
+
+
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
-import jax.numpy as jnp
 import solver.HPSInterp as interp
 
 
@@ -48,7 +57,8 @@ class solverOptions:
 
 def convertGeom(opts,geom):
     if opts.type=='hps':
-        return hpsGeom.BoxGeometry(jnp.array(geom))
+        #return hpsGeom.BoxGeometry(jnp.array(geom))
+        return hpsGeom.BoxGeometry(np.array(geom))
     if opts.type=='stencil':
         return stencilGeom.BoxGeometry(np.array(geom))
     if opts.type=='spectral':
@@ -91,8 +101,11 @@ class solverWrapper:
             self.solver_ii = solver.solver_Aii
         if self.type=='hps':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
+            #solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
+            print("self.a", self.a)
+            solver = hps.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord[0], d=len(self.ord)) #verbose=verbose)
             self.solver=solver
+            self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
@@ -106,7 +119,8 @@ class solverWrapper:
             self.Abb = solver.Axx
             tic      = time()
             print("start solver")
-            self.solver_ii = solver.solver_Aii
+            solver.setup_solver_Aii()
+            self.solver_ii = solver.solver_Aii #solver.solver_Aii
             print("solver done")
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None

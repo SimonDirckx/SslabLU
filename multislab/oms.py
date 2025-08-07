@@ -129,6 +129,7 @@ class oms:
                 v_tmp = v
 
             if (not transpose):
+                thing = solver.Aib[...,J]@v_tmp
                 result = (A_solver@(solver.Aib[...,J]@v_tmp))[I,...]
             else:
                 result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
