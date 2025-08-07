@@ -312,6 +312,7 @@ for slabInd in range(len(connectivity)):
     g[Ir]=ur
     g[Igb] = bc(XXb[Igb,:])
     g=g[:,np.newaxis]
+    g = torch.from_numpy(g)
     uu = solver.solver.solve_dir_full(g)
     uu0 = bc(solver.XXfull)
     uu=uu.flatten()
