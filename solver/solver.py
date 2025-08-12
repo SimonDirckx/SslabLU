@@ -1,4 +1,4 @@
-import geometry.slabGeometry as slabGeom
+
 import pdo.pdo as pdo
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator

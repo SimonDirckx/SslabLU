@@ -17,7 +17,7 @@ from scipy.sparse.linalg import gmres
 #import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 
-import twistedTorusGeometry as twisted
+import geometry.geom_3D.twistedTorus as twisted
 
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -65,60 +65,24 @@ def u_exact(p):
     z=twisted.z1(p)
     return np.sin(kh*z)
 
-################################################################
+N = 16
+dSlabs,connectivity,H = twisted.dSlabs(N)
 
 
-##############################################################################################
-#
-#   SET-UP Slabs
-#   - left-to-right convention  (!!!)
-#   - single slabs              (slabs)
-#   - slab connectivity         (connectivity, i.e. are two single slabs connected)
-#   - interface connectivity    (if_connectivity, i.e. are two interfaces connected by a slab) 
-#   - periodicity               (period, i.e. period in the x-dir)
-#
-##############################################################################################
-
-
-N = 8
-slabs,H = twisted.slabs(N)
-connectivity,if_connectivity = twisted.connectivity(slabs)
-period = 2.
-
-##############################################################################################
-
-#################################################################
-#
-#   Compute OMS (overlapping multislab)
-#   - discretization options    (opts)
-#   - off-diag block assembler  (assembler)
-#   - Overlapping Multislab     (OMS)
-#
-#################################################################
-
-tol = 1e-5
 p = 10
-a = [H/8.,1/8,1/8]
-assembler = mA.rkHMatAssembler(p*p,75)
+a = [H/8.,1/16,1/16]
+assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,pdo_mod,lambda p: twisted.gb(p,True),opts,connectivity,if_connectivity,1.)
-print("computing Stot & rhstot...")
+OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
-print("done")
-#################################################################
-#E = np.identity(Stot.shape[1])
-#S00 = Stot@E
-#S00T = Stot.T@E
-#print("T err = ",np.linalg.norm(S00.T-S00T))
-#Finally, solve
 
 gInfo = gmres_info()
 stol = 1e-10*H*H
 
 if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=200,restart=200)
 else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=200,restart=200)
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot
@@ -131,38 +95,19 @@ print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
 print("==================================")
 
-uitot = np.zeros(shape=(0,))
-XXtot = np.zeros(shape=(0,3))
-dofs = 0
-glob_target_dofs=OMS.glob_target_dofs
-glob_source_dofs=OMS.glob_source_dofs
-nc = OMS.nc
-del OMS
-
-
-
-# check err.
-print("uhat shape = ",uhat.shape)
-print("uhat type = ",type(uhat))
-print("nc = ",nc)
-
-fig = plt.figure(1)
-N=len(connectivity)
 errInf = 0.
+nc = OMS.nc
 for slabInd in range(len(connectivity)):
-    geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-    slab_i  = oms.slab(geom,gb)
+    geom    = np.array(dSlabs[slabInd])
+    slab_i  = oms.slab(geom,lambda p : twisted.gb(p,True))
     solver  = oms.solverWrap.solverWrapper(opts)
     solver.construct(geom,pdo_mod)
-    
     Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
 
     startL = ((slabInd-1)%N)
     startR = ((slabInd+1)%N)
     ul = uhat[startL*nc:(startL+1)*nc]
     ur = uhat[startR*nc:(startR+1)*nc]
-    u0l = bc(XXb[Il,:])
-    u0r = bc(XXb[Ir,:])
     g = np.zeros(shape=(XXb.shape[0],))
     g[Il]=ul
     g[Ir]=ur
@@ -175,4 +120,3 @@ for slabInd in range(len(connectivity)):
     errInf = np.max([errInf,errI])
     print(errI)
 print("sup norm error = ",errInf)
-

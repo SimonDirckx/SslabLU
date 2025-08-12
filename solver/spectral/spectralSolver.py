@@ -5,7 +5,6 @@ import scipy.sparse.linalg as splinalg
 from scipy.sparse        import block_diag
 from solver.pde_solver import AbstractPDESolver
 import pdo.pdo as pdo
-from geometry.slabGeometry import slabGeometry as slab
 from solver import sparse_utils
 
 
@@ -195,7 +194,7 @@ def constructPDO3D(pdo,xpts,ypts,zpts,XX,geom):
 # stencil domain class for handling discretizations
 class spectralSolver(AbstractPDESolver):
     
-    def __init__(self, pdo, geom:slab, ord):
+    def __init__(self, pdo, geom, ord):
         """
         Initializes the stencil solver with domain 
         information and discretization parameters.

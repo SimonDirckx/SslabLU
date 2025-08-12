@@ -482,18 +482,62 @@ def box_geom(jax_avail=True):
 def bounds():
     return bnds
 
+
 def param_geom(jax_avail = True):
     return ParametrizedGeometry3D(
                         box_geom(jax_avail),\
                         z1=lambda p:z1(p,jax_avail),z2=lambda p:z2(p,jax_avail),z3=lambda p:z3(p,jax_avail),\
                         y1=lambda p:y1(p,jax_avail),y2=lambda p:y2(p,jax_avail),y3=lambda p:y3(p,jax_avail),\
-                        y1_d1=lambda p:y1_d1(p,jax_avail), y1_d2=lambda p:y1_d2(p,jax_avail),y1_d3=lambda p:y1_d3(p,jax_avail),\
-                        y2_d1=lambda p:y2_d1(p,jax_avail), y2_d2=lambda p:y2_d2(p,jax_avail),\
+                        y1_d1=lambda p:y1_d1(p,jax_avail), y1_d2=lambda p:y1_d2(p,jax_avail),\
+                        y2_d1=lambda p:y2_d1(p,jax_avail), y2_d2=lambda p:y2_d2(p,jax_avail),y2_d3=lambda p:y2_d3(p,jax_avail),\
                         y3_d1=lambda p:y3_d1(p,jax_avail), y3_d2=lambda p:y3_d2(p,jax_avail),y3_d3=lambda p:y3_d3(p,jax_avail),\
                         y1_d1d1=lambda p:y1_d1d1(p,jax_avail), y1_d2d2=lambda p:y1_d2d2(p,jax_avail),\
                         y2_d1d1=lambda p:y2_d1d1(p,jax_avail), y2_d2d2=lambda p:y2_d2d2(p,jax_avail),\
                         y3_d1d1=lambda p:y3_d1d1(p,jax_avail), y3_d2d2=lambda p:y3_d2d2(p,jax_avail)
                         )
+
+####################################
+#       slab functions
+####################################
+
+
+def slabs(N):
+    slabs = []
+    H = (bnds[1][0]-bnds[0][0])/N
+    for n in range(N):
+        bnds_n = [[bnds[0][0]+n*H,bnds[0][1],bnds[0][2]],[bnds[0][0]+(n+1)*H,bnds[1][1],bnds[1][2]]]
+        slabs+=[bnds_n]
+    return slabs,H
+def connectivity(slabs):
+    N=len(slabs)
+    connectivity = [[N-1,0]]
+    for i in range(N):
+        connectivity+=[[i,i+1]]
+    if_connectivity = []
+    for i in range(N):
+        if_connectivity+=[[(i-1)%N,(i+1)%N]]
+    return connectivity,if_connectivity
+
+# N is number of single slabs!!!
+# convention: ith dSlab is the double slab that has the ith interface as its central interface
+
+def dSlabs(N):
+    dSlabs = []
+    H = (bnds[1][0]-bnds[0][0])/N
+    connectivity=[]
+    for n in range(N):
+        c = bnds[0][0]+n*H
+        bnds_n = [[c-H,bnds[0][1],bnds[0][2]],[c+H,bnds[1][1],bnds[1][2]]]
+        connectivity+=[[(n-1)%N,(n+1)%N]]
+        dSlabs+=[bnds_n]
+    return dSlabs,connectivity,H
+    
+
+
+
+####################################
+#       validate diff
+####################################
 
 
 def check_param():
@@ -597,21 +641,3 @@ def check_param():
         plt.loglog(hvec,2*errH2[0,i]*(hvec**3)/(hvec[0]**3),label='h3',linestyle='dashed')
         plt.legend()
     plt.show()
-
-
-def slabs(N):
-    slabs = []
-    H = (bnds[1][0]-bnds[0][0])/N
-    for n in range(N):
-        bnds_n = [[bnds[0][0]+n*H,bnds[0][1],bnds[0][2]],[bnds[0][0]+(n+1)*H,bnds[1][1],bnds[1][2]]]
-        slabs+=[bnds_n]
-    return slabs,H
-def connectivity(slabs):
-    N=len(slabs)
-    connectivity = [[N-1,0]]
-    for i in range(N):
-        connectivity+=[[i,i+1]]
-    if_connectivity = []
-    for i in range(N):
-        if_connectivity+=[[(i-1)%N,(i+1)%N]]
-    return connectivity,if_connectivity

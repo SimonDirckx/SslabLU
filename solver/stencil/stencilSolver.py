@@ -4,7 +4,7 @@ import scipy.sparse as sparse
 from scipy.sparse        import block_diag
 from solver.pde_solver import AbstractPDESolver
 import pdo.pdo as pdo
-from geometry.slabGeometry import slabGeometry as slab
+
 from solver import sparse_utils
 import matplotlib.pyplot as plt
 def stencilD(pts):
@@ -64,7 +64,7 @@ def constructPDO3D(pdo,xpts,ypts,zpts,XX,geom):
 # stencil domain class for handling discretizations
 class stencilSolver(AbstractPDESolver):
     
-    def __init__(self, pdo, geom:slab, ord):
+    def __init__(self, pdo, geom, ord):
         """
         Initializes the stencil solver with domain 
         information and discretization parameters.
