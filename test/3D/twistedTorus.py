@@ -1,22 +1,23 @@
+# basic packages
 import numpy as np
-import pdo.pdo as pdo
-import solver.solver as solverWrap
-import matplotlib.pyplot as plt
-from scipy.spatial import Delaunay
-from matplotlib import cm
-import matplotlib.tri as tri
-import twistedTorusGeometry as twisted
 import jax.numpy as jnp
-import multislab.oms as oms
-import matAssembly.matAssembler as mA
 import scipy
 from packaging.version import Version
+
+
+# oms packages
+import solver.solver as solverWrap
+import matAssembly.matAssembler as mA
+import multislab.oms as oms
+from hps.geom              import ParametrizedGeometry3D
 
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
 #import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
+
+import twistedTorusGeometry as twisted
 
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -29,96 +30,95 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-nwaves = 1.24
+
+bnds = twisted.bnds
+
+################################################################
+#
+#   SET-UP BVP:         Helmholtz on 3D Annulus
+#   - wave number       (kh)
+#   - bfield            (= kh*ones)
+#   - pdo_mod           (pdo transformed to square)
+#   - BC
+#   - known exact sol.  (u_exact)
+#
+################################################################
+
+nwaves = 10.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-
-
-def bfield(p,kh):
-    return -kh*kh*jnp.ones_like(p[...,0])
-
-def bc(p):
-    z=twisted.z1(p,True)
-    return np.sin(kh*z)
-
-p=np.zeros(shape= (1,3))
-
-p[0,0] = .5
-p[0,1] = .3
-p[0,2] = .4
-
-
-z=np.zeros(shape= (1,3))
-z[0,0] = twisted.z1(p,False)
-z[0,1] = twisted.z2(p,False)
-z[0,2] = twisted.z3(p,False)
-print(z)
-
-dz = 1./32.
-
-zdz=np.zeros(shape= (1,3))
-zdz[0,0] = z[0,0]
-zdz[0,1] = z[0,1]
-zdz[0,2] = z[0,2]+dz
-
-
-y=np.zeros(shape= (1,3))
-y[0,0] = twisted.y1(z,False)
-y[0,1] = twisted.y2(z,False)
-y[0,2] = twisted.y3(z,False)
-
-ydy=np.zeros(shape= (1,3))
-ydy[0,0] = twisted.y1(zdz,False)
-ydy[0,1] = twisted.y2(zdz,False)
-ydy[0,2] = twisted.y3(zdz,False)
-
-diffy = twisted.y3_d3(z,False)
-#ddiffy = twisted.y3_d3d3(z,False)
-
-print(np.abs(ydy[0,2]-y[0,2]-diffy*dz))#-ddiffy*(dz*dz))[0])
-
-print("err y = ",np.linalg.norm(p-y))
-
-'''
-param_geom = twisted.param_geom(True)
+jax_avail = True
+if jax_avail:
+    def bfield(p,kh):
+        return -kh*kh*jnp.ones_like(p[...,0])
+else:
+    def bfield(p,kh):
+        return -kh*kh*np.ones(shape=(p.shape[0],))
+param_geom=twisted.param_geom()
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
+def bc(p):
+    z=twisted.z1(p)
+    return np.sin(kh*z)
 
-H = 1./8.
-N = (int)(1./H)
-slabs = []
-for n in range(N):
-    bnds_n = [[n*H,0.,0.],[(n+1)*H,1.,1.]]
-    slabs+=[bnds_n]
+def u_exact(p):
+    z=twisted.z1(p)
+    return np.sin(kh*z)
 
-connectivity = [[N-1,0]]
-for i in range(N-1):
-    connectivity+=[[i,i+1]]
-if_connectivity = []
-for i in range(N):
-    if_connectivity+=[[(i-1)%N,(i+1)%N]]
+################################################################
 
-period = 1.
+
+##############################################################################################
+#
+#   SET-UP Slabs
+#   - left-to-right convention  (!!!)
+#   - single slabs              (slabs)
+#   - slab connectivity         (connectivity, i.e. are two single slabs connected)
+#   - interface connectivity    (if_connectivity, i.e. are two interfaces connected by a slab) 
+#   - periodicity               (period, i.e. period in the x-dir)
+#
+##############################################################################################
+
+
+N = 8
+slabs,H = twisted.slabs(N)
+connectivity,if_connectivity = twisted.connectivity(slabs)
+period = 2.
+
+##############################################################################################
+
+#################################################################
+#
+#   Compute OMS (overlapping multislab)
+#   - discretization options    (opts)
+#   - off-diag block assembler  (assembler)
+#   - Overlapping Multislab     (OMS)
+#
+#################################################################
+
+tol = 1e-5
 p = 10
-a = [H/8.,1/16,1/16]
-assembler = mA.rkHMatAssembler(p*p,100)
+a = [H/8.,1/8,1/8]
+assembler = mA.rkHMatAssembler(p*p,75)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
-'''
-
-'''
-OMS = oms.oms(slabs,pdo_mod,lambda p:twisted.gb(p,True),opts,connectivity,if_connectivity,1.)
+OMS = oms.oms(slabs,pdo_mod,lambda p: twisted.gb(p,True),opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("done")
-
+#################################################################
+#E = np.identity(Stot.shape[1])
+#S00 = Stot@E
+#S00T = Stot.T@E
+#print("T err = ",np.linalg.norm(S00.T-S00T))
+#Finally, solve
 
 gInfo = gmres_info()
 stol = 1e-10*H*H
 
 if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
 else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot
@@ -141,23 +141,17 @@ del OMS
 
 
 
-
-
-
-
-
 # check err.
 print("uhat shape = ",uhat.shape)
 print("uhat type = ",type(uhat))
 print("nc = ",nc)
-'''
-'''
+
 fig = plt.figure(1)
 N=len(connectivity)
 errInf = 0.
 for slabInd in range(len(connectivity)):
     geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]],period))
-    slab_i  = oms.slab(geom,lambda p:twisted.gb(p,True))
+    slab_i  = oms.slab(geom,gb)
     solver  = oms.solverWrap.solverWrapper(opts)
     solver.construct(geom,pdo_mod)
     
@@ -165,13 +159,13 @@ for slabInd in range(len(connectivity)):
 
     startL = ((slabInd-1)%N)
     startR = ((slabInd+1)%N)
-    #ul = uhat[startL*nc:(startL+1)*nc]
-    #ur = uhat[startR*nc:(startR+1)*nc]
+    ul = uhat[startL*nc:(startL+1)*nc]
+    ur = uhat[startR*nc:(startR+1)*nc]
     u0l = bc(XXb[Il,:])
     u0r = bc(XXb[Ir,:])
     g = np.zeros(shape=(XXb.shape[0],))
-    g[Il]=bc(XXb[Il,:])
-    g[Ir]=bc(XXb[Ir,:])
+    g[Il]=ul
+    g[Ir]=ur
     g[Igb] = bc(XXb[Igb,:])
     g=g[:,np.newaxis]
     uu = solver.solver.solve_dir_full(g)
@@ -182,4 +176,3 @@ for slabInd in range(len(connectivity)):
     print(errI)
 print("sup norm error = ",errInf)
 
-'''

@@ -84,9 +84,9 @@ class slab:
         xr = self.geom[1][0]
         xc=(xl+xr)/2.
 
-        Il = np.where((np.abs(XXb[:, 0] - xl) < 1e-14) & ~(self.gb_vec(XXb)))[0]
-        Ir = np.where((np.abs(XXb[:, 0] - xr) < 1e-14) & ~(self.gb_vec(XXb)))[0]
-        Ic = np.where(np.abs(XXi[:, 0] - xc) < 1e-14)[0]
+        Il = np.where((np.abs(XXb[..., 0] - xl) < 1e-14) & ~(self.gb_vec(XXb)))[0]
+        Ir = np.where((np.abs(XXb[..., 0] - xr) < 1e-14) & ~(self.gb_vec(XXb)))[0]
+        Ic = np.where(np.abs(XXi[..., 0] - xc) < 1e-14)[0]
         Igb = np.where(self.gb_vec(XXb))[0]    
 
         return Il,Ir,Ic,Igb,XXi,XXb
@@ -200,8 +200,8 @@ class oms:
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 
-            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
-            rhs = rhs[Ic]
+            rhs = solver.solver_ii@(solver.Aib[...,Igb]@fgb)
+            rhs = -rhs[Ic]
             rhs_list+=[rhs]
             bool_r = len(Ir)>0
             bool_l = len(Il)>0
@@ -261,7 +261,7 @@ class oms:
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
-            rhstot[rhsInd*nc:(rhsInd+1)*nc]=-rhs_list[rhsInd]
+            rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
 
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
