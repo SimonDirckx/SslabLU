@@ -44,7 +44,7 @@ bnds = twisted.bnds
 #
 ################################################################
 
-nwaves = 10.24
+nwaves = 1.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 jax_avail = True
@@ -65,12 +65,12 @@ def u_exact(p):
     z=twisted.z1(p)
     return np.sin(kh*z)
 
-N = 16
+N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
 
 
-p = 10
-a = [H/8.,1/16,1/16]
+p = 6
+a = [H/8.,1/8,1/8]
 assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
@@ -118,5 +118,11 @@ for slabInd in range(len(connectivity)):
     uu=uu.flatten()
     errI=np.linalg.norm(uu-uu0,ord=np.inf)
     errInf = np.max([errInf,errI])
-    print(errI)
+    pts = np.random.uniform(size=(10,3))
+    pts[:,0]=pts[:,0]*(geom[1,0]-geom[0,0])+geom[0,0]
+    pts[:,1]=pts[:,1]*(geom[1,1]-geom[0,1])+geom[0,1]
+    pts[:,2]=pts[:,2]*(geom[1,2]-geom[0,2])+geom[0,2]
+    ghat = solver.interp(pts,uu)
+    g = bc(pts)
+    print(np.linalg.norm(g-ghat,ord=np.inf))
 print("sup norm error = ",errInf)
