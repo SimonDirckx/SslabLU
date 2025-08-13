@@ -44,7 +44,7 @@ bnds = twisted.bnds
 #
 ################################################################
 
-nwaves = 15.24
+nwaves = 11.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 jax_avail = True
@@ -68,9 +68,9 @@ N = 16
 dSlabs,connectivity,H = twisted.dSlabs(N)
 
 
-p = 14
-a = [H/8.,1/32,1/32]
-assembler = mA.rkHMatAssembler(p*p,75)
+p = 10
+a = [H/8.,1/16,1/16]
+assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
