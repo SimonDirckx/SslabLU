@@ -236,10 +236,10 @@ period = 1.
 #################################################################
 
 tol = 1e-5
-p = 10 + 2 # There's a difference in standards between the hps implementations - for hpsmultidomain p is internal order and q is external, for spectralmultidomain it is opposite
+p = 10
 a = np.array([H/8.,1/8,1/8])
 assembler = mA.rkHMatAssembler(p*p,75)
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
+opts = solverWrap.solverOptions('hps',[p+2,p+2,p+2],a)  # There's a difference in standards between the hps implementations - for hpsmultidomain p is internal order and q is external, for spectralmultidomain it is opposite
 OMS = oms.oms(slabs,pdo_mod,gb,opts,connectivity,if_connectivity,1.)
 print("computing Stot & rhstot...")
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
