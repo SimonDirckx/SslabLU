@@ -44,7 +44,7 @@ bnds = twisted.bnds
 #
 ################################################################
 
-nwaves = 11.24
+nwaves = 10.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 jax_avail = True
@@ -64,12 +64,12 @@ def u_exact(p):
     z=twisted.z1(p)
     return np.sin(kh*z)
 
-N = 16
+N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
 
 
-p = 10
-a = [H/8.,1/16,1/16]
+p = 8
+a = [H/8.,1/8,1/8]
 assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
@@ -97,8 +97,8 @@ print("==================================")
 errInf = 0.
 nc = OMS.nc
 
-nx=500
-ny=500
+nx=200
+ny=200
 
 xpts = np.linspace(-4,4,nx)
 ypts = np.linspace(-4,4,ny)
@@ -151,7 +151,8 @@ for slabInd in range(len(connectivity)):
     uu=uu.flatten()
     ghat = solver.interp(YY0,uu)
     gYY[I0] = ghat
-    
+g_ref = np.load('ref_sol.npy')
+print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf))   
 
 triang = tri.Triangulation(sliceZZ[:,0],sliceZZ[:,1])
 tri0 = triang.triangles
@@ -186,8 +187,10 @@ b3 = (yy3[:,0]<twisted.bnds[0][0]) | (yy3[:,0]>twisted.bnds[1][0]) | (yy3[:,1]<t
 mask = (b1&b2)|(b1&b3)|(b2&b3)
 triang.set_mask(mask)
 
+np.save('ref_sol.npy',gYY)
+
 plt.figure(5)
-plt.tripcolor(triang, gYY, shading='flat')
+plt.tripcolor(triang, gYY, shading='gouraud',cmap='jet')
 plt.axis('equal')
 plt.colorbar()
 plt.savefig('twistedTorus.png',dpi=1000)
