@@ -40,6 +40,11 @@ class slab:
         Igb = np.where(self.gb_vec(XXb))[0]    
 
         return Il,Ir,Ic,Igb,XXi,XXb
+class omsStats:
+    def __init__(self):
+        self.compression = None
+        self.compr_timing = None
+        self.discr_timing = None
 
 class oms:
     def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity):
@@ -53,6 +58,7 @@ class oms:
         self.localSolver=None
         self.nbytes = 0
         self.densebytes = 0 
+        self.stats = omsStats()
     def compute_global_dofs(self):
         if not self.glob_source_dofs:
             glob_source_dofs=[]
@@ -126,7 +132,7 @@ class oms:
         shapeMatch = True
         relerrl=0
         relerrr=0
-        for slabInd in range(len(connectivity)):
+        for slabInd in range(len(slabs)):
             geom = np.array(slabs[slabInd])
             slab_i = slab(geom,self.gb)
             start = time.time()
@@ -153,7 +159,7 @@ class oms:
             bool_r = len(Ir)>0
             bool_l = len(Il)>0
             start = time.time()
-            compression_l = 0
+            compression_l = 0 
             compression_r = 0
             if bool_r:
                 rkMat_r = assembler.assemble(st_r,dbg=dbg)
@@ -172,18 +178,27 @@ class oms:
             compressTime += tCompress
             #shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
             if dbg>0:
-                Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
-                Vr=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
-                Ul=st_l.A@Vl
-                Ur=st_r.A@Vr
-                Ulhat=rkMat_l@Vl
-                Urhat=rkMat_r@Vr
-                relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
-                relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
+                if bool_l:
+                    Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
+                    Ul=st_l.A@Vl
+                    Ulhat=rkMat_l@Vl
+                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
+                if bool_r:
+                    Vr=np.random.standard_normal(size=(st_r.A.shape[1],assembler.matOpts.maxRank))
+                    Ur=st_r.A@Vr
+                    Urhat=rkMat_r@Vr
+                    relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
             if dbg>1:
                 print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
-                print("SLAB %d error = %5.2e // %5.2e\n" % (slabInd,relerrl,relerrr))
-                print("SLAB %d compression = %5.3e // %5.3e\n" % (slabInd,compression_l,compression_r))
+                if bool_l and bool_r:
+                    print("SLAB %d error = %5.2e // %5.2e\n" % (slabInd,relerrl,relerrr))
+                    print("SLAB %d compression = %5.3e // %5.3e\n" % (slabInd,compression_l,compression_r))
+                elif not bool_l:
+                    print("SLAB %d error = %5.2e\n" % (slabInd,relerrr))
+                    print("SLAB %d compression = %5.3e\n" % (slabInd,compression_r))
+                elif not bool_r:
+                    print("SLAB %d error = %5.2e\n" % (slabInd,relerrl))
+                    print("SLAB %d compression = %5.3e\n" % (slabInd,compression_l))
             del st_l,st_r,Il,Ir,Ic,XXi,XXb,solver
             
             
@@ -204,6 +219,9 @@ class oms:
             print('total dofs                   = ',sum([len(dof) for dof in glob_target_dofs]))
             print('estim. max. err. ( l // r )  = (',relerrl," // ", relerrr,")")
             print('===================================================================')
+        self.stats.compression=self.nbytes/self.densebytes
+        self.stats.compr_timing = compressTime/(len(connectivity)-1)
+        self.stats.discr_timing = compressTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        

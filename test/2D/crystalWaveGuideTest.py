@@ -1,25 +1,23 @@
+# basic packages
 import numpy as np
-import hps.pdo as pdo
+import jax.numpy as jnp
+import scipy
+from packaging.version import Version
+import matplotlib.tri as tri
+
+# oms packages
 import solver.solver as solverWrap
-#import multiSlab as MS
-import matAssembly.matAssembler as mA
-import matplotlib.pyplot as plt
-import geometry.standardGeometries as stdGeom
-#import geometry.skeleton as skelTon
-import time
-import hps.hps_multidomain as HPS
-import hps.geom as hpsGeom
-from scipy.sparse        import block_diag
-#import scipy.sparse as sparse
-import scipy.sparse.linalg as splinalg
-#from scipy import interpolate
-from scipy.interpolate import griddata
-from scipy.sparse.linalg   import LinearOperator
-from scipy.sparse.linalg import gmres
-from solver.solver import stMap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-import jax.numpy as jnp
+import hps.pdo as pdo
+
+# validation&testing
+import time
+from scipy.sparse.linalg import gmres
+#import solver.HPSInterp3D as interp
+import matplotlib.pyplot as plt
+
+import geometry.geom_2D.square as square
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -34,12 +32,8 @@ class gmres_info(object):
 
 #nwaves = 24.623521102434587
 nwaves = 24.673521102434584
-#kh = (nwaves+0.03)*2*np.pi+1.8
-#kh=157.02
-#print("kh = ",kh)
-#kapp = 11.1
-#nwaves = 24.673521102434584
 kh = (nwaves+0.03)*2*np.pi+1.8
+
 jax_avail=True
 if jax_avail:
     def bfield(xx):
@@ -129,146 +123,106 @@ else:
 
 def bc(p):
     return np.ones_like(p[:,0])
-bnds = [[0.,0.],[1.,1.]]
-Om=stdGeom.Box(bnds)
 
-def gb_vec(P):
-    # P is (N, 2)
-    return (
-        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
-        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)  
-    )
+N = 8
+dSlabs,connectivity,H = square.dSlabs(N)
+print(connectivity)
+pvec = np.array([8,10,12,14,16,18,20,22,24,26,28,30],dtype = np.int64)
+err=np.zeros(shape = (len(pvec),))
+discr_time=np.zeros(shape = (len(pvec),))
+compr_time=np.zeros(shape = (len(pvec),))
+for indp in range(len(pvec)):
+    p = pvec[indp]
+    a = [H/8,1/64]
+    assembler = mA.rkHMatAssembler(p,25)
+    #assembler = mA.denseMatAssembler()
+    opts = solverWrap.solverOptions('hps',[p,p],a)
+    OMS = oms.oms(dSlabs,Lapl,lambda p:square.gb(p,True),opts,connectivity)
+    print("computing Stot & rhstot...")
+    Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
+    print("done")
+    gInfo = gmres_info()
+    stol = 1e-10*H*H
 
-
-H = 1./16.
-N = (int)(1./H)
-p = 20
-a = [H/2.,1/64]
-Sl_list = []
-Sr_list = []
-
-Sl_rk_list = []
-Sr_rk_list = []
-
-rhs_list = []
-disc_list = []
-trk     = 0
-tol = 1e-5
-assembler = mA.rkHMatAssembler(p,p)
-data = 0
-
-slabs = []
-for n in range(N):
-    bnds_n = [[n*H,0.],[(n+1)*H,1.]]
-    slabs+=[bnds_n]
-
-connectivity = []
-for i in range(N-1):
-    connectivity+=[[i,i+1]]
-
-if_connectivity = []
-for i in range(N-1):
-    if i==0:
-        if_connectivity+=[[-1,(i+1)]]
-    elif i==N-2:
-        if_connectivity+=[[(i-1),-1]]
+    if Version(scipy.__version__)>=Version("1.14"):
+        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=400,restart=400)
     else:
-        if_connectivity+=[[(i-1),(i+1)]]
-opts = solverWrap.solverOptions('hps',[p,p],a)
-#assembler = mA.denseMatAssembler()#((p+2)*(p+2),50)
-OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
-print("computing Stot & rhstot...")
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,True)
-print("done")
-gInfo = gmres_info()
-stol = 1e-6*H*H
-uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart = 1000)
-stop_solve = time.time()
-res = Stot@uhat-rhstot
+        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=400,restart=400)
 
-print("=============SOLVER SUMMARY==============")
-print("H                        = ",'%10.3E'%H)
-print("ord                      = ",p)
-print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-print("GMRES iters              = ", gInfo.niter)
-#print("constuction time rk.     = ",trk)
-#print("par. constuction time rk.= ",trk/(N-1))
-#print("solve time               = ",(stop_solve-start_solve))
-#print("par. solve time          = ",(stop_solve-start_solve)/(N-1))
-#print("data (MB)                = ",data/1e6)
-#print("data orig (MB)           = ",(8*Ntot+8*(nc*nc)*2.*(N-1))/1e6)
-print("=========================================")
+    stop_solve = time.time()
+    res = Stot@uhat-rhstot
 
 
-uitot = np.zeros(shape=(0,1))
-btot = np.zeros(shape=(0,))
-XXtot = np.zeros(shape=(0,2))
-dofs = 0
-global_dofs = OMS.glob_target_dofs
-for i in range(len(global_dofs)+1):
-    xl = i*H
-    xr = (i+1)*H
-    #print("constructing HPS...")
-    geom = hpsGeom.BoxGeometry(np.array([[xl,0.],[xr,1.]]))
-    disc = HPS.HPSMultidomain(Lapl, geom, a, p)
-    #print("done")
-    XX = disc._XX
-    XXb = XX[disc.Jx,:]
-    XXi = XX[disc.Ji,:]
-    Ir = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xr)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
-    Il = [i for i in range(len(disc.Jx)) if np.abs(XXb[i,0]-xl)<1e-10 and XXb[i,1]>1e-10 and XXb[i,1]<1-1e-10]
-    bvec = np.ones(shape=(len(disc.Jx),1))
-    if i>0:
-        bvec[Il,0] = uhat[global_dofs[i-1]]
-    if i<N-1:
-        bvec[Ir,0] = uhat[global_dofs[i]]
-    dofs+=bvec.shape[0]
-    #print("solving dirichlet...")
-    ui = disc.solve_dir_full(bvec)
-    #print("done")
-    uitot=np.append(uitot,ui,axis=0)
-    XXtot=np.append(XXtot,disc._XXfull,axis=0)
-    
+    print("=============SUMMARY==============")
+    print("H                        = ",'%10.3E'%H)
+    print("ord                      = ",p)
+    print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
+    print("GMRES iters              = ", gInfo.niter)
+    print("==================================")
 
-dofs+=XXtot.shape[0]
-print('u shape = ',uitot.shape)
-print('XX shape = ',XXtot.shape)
-print('total dofs = ',dofs)
+    nc = OMS.nc
 
-resolution = 1000
-min_x = 0.
-max_x = 1.
-min_y = 0.
-max_y = 1.
-grid_x, grid_y    = np.mgrid[min_x:max_x:resolution*1j, min_y:max_y:resolution*1j]
+    print("nc = ",nc)
+    print("N = ",Stot.shape)
 
-grid_solution           = griddata(XXtot, uitot[:,0], (grid_x, grid_y), method='cubic').T
 
-bf = -bfield(XXtot)/(kh**2)
-grid_bf           = griddata(XXtot, bf, (grid_x, grid_y), method='cubic').T
+    nx=500
+    ny=500
 
-plot_pad=0.1
-max_sol = np.max(grid_solution[:])
-min_sol = np.min(grid_solution[:])
+    xpts = np.linspace(0,1,nx)
+    ypts = np.linspace(0,1,ny)
+
+    YY = np.zeros(shape=(nx*ny,2))
+    YY[:,0] = np.kron(xpts,np.ones_like(ypts))
+    YY[:,1] = np.kron(np.ones_like(xpts),ypts)
+
+    gYY = np.zeros(shape=(YY.shape[0],))
+
+    for slabInd in range(len(dSlabs)):
+        geom    = np.array(dSlabs[slabInd])
+        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
+        print("len I0 = ",len(I0))
+        YY0 = YY[I0,:]
+        slab_i  = oms.slab(geom,lambda p : square.gb(p,True))
+        solver  = oms.solverWrap.solverWrapper(opts)
+        solver.construct(geom,Lapl)
+        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+        startL = slabInd-1
+        startR = slabInd+1
+        g = np.zeros(shape=(XXb.shape[0],))
+        g[Igb] = bc(XXb[Igb,:])
+        if startL>-1:
+            g[Il] = uhat[startL*nc:(startL+1)*nc]
+        if startR<len(dSlabs):
+            g[Ir] = uhat[startR*nc:(startR+1)*nc]
+        g=g[:,np.newaxis]
+        uu = solver.solver.solve_dir_full(g)
+        uu=uu.flatten()
+        ghat = solver.interp(YY0,uu)
+        print("norm ghat = ",np.linalg.norm(ghat,ord=np.inf))
+        gYY[I0] = ghat
+
+    triang = tri.Triangulation(YY[:,0],YY[:,1])
+    tri0 = triang.triangles
+
+    gref = np.load('ref_sol_waveguide.npy')
+    #np.save('ref_sol_waveguide.npy',gYY)
+    print("err ref = ",np.linalg.norm(gref-gYY)/np.linalg.norm(gref))
+    err[indp] = np.linalg.norm(gref-gYY)/np.linalg.norm(gref)
+    compr_time[indp] = OMS.stats.compr_timing
+    discr_time[indp] = OMS.stats.discr_timing
+
+
+fileName = 'crystal_waveguide.csv'
+errMat = np.zeros(shape=(len(pvec),4))
+errMat[:,0] = pvec
+errMat[:,1] = err
+errMat[:,2] = compr_time
+errMat[:,3] = discr_time
+with open(fileName,'w') as f:
+    f.write('p,err,compr,discr\n')
+    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
+
 plt.figure(0)
-plt.imshow(grid_solution, extent=(min_x-plot_pad,max_x+plot_pad,\
-                                    min_y-plot_pad,max_y+plot_pad),\
-                                        #vmin=min_sol, vmax=max_sol,\
-                origin='lower',cmap = 'jet')
-plt.colorbar()
-figString = 'waveGuide_'+str(kh)+'.png'
-plt.savefig(figString, transparent=True,format='png',bbox_inches='tight')
-
-
-plt.figure(1)
-plt.imshow(grid_bf, extent=(min_x-plot_pad,max_x+plot_pad,\
-                                    min_y-plot_pad,max_y+plot_pad),\
-                                        #vmin=min_sol, vmax=max_sol,\
-                origin='lower',cmap = 'jet')
-plt.colorbar()
-figString = 'bfield_'+str(kh)+'.png'
-plt.savefig(figString, transparent=True,format='png',bbox_inches='tight')
-
+plt.semilogy(pvec,err)
 plt.show()
