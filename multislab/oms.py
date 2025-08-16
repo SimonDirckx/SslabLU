@@ -221,7 +221,7 @@ class oms:
             print('===================================================================')
         self.stats.compression=self.nbytes/self.densebytes
         self.stats.compr_timing = compressTime/(len(connectivity)-1)
-        self.stats.discr_timing = discrTime/(len(connectivity)-1))
+        self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
         rhstot = np.zeros(shape = (Ntot,))        
