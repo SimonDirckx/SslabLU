@@ -66,7 +66,7 @@ class matAssembler:
             start = time.time()
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=3*(self.matOpts.maxRank+10)
+            s=5*(self.matOpts.maxRank+10)
             s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))

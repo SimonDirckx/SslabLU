@@ -44,7 +44,7 @@ bnds = twisted.bnds
 #
 ################################################################
 
-nwaves = 10.24
+nwaves = 8.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 jax_avail = True
@@ -76,12 +76,12 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 
 gInfo = gmres_info()
-stol = 1e-10*H*H
+stol = 1e-6*H*H
 
 if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=400,restart=400)
+    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=800,restart=800)
 else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=400,restart=400)
+    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=800,restart=800)
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot

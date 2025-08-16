@@ -7,8 +7,10 @@ import hps.cheb_utils as cheb
 
 def interp(solver,p,f):
     if solver.ndim==2:
+        print("INTERP 2D")
         return interp_2d(solver,p,f)
     elif solver.ndim==3:
+        print("INTERP 3D")
         return interp_3d(solver,p,f)
     else:
         raise ValueError("ndim must be 2 or 3")
