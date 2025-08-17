@@ -11,7 +11,7 @@ from matplotlib import cm
 from multislab.oms import slab
 from scipy.sparse.linalg import LinearOperator
 from solver.spectral import spectralSolver as spectral
-
+import geometry.geom_2D.square as square
 
 
 class stMap:
@@ -75,6 +75,8 @@ Om = stencilGeom.BoxGeometry(np.array([[0,0],[1,1]]))
 
 kvec = [2,3,4,5,6,7]
 errInf = np.zeros(shape=(len(kvec),))
+errBlock = np.zeros(shape=(len(kvec),))
+relerrBlock = np.zeros(shape=(len(kvec),))
 cond_eig = np.zeros(shape=(len(kvec),))
 cond_svd = np.zeros(shape=(len(kvec),))
 Hvec = np.zeros(shape=(len(kvec),))
@@ -83,7 +85,8 @@ method = 'stencil'
 
 for indk in range(len(kvec)):
     k = kvec[indk]
-    H = 1./(2**k)
+    N = (2**k)
+    dSlabs,connectivity,H = square.dSlabs(N)
     print("H = ",H)
     print("H = ",H)
     Hvec[indk] = H
@@ -100,29 +103,9 @@ for indk in range(len(kvec)):
             ordx += 1
     ord = [ordx,ordy]
 
-    N = (int)(1./H)
-
-    slabs = []
-    for n in range(N):
-        bnds_n = [[n*H,0.],[(n+1)*H,1.]]
-        slabs+=[bnds_n]
-
-    connectivity = []
-    for i in range(N-1):
-        connectivity+=[[i,i+1]]
-
-    if_connectivity = []
-    for i in range(N-1):
-        if i==0:
-            if_connectivity+=[[-1,(i+1)]]
-        elif i==N-2:
-            if_connectivity+=[[(i-1),-1]]
-        else:
-            if_connectivity+=[[(i-1),(i+1)]]
-
     assembler = mA.denseMatAssembler()
     opts = solverWrap.solverOptions(method,ord)
-    OMS = oms.oms(slabs,Lapl,gb_vec,opts,connectivity,if_connectivity)
+    OMS = oms.oms(dSlabs,Lapl,lambda p:square.gb(p,False),opts,connectivity)
     S_op,rhs = OMS.construct_Stot_and_rhstot(bc,assembler)
     print("S_op done")
     E = np.identity(S_op.shape[0])
@@ -133,7 +116,11 @@ for indk in range(len(kvec)):
         w = np.sqrt(cc[1:ordy])
         W = np.diag(w)
         S = np.kron(np.identity(N-1),W)@S@np.kron(np.identity(N-1),np.linalg.inv(W))
-    
+    nc = OMS.nc
+    S12 = S[:nc,:][:,nc:2*nc]
+    S21 = S[nc:2*nc,:][:,:nc]
+    errBlock[indk] = np.linalg.norm(S12-S21.T,ord=2)
+    relerrBlock[indk] = np.linalg.norm(S12-S21.T,ord=2)/np.linalg.norm(S12,ord=2)
     e = np.linalg.eigvals(S)
     ae = np.abs(e)
     s = np.linalg.svdvals(S)
@@ -146,13 +133,14 @@ for indk in range(len(kvec)):
     print(cond_eig[indk])
 
 fileName = 'err_svd_eig_'+method+'.csv'
-errMat = np.zeros(shape=(len(kvec),4))
+errMat = np.zeros(shape=(len(kvec),5))
 errMat[:,0] = Hvec
 errMat[:,1] = errInf
 errMat[:,2] = cond_svd
 errMat[:,3] = cond_eig
+errMat[:,3] = errBlock
 with open(fileName,'w') as f:
-    f.write('H,err,cond_svd,cond_eig\n')
+    f.write('H,err,cond_svd,cond_eig,errBlock\n')
     np.savetxt(f,errMat,fmt='%.8e',delimiter=',')
 
 
@@ -170,4 +158,9 @@ plt.figure(3)
 plt.loglog(Hvec,np.abs(cond_svd-cond_eig)/cond_svd)
 plt.figure(4)
 plt.loglog(Hvec,cond_svd/cond_eig)
+
+plt.figure(5)
+plt.loglog(Hvec,errBlock)
+plt.loglog(Hvec,Hvec**2)
+plt.legend(['err','H2'])
 plt.show()
