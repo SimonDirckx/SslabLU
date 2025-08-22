@@ -24,7 +24,7 @@ class SlabSubdomain:
                 raise ValueError("expected an odd number of points in x direction for double_slab")
 
         self._solver  = solver
-        self._solver.setup_solver_Aii()
+        #self._solver.setup_solver_Aii()
 
     @property
     def XX(self):
