@@ -2,7 +2,7 @@ import numpy as np
 import jax.numpy as jnp
 import tensorly as tl
 import tensorly.tenalg as tenalg
-import hps.cheb_utils as cheb
+import solver.spectralmultidomain.hps.cheb_utils as cheb
 
 
 def interp(solver,p,f):

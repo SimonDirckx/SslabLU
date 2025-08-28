@@ -9,8 +9,7 @@ import matplotlib.tri as tri
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-from hps.geom              import ParametrizedGeometry3D
-
+import torch
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
@@ -47,32 +46,42 @@ bnds = twisted.bnds
 nwaves = 8.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-jax_avail = True
+
+# What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
+jax_avail   = False
+torch_avail = True
+hpsalt      = True
+
+
 if jax_avail:
     def bfield(p,kh):
         return -kh*kh*jnp.ones_like(p[...,0])
+elif torch_avail:
+    def bfield(p,kh):
+        return -kh*kh*torch.ones(p.shape[0])
 else:
     def bfield(p,kh):
         return -kh*kh*np.ones(shape=(p.shape[0],))
-param_geom=twisted.param_geom()
+param_geom=twisted.param_geom(jax_avail=jax_avail, torch_avail=torch_avail, hpsalt=hpsalt)
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 def bc(p):
     return np.ones_like(p[:,0])
 
-def u_exact(p):
-    z=twisted.z1(p)
-    return np.sin(kh*z)
 
 N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
+formulation = "hps"
+p = 10
+p_disc = p
+if hpsalt:
+    formulation = "hpsalt"
+    p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-
-p = 8
-a = [H/8.,1/8,1/8]
+a = np.array([H/8.,1/16,1/16])
 assembler = mA.rkHMatAssembler(p*p,100)
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,True),opts,connectivity)
+opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 
 gInfo = gmres_info()

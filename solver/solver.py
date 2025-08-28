@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import solver.HPSInterp as interp
 
 # Things we need to add:
-from hpsmultidomain import domain_driver as hpsalt
-import hpsmultidomain.geom as hpsaltGeom
+from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
+import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 
 
 from time import time

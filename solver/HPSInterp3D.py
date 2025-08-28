@@ -2,8 +2,8 @@ import numpy as np
 import tensorly as tl
 import tensorly.tenalg as tenalg
 import jax.numpy as jnp
-import hps.geom as hpsGeom
-import hps.hps_multidomain as HPS
+import solver.spectralmultidomain.hps.geom as hpsGeom
+import solver.spectralmultidomain.hps.hps_multidomain as HPS
 #functions
 
 def computeTransform(x):

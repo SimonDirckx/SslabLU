@@ -1,7 +1,7 @@
 import numpy as np
 from abc import ABCMeta, abstractmethod, abstractproperty
-from hps.pdo import get_known_greens
-from hps.sparse_utils import SparseSolver
+#from hps.pdo import get_known_greens
+from solver.spectralmultidomain.hps.sparse_utils import SparseSolver
 
 class AbstractPDESolver(metaclass=ABCMeta):
     """
@@ -203,7 +203,7 @@ class AbstractPDESolver(metaclass=ABCMeta):
     #################################################
     # Discretization verification via known Green's functions
     #################################################
-
+    '''
     def verify_discretization(self, kh):
         """
         Test the Dirichlet solver by comparing to a known Green's function solution.
@@ -234,3 +234,4 @@ class AbstractPDESolver(metaclass=ABCMeta):
         err = np.linalg.norm(uu_sol - uu_true, ord=2)
         relerr = err / np.linalg.norm(uu_true, ord=2)
         return relerr
+'''

@@ -48,9 +48,9 @@ wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
-jax_avail   = True
-torch_avail = False
-hpsalt      = False
+jax_avail   = False
+torch_avail = True
+hpsalt      = True
 
 if jax_avail:
     def bfield(p,kh):

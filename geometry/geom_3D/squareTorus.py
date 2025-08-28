@@ -1,8 +1,8 @@
 import numpy as np
 import jax.numpy as jnp
-from hps.geom              import ParametrizedGeometry3D
+from solver.spectralmultidomain.hps.geom              import ParametrizedGeometry3D
 
-from hpsmultidomain.geom import ParametrizedGeometry3D as ParametrizedGeometry3Dalt
+from solver.hpsmultidomain.hpsmultidomain.geom import ParametrizedGeometry3D as ParametrizedGeometry3Dalt
 import matplotlib.pyplot as plt
 
 import torch

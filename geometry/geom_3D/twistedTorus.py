@@ -1,8 +1,11 @@
 
 import numpy as np
 import jax.numpy as jnp
-from hps.geom              import ParametrizedGeometry3D
 import matplotlib.pyplot as plt
+import torch
+
+from solver.spectralmultidomain.hps.geom              import ParametrizedGeometry3D
+from solver.hpsmultidomain.hpsmultidomain.geom import ParametrizedGeometry3D as ParametrizedGeometry3Dalt
 
 R = 1.5
 bnds = [[-1.,-1.,-1.],[1.,1.,1.]]
@@ -353,147 +356,376 @@ def y3_d2d2_jnp(p):
 def gb_jnp(p):
     return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
 
+
+####################################
+#           TORCH VERSION
+####################################
+
+def z1_torch(p):
+    c=torch.cos(torch.pi*p[...,0])
+    s=torch.sin(torch.pi*p[...,0])
+    c2 = torch.multiply(c,c)
+    cs = torch.multiply(c,s)
+    q = torch.multiply(c2,p[...,1])-torch.multiply(cs,p[...,2])+c*(R+1)
+    return q
+
+def z2_torch(p):
+    c=torch.cos(torch.pi*p[...,0])
+    s=torch.sin(torch.pi*p[...,0])
+    s2 = torch.multiply(s,s)
+    cs = torch.multiply(c,s)
+    q = torch.multiply(cs,p[...,1])-torch.multiply(s2,p[...,2])+s*(R+1)
+    return q
+def z3_torch(p):
+    c=torch.cos(torch.pi*p[...,0])
+    s=torch.sin(torch.pi*p[...,0])
+    q = torch.multiply(s,p[...,1])+torch.multiply(c,p[...,2])
+    return q
+
+
+
+def y1_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    return th/torch.pi
+
+def y2_torch(p):
+    # p is a vector of points, Nx3
+    th = torch.arctan2(p[...,1],p[...,0])
+    c=torch.cos(th)
+    s=torch.sin(th)
+    c2 = torch.multiply(c,c)
+    cs = torch.multiply(c,s)
+    q = torch.multiply(p[...,0],c2)+torch.multiply(p[...,1],cs)-(R+1)*c + torch.multiply(s,p[...,2])
+    return q
+
+
+def y3_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c=torch.cos(th)
+    s=torch.sin(th)
+    s2 = torch.multiply(s,s)
+    cs = torch.multiply(c,s)
+    q = -torch.multiply(p[...,0],cs)-torch.multiply(p[...,1],s2)+(R+1)*s+torch.multiply(c,p[...,2])
+    return q
+
+#verified
+def y2_d1_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]**2 - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
+    return (c2t+1)/2. + A/r2
+
+#verified
+def y1_d1_torch(p):
+    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    return -(p[...,1]/r2)/torch.pi
+#verified
+def y1_d2_torch(p):
+    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    return (p[...,0]/r2)/torch.pi
+
+#verified
+def y2_d2_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
+    return s2t/2. + A/r2
+
+def y2_d3_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    return torch.sin(th)
+
+
+
+
+def y3_d1_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
+    return -s2t/2. + A/r2
+
+def y3_d2_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
+    return (c2t-1)/2. - A/r2
+#verified
+def y3_d3_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    return torch.cos(th)
+
+
+#verified
+def y1_d1d1_torch(p):
+    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    return (2*p[...,1]*p[...,0]/r2)/(r2*torch.pi)
+#verified
+def y1_d2d2_torch(p):
+    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    return -2*(p[...,0]*p[...,1]/r2)/(r2*torch.pi)
+
+#verified
+def y2_d1d1_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]*p[...,1] - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
+    dA = p[...,1]*s2t-(2*c2t*p[...,0]*(p[...,1]**2)+2*s2t*p[...,1]**3-(R+1)*c*p[...,1]**2 + p[...,2]*s*(p[...,1]**2) )/r2
+    return (p[...,1]*s2t + dA - 2*A*p[...,0]/r2 )/r2
+#verified
+def y2_d2d2_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
+    dA  = p[...,0]*c2t-(2*s2t*p[...,1]*p[...,0]**2+2*c2t*(p[...,0]**3)-(R+1)*c*(p[...,0]**2)+p[...,2]*s*(p[...,0]**2))/r2
+    return (c2t*p[...,0] + dA - 2*A*p[...,1]/r2 )/r2
+
+
+#verified
+def y3_d1d1_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
+    dA  = p[...,1]*c2t+(2*p[...,0]*(p[...,1]**2)*s2t-2*(p[...,1]**3)*c2t-(R+1)*(p[...,1]**2)*s-p[...,2]*(p[...,1]**2)*c)/r2
+    return (c2t*p[...,1] + dA - 2*p[...,0]*A/r2)/r2
+#verified
+def y3_d2d2_torch(p):
+    th = torch.arctan2(p[...,1],p[...,0])
+    c2t = torch.cos(2*th)
+    s2t = torch.sin(2*th)
+    s   = torch.sin(th)
+    c   = torch.cos(th)
+    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
+    A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
+    dA  = p[...,0]*s2t+(2*(p[...,0]**2)*p[...,1]*c2t-2*(p[...,0]**3)*s2t + (R+1)*(p[...,0]**2)*s + p[...,2]*(p[...,0]**2)*c)/r2
+    return -(s2t*p[...,0] + dA - 2*p[...,1]*A/r2)/r2
+
+
 ####################################
 #           OVERALL
 ####################################
 
 
-def z1(p,jax_avail = True):
+def z1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return z1_jnp(p)
+    elif torch_avail:
+        return z1_torch(p)
     else:
         return z1_np(p)
-def z2(p,jax_avail = True):
+def z2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return z2_jnp(p)
+    elif torch_avail:
+        return z2_torch(p)
     else:
         return z2_np(p)
-def z3(p,jax_avail = True):
+def z3(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return z3_jnp(p)
+    elif torch_avail:
+        return z3_torch(p)
     else:
         return z3_np(p)
     
-def y1(p,jax_avail = True):
+def y1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y1_jnp(p)
+    elif torch_avail:
+        return y1_torch(p)
     else:
         return y1_np(p)
-def y2(p,jax_avail = True):
+def y2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_jnp(p)
+    elif torch_avail:
+        return y2_torch(p)
     else:
         return y2_np(p)
-def y3(p,jax_avail = True):
+def y3(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_jnp(p)
+    elif torch_avail:
+        return y3_torch(p)
     else:
         return y3_np(p)
     
-def y1_d1(p,jax_avail = True):
+def y1_d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y1_d1_jnp(p)
+    elif torch_avail:
+        return y1_d1_torch(p)
     else:
         return y1_d1_np(p)
-def y1_d2(p,jax_avail = True):
+def y1_d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y1_d2_jnp(p)
+    elif torch_avail:
+        return y1_d2_torch(p)
     else:
         return y1_d2_np(p)
 
     
 
-def y2_d1(p,jax_avail = True):
+def y2_d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_d1_jnp(p)
+    elif torch_avail:
+        return y2_d1_torch(p)
     else:
         return y2_d1_np(p)
-def y2_d2(p,jax_avail = True):
+def y2_d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_d2_jnp(p)
+    elif torch_avail:
+        return y2_d2_torch(p)
     else:
         return y2_d2_np(p)
-def y2_d3(p,jax_avail = True):
+def y2_d3(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_d3_jnp(p)
+    elif torch_avail:
+        return y2_d3_torch(p)
     else:
         return y2_d3_np(p)
 
-def y3_d1(p,jax_avail = True):
+def y3_d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_d1_jnp(p)
+    elif torch_avail:
+        return y3_d1_torch(p)
     else:
         return y3_d1_np(p)
-def y3_d2(p,jax_avail = True):
+def y3_d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_d2_jnp(p)
+    elif torch_avail:
+        return y3_d2_torch(p)
     else:
         return y3_d2_np(p)
-def y3_d3(p,jax_avail = True):
+def y3_d3(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_d3_jnp(p)
+    elif torch_avail:
+        return y3_d3_torch(p)
     else:
         return y3_d3_np(p)
     
-def y1_d1d1(p,jax_avail = True):
+def y1_d1d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y1_d1d1_jnp(p)
+    elif torch_avail:
+        return y1_d1d1_torch(p)
     else:
         return y1_d1d1_np(p)
-def y1_d2d2(p,jax_avail = True):
+def y1_d2d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y1_d2d2_jnp(p)
+    elif torch_avail:
+        return y1_d2d2_torch(p)
     else:
         return y1_d2d2_np(p)
 
     
-def y2_d1d1(p,jax_avail = True):
+def y2_d1d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_d1d1_jnp(p)
+    elif torch_avail:
+        return y2_d1d1_torch(p)
     else:
         return y2_d1d1_np(p)
-def y2_d2d2(p,jax_avail = True):
+def y2_d2d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y2_d2d2_jnp(p)
+    elif torch_avail:
+        return y2_d2d2_torch(p)
     else:
         return y2_d2d2_np(p)
 
-def y3_d1d1(p,jax_avail = True):
+def y3_d1d1(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_d1d1_jnp(p)
+    elif torch_avail:
+        return y3_d1d1_torch(p)
     else:
         return y3_d1d1_np(p)
-def y3_d2d2(p,jax_avail = True):
+def y3_d2d2(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return y3_d2d2_jnp(p)
+    elif torch_avail:
+        return y3_d2d2_torch(p)
     else:
         return y3_d2d2_np(p)
-def gb(p,jax_avail = True):
+def gb(p,jax_avail = True,torch_avail = False):
     if jax_avail:
         return gb_jnp(p)
+    elif torch_avail:
+        return gb_np(p)
     else:
         return gb_np(p)
 
-def box_geom(jax_avail=True):
+def box_geom(jax_avail=True,torch_avail = False):
     if jax_avail:
         return jnp.array(bnds)
+    elif torch_avail:
+        return np.array(bnds)
     else:
         return np.array(bnds)
 def bounds():
     return bnds
 
 
-def param_geom(jax_avail = True):
-    return ParametrizedGeometry3D(
-                        box_geom(jax_avail),\
-                        z1=lambda p:z1(p,jax_avail),z2=lambda p:z2(p,jax_avail),z3=lambda p:z3(p,jax_avail),\
-                        y1=lambda p:y1(p,jax_avail),y2=lambda p:y2(p,jax_avail),y3=lambda p:y3(p,jax_avail),\
-                        y1_d1=lambda p:y1_d1(p,jax_avail), y1_d2=lambda p:y1_d2(p,jax_avail),\
-                        y2_d1=lambda p:y2_d1(p,jax_avail), y2_d2=lambda p:y2_d2(p,jax_avail),y2_d3=lambda p:y2_d3(p,jax_avail),\
-                        y3_d1=lambda p:y3_d1(p,jax_avail), y3_d2=lambda p:y3_d2(p,jax_avail),y3_d3=lambda p:y3_d3(p,jax_avail),\
-                        y1_d1d1=lambda p:y1_d1d1(p,jax_avail), y1_d2d2=lambda p:y1_d2d2(p,jax_avail),\
-                        y2_d1d1=lambda p:y2_d1d1(p,jax_avail), y2_d2d2=lambda p:y2_d2d2(p,jax_avail),\
-                        y3_d1d1=lambda p:y3_d1d1(p,jax_avail), y3_d2d2=lambda p:y3_d2d2(p,jax_avail)
+def param_geom(jax_avail = True,torch_avail=False, hpsalt=False):
+    if hpsalt:
+        return ParametrizedGeometry3Dalt(
+                        box_geom(jax_avail,torch_avail),\
+                        z1=lambda p:z1(p,jax_avail,torch_avail),z2=lambda p:z2(p,jax_avail,torch_avail),z3=lambda p:z3(p,jax_avail,torch_avail),\
+                        y1=lambda p:y1(p,jax_avail,torch_avail),y2=lambda p:y2(p,jax_avail,torch_avail),y3=lambda p:y3(p,jax_avail,torch_avail),\
+                        y1_d1=lambda p:y1_d1(p,jax_avail,torch_avail), y1_d2=lambda p:y1_d2(p,jax_avail,torch_avail),\
+                        y2_d1=lambda p:y2_d1(p,jax_avail,torch_avail), y2_d2=lambda p:y2_d2(p,jax_avail,torch_avail),y2_d3=lambda p:y2_d3(p,jax_avail,torch_avail),\
+                        y3_d1=lambda p:y3_d1(p,jax_avail,torch_avail), y3_d2=lambda p:y3_d2(p,jax_avail,torch_avail),y3_d3=lambda p:y3_d3(p,jax_avail,torch_avail),\
+                        y1_d1d1=lambda p:y1_d1d1(p,jax_avail,torch_avail), y1_d2d2=lambda p:y1_d2d2(p,jax_avail,torch_avail),\
+                        y2_d1d1=lambda p:y2_d1d1(p,jax_avail,torch_avail), y2_d2d2=lambda p:y2_d2d2(p,jax_avail,torch_avail),\
+                        y3_d1d1=lambda p:y3_d1d1(p,jax_avail,torch_avail), y3_d2d2=lambda p:y3_d2d2(p,jax_avail,torch_avail)
+                        )
+    else:
+        return ParametrizedGeometry3D(
+                        box_geom(jax_avail,torch_avail),\
+                        z1=lambda p:z1(p,jax_avail,torch_avail),z2=lambda p:z2(p,jax_avail,torch_avail),z3=lambda p:z3(p,jax_avail,torch_avail),\
+                        y1=lambda p:y1(p,jax_avail,torch_avail),y2=lambda p:y2(p,jax_avail,torch_avail),y3=lambda p:y3(p,jax_avail,torch_avail),\
+                        y1_d1=lambda p:y1_d1(p,jax_avail,torch_avail), y1_d2=lambda p:y1_d2(p,jax_avail,torch_avail),\
+                        y2_d1=lambda p:y2_d1(p,jax_avail,torch_avail), y2_d2=lambda p:y2_d2(p,jax_avail,torch_avail),y2_d3=lambda p:y2_d3(p,jax_avail,torch_avail),\
+                        y3_d1=lambda p:y3_d1(p,jax_avail,torch_avail), y3_d2=lambda p:y3_d2(p,jax_avail,torch_avail),y3_d3=lambda p:y3_d3(p,jax_avail,torch_avail),\
+                        y1_d1d1=lambda p:y1_d1d1(p,jax_avail,torch_avail), y1_d2d2=lambda p:y1_d2d2(p,jax_avail,torch_avail),\
+                        y2_d1d1=lambda p:y2_d1d1(p,jax_avail,torch_avail), y2_d2d2=lambda p:y2_d2d2(p,jax_avail,torch_avail),\
+                        y3_d1d1=lambda p:y3_d1d1(p,jax_avail,torch_avail), y3_d2d2=lambda p:y3_d2d2(p,jax_avail,torch_avail)
                         )
 
 ####################################
