@@ -11,6 +11,10 @@ import solver.spectral.geom as spectralGeom
 import jax.numpy as jnp
 import solver.HPSInterp as interp
 
+# Things we need to add:
+from hpsmultidomain import domain_driver as hpsalt
+import hpsmultidomain.geom as hpsaltGeom
+
 
 from time import time
 """
@@ -37,7 +41,7 @@ class solverOptions:
     """
     Class that encodes the options for a local slab Solver
     @param:
-    type:       type of discretization (HPS/cheb/stencil)
+    type:       type of discretization (HPS/cheb/stencil/HPSalt)
     ordx,ordy:  order in x and y directions
     a:          characteristic scale in case of HPS
     """
@@ -47,6 +51,8 @@ class solverOptions:
         self.a      =   a
 
 def convertGeom(opts,geom):
+    if opts.type=='hpsalt':
+        return hpsaltGeom.BoxGeometry(np.array(geom))
     if opts.type=='hps':
         return hpsGeom.BoxGeometry(jnp.array(geom))
     if opts.type=='stencil':
@@ -106,6 +112,29 @@ class solverWrapper:
             self.Abb = solver.Axx
             tic      = time()
             print("start solver")
+            self.solver_ii = solver.solver_Aii
+            print("solver done")
+            toc      = time() - tic
+            print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+        if self.type=='hpsalt':
+            geomHPS = convertGeom(self.opts,geom)
+            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord[0], d=len(self.ord)) #verbose=verbose)
+            self.solver=solver
+            self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
+            self.constructed=True
+            '''
+            adapt these to fit the notation of custom solver
+            '''
+            self.XX = solver.XX
+            self.XXfull = solver._XXfull
+            self.Ii = solver._Ji
+            self.Ib = solver._Jx
+            self.Aib = solver.Aix
+            self.Abi = solver.Axi
+            self.Abb = solver.Axx
+            tic      = time()
+            print("start solver")
+            solver.setup_solver_Aii()
             self.solver_ii = solver.solver_Aii
             print("solver done")
             toc      = time() - tic

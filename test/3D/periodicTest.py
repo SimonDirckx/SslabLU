@@ -9,13 +9,17 @@ from packaging.version import Version
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-from hps.geom              import ParametrizedGeometry3D
+#from hps.geom import ParametrizedGeometry3D
 
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
 import matplotlib.pyplot as plt
 import geometry.geom_3D.squareTorus as squareTorus
+
+from hpsmultidomain.geom import ParametrizedGeometry3D as ParametrizedGeometry3Dalt
+
+import torch
 
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -63,12 +67,12 @@ def u_exact(p):
     z=squareTorus.z1(p)
     return np.sin(kh*z)
 
-N = 16
+N = 8
 dSlabs,connectivity,H = squareTorus.dSlabs(N)
 
 
-p = 8
-a = [H/8.,1/16,1/16]
+p = 10
+a = [H/8.,1/8,1/8]
 assembler = mA.rkHMatAssembler(p*p,50)
 opts = solverWrap.solverOptions('hps',[p,p,p],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,True),opts,connectivity)
