@@ -90,20 +90,20 @@ z3_torch = lambda zz: zz[:,2]
 
 
 y1_torch = lambda zz: const_theta* torch.atan2(zz[:,1],zz[:,0])
-y2_torch = lambda zz: r(zz) - 1
+y2_torch = lambda zz: r_np(zz) - 1
 y3_torch = lambda zz: zz[:,2]
 
-y1_d1_torch    = lambda zz: -const_theta     * torch.div(zz[:,1], r(zz)**2)
-y1_d2_torch    = lambda zz: +const_theta     * torch.div(zz[:,0], r(zz)**2)
-y1_d1d1_torch  = lambda zz: +2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r(zz)**4)
-y1_d2d2_torch  = lambda zz: -2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r(zz)**4)
+y1_d1_torch    = lambda zz: -const_theta     * torch.div(zz[:,1], r_np(zz)**2) # r_np works here
+y1_d2_torch    = lambda zz: +const_theta     * torch.div(zz[:,0], r_np(zz)**2)
+y1_d1d1_torch  = lambda zz: +2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r_np(zz)**4)
+y1_d2d2_torch  = lambda zz: -2*const_theta   * torch.div(torch.mul(zz[:,0],zz[:,1]), r_np(zz)**4)
 y1_d1d1_torch  = None; y1_d2d2 = None
 
 
-y2_d1_torch    = lambda zz: torch.div(zz[:,0], r(zz))
-y2_d2_torch    = lambda zz: torch.div(zz[:,1], r(zz))
-y2_d1d1_torch  = lambda zz: torch.div(zz[:,1]**2, r(zz)**3)
-y2_d2d2_torch  = lambda zz: torch.div(zz[:,0]**2, r(zz)**3)
+y2_d1_torch    = lambda zz: torch.div(zz[:,0], r_np(zz))
+y2_d2_torch    = lambda zz: torch.div(zz[:,1], r_np(zz))
+y2_d1d1_torch  = lambda zz: torch.div(zz[:,1]**2, r_np(zz)**3)
+y2_d2d2_torch  = lambda zz: torch.div(zz[:,0]**2, r_np(zz)**3)
 
 y3_d3_torch    = lambda zz: torch.ones(zz[:,2].shape)
 
