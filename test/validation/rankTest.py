@@ -132,7 +132,7 @@ for i in range(N-1):
         if_connectivity+=[[(i-1),(i+1)]]
 period = 0.
 binary = False
-pvec = [6,8,10,12]
+pvec = [6,8,10]
 a = [H/4.,1/32,1/32]
 nlvl = int(np.log2(1/(2*a[1])))
 if binary:
@@ -149,11 +149,11 @@ else:
     rkWeak=np.zeros(shape=(len(pvec),nlvl-coarsestLevel),dtype = np.int64)
     rkStrong=np.zeros(shape=(len(pvec),nlvl-coarsestLevel),dtype=np.int64)
     indvec=pvec
-#form = 'S'
-form = 'T'
+form = 'S'
+#form = 'T'
 ll = False
 lr = not ll
-p=12
+p=10
 H=1/8 
 for ind in range(len(indvec)):
     if mode=='p':
