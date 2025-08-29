@@ -1,6 +1,6 @@
 import numpy as np
 import jax.numpy as jnp
-import solver.spectralmultidomain.hps.pdo as pdo
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 from packaging.version import Version
 import scipy
 import matplotlib.pyplot as plt
@@ -15,7 +15,7 @@ from scipy.sparse.linalg import gmres
 from matAssembly.HBS.simpleoctree import simpletree as tree
 from time import time
 import gc
-
+import torch
 
 def compute_c0_L0(XX):
     N,ndim = XX.shape
@@ -81,17 +81,17 @@ nwaves = 6.24
 kh = (nwaves/4)*2.*np.pi
 print("kappa = ",kh)
 def c11(p):
-    return jnp.ones_like(p[...,0])
+    return torch.ones_like(p[:,0])
 def c22(p):
-    return jnp.ones_like(p[...,0])
+    return torch.ones_like(p[:,0])
 def c33(p):
-    return jnp.ones_like(p[...,0])
+    return torch.ones_like(p[:,0])
 def bfield(p):
-    return -kh*kh*jnp.ones_like(p[...,0])
-helmholtz = pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=pdo.const(-kh*kh))
+    return -kh*kh*jnp.ones_like(p[:,0])
+helmholtz = pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=pdo.const(-kh*kh))
 
 bnds = [[0.,0.,0.],[1.,1.,1.]]
-box_geom   = jnp.array(bnds)
+box_geom   = np.array(bnds)
 
 def gb(p):
     return np.abs(p[0]-bnds[0][0])<1e-14 or np.abs(p[0]-bnds[1][0])<1e-14 or np.abs(p[1]-bnds[0][1])<1e-14 or np.abs(p[1]-bnds[1][1])<1e-14
@@ -108,7 +108,7 @@ def gb_vec(P):
     )
 
 def bc(p):
-    return jnp.ones_like(p[...,0])
+    return np.ones_like(p[:,0])
 
 H = 1./4.
 N = (int)(1./H)
@@ -133,7 +133,7 @@ for i in range(N-1):
 period = 0.
 binary = False
 pvec = [6,8,10]
-a = [H/4.,1/32,1/32]
+a = [H/8.,1/32,1/32]
 nlvl = int(np.log2(1/(2*a[1])))
 if binary:
     nlvl *=2
@@ -160,10 +160,10 @@ for ind in range(len(indvec)):
         p = pvec[ind]
     else:
         H=Hvec[ind]
-    a= [H/8.,1/32,1/32]
+    a= np.array([H/8.,1/32,1/32])
     print("ppw = ",np.array( [p/a[0] , p*(2/a[1]) , p*(2/a[2]) ] )/nwaves)
     
-    opts = solverWrap.solverOptions('hps',[p,p,p],a)
+    opts = solverWrap.solverOptions('hpsalt',[p+2,p+2,p+2],a)
     if form == 'S':
         geom    = np.array([[0.,0.,0.],[2*H,1.,1.]])
         solver  = solverWrap.solverWrapper(opts)
