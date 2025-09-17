@@ -12,7 +12,7 @@ def c22(p):
     return np.ones_like(p[:,0])
 
 Lapl=pdo.PDO2d(c11,c22)
-k=8
+k=6
 ord = (2**k)+1
 disc = stencil.stencilSolver(Lapl,np.array([[0,0],[1,1]]),[ord,ord])
 
@@ -87,3 +87,103 @@ ip1 = vmaxr.T@Trr@vmaxr+vmaxb.T@Tbb@vmaxb
 ip2 = v.T@Tperm@v
 print("ip1/ip2 = ",ip1/ip2)
 print("H2 = ",1/(H*H))
+
+
+
+# harmonic extension property
+
+H=1./8.
+ord = 100
+ordx = ord
+bnds = np.array([[0,0],[H,1]])
+
+discH = stencil.stencilSolver(Lapl,bnds,[ordx,ord])
+XXi = discH.XXi
+XXb = discH.XXb
+Aii = discH.Aii
+Aib = discH.Aix
+Abi = discH.Axi
+Abb = discH.Axx
+
+
+
+Il = np.where((np.abs(XXb[:,0])<1e-10) & ( np.abs(XXb[:,1]) > 1e-10 ) & ( np.abs(XXb[:,1] -1 ) > 1e-10 ) )[0]
+gl = np.sin(np.pi*XXb[Il,1])
+sol_l = splinalg.spsolve(Aii,-Aib[:,Il]@gl)
+Tll = Abb[Il,:][:,Il]-Abi[Il,:]@splinalg.spsolve(Aii,Aib[:,Il])
+
+ip1 = gl@Tll@gl
+ip2 = gl@Abi[Il,:]@sol_l+gl@Abb[Il,:][:,Il]@gl
+print("ip err = ",np.abs(ip1-ip2)/np.abs(ip1))
+
+
+# thin strip property
+
+kvec = [1,2,3,4,5,6]
+c = np.zeros(shape = (len(kvec),))
+for indk in range(len(kvec)):
+    H=2**(-kvec[indk])
+    ord = 256
+    ordx = 8*(int)(ord*H)
+    print("ordx = ",ordx)
+    bnds = np.array([[0,0],[H,1]])
+
+    discH = stencil.stencilSolver(Lapl,bnds,[ordx,ord])
+    XXi = discH.XXi
+    XXb = discH.XXb
+    Aii = discH.Aii
+    Aib = discH.Aix
+    Abi = discH.Axi
+    Abb = discH.Axx
+
+
+    Il = np.where((np.abs(XXb[:,0])<1e-10) & ( np.abs(XXb[:,1]) > 1e-10 ) & ( np.abs(XXb[:,1] -1 ) > 1e-10 ) )[0]
+    Ir = np.where((np.abs(XXb[:,0]-H)<1e-10) & ( np.abs(XXb[:,1]) > 1e-10 ) & ( np.abs(XXb[:,1] -1 ) > 1e-10 ) )[0]
+    gl = np.sin(2*np.pi*XXb[Il,1])
+    gr = np.sqrt(4*np.pi*XXb[Il,1])-1
+    gr = gr
+
+
+
+
+    Tll = Abb[Il,:][:,Il]-Abi[Il,:]@splinalg.spsolve(Aii,Aib[:,Il])
+    Trr = Abb[Ir,:][:,Ir]-Abi[Ir,:]@splinalg.spsolve(Aii,Aib[:,Ir])
+    Tlr = Abb[Il,:][:,Ir]-Abi[Il,:]@splinalg.spsolve(Aii,Aib[:,Ir])
+    Trl = Abb[Ir,:][:,Il]-Abi[Ir,:]@splinalg.spsolve(Aii,Aib[:,Il])
+
+    nl = len(Il)
+    nr = len(Ir)
+
+    Ttot = np.zeros(shape = (nl+nr,nl+nr))
+
+    Ttot[0:nl,:][:,0:nl] = Tll.todense()
+    Ttot[nl:nl+nr,:][:,nl:nl+nr] = Trr.todense()
+    Ttot[0:nl,:][:,nl:nl+nr] = Tlr.todense()
+    Ttot[nl:nl+nr,:][:,0:nl] = Trl.todense()
+
+
+
+    [e,V] = np.linalg.eig(Ttot)
+
+    imin = np.argmin(abs(e))
+    vmin = V[:,imin]
+    vl = vmin[0:nl]
+    vr = vmin[nl:nl+nr]
+
+
+    ipl = vl.T@(Tll@vl)
+    ipr = vr.T@(Trr@vr)
+    iplr = vl.T@(Tlr@vr)
+    iprl = vr.T@(Trl@vl)
+
+    print("ipr+ipl = ",ipr+ipl)
+    print("iptot = ",ipr+ipl+iprl+iplr)
+    print("(ipr+ipl)/iptot = ",(ipr+ipl)/(ipr+ipl+iprl+iplr))
+    c[indk] = (ipr+ipl)/(ipr+ipl+iprl+iplr)
+Hvec = 2.**(-np.array(kvec))
+
+plt.figure(1)
+plt.loglog(Hvec,c)
+plt.loglog( Hvec,(1./(Hvec*Hvec))*c[0]*(Hvec[0]*Hvec[0]) ,linestyle="dashed")
+plt.legend(['coeff','O(1/H2)'])
+plt.show()
