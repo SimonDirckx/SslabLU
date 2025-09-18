@@ -177,6 +177,8 @@ for indk in range(len(kvec)):
     iprl = vr.T@(Trl@vl)
 
     print("ipr+ipl = ",ipr+ipl)
+    print("iprl = ",iprl)
+    print("iplr = ",iplr)
     print("iptot = ",ipr+ipl+iprl+iplr)
     print("(ipr+ipl)/iptot = ",(ipr+ipl)/(ipr+ipl+iprl+iplr))
     c[indk] = (ipr+ipl)/(ipr+ipl+iprl+iplr)
