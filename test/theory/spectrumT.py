@@ -12,7 +12,7 @@ def c22(p):
     return np.ones_like(p[:,0])
 
 Lapl=pdo.PDO2d(c11,c22)
-k=6
+k=5
 ord = (2**k)+1
 disc = stencil.stencilSolver(Lapl,np.array([[0,0],[1,1]]),[ord,ord])
 
@@ -42,33 +42,44 @@ Aii = disc.Aii
 T = Aii[I,:][:,I]-Aii[I,:][:,Ic]@(splinalg.spsolve(Aii[Ic,:][:,Ic],Aii[Ic,:][:,I])).todense()
 
 nc=ord-2
+Ir = []
+Ib = []
+
+
 
 S=T.copy()
 
 
 for i in range(len(I)//nc):
     S[i*nc:(i+1)*nc,:] = np.linalg.solve(T[i*nc:(i+1)*nc,:][:,i*nc:(i+1)*nc],T[i*nc:(i+1)*nc,:])
-plt.figure(1)
-plt.spy(S,1e-8)
+    if i%2==0:
+        Ir+=[j for j in range(i*nc,(i+1)*nc)]
+    else:
+        Ib+=[j for j in range(i*nc,(i+1)*nc)]
 
+nr = len(Ir)
+nb = len(Ib)
+Trr = T[Ir,:][:,Ir]
+Tbb = T[Ib,:][:,Ib]
+Trb = T[Ir,:][:,Ib]
+Tbr = T[Ib,:][:,Ir]
+
+
+Trbbr = np.zeros(shape = T.shape)
+Trbbr[:nr,:][:,nr:nr+nb] = Trb
+Trbbr[nr:nr+nb,:][:,:nr] = Tbr
+plt.figure(1)
+plt.spy(Trbbr)
+plt.show()
 
 
 [e,V] = np.linalg.eig(T)
-[eS,VS] = np.linalg.eig(S)
+eMat = np.zeros(shape=(len(e),2))
+eMat[:,0] = np.real(e)
+eMat[:,1] = np.imag(e)
 
-print("mne = ",np.min(e))
-print("mxe = ",np.max(e))
-print("condest = ",np.max(e)/np.min(e))
-print("=========================")
-print("mneS = ",np.min(eS))
-print("mxeS = ",np.max(eS))
-print("condestS = ",np.max(eS)/np.min(eS))
-
-
-plt.figure(2)
-plt.scatter(np.real(e),np.imag(e))
-
-plt.figure(3)
-plt.scatter(np.real(eS),np.imag(eS))
-
-plt.show()
+filename = "spectrumT_"+str(h)+".csv"
+header = "real,imag"
+with open(filename,'w') as f:
+    f.write(header+'\n')
+    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
