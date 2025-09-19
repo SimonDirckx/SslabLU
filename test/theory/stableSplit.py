@@ -121,6 +121,7 @@ print("ip err = ",np.abs(ip1-ip2)/np.abs(ip1))
 
 kvec = [1,2,3,4,5,6]
 c = np.zeros(shape = (len(kvec),))
+ctild = np.zeros(shape = (len(kvec),))
 for indk in range(len(kvec)):
     H=2**(-kvec[indk])
     ord = 256
@@ -155,11 +156,15 @@ for indk in range(len(kvec)):
     nr = len(Ir)
 
     Ttot = np.zeros(shape = (nl+nr,nl+nr))
+    T0 = np.zeros(shape = (nl+nr,nl+nr))
 
     Ttot[0:nl,:][:,0:nl] = Tll.todense()
     Ttot[nl:nl+nr,:][:,nl:nl+nr] = Trr.todense()
     Ttot[0:nl,:][:,nl:nl+nr] = Tlr.todense()
     Ttot[nl:nl+nr,:][:,0:nl] = Trl.todense()
+
+    T0[0:nl,:][:,nl:nl+nr] = Tlr.todense()
+    T0[nl:nl+nr,:][:,0:nl] = Trl.todense()
 
 
 
@@ -181,11 +186,36 @@ for indk in range(len(kvec)):
     print("iplr = ",iplr)
     print("iptot = ",ipr+ipl+iprl+iplr)
     print("(ipr+ipl)/iptot = ",(ipr+ipl)/(ipr+ipl+iprl+iplr))
+    print("========================================")
     c[indk] = (ipr+ipl)/(ipr+ipl+iprl+iplr)
+
+    [e0,V0] = np.linalg.eig(T0)
+
+    imin = np.argmin(e0)
+    vmin = V0[:,imin]
+    vl = vmin[0:nl]
+    vr = vmin[nl:nl+nr]
+
+
+    ipl = vl.T@(Tll@vl)
+    ipr = vr.T@(Trr@vr)
+    iplr = vl.T@(Tlr@vr)
+    iprl = vr.T@(Trl@vl)
+
+    print("ipr+ipl = ",ipr+ipl)
+    print("iprl = ",iprl)
+    print("iplr = ",iplr)
+    print("iptot = ",ipr+ipl+iprl+iplr)
+    print("(ipr+ipl)/iptot = ",(ipr+ipl)/(ipr+ipl+iprl+iplr))
+    ctild[indk] = (ipr+ipl)/(ipr+ipl+iprl+iplr)
+
+
+
 Hvec = 2.**(-np.array(kvec))
 
 plt.figure(1)
 plt.loglog(Hvec,c)
+plt.loglog(Hvec,ctild)
 plt.loglog( Hvec,(1./(Hvec*Hvec))*c[0]*(Hvec[0]*Hvec[0]) ,linestyle="dashed")
-plt.legend(['coeff','O(1/H2)'])
+plt.legend(['coeff','ctild','O(1/H2)'])
 plt.show()
