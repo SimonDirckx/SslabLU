@@ -103,18 +103,10 @@ class oms:
         st_l = stMap(Linop_l,XXb[Il,...],XXi[Ic,...])
         return st_l,st_r
 
-    def construct_Stot_and_rhstot(self,bc,assembler,dbg=0):
-        '''
-        construct S operator and total global rhs
-
-
-        EXPLAINER OF CONVENTIONS:
-            - global dof ordering is inferred from the supplied connectivity
-            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
-            - no domain checks are done (garbage in, garbage out)
-            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
-            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
-        '''
+    def construct_Stot_helper(self, bc, assembler, dbg=0):
+        """
+        construct S_rk_list needed for S operator, whether iterative or direct
+        """
         connectivity    = self.connectivity
         slabs           = self.slabList
         Ntot = 0
@@ -224,6 +216,29 @@ class oms:
         self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
+
+        print("#\n# self.glob_target_dofs:\n#")
+        print(self.glob_target_dofs)
+        print("#\n# S_rk_list:\n#")
+        print(S_rk_list)
+
+        print("###\n###\n### WE NEED TO USE S_rk_list TO BUILD DENSE MATRIX\n###\n###")
+
+        return S_rk_list, rhs_list, Ntot, nc
+
+
+    def construct_Stot_and_rhstot(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
+        '''
+        construct S operator and total global rhs
+
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
+            - no domain checks are done (garbage in, garbage out)
+            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
+            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
+        '''
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
@@ -237,11 +252,11 @@ class oms:
             if (not transpose):
                 for i in range(len(self.glob_target_dofs)):
                     for j in range(len(self.glob_source_dofs[i])):
-                            result[glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
+                            result[self.glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
             else:
-                for i in range(len(glob_target_dofs)):
+                for i in range(len(self.glob_target_dofs)):
                     for j in range(len(self.glob_source_dofs[i])):
-                            result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[glob_target_dofs[i]]
+                            result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[self.glob_target_dofs[i]]
             if (v.ndim == 1):
                 result = result.flatten()
             return result
