@@ -83,7 +83,7 @@ print("#\n# H:\n#")
 print(H)
 
 formulation = "hps"
-p = 8
+p = 10
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -92,8 +92,7 @@ a = np.array([H/8.,1/8,1/8])
 assembler = mA.rkHMatAssembler(p*p,50)
 opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler,dbg=2)
-Stot,rhstot = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+Stot,rhstot = OMS.construct_Stot_and_rhstot(bc, assembler,dbg=2)
 
 print("#\n# Stot:\n#")
 print(Stot)

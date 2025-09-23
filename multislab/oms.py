@@ -105,7 +105,14 @@ class oms:
 
     def construct_Stot_helper(self, bc, assembler, dbg=0):
         """
-        construct S_rk_list needed for S operator, whether iterative or direct
+        construct S_rk_list and other helpers needed for S operator, whether iterative or direct
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
+            - no domain checks are done (garbage in, garbage out)
+            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
+            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
         """
         connectivity    = self.connectivity
         slabs           = self.slabList
@@ -227,7 +234,7 @@ class oms:
         return S_rk_list, rhs_list, Ntot, nc
 
 
-    def construct_Stot_and_rhstot(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
+    def construct_Stot_and_rhstot_linearOperator(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
         '''
         construct S operator and total global rhs
 
@@ -264,6 +271,14 @@ class oms:
         Linop = LinearOperator(shape=(Ntot,Ntot),\
         matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
         matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
+        return Linop,rhstot
+
+    def construct_Stot_and_rhstot(self, bc, assembler, dbg=0):
+
+        S_rk_list, rhs_list, Ntot, nc = self.construct_Stot_helper(bc,assembler,dbg)
+
+        Linop,rhstot = self.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg)
+
         return Linop,rhstot
     
 
