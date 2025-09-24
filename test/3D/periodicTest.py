@@ -49,9 +49,10 @@ wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
-jax_avail   = False
-torch_avail = True
-hpsalt      = True
+jax_avail    = False
+torch_avail  = True
+hpsalt       = True
+direct_solve = True
 
 if jax_avail:
     def bfield(p,kh):
@@ -76,13 +77,6 @@ def u_exact(p):
 N = 8
 dSlabs,connectivity,H = squareTorus.dSlabs(N)
 
-print("#\n# dSlabs:\n#")
-print(dSlabs)
-print("#\n# connectivity:\n#")
-print(connectivity)
-print("#\n# H:\n#")
-print(H)
-
 formulation = "hps"
 p = 10
 p_disc = p
@@ -96,33 +90,9 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torc
 
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
-print("len(S_rk_list): ", len(S_rk_list))
-print("length of sublists: ", [len(_) for _ in S_rk_list])
-
-# For testing, let's try replacing all S_rk with offdiagonal operators that loosely resembles 1D 2nd order FD:
-#ZERO = np.zeros(S_rk_list[0][0].shape)
-#offdiag = -0.25 * np.eye(S_rk_list[0][0].shape[0])
-#S_rk_list = [[ZERO]] + [[ZERO, ZERO]] * (N-2) + [[ZERO]]
-#S_rk_list = [[offdiag, offdiag]] * N
-
-#print("#\n# S_rk_list:\n#")
-#print(S_rk_list)
-
-Stot,rhstot = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-
-#T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
-#uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
-
+Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
 uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
-
-print("Investigating T:")
-A, B, C = T
-print(len(A), len(B), len(C))
-
-#print([np.max(np.abs(_ - ZERO)) for _ in A])
-#print([np.max(np.abs(_ - np.eye(ZERO.shape[0]))) for _ in B])
-#print([np.max(np.abs(_ - ZERO)) for _ in C])
 
 gInfo = gmres_info()
 stol = 1e-8*H*H
@@ -132,9 +102,6 @@ if Version(scipy.__version__)>=Version("1.14"):
 else:
     uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=300,restart=300)
 
-print("rhstot.shape: ", rhstot.shape)
-print("uhat.shape: ", uhat.shape)
-
 stop_solve = time.time()
 res = Stot@uhat-rhstot
 
@@ -142,8 +109,9 @@ res = Stot@uhat-rhstot
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
-print("Now we'll use solution from direct solver to get overall result:")
-uhat = uhat_direct
+if direct_solve:
+    print("We'll use solution from direct solver to get overall result:")
+    uhat = uhat_direct
 
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)

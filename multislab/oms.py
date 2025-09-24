@@ -224,11 +224,6 @@ class oms:
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
 
-        print("#\n# self.glob_source_dofs:\n#")
-        print(self.glob_source_dofs)
-        print("#\n# self.glob_target_dofs:\n#")
-        print(self.glob_target_dofs)
-
         return S_rk_list, rhs_list, Ntot, nc
 
 
