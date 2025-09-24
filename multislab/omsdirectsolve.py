@@ -51,8 +51,8 @@ def build_block_tridiagonal_solver(S_rk_list):
     B = [I] # Set initial B_i to identity matrix
     C = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
 
-    for i in range(1, n):
-        A_i = S_rk_list[i][0] @ B[-1]
+    for i in range(1, n+1):
+        A_i = S_rk_list[i][0] @ np.linalg.solve(B[-1], I)
         B_i = I - A_i @ (C[i-1] @ I)
 
         A.append(A_i)
@@ -60,11 +60,12 @@ def build_block_tridiagonal_solver(S_rk_list):
 
     return A, B, C
 
-def block_tridiagonal_solve(OMS, A, B, C, rhs):
+def block_tridiagonal_solve(OMS, T, rhs):
     """
     Given precomputed factors for T and a RHS d, this solves Tx = d
     Note that d can be a matrix (i.e. this can handle multiple RHS)
     """
+    A, B, C = T
     n       = len(A)
     indices = OMS.glob_target_dofs
 
@@ -73,14 +74,14 @@ def block_tridiagonal_solve(OMS, A, B, C, rhs):
     #
     # For i = 1 to n, we have d_i = d_i - A_i d_i-1
     #
-    for i in range(1, n):
+    for i in range(1, n+1):
         d[indices[i]] = d[indices[i]] - A[i-1] @ d[indices[i-1]]
 
     #
     # Then for i = n-1 to 0, we have x_n = B_n \ d_n,   x_i = B_i \ (d_i - C_i x_i+1)
     #
     x             = np.zeros(d.shape)
-    x[indices[n]] = np.linalg.solve(B[-1], d[indices[n]])
+    x[indices[n]] = np.linalg.solve(B[n], d[indices[n]])
 
     for i in range(n-1, -1, -1):
         x[indices[i]] = np.linalg.solve(B[i], d[indices[i]] - C[i] @ x[indices[i+1]])
@@ -127,7 +128,7 @@ def build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc):
     #
     # Now that we have the components of the tridiagonal solver and U,V, we can apply the SMW formula
     #
-    Z = block_tridiagonal_solve(OMS, A, B, C, U)
+    Z = block_tridiagonal_solve(OMS, (A, B, C), U)
 
     smw_block = Z @ np.linalg.solve(np.eye(2*m, dtype=E.dtype) + V.T @ Z, V.T)
 
@@ -142,9 +143,8 @@ def block_cyclic_tridiagonal_solve(OMS, T, smw_block, d):
 
     Note that d can be a matrix (i.e. this can handle multiple RHS)
     """
-    A, B, C = T
 
-    y = block_tridiagonal_solve(OMS, A, B, C, d)
+    y = block_tridiagonal_solve(OMS, T, d)
     x = y - smw_block @ y
 
     return x

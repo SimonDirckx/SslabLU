@@ -228,10 +228,6 @@ class oms:
         print(self.glob_source_dofs)
         print("#\n# self.glob_target_dofs:\n#")
         print(self.glob_target_dofs)
-        print("#\n# S_rk_list:\n#")
-        print(S_rk_list)
-
-        print("###\n###\n### WE NEED TO USE S_rk_list TO BUILD DENSE MATRIX\n###\n###")
 
         return S_rk_list, rhs_list, Ntot, nc
 

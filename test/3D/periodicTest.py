@@ -84,7 +84,7 @@ print("#\n# H:\n#")
 print(H)
 
 formulation = "hps"
-p = 6
+p = 8
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -95,11 +95,34 @@ opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
 
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+
+print("len(S_rk_list): ", len(S_rk_list))
+print("length of sublists: ", [len(_) for _ in S_rk_list])
+
+# For testing, let's try replacing all S_rk with 0 operators:
+#ZERO = np.zeros(S_rk_list[0][0].shape)
+#offdiag = -0.25 * np.eye(S_rk_list[0][0].shape[0])
+#S_rk_list = [[ZERO]] + [[ZERO, ZERO]] * (N-2) + [[ZERO]]
+#S_rk_list = [[offdiag]] + [[offdiag, offdiag]] * (N-2) + [[offdiag]]
+
+#print("#\n# S_rk_list:\n#")
+#print(S_rk_list)
+
 Stot,rhstot = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
 
-T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
+#T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
+#uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
 
-uhat_direct = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
+T = omsdirectsolve.build_block_tridiagonal_solver(S_rk_list)
+uhat_direct  = omsdirectsolve.block_tridiagonal_solve(OMS, T, rhstot)
+
+print("Investigating T:")
+A, B, C = T
+print(len(A), len(B), len(C))
+
+#print([np.max(np.abs(_ - ZERO)) for _ in A])
+#print([np.max(np.abs(_ - np.eye(ZERO.shape[0]))) for _ in B])
+#print([np.max(np.abs(_ - ZERO)) for _ in C])
 
 gInfo = gmres_info()
 stol = 1e-8*H*H
@@ -109,6 +132,9 @@ if Version(scipy.__version__)>=Version("1.14"):
 else:
     uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=300,restart=300)
 
+print("rhstot.shape: ", rhstot.shape)
+print("uhat.shape: ", uhat.shape)
+
 stop_solve = time.time()
 res = Stot@uhat-rhstot
 
@@ -117,6 +143,7 @@ print("Relative error of iterative solve vs direct solve with Thomas Algorithm p
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
 
+"""
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p_disc)
@@ -150,3 +177,5 @@ for slabInd in range(len(connectivity)):
     errInf = np.max([errInf,errI])
     print(errI)
 print("sup norm error = ",errInf)
+
+"""
