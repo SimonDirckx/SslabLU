@@ -91,16 +91,27 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torc
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
 Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+start_time   = time.perf_counter()
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
+end_time     = time.perf_counter()
+
+elapsed_time_direct_factor = end_time - start_time
+
+start_time   = time.perf_counter()
 uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
+end_time     = time.perf_counter()
+elapsed_time_direct_solve = end_time - start_time
 
 gInfo = gmres_info()
 stol = 1e-8*H*H
 
+start_time = time.perf_counter()
 if Version(scipy.__version__)>=Version("1.14"):
     uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=300,restart=300)
 else:
     uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=300,restart=300)
+end_time = time.perf_counter()
+elapsed_time_iterative = end_time - start_time
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot
@@ -108,6 +119,10 @@ res = Stot@uhat-rhstot
 
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
+
+print(f"Elapsed time for iterative solve: {elapsed_time_iterative} seconds")
+print(f"Elapsed time for direct factorization: {elapsed_time_direct_factor} seconds")
+print(f"Elapsed time for direct solve: {elapsed_time_direct_solve} seconds")
 
 if direct_solve:
     print("We'll use solution from direct solver to get overall result:")
