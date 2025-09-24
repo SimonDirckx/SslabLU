@@ -84,7 +84,7 @@ print("#\n# H:\n#")
 print(H)
 
 formulation = "hps"
-p = 8
+p = 10
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -99,11 +99,11 @@ S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 print("len(S_rk_list): ", len(S_rk_list))
 print("length of sublists: ", [len(_) for _ in S_rk_list])
 
-# For testing, let's try replacing all S_rk with 0 operators:
+# For testing, let's try replacing all S_rk with offdiagonal operators that loosely resembles 1D 2nd order FD:
 #ZERO = np.zeros(S_rk_list[0][0].shape)
 #offdiag = -0.25 * np.eye(S_rk_list[0][0].shape[0])
 #S_rk_list = [[ZERO]] + [[ZERO, ZERO]] * (N-2) + [[ZERO]]
-#S_rk_list = [[offdiag]] + [[offdiag, offdiag]] * (N-2) + [[offdiag]]
+#S_rk_list = [[offdiag, offdiag]] * N
 
 #print("#\n# S_rk_list:\n#")
 #print(S_rk_list)
@@ -113,8 +113,8 @@ Stot,rhstot = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Nt
 #T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
 #uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
 
-T = omsdirectsolve.build_block_tridiagonal_solver(S_rk_list)
-uhat_direct  = omsdirectsolve.block_tridiagonal_solve(OMS, T, rhstot)
+T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
+uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
 
 print("Investigating T:")
 A, B, C = T
@@ -142,8 +142,9 @@ res = Stot@uhat-rhstot
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
+print("Now we'll use solution from direct solver to get overall result:")
+uhat = uhat_direct
 
-"""
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p_disc)
@@ -178,4 +179,3 @@ for slabInd in range(len(connectivity)):
     print(errI)
 print("sup norm error = ",errInf)
 
-"""

@@ -272,12 +272,7 @@ def dSlabs(N):
     for n in range(N):
         c = bnds[0][0]+n*H
         bnds_n = [[c-H,bnds[0][1],bnds[0][2]],[c+H,bnds[1][1],bnds[1][2]]]
-        if n==0:
-            connectivity+=[[-1,(n+1)%N]]
-        elif n==N-1:
-            connectivity+=[[(n-1)%N,-1]]
-        else:
-            connectivity+=[[(n-1)%N,(n+1)%N]]
+        connectivity+=[[(n-1)%N,(n+1)%N]]
         dSlabs+=[bnds_n]
     return dSlabs,connectivity,H
     
