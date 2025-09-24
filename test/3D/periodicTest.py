@@ -9,6 +9,7 @@ from packaging.version import Version
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
+import multislab.omsdirectsolve as omsdirectsolve
 
 # validation&testing
 import time
@@ -83,7 +84,7 @@ print("#\n# H:\n#")
 print(H)
 
 formulation = "hps"
-p = 10
+p = 6
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -92,18 +93,13 @@ a = np.array([H/8.,1/8,1/8])
 assembler = mA.rkHMatAssembler(p*p,50)
 opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc, assembler,dbg=2)
 
-print("#\n# Stot:\n#")
-print(Stot)
-import sys
-np.set_printoptions(threshold=sys.maxsize, precision=2, linewidth=np.inf)
+S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+Stot,rhstot = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
 
-identity_matrix = np.eye(Stot.shape[1])
-dense_Stot      = Stot @ identity_matrix
+T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
 
-print("Dense:")
-#print(dense_Stot)
+uhat_direct = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
 
 gInfo = gmres_info()
 stol = 1e-8*H*H
@@ -115,6 +111,10 @@ else:
 
 stop_solve = time.time()
 res = Stot@uhat-rhstot
+
+
+print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
+print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
 
 print("=============SUMMARY==============")
