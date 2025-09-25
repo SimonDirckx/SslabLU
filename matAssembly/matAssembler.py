@@ -52,7 +52,7 @@ class matAssembler:
         if self.matOpts.method == 'dense':
             M=linOp@np.identity(linOp.shape[1])
             self.stats.nbytes = M.nbytes
-            return M
+            return M #linOp
         
         if self.matOpts.method == 'epsHBS':
             

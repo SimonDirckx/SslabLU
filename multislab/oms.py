@@ -10,6 +10,7 @@ import time
 import sys
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import scipy.sparse.linalg as splinalg
 #import gc
     
 
@@ -75,9 +76,11 @@ class oms:
         self.glob_source_dofs=glob_source_dofs
 
     def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
-        A_solver = solver.solver_ii    
+        A_solver = solver.solver_ii
         def smatmat(v,I,J,transpose=False):
+            print("v shape = ",v.shape)
             if (v.ndim == 1):
+                print("ndim == 1 called")
                 v_tmp = v[...,np.newaxis]
             else:
                 v_tmp = v
@@ -85,6 +88,7 @@ class oms:
             if (not transpose):
                 result = (A_solver@(solver.Aib[...,J]@v_tmp))[I,...]
             else:
+                
                 result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
                 result[I,:] = v_tmp
                 result      = solver.Aib[...,J].T @ (A_solver.T@(result))
@@ -182,12 +186,15 @@ class oms:
                     Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                     Ul=st_l.A@Vl
                     Ulhat=rkMat_l@Vl
-                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
+                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
+                    print("LEFT ERR = ",np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
                 if bool_r:
                     Vr=np.random.standard_normal(size=(st_r.A.shape[1],assembler.matOpts.maxRank))
                     Ur=st_r.A@Vr
                     Urhat=rkMat_r@Vr
-                    relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
+                    errr = np.linalg.norm(Ur-Urhat)/( np.linalg.norm(Ur)*Ur.shape[1] )
+                    relerrr = max(relerrr,errr)
+                    print("RIGHT ERR = ",errr)
             if dbg>1:
                 print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
                 if bool_l and bool_r:

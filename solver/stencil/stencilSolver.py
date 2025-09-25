@@ -68,7 +68,7 @@ class stencilSolver(AbstractPDESolver):
         - ord (list[int])   : order in the x,y and (possibly) z-direction
         """
 
-        self._box_geom = geom#geom.bounds
+        self._box_geom = geom.bounds
         ndim = self._box_geom.shape[-1]
         print("ndim = ",ndim)
         self._geom     = geom
