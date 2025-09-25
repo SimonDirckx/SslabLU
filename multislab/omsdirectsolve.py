@@ -5,6 +5,7 @@ from solver.solver import stMap
 import numpy as np
 import solver.solver as solverWrap
 from scipy.sparse.linalg   import LinearOperator
+from scipy.linalg   import lu_factor, lu_solve
 from solver.solver import stMap
 import time
 import sys
@@ -46,14 +47,19 @@ def build_block_tridiagonal_solver(S_rk_list):
     n = len(S_rk_list) - 1 # Accounts for E and F in periodic case
     I = np.eye(m, dtype=S_rk_list[0][0].dtype)
 
+    B_0 = lu_factor(I)
+
     # Thus we need three lists of block matrices: A, B, and C:
     A = []
-    B = [I] # Set initial B_i to identity matrix
+    B = [B_0] # Set initial B_i to identity matrix LU factor (can specialize this to be just identity later)
     C = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
 
     for i in range(1, n+1):
-        A_i = S_rk_list[i][0] @ np.linalg.solve(B[-1], I)
+        A_i = S_rk_list[i][0] @ lu_solve(B[-1], I)
         B_i = I - A_i @ (C[i-1] @ I)
+
+        # Factorize B_i since it's always used in a solve. This means B_i will now be a tuple:
+        B_i = lu_factor(B_i, overwrite_a=True)
 
         A.append(A_i)
         B.append(B_i)
@@ -81,10 +87,10 @@ def block_tridiagonal_solve(OMS, T, rhs):
     # Then for i = n-1 to 0, we have x_n = B_n \ d_n,   x_i = B_i \ (d_i - C_i x_i+1)
     #
     x             = np.zeros(d.shape)
-    x[indices[n]] = np.linalg.solve(B[n], d[indices[n]])
+    x[indices[n]] = lu_solve(B[n], d[indices[n]])
 
     for i in range(n-1, -1, -1):
-        x[indices[i]] = np.linalg.solve(B[i], d[indices[i]] - C[i] @ x[indices[i+1]])
+        x[indices[i]] = lu_solve(B[i], d[indices[i]] - C[i] @ x[indices[i+1]])
 
     return x
 
