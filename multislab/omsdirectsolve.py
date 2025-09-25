@@ -47,16 +47,18 @@ def build_block_tridiagonal_solver(S_rk_list):
     n = len(S_rk_list) - 1 # Accounts for E and F in periodic case
     I = np.eye(m, dtype=S_rk_list[0][0].dtype)
 
-    B_0 = lu_factor(I)
-
     # Thus we need three lists of block matrices: A, B, and C:
     A = []
-    B = [B_0] # Set initial B_i to identity matrix LU factor (can specialize this to be just identity later)
+    B = [I] # Set initial B_i to identity matrix LU factor (can specialize this to be just identity later)
     C = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
 
     for i in range(1, n+1):
-        A_i = S_rk_list[i][0] @ lu_solve(B[-1], I)
-        B_i = I - A_i @ (C[i-1] @ I)
+        if i==1:
+            A_i = S_rk_list[i][0] @ B[-1]
+        else:
+            A_i = S_rk_list[i][0] @ lu_solve(B[-1], I)
+            
+        B_i = I - C[i-1].rmatmat(A_i.T).T
 
         # Factorize B_i since it's always used in a solve. This means B_i will now be a tuple:
         B_i = lu_factor(B_i, overwrite_a=True)
@@ -89,8 +91,11 @@ def block_tridiagonal_solve(OMS, T, rhs):
     x             = np.zeros(d.shape)
     x[indices[n]] = lu_solve(B[n], d[indices[n]])
 
-    for i in range(n-1, -1, -1):
+    for i in range(n-1, 0, -1):
         x[indices[i]] = lu_solve(B[i], d[indices[i]] - C[i] @ x[indices[i+1]])
+
+    # Since B[0] is the identity matrix, we can avoid a solve there:
+    x[indices[0]] = d[indices[0]] - C[0] @ x[indices[1]]
 
     return x
 
