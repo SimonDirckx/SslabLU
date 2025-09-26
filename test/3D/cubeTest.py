@@ -108,9 +108,9 @@ for indp in range(len(pvec)):
     print("N = ",Stot.shape)
 
 
-    nx=5
-    ny=20
-    nz=20
+    nx=50
+    ny=200
+    nz=200
 
     xpts = np.linspace(0,1,nx)
     ypts = np.linspace(0,1,ny)
