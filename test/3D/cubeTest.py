@@ -67,7 +67,7 @@ else:
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
 print(connectivity)
-pvec = np.array([6,7],dtype = np.int64)
+pvec = np.array([4,5,6,7,8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
@@ -126,7 +126,7 @@ for indp in range(len(pvec)):
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
         print("GEOM = ",geom)
-        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]))[0]
+        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
         print("len I0 = ",len(I0))
         YY0 = YY[I0,:]
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,True))
