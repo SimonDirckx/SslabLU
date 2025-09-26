@@ -60,21 +60,21 @@ else:
     Lapl=pdo.PDO3d(c11,c22,c33,None,None,None,c)
     def bc(p):
         source_loc = np.array([-.5,-.2,1])
-        rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=0))
+        rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
         return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
 
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
 print(connectivity)
-pvec = np.array([4,6,8,10],dtype = np.int64)
+pvec = np.array([6,7],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 for indp in range(len(pvec)):
     p = pvec[indp]
-    a = [H/8,1/32,1/32]
-    assembler = mA.rkHMatAssembler(p,125)
+    a = [H/6,1/32,1/32]
+    assembler = mA.rkHMatAssembler(p,75)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions('hps',[p,p,p],a)
     OMS = oms.oms(dSlabs,Lapl,lambda p:cube.gb(p,True),opts,connectivity)
