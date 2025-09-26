@@ -2,15 +2,13 @@ import numpy as np
 import jax.numpy as jnp
 
 
-bnds = [[0,0,0][1,1,1]]
-def bnds():
-    return bnds
+bnds = [[0,0,0],[1,1,1]]
 
 def gb_np(p):
-    return ((np.abs(p[:,0]-bnds[0][0]))<1e-14) | ((np.abs(p[:,0]-bnds[1][0]))<1e-14) | ((np.abs(p[:,1]-bnds[0][1]))<1e-14) | ((np.abs(p[:,1]-bnds[1][1]))<1e-14) | (np.abs(p[:,2]-bnds[0][2])<1e-14) | (np.abs(p[:,2]-bnds[1][2])<1e-14)
+    return ((np.abs(p[:,0]-bnds[0][0]))<1e-14) | ((np.abs(p[:,0]-bnds[1][0]))<1e-14) | ((np.abs(p[:,1]-bnds[0][1]))<1e-14) | ((np.abs(p[:,1]-bnds[1][1]))<1e-14) | ((np.abs(p[:,2]-bnds[0][2]))<1e-14) | ((np.abs(p[:,2]-bnds[1][2]))<1e-14)
 
 def gb_jnp(p):
-    return ((jnp.abs(p[...,0]-bnds[0][0]))<1e-14) | ((jnp.abs(p[...,0]-bnds[1][0]))<1e-14) | ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
+    return ((jnp.abs(p[...,0]-bnds[0][0]))<1e-14) | ((jnp.abs(p[...,0]-bnds[1][0]))<1e-14) | ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | ((jnp.abs(p[...,2]-bnds[0][2]))<1e-14) | ((jnp.abs(p[...,2]-bnds[1][2]))<1e-14)
 
 def gb(p,jax_avail = True):
     if jax_avail:
@@ -35,8 +33,8 @@ def dSlabs(N):
         c = bnds[0][0]+(n+1)*H
         bnds_n = [[c-H,bnds[0][1],bnds[0][2]],[c+H,bnds[1][1],bnds[1][2]]]
         if n == 0:
-            connectivity+=[[-1,n+1]]
-        if n == N-2:
+            connectivity+=[[-1,1]]
+        elif n == N-2:
             connectivity+=[[n-1,-1]]
         else:
             connectivity+=[[n-1,n+1]]

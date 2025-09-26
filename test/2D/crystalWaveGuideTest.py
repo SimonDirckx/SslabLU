@@ -128,15 +128,14 @@ N = 8
 dSlabs,connectivity,H = square.dSlabs(N)
 print(connectivity)
 pvec = np.array([8,10,12,14,16,18,20,22,24,26,28,30],dtype = np.int64)
-#pvec = np.array([32],dtype = np.int64) # ref sol
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 for indp in range(len(pvec)):
     p = pvec[indp]
     a = [H/8,1/64]
-    assembler = mA.rkHMatAssembler(p,20)
-    #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
+    #assembler = mA.rkHMatAssembler(p,25)
+    assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions('hps',[p,p],a)
     OMS = oms.oms(dSlabs,Lapl,lambda p:square.gb(p,True),opts,connectivity)
     print("computing Stot & rhstot...")
@@ -146,13 +145,13 @@ for indp in range(len(pvec)):
     gInfo = gmres_info()
     stol = 1e-10*H*H
 
-    if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=400,restart=400)
-    else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=400,restart=400)
+    #if Version(scipy.__version__)>=Version("1.14"):
+    #    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=400,restart=400)
+    #else:
+    #    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=400,restart=400)
     #stop_solve = time.time()
-    #Sdense = Stot@np.identity(Stot.shape[1])
-    #uhat = np.linalg.solve(Sdense,rhstot)
+    Sdense = Stot@np.identity(Stot.shape[0])
+    uhat = np.linalg.solve(Sdense,rhstot)
     res = Stot@uhat-rhstot
 
 
@@ -160,7 +159,7 @@ for indp in range(len(pvec)):
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
     print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-    #print("GMRES iters              = ", gInfo.niter)
+    print("GMRES iters              = ", gInfo.niter)
     print("==================================")
 
     nc = OMS.nc
@@ -210,6 +209,7 @@ for indp in range(len(pvec)):
 
     gref = np.load('ref_sol_waveguide.npy')
     #np.save('ref_sol_waveguide.npy',gYY)
+    
     print("err ref = ",np.linalg.norm(gref-gYY)/np.linalg.norm(gref))
     err[indp] = np.linalg.norm(gref-gYY)/np.linalg.norm(gref)
     compr_time[indp] = OMS.stats.compr_timing

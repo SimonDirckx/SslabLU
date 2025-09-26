@@ -110,6 +110,7 @@ class solverWrapper:
             self.Aib = solver.Aix
             self.Abi = solver.Axi
             self.Abb = solver.Axx
+            self.Aii = solver.Aii
             tic      = time()
             print("start solver")
             self.solver_ii = solver.solver_Aii

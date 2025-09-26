@@ -88,7 +88,6 @@ class oms:
             if (not transpose):
                 result = (A_solver@(solver.Aib[...,J]@v_tmp))[I,...]
             else:
-                
                 result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
                 result[I,:] = v_tmp
                 result      = solver.Aib[...,J].T @ (A_solver.T@(result))
@@ -166,10 +165,12 @@ class oms:
             compression_l = 0 
             compression_r = 0
             if bool_r:
+                print("CONSTRUCTING R")
                 rkMat_r = assembler.assemble(st_r,dbg=dbg)
                 self.nbytes+=assembler.stats.nbytes
                 compression_r = assembler.stats.nbytes
             if bool_l:
+                print("CONSTRUCTING L")
                 rkMat_l = assembler.assemble(st_l,dbg=dbg)
                 compression_l = assembler.stats.nbytes
                 self.nbytes+=assembler.stats.nbytes
