@@ -108,9 +108,9 @@ for indp in range(len(pvec)):
     print("N = ",Stot.shape)
 
 
-    nx=50
-    ny=200
-    nz=200
+    nx=5
+    ny=20
+    nz=20
 
     xpts = np.linspace(0,1,nx)
     ypts = np.linspace(0,1,ny)
@@ -125,7 +125,8 @@ for indp in range(len(pvec)):
 
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
-        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
+        print("GEOM = ",geom)
+        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]))[0]
         print("len I0 = ",len(I0))
         YY0 = YY[I0,:]
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,True))
@@ -144,7 +145,7 @@ for indp in range(len(pvec)):
         uu = solver.solver.solve_dir_full(g)
         uu=uu.flatten()
         ghat = solver.interp(YY0,uu)
-        print("norm ghat = ",np.linalg.norm(ghat,ord=np.inf))
+        print("err ghat = ",np.linalg.norm(ghat-bc(YY0))/np.linalg.norm(bc(YY0)))
         gYY[I0] = ghat
 
     #triang = tri.Triangulation(YY[:,0],YY[:,1])
