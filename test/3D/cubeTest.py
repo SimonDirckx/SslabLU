@@ -46,7 +46,7 @@ if jax_avail:
     def bc(p):
         source_loc = jnp.array([-.5,-.2,1.])
         rr = jnp.sqrt(jnp.linalg.norm(p-source_loc.T,axis=1))
-        return jnp.real(jnp.exp(-1j*kh*rr)/(4*jnp.pi*rr))
+        return jnp.real(jnp.exp(1j*kh*rr)/(4*jnp.pi*rr))
     
 else:
     def c11(p):
@@ -61,7 +61,7 @@ else:
     def bc(p):
         source_loc = np.array([-.5,-.2,1])
         rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=0))
-        return np.real(np.exp(-1j*kh*rr)/(4*np.pi*rr))
+        return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
 
 
 N = 8
