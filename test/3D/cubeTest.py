@@ -32,7 +32,7 @@ class gmres_info(object):
 
 
 jax_avail=True
-kh = 5.1
+kh = .25
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -47,6 +47,7 @@ if jax_avail:
         source_loc = jnp.array([-.5,-.2,1.])
         rr = jnp.sqrt(jnp.linalg.norm(p-source_loc.T,axis=1))
         return jnp.real(jnp.exp(1j*kh*rr)/(4*jnp.pi*rr))
+        #return jnp.sin(kh*p[...,0])
     
 else:
     def c11(p):
@@ -62,19 +63,20 @@ else:
         source_loc = np.array([-.5,-.2,1])
         rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
         return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
+        #return np.sin(kh*p[:,0])
 
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
 print(connectivity)
-pvec = np.array([4,5,6,7,8],dtype = np.int64)
+pvec = np.array([7,8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 for indp in range(len(pvec)):
     p = pvec[indp]
-    a = [H/6,1/32,1/32]
-    assembler = mA.rkHMatAssembler(p,75)
+    a = [H/6,1/16,1/16]
+    assembler = mA.rkHMatAssembler(p,80)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions('hps',[p,p,p],a)
     OMS = oms.oms(dSlabs,Lapl,lambda p:cube.gb(p,True),opts,connectivity)
@@ -160,7 +162,7 @@ for indp in range(len(pvec)):
     discr_time[indp] = OMS.stats.discr_timing
 
 
-fileName = 'crystal_waveguide.csv'
+fileName = 'cube.csv'
 errMat = np.zeros(shape=(len(pvec),4))
 errMat[:,0] = pvec
 errMat[:,1] = err

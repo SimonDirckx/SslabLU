@@ -3,9 +3,10 @@ import jax.numpy as jnp
 import tensorly as tl
 import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
-
+import matplotlib.pyplot as plt
 
 def interp(solver,p,f):
+
     if solver.ndim==2:
         print("INTERP 2D")
         return interp_2d(solver,p,f)
@@ -106,7 +107,7 @@ def construct_boxes_3d(npan_dim,geom):
 def idxs_2d(p,box):
     return jnp.where( (box[0][0]<=p[...,0]) & (box[1][0]>=p[...,0]) & (box[0][1]<=p[...,1]) & (box[1][1]>=p[...,1]))[0]
 def idxs_3d(p,box):
-    return jnp.where( (box[0][0]<=p[...,0]) & (box[1][0]>=p[...,0]) & (box[0][1]<=p[...,1]) & (box[1][1]>=p[...,1]) & (box[0][2]<=p[...,2]) & (box[1][2]>=p[...,2]) )[0]
+    return jnp.where( (box[0][0]<p[...,0]+1e-10) & (box[1][0]>p[...,0]-1e-10) & (box[0][1]<p[...,1]+1e-10) & (box[1][1]>p[...,1]-1e-10) & (box[0][2]<p[...,2]+1e-10) & (box[1][2]>p[...,2]-1e-10) )[0]
 
 
 def tucker_tol(Tens,tol):
@@ -147,7 +148,7 @@ def chebInterpFromSamples(xpts,ff,targetpts):
 
 def local_interp_3d(pts,f,XX,box,ord0):
     ord = [ord0[0]+2,ord0[1]+2,ord0[2]+2]
-    _,I0  = np.unique(XX,axis=0,return_index=True)
+    _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
     

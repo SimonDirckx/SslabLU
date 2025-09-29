@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import solver.HPSInterp as interp
 
 # Things we need to add:
-from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
-import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
+#from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
+#import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 
 
 from time import time
@@ -51,8 +51,8 @@ class solverOptions:
         self.a      =   a
 
 def convertGeom(opts,geom):
-    if opts.type=='hpsalt':
-        return hpsaltGeom.BoxGeometry(np.array(geom))
+    #if opts.type=='hpsalt':
+    #    return hpsaltGeom.BoxGeometry(np.array(geom))
     if opts.type=='hps':
         return hpsGeom.BoxGeometry(jnp.array(geom))
     if opts.type=='stencil':
@@ -119,7 +119,7 @@ class solverWrapper:
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='hpsalt':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord[0], d=len(self.ord)) #verbose=verbose)
+            #solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord[0], d=len(self.ord)) #verbose=verbose)
             self.solver=solver
             self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
