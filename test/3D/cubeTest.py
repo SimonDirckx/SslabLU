@@ -1,6 +1,7 @@
 # basic packages
 import numpy as np
 import jax.numpy as jnp
+import torch
 import scipy
 from packaging.version import Version
 import matplotlib.tri as tri
@@ -9,7 +10,7 @@ import matplotlib.tri as tri
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-import solver.spectralmultidomain.hps.pdo as pdo
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 
 # validation&testing
 import time
@@ -31,7 +32,9 @@ class gmres_info(object):
 
 
 
-jax_avail=True
+jax_avail   = False
+torch_avail = True
+hpsalt      = True
 kh = .25
 if jax_avail:
     def c11(p):
@@ -42,13 +45,29 @@ if jax_avail:
         return jnp.ones_like(p[...,0])
     def c(p):
         return -kh*kh*jnp.ones_like(p[...,0])
-    Lapl=pdo.PDO3d(c11,c22,c33,None,None,None,c)
+    Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
     def bc(p):
         source_loc = jnp.array([-.5,-.2,1.])
         rr = jnp.sqrt(jnp.linalg.norm(p-source_loc.T,axis=1))
         return jnp.real(jnp.exp(1j*kh*rr)/(4*jnp.pi*rr))
         #return jnp.sin(kh*p[...,0])
-    
+
+elif torch_avail:
+    def c11(p):
+        return torch.ones_like(p[:,0])
+    def c22(p):
+        return torch.ones_like(p[:,0])
+    def c33(p):
+        return torch.ones_like(p[:,0])
+    def c(p):
+        return -kh*kh*torch.ones_like(p[:,0])
+    Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
+    def bc(p):
+        source_loc = np.array([-.5,-.2,1.])
+        rr = torch.sqrt(torch.linalg.norm(p-source_loc.T,axis=1))
+        return torch.real(torch.exp(1j*kh*rr)/(4*torch.pi*rr))
+        #return jnp.sin(kh*p[...,0])
+
 else:
     def c11(p):
         return np.ones_like(p[:,0])
@@ -58,7 +77,7 @@ else:
         return np.ones_like(p[:,0])
     def c(p):
         return -kh*kh*np.ones_like(p[:,0])
-    Lapl=pdo.PDO3d(c11,c22,c33,None,None,None,c)
+    Helm=pdo.PDO3d(c11,c22,c33,None,None,None,c)
     def bc(p):
         source_loc = np.array([-.5,-.2,1])
         rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
@@ -69,17 +88,21 @@ else:
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
 print(connectivity)
-pvec = np.array([7,8],dtype = np.int64)
+pvec = np.array([6,7,8,9,10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 for indp in range(len(pvec)):
     p = pvec[indp]
-    a = [H/6,1/16,1/16]
-    assembler = mA.rkHMatAssembler(p,80)
+    p_disc = p
+    if hpsalt:
+        formulation = "hpsalt"
+        p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
+    a = np.array([H/6,1/32,1/32])
+    assembler = mA.rkHMatAssembler(p*p,80)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
-    opts = solverWrap.solverOptions('hps',[p,p,p],a)
-    OMS = oms.oms(dSlabs,Lapl,lambda p:cube.gb(p,True),opts,connectivity)
+    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing Stot & rhstot...")
     Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
     print("done")
@@ -133,7 +156,7 @@ for indp in range(len(pvec)):
         YY0 = YY[I0,:]
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,True))
         solver  = oms.solverWrap.solverWrapper(opts)
-        solver.construct(geom,Lapl)
+        solver.construct(geom,Helm)
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
         startL = slabInd-1
         startR = slabInd+1
