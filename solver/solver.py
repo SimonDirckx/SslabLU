@@ -164,6 +164,8 @@ class solverWrapper:
     def interp(self,pts,f):
         if self.type=='hps':
             return interp.interp(self.solver,pts,f)
+        elif self.type == 'hpsalt':
+            return interp.interp(self.solver,pts,f)
         else:
             raise ValueError("interp not implemented yet")
 

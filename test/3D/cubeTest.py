@@ -46,11 +46,7 @@ if jax_avail:
     def c(p):
         return -kh*kh*jnp.ones_like(p[...,0])
     Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
-    def bc(p):
-        source_loc = jnp.array([-.5,-.2,1.])
-        rr = jnp.sqrt(jnp.linalg.norm(p-source_loc.T,axis=1))
-        return jnp.real(jnp.exp(1j*kh*rr)/(4*jnp.pi*rr))
-        #return jnp.sin(kh*p[...,0])
+
 
 elif torch_avail:
     def c11(p):
@@ -62,11 +58,6 @@ elif torch_avail:
     def c(p):
         return -kh*kh*torch.ones_like(p[:,0])
     Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
-    def bc(p):
-        source_loc = np.array([-.5,-.2,1.])
-        rr = torch.sqrt(torch.linalg.norm(p-source_loc.T,axis=1))
-        return torch.real(torch.exp(1j*kh*rr)/(4*torch.pi*rr))
-        #return jnp.sin(kh*p[...,0])
 
 else:
     def c11(p):
@@ -78,16 +69,15 @@ else:
     def c(p):
         return -kh*kh*np.ones_like(p[:,0])
     Helm=pdo.PDO3d(c11,c22,c33,None,None,None,c)
-    def bc(p):
-        source_loc = np.array([-.5,-.2,1])
-        rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
-        return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
-        #return np.sin(kh*p[:,0])
+def bc(p):
+    source_loc = np.array([-.5,-.2,1])
+    rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
+    return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
+    #return np.sin(kh*p[:,0])
 
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-print(connectivity)
 pvec = np.array([6,7,8,9,10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -129,8 +119,7 @@ for indp in range(len(pvec)):
 
     nc = OMS.nc
 
-    print("nc = ",nc)
-    print("N = ",Stot.shape)
+    
 
 
     nx=50
@@ -150,11 +139,9 @@ for indp in range(len(pvec)):
 
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
-        print("GEOM = ",geom)
         I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
-        print("len I0 = ",len(I0))
         YY0 = YY[I0,:]
-        slab_i  = oms.slab(geom,lambda p : cube.gb(p,True))
+        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
         solver  = oms.solverWrap.solverWrapper(opts)
         solver.construct(geom,Helm)
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
@@ -167,7 +154,8 @@ for indp in range(len(pvec)):
         if startR<len(dSlabs):
             g[Ir] = uhat[startR*nc:(startR+1)*nc]
         g=g[:,np.newaxis]
-        uu = solver.solver.solve_dir_full(g)
+        uu00 = solver.solver.solve_dir_full(torch.tensor(g))
+        uu = np.array(uu00,dtype = np.float64,copy=True)
         uu=uu.flatten()
         ghat = solver.interp(YY0,uu)
         print("err ghat = ",np.linalg.norm(ghat-bc(YY0))/np.linalg.norm(bc(YY0)))
