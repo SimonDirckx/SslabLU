@@ -1,4 +1,3 @@
-# basic packages
 import numpy as np
 import jax.numpy as jnp
 import torch
@@ -11,7 +10,7 @@ import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
 import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
-
+#import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
@@ -35,7 +34,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = True
 hpsalt      = True
-kh = .25
+kh = 50.25
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -45,7 +44,7 @@ if jax_avail:
         return jnp.ones_like(p[...,0])
     def c(p):
         return -kh*kh*jnp.ones_like(p[...,0])
-    Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
+    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
 
 
 elif torch_avail:
@@ -57,7 +56,7 @@ elif torch_avail:
         return torch.ones_like(p[:,0])
     def c(p):
         return -kh*kh*torch.ones_like(p[:,0])
-    Helm=pdo.PDO_3d(c11,c22,c33,None,None,None,c)
+    Helm=pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
 else:
     def c11(p):
@@ -68,12 +67,12 @@ else:
         return np.ones_like(p[:,0])
     def c(p):
         return -kh*kh*np.ones_like(p[:,0])
-    Helm=pdo.PDO3d(c11,c22,c33,None,None,None,c)
+    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
 def bc(p):
     source_loc = np.array([-.5,-.2,1])
-    rr = np.sqrt(np.linalg.norm(p-source_loc.T,axis=1))
+    rr = np.linalg.norm(p-source_loc.T,axis=1)
     return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
-    #return np.sin(kh*p[:,0])
+    #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
 N = 8
@@ -89,7 +88,7 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/6,1/32,1/32])
-    assembler = mA.rkHMatAssembler(p*p,80)
+    assembler = mA.rkHMatAssembler(p*p,200)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
