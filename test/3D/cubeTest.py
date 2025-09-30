@@ -77,7 +77,7 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([6,7,8,9,10],dtype = np.int64)
+pvec = np.array([2,7,8,9,10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
@@ -88,7 +88,7 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/6,1/32,1/32])
-    assembler = mA.rkHMatAssembler(p*p,200)
+    assembler = mA.rkHMatAssembler(p*p,50)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -135,7 +135,7 @@ for indp in range(len(pvec)):
     YY[:,2] = np.kron(np.kron(np.ones_like(xpts),np.ones_like(ypts)),zpts)
 
     gYY = np.zeros(shape=(YY.shape[0],))
-
+    err_tot = 0
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
         I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
@@ -152,22 +152,25 @@ for indp in range(len(pvec)):
             g[Il] = uhat[startL*nc:(startL+1)*nc]
         if startR<len(dSlabs):
             g[Ir] = uhat[startR*nc:(startR+1)*nc]
-        g=g[:,np.newaxis]
-        uu00 = solver.solver.solve_dir_full(torch.tensor(g))
-        uu = np.array(uu00,dtype = np.float64,copy=True)
-        uu=uu.flatten()
-        ghat = solver.interp(YY0,uu)
-        print("err ghat = ",np.linalg.norm(ghat-bc(YY0))/np.linalg.norm(bc(YY0)))
-        gYY[I0] = ghat
+        ghat = bc(XXb)
+        #g=g[:,np.newaxis]
+        #uu00 = solver.solver.solve_dir_full(torch.tensor(g))
+        #uu = np.array(uu00,dtype = np.float64,copy=True)
+        #uu=uu.flatten()
+        #ghat = solver.interp(YY0,uu)
+        err_loc = np.linalg.norm(ghat-g,ord=np.inf)/np.linalg.norm(g,ord=np.inf)
+        err_tot = np.max([err_loc,err_tot])
+        print("err ghat = ",err_loc)
+        #gYY[I0] = ghat
 
     #triang = tri.Triangulation(YY[:,0],YY[:,1])
     #tri0 = triang.triangles
 
-    gref = bc(YY)
+    #gref = bc(YY)
     #np.save('ref_sol_waveguide.npy',gYY)
     
-    print("err ref = ",np.linalg.norm(gref-gYY)/np.linalg.norm(gref))
-    err[indp] = np.linalg.norm(gref-gYY)/np.linalg.norm(gref)
+    print("err_tot = ",err_tot)
+    err[indp] = err_tot
     compr_time[indp] = OMS.stats.compr_timing
     discr_time[indp] = OMS.stats.discr_timing
 

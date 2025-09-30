@@ -112,9 +112,8 @@ class solverWrapper:
             self.Abb = solver.Axx
             self.Aii = solver.Aii
             tic      = time()
-            print("start solver")
+            
             self.solver_ii = solver.solver_Aii
-            print("solver done")
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='hpsalt':

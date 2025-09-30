@@ -78,9 +78,9 @@ class oms:
     def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
         A_solver = solver.solver_ii
         def smatmat(v,I,J,transpose=False):
-            print("v shape = ",v.shape)
+            
             if (v.ndim == 1):
-                print("ndim == 1 called")
+            
                 v_tmp = v[...,np.newaxis]
             else:
                 v_tmp = v
