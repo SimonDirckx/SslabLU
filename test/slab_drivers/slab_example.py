@@ -1,9 +1,9 @@
 import numpy as np
 
-import solver.spectralmultidomain.hps as hps
+import solver.hpsmultidomain.hpsmultidomain as hps
 
-from hps.pdo               import PDO2d,PDO3d,const
-from hps.geom              import BoxGeometry
+from solver.hpsmultidomain.hpsmultidomain.pdo               import PDO_2d,PDO_3d,const
+from solver.hpsmultidomain.hpsmultidomain.geom              import BoxGeometry
 from slab_subdomain        import SlabSubdomain
 
 from time import time
@@ -30,18 +30,18 @@ kh   = args.kh
 ndim = args.ndim
 if (ndim == 2):
 
-	pdo         = PDO2d(c11=const(1.0),c22=const(1.0),c=const(-kh**2))
+	pdo         = PDO_2d(c11=const(1.0),c22=const(1.0),c=const(-kh**2))
 	box         = np.array([[0,0],[2.0*H,1.0]])
 	geom        = BoxGeometry(box)
 else:
-	pdo         = PDO3d(c11=const(1.0),c22=const(1.0),c33=const(1.0),c=const(-kh**2))
+	pdo         = PDO_3d(c11=const(1.0),c22=const(1.0),c33=const(1.0),c=const(-kh**2))
 	box         = np.array([[0,0,0],[2.0*H,1.0,1.0]])
 	geom        = BoxGeometry(box)
 
 print(box)
 
 # setting p = 2 will use FD discretization
-slab      = SlabSubdomain(pdo,geom,a,p)
+slab      = SlabSubdomain(pdo,geom,a,p, d=ndim)
 
 # if you are using a constant coefficient PDE, you can verify discretization
 relerr    = slab.solver.verify_discretization(kh)
@@ -142,4 +142,4 @@ else:
 	with open(args.pickle_loc, 'wb') as f:
 	    pickle.dump(my_data, f)
 
-	print(f'Data saved to {args.pickle_loc}')
+	#print(f'Data saved to {args.pickle_loc}')

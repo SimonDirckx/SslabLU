@@ -1,19 +1,24 @@
-from hps.hps_multidomain   import HPSMultidomain
-from hps.fd_discretization import FDDiscretization
+#from hps.hps_multidomain   import HPSMultidomain
+from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
+from solver.spectralmultidomain.hps.fd_discretization import FDDiscretization
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
+
+import torch
 
 def find_subindices_location(Jsub,Jlong):
     return np.intersect1d(Jsub,Jlong,return_indices=True)[2]
 
 class SlabSubdomain:
 
-    def __init__(self,pdo,geom,a,p,double_slab=True):
+    def __init__(self,pdo,geom,a,p,d=2,double_slab=True):
 
         if (p > 2):
-            solver    = HPSMultidomain(pdo,geom,a,p,verbose=True)
+            solver    = hpsalt.Domain_Driver(geom, pdo, 0, a, p=p, d=d)
+            solver.build("reduced_cpu", "MUMPS", verbose=True)
+            solver.setup_solver_Aii()
 
-            npan_x    = solver.npan_dim[0]
+            npan_x    = solver.hps.n[0]
             if (double_slab and np.mod(npan_x,2) == 1 ):
                 raise ValueError("expected an even number of panels in x direction for double_slab")
         else:
@@ -54,7 +59,7 @@ class SlabSubdomain:
 
         len0         = self.solver.geom.bounds[1,0] - self.solver.geom.bounds[0,0]
         center_bound = self.solver.geom.bounds[0,0] + 0.5*len0
-        hmin         = np.max(self.XX[1] - self.XX[0])
+        hmin         = torch.max(self.XX[1] - self.XX[0])
 
         Lbool   = self.XX[self.Ji,0] < center_bound + 0.1*hmin
         Rbool   = self.XX[self.Ji,0] > center_bound - 0.1*hmin
@@ -63,8 +68,7 @@ class SlabSubdomain:
     # the left exterior points
     @property
     def Jl(self):
-
-        hmin    = np.max(self.XX[1] - self.XX[0])
+        hmin    = torch.max(self.XX[1] - self.XX[0])
         Lbool   = self.XX[self.Jx,0] < self.solver.geom.bounds[0,0] + 0.1*hmin
         return self.Jx[np.where(Lbool)[0]]
 
@@ -72,7 +76,7 @@ class SlabSubdomain:
     @property
     def Jr(self):
 
-        hmin    = np.max(self.XX[1] - self.XX[0])
+        hmin    = torch.max(self.XX[1] - self.XX[0])
         Lbool   = self.XX[self.Jx,0] > self.solver.geom.bounds[1,0] - 0.1*hmin
         return self.Jx[np.where(Lbool)[0]]
 

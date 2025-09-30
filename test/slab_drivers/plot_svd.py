@@ -15,7 +15,7 @@ plt.figure()
 
 H = 1; p = 8
 for ainv in [2,4,8,16]:
-    pickle_loc = "thinslab_H%2.2f_p%d_ainv%d.pkl" % (H,p,ainv)
+    pickle_loc = "thinslab_H%2.5f_p%d_ainv%d.pkl" % (H,p,ainv)
 
     svd_data = load_svd_from_pickle(pickle_loc)
     plt.semilogy(svd_data,label='a=%5.5f'%(1/ainv))
@@ -31,6 +31,7 @@ plt.xlim(-100, 1100)
 plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.legend(title="Patch size $2a \\times 2a \\times 2a$",fontsize=10,title_fontsize=12)
 plt.tight_layout()
+plt.savefig("glr_hps_withtorch_H1.png")
 plt.show()
 
 plt.figure()
@@ -51,6 +52,7 @@ plt.title(
 plt.grid(True, which='both', linestyle='--', linewidth=0.5)
 plt.legend(title="Patch size $2a \\times 2a \\times 2a$",fontsize=10,title_fontsize=12)
 plt.tight_layout()
+plt.savefig("glr_hps_withtorch_H025.png")
 plt.show()
 
 plt.figure()
