@@ -3,14 +3,15 @@ import jax.numpy as jnp
 import tensorly as tl
 import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
-
+import matplotlib.pyplot as plt
 
 def interp(solver,p,f):
+
     if solver.ndim==2:
-        print("INTERP 2D")
+        
         return interp_2d(solver,p,f)
     elif solver.ndim==3:
-        print("INTERP 3D")
+        
         return interp_3d(solver,p,f)
     else:
         raise ValueError("ndim must be 2 or 3")
@@ -20,7 +21,7 @@ def interp_2d(solver,pts,f):
     g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_2d(npan_dim,solver.geom)
-    ord=[solver._p,solver._p]
+    ord=[solver.p,solver.p]
     for box in boxes:
         I = idxs_2d(pts,box)
         J = idxs_2d(solver._XXfull,box)
@@ -32,7 +33,7 @@ def interp_3d(solver,pts,f):
     g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_3d(npan_dim,solver.geom)
-    ord=[solver._p,solver._p,solver._p]
+    ord=[solver.p,solver.p,solver.p]
     for box in boxes:
         I = idxs_3d(pts,box)
         J = idxs_3d(solver._XXfull,box)
@@ -106,7 +107,7 @@ def construct_boxes_3d(npan_dim,geom):
 def idxs_2d(p,box):
     return jnp.where( (box[0][0]<=p[...,0]) & (box[1][0]>=p[...,0]) & (box[0][1]<=p[...,1]) & (box[1][1]>=p[...,1]))[0]
 def idxs_3d(p,box):
-    return jnp.where( (box[0][0]<=p[...,0]) & (box[1][0]>=p[...,0]) & (box[0][1]<=p[...,1]) & (box[1][1]>=p[...,1]) & (box[0][2]<=p[...,2]) & (box[1][2]>=p[...,2]) )[0]
+    return np.where( (box[0][0]<p[:,0]+1e-10) & (box[1][0]>p[:,0]-1e-10) & (box[0][1]<p[:,1]+1e-10) & (box[1][1]>p[:,1]-1e-10) & (box[0][2]<p[:,2]+1e-10) & (box[1][2]>p[:,2]-1e-10) )[0]
 
 
 def tucker_tol(Tens,tol):
@@ -146,8 +147,8 @@ def chebInterpFromSamples(xpts,ff,targetpts):
     return np.polynomial.chebyshev.chebval(aT(targetpts), coeffs)
 
 def local_interp_3d(pts,f,XX,box,ord0):
-    ord = [ord0[0]+2,ord0[1]+2,ord0[2]+2]
-    _,I0  = np.unique(XX,axis=0,return_index=True)
+    ord = [ord0[0],ord0[1],ord0[2]]
+    _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
     

@@ -110,10 +110,10 @@ class solverWrapper:
             self.Aib = solver.Aix
             self.Abi = solver.Axi
             self.Abb = solver.Axx
+            self.Aii = solver.Aii
             tic      = time()
-            print("start solver")
+            
             self.solver_ii = solver.solver_Aii
-            print("solver done")
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='hpsalt':
@@ -162,6 +162,8 @@ class solverWrapper:
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):
         if self.type=='hps':
+            return interp.interp(self.solver,pts,f)
+        elif self.type == 'hpsalt':
             return interp.interp(self.solver,pts,f)
         else:
             raise ValueError("interp not implemented yet")

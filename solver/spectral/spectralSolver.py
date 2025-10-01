@@ -173,6 +173,7 @@ def constructPDO2D(pdo,xpts,ypts,XX,geom):
     return L
 
 def constructPDO3D(pdo,xpts,ypts,zpts,XX,geom):
+    N=XX.shape[0]
     Dxx = spectralD2(xpts)
     Dyy = spectralD2(ypts)
     Dzz = spectralD2(zpts)
@@ -181,13 +182,15 @@ def constructPDO3D(pdo,xpts,ypts,zpts,XX,geom):
     Ey  = np.identity(len(ypts))
     Ez  = np.identity(len(zpts))
     
-    C11 = sparse.spdiags(pdo.c11(geom.l2g(XX)),0)
-    C22 = sparse.spdiags(pdo.c22(geom.l2g(XX)),0)
-    C33 = sparse.spdiags(pdo.c33(geom.l2g(XX)),0)
+    C11 = sparse.spdiags(pdo.c11(XX),[0],N,N)
+    C22 = sparse.spdiags(pdo.c22(XX),[0],N,N)
+    C33 = sparse.spdiags(pdo.c33(XX),[0],N,N)
     
     L   =-C11@sparse.kron(sparse.kron(Dxx,Ey),Ez)
     L   -=C22@sparse.kron(sparse.kron(Ex,Dyy),Ez)
     L   -=C33@sparse.kron(sparse.kron(Ex,Ey),Dzz)
+    
+    L+=sparse.spdiags(pdo.c(XX),[0],N,N)
     return L
 
 
@@ -224,12 +227,29 @@ class spectralSolver(AbstractPDESolver):
             self._Ji=np.where( (self._box_geom[0][0]<self._XX[:,0])     & (self._box_geom[1][0]>self._XX[:,0]) & (self._box_geom[0][1]<self._XX[:,1]) & (self._box_geom[1][1]>self._XX[:,1]))[0]
             self._Jx=np.where( (self._box_geom[0][0]==self._XX[:,0])    | (self._box_geom[1][0]==self._XX[:,0]) | (self._box_geom[0][1]==self._XX[:,1]) | (self._box_geom[1][1]==self._XX[:,1]))[0] 
         elif (ndim == 3):
-            xpts        = np.linspace(self._box_geom[0][0],self._box_geom[1][0],ord[0])
-            ypts        = np.linspace(self._box_geom[0][1],self._box_geom[1][1],ord[1])
-            zpts        = np.linspace(self._box_geom[0][2],self._box_geom[1][2],ord[2])
-            YZ          = np.vstack([np.concatenate((np.tile(y,zpts.shape)[:,np.newaxis],zpts[:,np.newaxis]),axis=1) for y in ypts])
-            self._XX    = np.vstack([np.concatenate((np.tile(x,YZ.shape[0])[:,np.newaxis],YZ),axis=1) for x in xpts])
+            xmin = self._box_geom[0][0]
+            xmax = self._box_geom[1][0]
+            ymin = self._box_geom[0][1]
+            ymax = self._box_geom[1][1]
+            zmin = self._box_geom[0][2]
+            zmax = self._box_geom[1][2]
+            ordx = ord[0]
+            ordy = ord[1]
+            ordz = ord[2]
+            _,chebx = cheb(ordx)
+            _,cheby = cheb(ordy)
+            _,chebz = cheb(ordz)
+            xpts = ((chebx-chebx[0])*(xmax-xmin)/(chebx[len(chebx)-1]-chebx[0])) + xmin
+            ypts = ((cheby-cheby[0])*(ymax-zmin)/(cheby[len(cheby)-1]-cheby[0])) + ymin
+            zpts = ((chebz-chebz[0])*(zmax-zmin)/(chebz[len(chebz)-1]-chebz[0])) + zmin
+            XX = np.zeros(shape = (len(xpts)*len(ypts)*len(zpts),3))
+            XX[:,0] = np.kron(np.kron(xpts,np.ones_like(ypts)),np.ones_like(zpts))
+            XX[:,1] = np.kron(np.kron(np.ones_like(xpts),ypts),np.ones_like(zpts))
+            XX[:,2] = np.kron(np.kron(np.ones_like(xpts),np.ones_like(ypts)),zpts)
+            self._XX    = XX
             self._A      = constructPDO3D(pdo,xpts,ypts,zpts,self._XX,self.geom)
+            self._Ji=np.where( (self._box_geom[0][0]<self._XX[:,0])     & (self._box_geom[1][0]>self._XX[:,0]) & (self._box_geom[0][1]<self._XX[:,1]) & (self._box_geom[1][1]>self._XX[:,1])& (self._box_geom[0][2]<self._XX[:,2]) & (self._box_geom[1][2]>self._XX[:,2]))[0]
+            self._Jx=np.where( (self._box_geom[0][0]==self._XX[:,0])    | (self._box_geom[1][0]==self._XX[:,0]) | (self._box_geom[0][1]==self._XX[:,1]) | (self._box_geom[1][1]==self._XX[:,1])  | (self._box_geom[0][2]==self._XX[:,2]) | (self._box_geom[1][2]==self._XX[:,2]))[0] 
         else:
             raise ValueError
         self._XXi=self._XX[self._Ji,:]

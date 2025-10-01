@@ -1,22 +1,23 @@
-# basic packages
 import numpy as np
 import jax.numpy as jnp
+import torch
 import scipy
 from packaging.version import Version
-import hps.pdo as pdo
+import matplotlib.tri as tri
 
 # oms packages
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-
-
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
+#import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
 import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 
+import geometry.geom_3D.cube as cube
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -29,173 +30,161 @@ class gmres_info(object):
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
 
-jax_avail = True
+
+jax_avail   = False
+torch_avail = True
+hpsalt      = True
+kh = 50.25
 if jax_avail:
-    bnds = [[0.,0.,0.],[1.,1.,1.]]
-    box_geom   = jnp.array(bnds)
+    def c11(p):
+        return jnp.ones_like(p[...,0])
+    def c22(p):
+        return jnp.ones_like(p[...,0])
+    def c33(p):
+        return jnp.ones_like(p[...,0])
+    def c(p):
+        return -kh*kh*jnp.ones_like(p[...,0])
+    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
+
+
+elif torch_avail:
+    def c11(p):
+        return torch.ones_like(p[:,0])
+    def c22(p):
+        return torch.ones_like(p[:,0])
+    def c33(p):
+        return torch.ones_like(p[:,0])
+    def c(p):
+        return -kh*kh*torch.ones_like(p[:,0])
+    Helm=pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
+
 else:
-    bnds = [[0.,0.,0.],[1.,1.,1.]]
-    box_geom   = np.array(bnds)
-
-
-def gb_vec(P):
-    # P is (N, 3)
-    return (
-        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
-        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14) | 
-        (np.abs(P[:, 2] - bnds[0][2]) < 1e-14) | 
-        (np.abs(P[:, 2] - bnds[1][2]) < 1e-14)
-    )
-
-#########################################################################################################
-
-
-################################################################
-#
-#   SET-UP BVP:         Helmholtz on 3D Annulus
-#   - wave number       (kh)
-#   - bfield            (= kh*ones)
-#   - pdo_mod           (pdo transformed to square)
-#   - BC
-#   - known exact sol.  (u_exact)
-#
-################################################################
-
-nwaves = 5.24
-wavelength = 4/nwaves
-kh = (nwaves/4)*2.*np.pi
-
-def c11(p):
-    return jnp.ones_like(p[...,0])
-def c22(p):
-    return jnp.ones_like(p[...,0])
-def c33(p):
-    return jnp.ones_like(p[...,0])
-
-helmholtz = pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=pdo.const(-kh*kh))
-
+    def c11(p):
+        return np.ones_like(p[:,0])
+    def c22(p):
+        return np.ones_like(p[:,0])
+    def c33(p):
+        return np.ones_like(p[:,0])
+    def c(p):
+        return -kh*kh*np.ones_like(p[:,0])
+    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
 def bc(p):
-    return np.sin(kh*p[:,0])
-
-def u_exact(p):
-    return np.sin(kh*p[:,0])
-
-##############################################################################################
-#
-#   SET-UP Slabs
-#   - left-to-right convention  (!!!)
-#   - single slabs              (slabs)
-#   - slab connectivity         (connectivity, i.e. are two single slabs connected)
-#   - interface connectivity    (if_connectivity, i.e. are two interfaces connected by a slab) 
-#   - periodicity               (period, i.e. period in the x-dir)
-#
-##############################################################################################
+    source_loc = np.array([-.5,-.2,1])
+    rr = np.linalg.norm(p-source_loc.T,axis=1)
+    return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
+    #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-H = 1./8.
-N = (int)(1./H)
-slabs = []
-for n in range(N):
-    bnds_n = [[n*H,0.,0.],[(n+1)*H,1.,1.]]
-    slabs+=[bnds_n]
+N = 8
+dSlabs,connectivity,H = cube.dSlabs(N)
+pvec = np.array([2,7,8,9,10],dtype = np.int64)
+err=np.zeros(shape = (len(pvec),))
+discr_time=np.zeros(shape = (len(pvec),))
+compr_time=np.zeros(shape = (len(pvec),))
+for indp in range(len(pvec)):
+    p = pvec[indp]
+    p_disc = p
+    if hpsalt:
+        formulation = "hpsalt"
+        p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
+    a = np.array([H/6,1/32,1/32])
+    assembler = mA.rkHMatAssembler(p*p,50)
+    #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
+    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    print("computing Stot & rhstot...")
+    Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
+    print("done")
+    
+    gInfo = gmres_info()
+    stol = 1e-10*H*H
 
-connectivity = []
-for i in range(N-1):
-    connectivity+=[[i,i+1]]
-
-if_connectivity = []
-for i in range(N-1):
-    if i==0:
-        if_connectivity+=[[-1,(i+1)]]
-    elif i==N-2:
-        if_connectivity+=[[(i-1),-1]]
+    if Version(scipy.__version__)>=Version("1.14"):
+        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
     else:
-        if_connectivity+=[[(i-1),(i+1)]]
-
-##############################################################################################
-
-#################################################################
-#
-#   Compute OMS (overlapping multislab)
-#   - discretization options    (opts)
-#   - off-diag block assembler  (assembler)
-#   - Overlapping Multislab     (OMS)
-#
-#################################################################
-
-tol = 1e-5
-p = 8
-a = [H/2.,1/16,1/16]
-assembler = mA.denseMatAssembler()#mA.rkHMatAssembler(p*p,160)
-opts = solverWrap.solverOptions('hps',[p,p,p],a)
-OMS = oms.oms(slabs,helmholtz,gb_vec,opts,connectivity,if_connectivity)
-print("computing Stot & rhstot...")
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
-print("done")
-#################################################################
-#E = np.identity(Stot.shape[1])
-#S00 = Stot@E
-#plt.spy(S00)
-#plt.show()
-#S00T = Stot.T@E
-#print("T err = ",np.linalg.norm(S00.T-S00T))
-#Finally, solve
-
-gInfo = gmres_info()
-stol = 1e-10*H*H
-
-if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=100,restart=100)
-else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=100,restart=100)
-
-stop_solve = time.time()
-res = Stot@uhat-rhstot
+        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+    stop_solve = time.time()
+    #Sdense = Stot@np.identity(Stot.shape[0])
+    #uhat = np.linalg.solve(Sdense,rhstot)
+    res = Stot@uhat-rhstot
 
 
-print("=============SUMMARY==============")
-print("H                        = ",'%10.3E'%H)
-print("ord                      = ",p)
-print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-print("GMRES iters              = ", gInfo.niter)
-print("==================================")
+    print("=============SUMMARY==============")
+    print("H                        = ",'%10.3E'%H)
+    print("ord                      = ",p)
+    print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
+    print("GMRES iters              = ", gInfo.niter)
+    print("==================================")
 
-uitot = np.zeros(shape=(0,))
-XXtot = np.zeros(shape=(0,3))
-dofs = 0
-glob_target_dofs=OMS.glob_target_dofs
-glob_source_dofs=OMS.glob_source_dofs
-nc = OMS.nc
-del OMS
+    nc = OMS.nc
+
+    
 
 
+    nx=50
+    ny=200
+    nz=200
+
+    xpts = np.linspace(0,1,nx)
+    ypts = np.linspace(0,1,ny)
+    zpts = np.linspace(0,1,nz)
+
+    YY = np.zeros(shape=(nx*ny*nz,3))
+    YY[:,0] = np.kron(np.kron(xpts,np.ones_like(ypts)),np.ones_like(zpts))
+    YY[:,1] = np.kron(np.kron(np.ones_like(xpts),ypts),np.ones_like(zpts))
+    YY[:,2] = np.kron(np.kron(np.ones_like(xpts),np.ones_like(ypts)),zpts)
+
+    gYY = np.zeros(shape=(YY.shape[0],))
+    err_tot = 0
+    for slabInd in range(len(dSlabs)):
+        geom    = np.array(dSlabs[slabInd])
+        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
+        YY0 = YY[I0,:]
+        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
+        solver  = oms.solverWrap.solverWrapper(opts)
+        solver.construct(geom,Helm)
+        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+        startL = slabInd-1
+        startR = slabInd+1
+        g = np.zeros(shape=(XXb.shape[0],))
+        g[Igb] = bc(XXb[Igb,:])
+        if startL>-1:
+            g[Il] = uhat[startL*nc:(startL+1)*nc]
+        if startR<len(dSlabs):
+            g[Ir] = uhat[startR*nc:(startR+1)*nc]
+        ghat = bc(XXb)
+        #g=g[:,np.newaxis]
+        #uu00 = solver.solver.solve_dir_full(torch.tensor(g))
+        #uu = np.array(uu00,dtype = np.float64,copy=True)
+        #uu=uu.flatten()
+        #ghat = solver.interp(YY0,uu)
+        err_loc = np.linalg.norm(ghat-g,ord=np.inf)/np.linalg.norm(g,ord=np.inf)
+        err_tot = np.max([err_loc,err_tot])
+        print("err ghat = ",err_loc)
+        #gYY[I0] = ghat
+
+    #triang = tri.Triangulation(YY[:,0],YY[:,1])
+    #tri0 = triang.triangles
+
+    #gref = bc(YY)
+    #np.save('ref_sol_waveguide.npy',gYY)
+    
+    print("err_tot = ",err_tot)
+    err[indp] = err_tot
+    compr_time[indp] = OMS.stats.compr_timing
+    discr_time[indp] = OMS.stats.discr_timing
 
 
-# check err.
-print("uhat shape = ",uhat.shape)
-print("uhat type = ",type(uhat))
-print("nc = ",nc)
+fileName = 'cube.csv'
+errMat = np.zeros(shape=(len(pvec),4))
+errMat[:,0] = pvec
+errMat[:,1] = err
+errMat[:,2] = compr_time
+errMat[:,3] = discr_time
+with open(fileName,'w') as f:
+    f.write('p,err,compr,discr\n')
+    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
 
-
-slabInd = 0
-geom    = np.array(oms.join_geom(slabs[connectivity[slabInd][0]],slabs[connectivity[slabInd][1]]))
-slab_i  = oms.slab(geom,gb)
-solver  = oms.solverWrap.solverWrapper(opts)
-solver.construct(geom,helmholtz)
-Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-XXIc = np.array(XXi)[Ic,:]
-u_known = np.sin(kh*XXIc[:,0])
-ul = uhat[:nc]
-ur = uhat[nc:2*nc]
-
-print("err = ",np.linalg.norm(ul-u_known)/np.linalg.norm(u_known))
-
-'''
-for i in range(len(slabs)):
-    slab = slabs[i]
-    ul = uhat[glob_target_dofs[i]]
-    ur = uhat[glob_source_dofs[i][1]]
-    interp.check_err(slab,ul,ur,a,p,pdo_mod,gb,bc,u_exact)
-'''
+plt.figure(0)
+plt.semilogy(pvec,err)
+plt.show()
