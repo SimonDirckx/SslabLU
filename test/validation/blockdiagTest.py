@@ -21,7 +21,7 @@ for i in range(Nds):
 
 Stot = sparse.bmat([[Slvec[i] if i == j-1 else np.eye(n) if i==j else Srvec[i-1] if i==j+1
                 else None for i in range(Nds)]
-                for j in range(Nds)], format='bsr')
+                for j in range(Nds)], format='csc')
 Stot = Stot.todense()
 
 Sl0 = Stot[10:20,:][:,0:10]

@@ -107,17 +107,9 @@ class oms:
         st_l = stMap(Linop_l,XXb[Il,...],XXi[Ic,...])
         return st_l,st_r
 
-    def construct_Stot_and_rhstot(self,bc,assembler,dbg=0,tridiag=False):
-        '''
-        construct S operator and total global rhs
-
-
-        EXPLAINER OF CONVENTIONS:
-            - global dof ordering is inferred from the supplied connectivity
-            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
-            - no domain checks are done (garbage in, garbage out)
-            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
-            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
+    def construct_Stot_helper(self, bc, assembler, dbg=0):
+        """
+        construct S_rk_list needed for S operator, whether iterative or direct
         """
         connectivity    = self.connectivity
         slabs           = self.slabList
@@ -125,7 +117,6 @@ class oms:
         S_rk_list = []
         
         rhs_list = []
-
         glob_target_dofs=[]
         startCentral = 0
         opts = self.opts
@@ -156,7 +147,6 @@ class oms:
             fgb = bc(XXb[Igb,...])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-
             rhs = solver.solver_ii@(solver.Aib[...,Igb]@fgb)
             rhs = -rhs[Ic]
             rhs_list+=[rhs]
@@ -166,12 +156,10 @@ class oms:
             compression_l = 0 
             compression_r = 0
             if bool_r:
-                print("CONSTRUCTING R")
                 rkMat_r = assembler.assemble(st_r,dbg=dbg)
                 self.nbytes+=assembler.stats.nbytes
                 compression_r = assembler.stats.nbytes
             if bool_l:
-                print("CONSTRUCTING L")
                 rkMat_l = assembler.assemble(st_l,dbg=dbg)
                 compression_l = assembler.stats.nbytes
                 self.nbytes+=assembler.stats.nbytes
@@ -188,15 +176,12 @@ class oms:
                     Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                     Ul=st_l.A@Vl
                     Ulhat=rkMat_l@Vl
-                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
-                    print("LEFT ERR = ",np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
+                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/np.linalg.norm(Ul))
                 if bool_r:
                     Vr=np.random.standard_normal(size=(st_r.A.shape[1],assembler.matOpts.maxRank))
                     Ur=st_r.A@Vr
                     Urhat=rkMat_r@Vr
-                    errr = np.linalg.norm(Ur-Urhat)/( np.linalg.norm(Ur)*Ur.shape[1] )
-                    relerrr = max(relerrr,errr)
-                    print("RIGHT ERR = ",errr)
+                    relerrr = max(relerrr,np.linalg.norm(Ur-Urhat)/np.linalg.norm(Ur))
             if dbg>1:
                 print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
                 if bool_l and bool_r:
@@ -234,14 +219,19 @@ class oms:
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
 
+        print("#\n# self.glob_target_dofs:\n#")
+        print(self.glob_target_dofs)
+        print("#\n# S_rk_list:\n#")
+        print(S_rk_list)
+
+        print("###\n###\n### WE NEED TO USE S_rk_list TO BUILD DENSE MATRIX\n###\n###")
+
         return S_rk_list, rhs_list, Ntot, nc
 
 
-    def construct_Stot_and_rhstot_linearOperator(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
+    def construct_Stot_and_rhstot(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
         '''
         construct S operator and total global rhs
-
-
         EXPLAINER OF CONVENTIONS:
             - global dof ordering is inferred from the supplied connectivity
             - joined slabs are contiguous (ficticious domain extension used for periodic domains)
@@ -252,43 +242,25 @@ class oms:
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
-        if not tridiag:
-            def smatmat(v,transpose=False):
-                if (v.ndim == 1):
-                    v_tmp = v[...,jnp.newaxis].astype('float64')
-                else:
-                    v_tmp = v.astype('float64')
-                result  = v_tmp.copy()
-                if (not transpose):
-                    for i in range(len(self.glob_target_dofs)):
-                        for j in range(len(self.glob_source_dofs[i])):
-                                result[glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
-                else:
-                    for i in range(len(glob_target_dofs)):
-                        for j in range(len(self.glob_source_dofs[i])):
-                                result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[glob_target_dofs[i]]
-                if (v.ndim == 1):
-                    result = result.flatten()
-                return result
-            
-            Linop = LinearOperator(shape=(Ntot,Ntot),\
-            matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
-            matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
-            return Linop,rhstot
-        else:
-
-            Nds = len(slabs)
-            Stot = sparse.bmat([[S_rk_list[0][0] if ((i==0) and (j==1)) else S_rk_list[Nds-1][0] if ((i==Nds-1) and (j==Nds-2)) else S_rk_list[i][0] if ((i == j+1) and (i>0)) else S_rk_list[i][1] if ((i == j-1) and (i<Nds-1)) else np.eye(nc) if i==j
-                else None for i in range(len(slabs))]
-                for j in range(len(slabs))], format='bsr')
-            Stot = Stot.tocsc()
-            return Stot,rhstot
-
-    
-
-    
-    def construct_rhstot(self,bc):
-        '''
-        TODO IMPLEMENT RHS
-        '''
-        return 0
+        def smatmat(v,transpose=False):
+            if (v.ndim == 1):
+                v_tmp = v[...,jnp.newaxis].astype('float64')
+            else:
+                v_tmp = v.astype('float64')
+            result  = v_tmp.copy()
+            if (not transpose):
+                for i in range(len(self.glob_target_dofs)):
+                    for j in range(len(self.glob_source_dofs[i])):
+                        result[self.glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
+            else:
+                for i in range(len(self.glob_target_dofs)):
+                    for j in range(len(self.glob_source_dofs[i])):
+                        result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[self.glob_target_dofs[i]]
+            if (v.ndim == 1):
+                result = result.flatten()
+            return result
+        
+        Linop = LinearOperator(shape=(Ntot,Ntot),\
+        matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
+        matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
+        return Linop,rhstot
