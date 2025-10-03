@@ -94,14 +94,15 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/16,1/16])
-    #assembler = mA.rkHMatAssembler(p*p,100)
-    assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
+    a = np.array([H/4,1/8,1/8])
+    assembler = mA.rkHMatAssembler(p*p,50)
+    #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     print("done")
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
     niter = 0
     if solve_method == 'iterative':
         Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
@@ -114,8 +115,11 @@ for indp in range(len(pvec)):
             uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
         niter = gInfo.niter
     elif solve_method == 'direct':
-        T, smw_block = omsdirect.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
-        uhat  = omsdirect.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
+        rhstot = np.zeros(shape = (Ntot,))
+        for i in range(len(rhs_list)):
+            rhstot[i*nc:(i+1)*nc] = rhs_list[i]
+        T = omsdirect.build_block_tridiagonal_solver(S_rk_list)
+        uhat  = omsdirect.block_tridiagonal_solve(OMS, T, rhstot)
     
     res = Stot@uhat-rhstot
 
