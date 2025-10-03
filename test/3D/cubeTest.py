@@ -17,6 +17,7 @@ from scipy.sparse.linalg import gmres
 import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
+import multislab.omsdirectsolve as omsdirect
 
 import geometry.geom_3D.cube as cube
 class gmres_info(object):
@@ -98,11 +99,12 @@ for indp in range(len(pvec)):
     assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-    print("computing Stot & rhstot...")
-    Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2,tridiag)
+    print("computing S blocks & rhs's...")
+    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     print("done")
     niter = 0
     if solve_method == 'iterative':
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
         stol = 1e-10*H*H
 
@@ -112,7 +114,8 @@ for indp in range(len(pvec)):
             uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
         niter = gInfo.niter
     elif solve_method == 'direct':
-        uhat = splinalg.spsolve(Stot,rhstot)
+        T, smw_block = omsdirect.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
+        uhat  = omsdirect.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
     
     res = Stot@uhat-rhstot
 
