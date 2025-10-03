@@ -11,6 +11,7 @@ import sys
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
+import scipy.sparse as sparse
 #import gc
     
 
@@ -106,7 +107,7 @@ class oms:
         st_l = stMap(Linop_l,XXb[Il,...],XXi[Ic,...])
         return st_l,st_r
 
-    def construct_Stot_and_rhstot(self,bc,assembler,dbg=0):
+    def construct_Stot_and_rhstot(self,bc,assembler,dbg=0,tridiag=False):
         '''
         construct S operator and total global rhs
 
@@ -235,29 +236,38 @@ class oms:
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
+        if not tridiag:
+            def smatmat(v,transpose=False):
+                if (v.ndim == 1):
+                    v_tmp = v[...,jnp.newaxis].astype('float64')
+                else:
+                    v_tmp = v.astype('float64')
+                result  = v_tmp.copy()
+                if (not transpose):
+                    for i in range(len(self.glob_target_dofs)):
+                        for j in range(len(self.glob_source_dofs[i])):
+                                result[glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
+                else:
+                    for i in range(len(glob_target_dofs)):
+                        for j in range(len(self.glob_source_dofs[i])):
+                                result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[glob_target_dofs[i]]
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
+            
+            Linop = LinearOperator(shape=(Ntot,Ntot),\
+            matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
+            matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
+            return Linop,rhstot
+        else:
 
-        def smatmat(v,transpose=False):
-            if (v.ndim == 1):
-                v_tmp = v[...,jnp.newaxis].astype('float64')
-            else:
-                v_tmp = v.astype('float64')
-            result  = v_tmp.copy()
-            if (not transpose):
-                for i in range(len(self.glob_target_dofs)):
-                    for j in range(len(self.glob_source_dofs[i])):
-                            result[glob_target_dofs[i]]+=S_rk_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
-            else:
-                for i in range(len(glob_target_dofs)):
-                    for j in range(len(self.glob_source_dofs[i])):
-                            result[self.glob_source_dofs[i][j]]+=S_rk_list[i][j].T@v_tmp[glob_target_dofs[i]]
-            if (v.ndim == 1):
-                result = result.flatten()
-            return result
-        
-        Linop = LinearOperator(shape=(Ntot,Ntot),\
-        matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
-        matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
-        return Linop,rhstot
+            Nds = len(slabs)
+            Stot = sparse.bmat([[S_rk_list[0][0] if ((i==0) and (j==1)) else S_rk_list[Nds-1][0] if ((i==Nds-1) and (j==Nds-2)) else S_rk_list[i][0] if ((i == j+1) and (i>0)) else S_rk_list[i][1] if ((i == j-1) and (i<Nds-1)) else np.eye(nc) if i==j
+                else None for i in range(len(slabs))]
+                for j in range(len(slabs))], format='bsr')
+            Stot = Stot.tocsc()
+            return Stot,rhstot
+
     
 
     

@@ -16,6 +16,7 @@ import time
 from scipy.sparse.linalg import gmres
 import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
+import scipy.sparse.linalg as splinalg
 
 import geometry.geom_3D.cube as cube
 class gmres_info(object):
@@ -34,7 +35,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = True
 hpsalt      = True
-kh = 50.25
+kh = 5.25
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -77,72 +78,59 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([2,7,8,9,10],dtype = np.int64)
+pvec = np.array([4],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
+
+#solve_method = 'iterative'
+solve_method = 'direct'
+
+tridiag = (solve_method=='direct')
 for indp in range(len(pvec)):
     p = pvec[indp]
     p_disc = p
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/6,1/32,1/32])
-    assembler = mA.rkHMatAssembler(p*p,50)
-    #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
+    a = np.array([H/8,1/16,1/16])
+    #assembler = mA.rkHMatAssembler(p*p,100)
+    assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing Stot & rhstot...")
-    Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
+    Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2,tridiag)
     print("done")
-    
-    gInfo = gmres_info()
-    stol = 1e-10*H*H
+    niter = 0
+    if solve_method == 'iterative':
+        gInfo = gmres_info()
+        stol = 1e-10*H*H
 
-    if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
-    else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
-    stop_solve = time.time()
-    #Sdense = Stot@np.identity(Stot.shape[0])
-    #uhat = np.linalg.solve(Sdense,rhstot)
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+        else:
+            uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        niter = gInfo.niter
+    elif solve_method == 'direct':
+        uhat = splinalg.spsolve(Stot,rhstot)
+    
     res = Stot@uhat-rhstot
 
-
+    
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
     print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-    print("GMRES iters              = ", gInfo.niter)
+    print("GMRES iters              = ", niter)
     print("==================================")
 
     nc = OMS.nc
-
-    
-
-
-    nx=50
-    ny=200
-    nz=200
-
-    xpts = np.linspace(0,1,nx)
-    ypts = np.linspace(0,1,ny)
-    zpts = np.linspace(0,1,nz)
-
-    YY = np.zeros(shape=(nx*ny*nz,3))
-    YY[:,0] = np.kron(np.kron(xpts,np.ones_like(ypts)),np.ones_like(zpts))
-    YY[:,1] = np.kron(np.kron(np.ones_like(xpts),ypts),np.ones_like(zpts))
-    YY[:,2] = np.kron(np.kron(np.ones_like(xpts),np.ones_like(ypts)),zpts)
-
-    gYY = np.zeros(shape=(YY.shape[0],))
     err_tot = 0
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
-        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]))[0]
-        YY0 = YY[I0,:]
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
         solver  = oms.solverWrap.solverWrapper(opts)
-        solver.construct(geom,Helm)
+        solver.construct(geom,Helm,False)
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
         startL = slabInd-1
         startR = slabInd+1
@@ -153,23 +141,15 @@ for indp in range(len(pvec)):
         if startR<len(dSlabs):
             g[Ir] = uhat[startR*nc:(startR+1)*nc]
         ghat = bc(XXb)
-        #g=g[:,np.newaxis]
-        #uu00 = solver.solver.solve_dir_full(torch.tensor(g))
-        #uu = np.array(uu00,dtype = np.float64,copy=True)
-        #uu=uu.flatten()
-        #ghat = solver.interp(YY0,uu)
-        err_loc = np.linalg.norm(ghat-g,ord=np.inf)/np.linalg.norm(g,ord=np.inf)
+        err_loc = np.linalg.norm(ghat-g)/np.linalg.norm(g)
         err_tot = np.max([err_loc,err_tot])
+        print("===================LOCAL ERR===================")
         print("err ghat = ",err_loc)
-        #gYY[I0] = ghat
-
-    #triang = tri.Triangulation(YY[:,0],YY[:,1])
-    #tri0 = triang.triangles
-
-    #gref = bc(YY)
-    #np.save('ref_sol_waveguide.npy',gYY)
+        print("===============================================")
     
+    print("===================LOCAL ERR===================")
     print("err_tot = ",err_tot)
+    print("===============================================")
     err[indp] = err_tot
     compr_time[indp] = OMS.stats.compr_timing
     discr_time[indp] = OMS.stats.discr_timing
