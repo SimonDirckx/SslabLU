@@ -118,7 +118,7 @@ class oms:
             - no domain checks are done (garbage in, garbage out)
             - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
             - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
-        '''
+        """
         connectivity    = self.connectivity
         slabs           = self.slabList
         Ntot = 0
@@ -233,6 +233,22 @@ class oms:
         self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
+
+        return S_rk_list, rhs_list, Ntot, nc
+
+
+    def construct_Stot_and_rhstot_linearOperator(self,S_rk_list,rhs_list,Ntot,nc,dbg=0):
+        '''
+        construct S operator and total global rhs
+
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
+            - no domain checks are done (garbage in, garbage out)
+            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
+            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
+        '''
         rhstot = np.zeros(shape = (Ntot,))        
         for rhsInd in range(len(rhs_list)):
             rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
