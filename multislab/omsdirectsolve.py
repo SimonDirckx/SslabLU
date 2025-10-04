@@ -58,8 +58,8 @@ def build_block_tridiagonal_solver(S_rk_list):
         else:
             A_i = S_rk_list[i][0] @ lu_solve(B[-1], I)
             
-        B_i = I - C[i-1].rmatmat(A_i.T).T
-
+        #B_i = I - C[i-1].rmatmat(A_i.T).T
+        B_i = I - (C[i-1].T@(A_i.T)).T
         # Factorize B_i since it's always used in a solve. This means B_i will now be a tuple:
         B_i = lu_factor(B_i, overwrite_a=True)
 
