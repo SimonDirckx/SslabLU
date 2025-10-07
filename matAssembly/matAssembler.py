@@ -31,8 +31,8 @@ class matAssemblerOptions:
         self.reduced    = reduced
 class matAssemblerStats:
     def __init__(self):
-        self.timeMatvecs    = 0
-        self.timeHBS        = 0
+        self.timeSample     = 0
+        self.timeCompress   = 0
         self.nbytes         = 0
 
 
@@ -50,7 +50,9 @@ class matAssembler:
 
         print("MAT ASSEMBLER METHOD=%s" % self.matOpts.method) if dbg > 0 else None
         if self.matOpts.method == 'dense':
+            tic = time.time()
             M=linOp@np.identity(linOp.shape[1])
+            self.stats.timeSample = time.time()-tic
             self.stats.nbytes = M.nbytes
             return M #linOp
         
@@ -70,14 +72,12 @@ class matAssembler:
             m=linOp.shape[0]
             n=linOp.shape[1]
             s=5*(self.matOpts.maxRank+10)
-            s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
+            #s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
-            start = time.time()
             Y = linOp@Om
             Z = linOp.T@Psi
-            timeRand = time.time()-start
-            self.stats.timeMatvecs=timeRand
+            self.stats.timeSample=time.time()-start
 
             Y = torch.from_numpy(Y)
             Z = torch.from_numpy(Z)
@@ -85,13 +85,13 @@ class matAssembler:
             Psi = torch.from_numpy(Psi)
             
             if dbg>0:
-                print("\t Toc tree %5.2f s, toc solve %d random pdes %5.2f s" %(toc_tree, s, self.stats.timeMatvecs))
+                print("\t Toc tree %5.2f s, toc solve %d random pdes %5.2f s" %(toc_tree, s, self.stats.timeSample))
             start = time.time()
             hbsMat = HBS.HBSMAT(tree0,Om,Psi,Y,Z,self.matOpts.maxRank,reduced)
             timeHBS = time.time()-start
-            self.stats.timeHBS=timeHBS
+            self.stats.timeCompress=timeHBS
             if dbg>0:
-                print("\t Toc HBS construction %5.2f s"%self.stats.timeHBS)
+                print("\t Toc HBS construction %5.2f s"%self.stats.timeCompress)
             self.stats.nbytes = hbsMat.nbytes
             def matmat(v,transpose=False):
                 if transpose:

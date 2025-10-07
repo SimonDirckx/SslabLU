@@ -131,6 +131,7 @@ class oms:
         data = 0
         discrTime = 0
         compressTime=0
+        sampleTime=0
         shapeMatch = True
         relerrl=0
         relerrr=0
@@ -164,22 +165,24 @@ class oms:
             compression_l = 0 
             compression_r = 0
             if bool_r:
-                print("CONSTRUCTING R")
                 rkMat_r = assembler.assemble(st_r,dbg=dbg)
                 self.nbytes+=assembler.stats.nbytes
                 compression_r = assembler.stats.nbytes
+                compressTime+=assembler.stats.timeCompress
+                sampleTime+=assembler.stats.timeSample
+                print("LEFT SLAB %d compression time %5.2f s, sample time %5.2f s"% (slabInd,assembler.stats.timeCompress,assembler.stats.timeSample) ) if dbg>0 else None
             if bool_l:
-                print("CONSTRUCTING L")
                 rkMat_l = assembler.assemble(st_l,dbg=dbg)
                 compression_l = assembler.stats.nbytes
                 self.nbytes+=assembler.stats.nbytes
+                compressTime+=assembler.stats.timeCompress
+                sampleTime+=assembler.stats.timeSample
+                print("RIGHT SLAB %d compression time %5.2f s, sample time %5.2f s"% (slabInd, assembler.stats.timeCompress,assembler.stats.timeSample)) if dbg>0 else None
             
             self.densebytes+=np.prod(st_l.A.shape)*8
             compression_l/=np.prod(st_l.A.shape)*8
             self.densebytes+=np.prod(st_r.A.shape)*8
             compression_r/=np.prod(st_r.A.shape)*8
-            tCompress=time.time()-start
-            compressTime += tCompress
             #shapeMatch = shapeMatch and (rkMat_l.shape==st_l.A.shape) and (rkMat_r.shape==st_r.A.shape)
             if dbg>0:
                 if bool_l:
@@ -196,7 +199,6 @@ class oms:
                     relerrr = max(relerrr,errr)
                     print("RIGHT ERR = ",errr)
             if dbg>1:
-                print("SLAB %d compression time %5.2f s"% (slabInd,tCompress))
                 if bool_l and bool_r:
                     print("SLAB %d error = %5.2e // %5.2e\n" % (slabInd,relerrl,relerrr))
                     print("SLAB %d compression = %5.3e // %5.3e\n" % (slabInd,compression_l,compression_r))
@@ -220,6 +222,7 @@ class oms:
         if dbg>0:
             print('============================OMS SUMMARY============================')
             print('avg. discr. time             = ',discrTime/(len(connectivity)-1))
+            print('avg. sample time             = ',sampleTime/(len(connectivity)-1))
             print('avg. compr. time             = ',compressTime/(len(connectivity)-1))
             print('compression rate             = ',self.nbytes/self.densebytes)
             print('shapes match?                = ',shapeMatch)
@@ -227,6 +230,7 @@ class oms:
             print('estim. max. err. ( l // r )  = (',relerrl," // ", relerrr,")")
             print('===================================================================')
         self.stats.compression=self.nbytes/self.densebytes
+        self.stats.sample_timing = sampleTime/(len(connectivity)-1)
         self.stats.compr_timing = compressTime/(len(connectivity)-1)
         self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
