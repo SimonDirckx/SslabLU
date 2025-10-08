@@ -1,6 +1,6 @@
 import numpy as np
 import jax.numpy as jnp
-import torch
+
 
 bnds = [[0,0,0],[1,1,1]]
 

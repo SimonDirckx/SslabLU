@@ -46,6 +46,7 @@ class omsStats:
         self.compression = None
         self.compr_timing = None
         self.discr_timing = None
+        self.sampl_timing = None
 
 class oms:
     def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity):
@@ -189,13 +190,13 @@ class oms:
                     Vl=np.random.standard_normal(size=(st_l.A.shape[1],assembler.matOpts.maxRank))
                     Ul=st_l.A@Vl
                     Ulhat=rkMat_l@Vl
-                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
-                    print("LEFT ERR = ",np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)*Ul.shape[1]))
+                    relerrl = max(relerrl,np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)))
+                    print("LEFT ERR = ",np.linalg.norm(Ul-Ulhat)/(np.linalg.norm(Ul)))
                 if bool_r:
                     Vr=np.random.standard_normal(size=(st_r.A.shape[1],assembler.matOpts.maxRank))
                     Ur=st_r.A@Vr
                     Urhat=rkMat_r@Vr
-                    errr = np.linalg.norm(Ur-Urhat)/( np.linalg.norm(Ur)*Ur.shape[1] )
+                    errr = np.linalg.norm(Ur-Urhat)/( np.linalg.norm(Ur) )
                     relerrr = max(relerrr,errr)
                     print("RIGHT ERR = ",errr)
             if dbg>1:
@@ -230,7 +231,7 @@ class oms:
             print('estim. max. err. ( l // r )  = (',relerrl," // ", relerrr,")")
             print('===================================================================')
         self.stats.compression=self.nbytes/self.densebytes
-        self.stats.sample_timing = sampleTime/(len(connectivity)-1)
+        self.stats.sampl_timing = sampleTime/(len(connectivity)-1)
         self.stats.compr_timing = compressTime/(len(connectivity)-1)
         self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs

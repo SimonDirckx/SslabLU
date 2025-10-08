@@ -105,7 +105,7 @@ def construct_boxes_3d(npan_dim,geom):
     return boxes
 
 def idxs_2d(p,box):
-    return jnp.where( (box[0][0]<=p[...,0]) & (box[1][0]>=p[...,0]) & (box[0][1]<=p[...,1]) & (box[1][1]>=p[...,1]))[0]
+    return np.where( (box[0][0]<=p[:,0]) & (box[1][0]>=p[:,0]) & (box[0][1]<=p[:,1]) & (box[1][1]>=p[:,1]))[0]
 def idxs_3d(p,box):
     return np.where( (box[0][0]<p[:,0]+1e-10) & (box[1][0]>p[:,0]-1e-10) & (box[0][1]<p[:,1]+1e-10) & (box[1][1]>p[:,1]-1e-10) & (box[0][2]<p[:,2]+1e-10) & (box[1][2]>p[:,2]-1e-10) )[0]
 
@@ -140,7 +140,8 @@ def chebInterpFromSamples(xpts,ff,targetpts):
     else:
         f0 = ff
     N,aT = computeTransform(xpts)
-    DFT = np.fft.fft(np.vstack((f0[::-1,],f0[1:N-1,:])),axis=0).real / (2 * N - 2)
+
+    DFT = np.fft.fft(np.vstack((f0[::-1,:],f0[1:N-1,:])),axis=0).real / (2 * N - 2)
     coeffs      = DFT[:N,:] * 2
     coeffs[0,:]   /= 2
     coeffs[-1,:]  /= 2
@@ -170,7 +171,7 @@ def local_interp_3d(pts,f,XX,box,ord0):
                 F_approx+=core[k0,k1,k2]*cx[:,k0]*cy[:,k1]*cz[:,k2]
     return F_approx
 def local_interp_2d(pts,f,XX,box,ord0):
-    ord = [ord0[0]+2,ord0[1]+2]
+    ord = [ord0[0],ord0[1]]
     _,I0  = np.unique(XX,axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1]))
@@ -180,8 +181,6 @@ def local_interp_2d(pts,f,XX,box,ord0):
     
     xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
     ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
-
-
     cx = chebInterpFromSamples(xpts,U,pts[:,0]).T
     cy = chebInterpFromSamples(ypts,Vh.T,pts[:,1]).T
     

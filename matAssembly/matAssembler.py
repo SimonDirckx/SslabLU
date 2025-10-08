@@ -21,13 +21,14 @@ class matAssemblerOptions:
     """
     Options for matrix constuction
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,reduced=False):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,reduced=False):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
         self.maxRank    = maxRank
         self.tree       = tree
         self.leaf_size  = leaf_size
+        self.ndim = 3
         self.reduced    = reduced
 class matAssemblerStats:
     def __init__(self):
@@ -71,7 +72,10 @@ class matAssembler:
             start = time.time()
             m=linOp.shape[0]
             n=linOp.shape[1]
-            s=5*(self.matOpts.maxRank+10)
+            if self.matOpts.ndim==3:
+                s=5*(self.matOpts.maxRank+10)
+            if self.matOpts.ndim==2:
+                s=4*(self.matOpts.maxRank+10)
             #s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
@@ -113,9 +117,9 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,leaf_size,rk,tree=None):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree))
+    def __init__(self,leaf_size,rk,tree=None,ndim=3):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim))
 
 class tolHMatAssembler(matAssembler):
-    def __init__(self,tol,leaf_size,rk):
-        super(tolHMatAssembler,self).__init__(matAssemblerOptions('epsHBS',tol,leaf_size,rk))
+    def __init__(self,tol,leaf_size,rk,ndim=3):
+        super(tolHMatAssembler,self).__init__(matAssemblerOptions('epsHBS',tol,leaf_size,rk,ndim))
