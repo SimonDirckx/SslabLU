@@ -8,17 +8,21 @@ def gb_np(p):
     return ((np.abs(p[:,0]-bnds[0][0]))<1e-14) | ((np.abs(p[:,0]-bnds[1][0]))<1e-14) | ((np.abs(p[:,1]-bnds[0][1]))<1e-14) | ((np.abs(p[:,1]-bnds[1][1]))<1e-14)
 
 def gb_jnp(p):
-    return ((jnp.abs(p[...,0]-bnds[0][0]))<1e-14) | ((jnp.abs(p[...,0]-bnds[1][0]))<1e-14) | ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14)
+    return ((jnp.abs(p[...,0]-bnds[0][0]))<1e-14) | ((jnp.abs(p[...,0]-bnds[1][0]))<1e-14) | ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) 
 
-def gb(p,jax_avail = True):
+def gb(p,jax_avail = True,torch_avail=False):
     if jax_avail:
         return gb_jnp(p)
+    elif torch_avail:
+        return gb_np(p)
     else:
         return gb_np(p)
 
-def box_geom(jax_avail=True):
+def box_geom(jax_avail=True,torch_avail=True):
     if jax_avail:
         return jnp.array(bnds)
+    elif torch_avail:
+        return np.array(bnds)
     else:
         return np.array(bnds)
 def bounds():

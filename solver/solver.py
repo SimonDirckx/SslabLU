@@ -75,7 +75,7 @@ class solverWrapper:
         self.constructed = False
         self.opts=opts
 
-    def construct(self,geom,PDE:pdo,verbose=False):
+    def construct(self,geom,PDE:pdo,verbose=False,compute_inverse=True):
         """
         Actual construction of the local solver
         """
@@ -132,13 +132,14 @@ class solverWrapper:
             self.Aib = solver.Aix
             self.Abi = solver.Axi
             self.Abb = solver.Axx
-            tic      = time()
-            print("start solver")
-            solver.setup_solver_Aii()
-            self.solver_ii = solver.solver_Aii
-            print("solver done")
-            toc      = time() - tic
-            print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+            if compute_inverse:
+                tic      = time()
+                print("start solver")
+                solver.setup_solver_Aii()
+                self.solver_ii = solver.solver_Aii
+                print("solver done")
+                toc      = time() - tic
+                print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='spectral':
             geomSpectral = convertGeom(self.opts,geom)
             solver = spectral(PDE, geomSpectral, self.ord)

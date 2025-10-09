@@ -36,7 +36,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = True
 hpsalt      = True
-kh = 5.25
+kh = 5.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -79,9 +79,10 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([4],dtype = np.int64)
+pvec = np.array([4,6,8,10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
+sample_time = np.zeros(shape=(len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 
 #solve_method = 'iterative'
@@ -94,8 +95,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/16,1/16])
-    assembler = mA.rkHMatAssembler(p*p,150)
+    a = np.array([H/8,1/32,1/32])
+    assembler = mA.rkHMatAssembler(p*p,75)
     #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -137,7 +138,7 @@ for indp in range(len(pvec)):
         geom    = np.array(dSlabs[slabInd])
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
         solver  = oms.solverWrap.solverWrapper(opts)
-        solver.construct(geom,Helm,False)
+        solver.construct(geom,Helm,False,False)
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
         startL = slabInd-1
         startR = slabInd+1
@@ -154,22 +155,24 @@ for indp in range(len(pvec)):
         print("err ghat = ",err_loc)
         print("===============================================")
     
-    print("===================LOCAL ERR===================")
+    print("===================GLOBAL ERR===================")
     print("err_tot = ",err_tot)
     print("===============================================")
     err[indp] = err_tot
+    sample_time[indp] = OMS.stats.sample_timing
     compr_time[indp] = OMS.stats.compr_timing
     discr_time[indp] = OMS.stats.discr_timing
 
 
 fileName = 'cube.csv'
-errMat = np.zeros(shape=(len(pvec),4))
+errMat = np.zeros(shape=(len(pvec),5))
 errMat[:,0] = pvec
 errMat[:,1] = err
-errMat[:,2] = compr_time
-errMat[:,3] = discr_time
+errMat[:,2] = sample_time
+errMat[:,3] = compr_time
+errMat[:,4] = discr_time
 with open(fileName,'w') as f:
-    f.write('p,err,compr,discr\n')
+    f.write('p,err,sample,compr,discr\n')
     np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
 
 plt.figure(0)
