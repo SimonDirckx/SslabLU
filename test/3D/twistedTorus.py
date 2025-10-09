@@ -94,7 +94,7 @@ niter = 0
 if solve_method == 'iterative':
     Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
     gInfo = gmres_info()
-    stol = 1e-10*H*H
+    stol = 1e-8*H*H
 
     if Version(scipy.__version__)>=Version("1.14"):
         uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
