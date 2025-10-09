@@ -72,13 +72,13 @@ def bc(p):
 N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
 formulation = "hps"
-p = 10
+p = 4
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
     p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-a = np.array([H/8.,1/16,1/16])
+a = np.array([H/6.,1/16,1/16])
 assembler = mA.rkHMatAssembler(p*p,100)
 opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -142,7 +142,7 @@ for slabInd in range(len(connectivity)):
     geom    = np.array(dSlabs[slabInd])
     I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]) & (YY[:,2]>=geom[0,2]) & (YY[:,2]<=geom[1,2]) )[0]
     YY0 = YY[I0,:]
-    slab_i  = oms.slab(geom,lambda p : twisted.gb(p,True))
+    slab_i  = oms.slab(geom,lambda p : twisted.gb(p,jax_avail,torch_avail))
     solver  = oms.solverWrap.solverWrapper(opts)
     solver.construct(geom,pdo_mod)
     Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
@@ -156,8 +156,8 @@ for slabInd in range(len(connectivity)):
     g[Ir]=ur
     g[Igb] = bc(XXb[Igb,:])
     g=g[:,np.newaxis]
-    uu = solver.solver.solve_dir_full(g)
-    uu=uu.flatten()
+    uu = solver.solver.solve_dir_full(torch.from_numpy(g))
+    uu=uu.numpy().flatten()
     ghat = solver.interp(YY0,uu)
     gYY[I0] = ghat
 g_ref = np.load('ref_sol.npy')
