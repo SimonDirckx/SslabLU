@@ -9,6 +9,7 @@ import matplotlib.tri as tri
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
+import multislab.omsdirectsolve as omsdirect
 import torch
 # validation&testing
 import time
@@ -71,7 +72,10 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
-formulation = "hps"
+formulation = "hpsalt"
+#solve_method = 'iterative'
+solve_method = 'direct'
+HBS = True
 p = 4
 p_disc = p
 if hpsalt:
@@ -79,20 +83,29 @@ if hpsalt:
     p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
 a = np.array([H/6.,1/16,1/16])
-assembler = mA.rkHMatAssembler(p*p,100)
+if HBS:
+    assembler = mA.rkHMatAssembler(p*p,100)
+else:
+    assembler = mA.denseMatAssembler()
 opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
 OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
+S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+niter = 0
+if solve_method == 'iterative':
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    gInfo = gmres_info()
+    stol = 1e-10*H*H
 
-gInfo = gmres_info()
-stol = 1e-6*H*H
+    if Version(scipy.__version__)>=Version("1.14"):
+        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+    else:
+        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+    niter = gInfo.niter
+elif solve_method == 'direct':
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    T,block = omsdirect.build_block_cyclic_tridiagonal_solver(OMS,S_rk_list,rhs_list,Ntot,nc)
+    uhat  = omsdirect.block_cyclic_tridiagonal_solve(OMS, T, block,rhstot)
 
-if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=800,restart=800)
-else:
-    uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=800,restart=800)
-
-stop_solve = time.time()
 res = Stot@uhat-rhstot
 
 
