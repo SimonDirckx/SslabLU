@@ -82,16 +82,16 @@ class oms:
             
             if (v.ndim == 1):
             
-                v_tmp = v[...,np.newaxis]
+                v_tmp = v[:,np.newaxis]
             else:
                 v_tmp = v
 
             if (not transpose):
-                result = (A_solver@(solver.Aib[...,J]@v_tmp))[I,...]
+                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I,:]
             else:
                 result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
                 result[I,:] = v_tmp
-                result      = solver.Aib[...,J].T @ (A_solver.T@(result))
+                result      = solver.Aib[:,J].T @ (A_solver.T@(result))
             if (v.ndim == 1):
                 result = result.flatten()
             return result
@@ -103,8 +103,8 @@ class oms:
             matvec = lambda v:smatmat(v,Ic,Il), rmatvec = lambda v:smatmat(v,Ic,Il,transpose=True),\
             matmat = lambda v:smatmat(v,Ic,Il), rmatmat = lambda v:smatmat(v,Ic,Il,transpose=True))
         
-        st_r = stMap(Linop_r,XXb[Ir,...],XXi[Ic,...])
-        st_l = stMap(Linop_l,XXb[Il,...],XXi[Ic,...])
+        st_r = stMap(Linop_r,XXb[Ir,:],XXi[Ic,:],solver.solver_ii.shape[0],solver.solver_ii.shape[1])
+        st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:],solver.solver_ii.shape[0],solver.solver_ii.shape[1])
         return st_l,st_r
 
     def construct_Stot_helper(self, bc, assembler, dbg=0):
@@ -157,7 +157,7 @@ class oms:
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 
-            rhs = solver.solver_ii@(solver.Aib[...,Igb]@fgb)
+            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
             rhs = -rhs[Ic]
             rhs_list+=[rhs]
             bool_r = len(Ir)>0

@@ -1,0 +1,230 @@
+PETSC IMPORTED
+PETSC IMPORTED
+PETSC IMPORTED
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43443
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (116.58) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 246.49 s
+SLAB  0 discretization time = 393.37 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 103.13 s
+	 Toc HBS construction  3.89 s
+LEFT SLAB 0 compression time  3.89 s, sample time 103.13 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.05 s, toc solve 550 random pdes 111.74 s
+	 Toc HBS construction  3.77 s
+RIGHT SLAB 0 compression time  3.77 s, sample time 111.74 s
+LEFT ERR =  6.003992272403029e-08
+RIGHT ERR =  5.988996875866985e-08
+SLAB 0 error = 6.00e-08 // 5.99e-08
+
+SLAB 0 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  1  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.45011
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (124.17) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 241.20 s
+SLAB  1 discretization time = 395.01 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 76.32 s
+	 Toc HBS construction  3.84 s
+LEFT SLAB 1 compression time  3.84 s, sample time 76.32 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.05 s, toc solve 550 random pdes 90.86 s
+	 Toc HBS construction  3.83 s
+RIGHT SLAB 1 compression time  3.83 s, sample time 90.86 s
+LEFT ERR =  9.545673435299714e-09
+RIGHT ERR =  9.90394126675175e-09
+SLAB 1 error = 6.00e-08 // 5.99e-08
+
+SLAB 1 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  2  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.44373
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (122.00) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 252.96 s
+SLAB  2 discretization time = 405.56 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 105.26 s
+	 Toc HBS construction  4.55 s
+LEFT SLAB 2 compression time  4.55 s, sample time 105.26 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 112.39 s
+	 Toc HBS construction  4.57 s
+RIGHT SLAB 2 compression time  4.57 s, sample time 112.39 s
+LEFT ERR =  5.1622110300426856e-08
+RIGHT ERR =  5.287659002396225e-08
+SLAB 2 error = 6.00e-08 // 5.99e-08
+
+SLAB 2 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  3  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.45994
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (126.45) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 246.30 s
+SLAB  3 discretization time = 402.77 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 85.40 s
+	 Toc HBS construction  4.19 s
+LEFT SLAB 3 compression time  4.19 s, sample time 85.40 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 83.03 s
+	 Toc HBS construction  3.86 s
+RIGHT SLAB 3 compression time  3.86 s, sample time 83.03 s
+LEFT ERR =  1.1430940612504604e-08
+RIGHT ERR =  1.0782600177532034e-08
+SLAB 3 error = 6.00e-08 // 5.99e-08
+
+SLAB 3 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  4  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43370
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (125.95) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 246.84 s
+SLAB  4 discretization time = 402.53 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 102.27 s
+	 Toc HBS construction  4.42 s
+LEFT SLAB 4 compression time  4.42 s, sample time 102.27 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 100.86 s
+	 Toc HBS construction  4.20 s
+RIGHT SLAB 4 compression time  4.20 s, sample time 100.86 s
+LEFT ERR =  5.731029120463342e-08
+RIGHT ERR =  6.01598477936211e-08
+SLAB 4 error = 6.00e-08 // 6.02e-08
+
+SLAB 4 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  5  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.48889
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (128.65) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 242.81 s
+SLAB  5 discretization time = 401.66 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 76.70 s
+	 Toc HBS construction  4.29 s
+LEFT SLAB 5 compression time  4.29 s, sample time 76.70 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 84.15 s
+	 Toc HBS construction  4.03 s
+RIGHT SLAB 5 compression time  4.03 s, sample time 84.15 s
+LEFT ERR =  1.140573504436425e-08
+RIGHT ERR =  9.803073177635257e-09
+SLAB 5 error = 6.00e-08 // 6.02e-08
+
+SLAB 5 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  6  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43953
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (126.89) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 249.35 s
+SLAB  6 discretization time = 406.12 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 103.91 s
+	 Toc HBS construction  4.24 s
+LEFT SLAB 6 compression time  4.24 s, sample time 103.91 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 112.31 s
+	 Toc HBS construction  4.52 s
+RIGHT SLAB 6 compression time  4.52 s, sample time 112.31 s
+LEFT ERR =  5.284353650894098e-08
+RIGHT ERR =  5.331952394220694e-08
+SLAB 6 error = 6.00e-08 // 6.02e-08
+
+SLAB 6 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  7  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43693
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (127.64) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 249.85 s
+SLAB  7 discretization time = 407.47 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 87.10 s
+	 Toc HBS construction  5.09 s
+LEFT SLAB 7 compression time  5.09 s, sample time 87.10 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 98.81 s
+	 Toc HBS construction  4.42 s
+RIGHT SLAB 7 compression time  4.42 s, sample time 98.81 s
+LEFT ERR =  1.1812805110159563e-08
+RIGHT ERR =  1.0369593160822263e-08
+SLAB 7 error = 6.00e-08 // 6.02e-08
+
+SLAB 7 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  8  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43745
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (127.29) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 243.00 s
+SLAB  8 discretization time = 400.39 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 106.56 s
+	 Toc HBS construction  4.83 s
+LEFT SLAB 8 compression time  4.83 s, sample time 106.56 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 100.32 s
+	 Toc HBS construction  4.65 s
+RIGHT SLAB 8 compression time  4.65 s, sample time 100.32 s
+LEFT ERR =  5.69725003854808e-08
+RIGHT ERR =  6.134530864086206e-08
+SLAB 8 error = 6.00e-08 // 6.13e-08
+
+SLAB 8 compression = 4.272e-02 // 4.272e-02
+
+overlapping slab  9  of  16  done
+--Interp_mat has GtC condition number 1.60091, CtG condition number 5.94138e+00, and time to calculate      0.43772
+Assembled sparse matrix
+SPARSE ASSEMBLY
+	--time for (sparse assembly) (129.07) s
+	--memory for (A sparse) ( 8.85) GB
+start solver
+solver done
+	 Toc construct Aii inverse 244.71 s
+SLAB  9 discretization time = 403.64 s
+MAT ASSEMBLER METHOD=rkHBS
+	 Toc tree  0.06 s, toc solve 550 random pdes 89.22 s

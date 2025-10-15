@@ -29,7 +29,12 @@ class gmres_info(object):
         self.resList+=[rk]
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
-
+from petsc4py import PETSc
+#try:
+#    vec = PETSc.Vec().createSeq(10**9)
+#    print("vec created successfully")
+#except Exception as e:
+#    print(e)
 
 bnds = twisted.bnds
 
@@ -70,21 +75,21 @@ def bc(p):
     return np.ones_like(p[:,0])
 
 
-N = 8
+N = 16
 dSlabs,connectivity,H = twisted.dSlabs(N)
-formulation = "hpsalt"
-#solve_method = 'iterative'
-solve_method = 'direct'
+formulation = "hps"
+solve_method = 'iterative'
+#solve_method = 'direct'
 HBS = True
-p = 4
+p = 10
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
     p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-a = np.array([H/6.,1/16,1/16])
+a = np.array([H/8.,1./16,1./16])
 if HBS:
-    assembler = mA.rkHMatAssembler(p*p,100)
+    assembler = mA.rkHMatAssembler(p*p,300)
 else:
     assembler = mA.denseMatAssembler()
 opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
@@ -92,14 +97,14 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_av
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 niter = 0
 if solve_method == 'iterative':
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
     gInfo = gmres_info()
-    stol = 1e-8*H*H
+    stol = 1e-7*H*H
 
     if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart=1000)
     else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=1000,restart=1000)
     niter = gInfo.niter
 elif solve_method == 'direct':
     Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
@@ -113,7 +118,7 @@ print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
 print("ord                      = ",p)
 print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-print("GMRES iters              = ", gInfo.niter)
+print("GMRES iters              = ", niter)
 print("==================================")
 
 errInf = 0.
@@ -173,6 +178,7 @@ for slabInd in range(len(connectivity)):
     uu=uu.numpy().flatten()
     ghat = solver.interp(YY0,uu)
     gYY[I0] = ghat
+'''
 g_ref = np.load('ref_sol.npy')
 print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf))   
 
@@ -208,12 +214,13 @@ b3 = (yy3[:,0]<twisted.bnds[0][0]) | (yy3[:,0]>twisted.bnds[1][0]) | (yy3[:,1]<t
 
 mask = (b1&b2)|(b1&b3)|(b2&b3)
 triang.set_mask(mask)
-
+'''
 np.save('ref_sol.npy',gYY)
-
+'''
 plt.figure(5)
 plt.tripcolor(triang, gYY, shading='gouraud',cmap='jet')
 plt.axis('equal')
 plt.colorbar()
 plt.savefig('twistedTorus.png',dpi=1000)
 plt.show()
+'''

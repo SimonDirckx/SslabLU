@@ -1,5 +1,4 @@
 
-import pdo.pdo as pdo
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
@@ -31,10 +30,12 @@ from time import time
 """
 
 class stMap:
-    def __init__(self,A:LinearOperator,XXI,XXJ):
+    def __init__(self,A:LinearOperator,XXI,XXJ,m_large = 0,n_large=0):
         self.XXI = XXI
         self.XXJ = XXJ
         self.A = A
+        self.m_large = m_large
+        self.n_large = n_large
 
 
 class solverOptions:
@@ -75,7 +76,7 @@ class solverWrapper:
         self.constructed = False
         self.opts=opts
 
-    def construct(self,geom,PDE:pdo,verbose=False,compute_inverse=True):
+    def construct(self,geom,PDE,verbose=False,compute_inverse=True):
         """
         Actual construction of the local solver
         """

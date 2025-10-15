@@ -3,7 +3,7 @@ from scipy.sparse.linalg   import LinearOperator
 import scipy.sparse as sparse
 from scipy.sparse        import block_diag
 from solver.pde_solver import AbstractPDESolver
-import pdo.pdo as pdo
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 
 from solver import sparse_utils
 import matplotlib.pyplot as plt

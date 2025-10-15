@@ -4,7 +4,7 @@ import scipy.sparse as sparse
 import scipy.sparse.linalg as splinalg
 from scipy.sparse        import block_diag
 from solver.pde_solver import AbstractPDESolver
-import pdo.pdo as pdo
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 from solver import sparse_utils
 
 
