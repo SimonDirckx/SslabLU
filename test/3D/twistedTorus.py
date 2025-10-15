@@ -81,107 +81,128 @@ formulation = "hps"
 solve_method = 'iterative'
 #solve_method = 'direct'
 HBS = True
-p = 10
-p_disc = p
-if hpsalt:
-    formulation = "hpsalt"
-    p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-a = np.array([H/8.,1./16,1./16])
-if HBS:
-    assembler = mA.rkHMatAssembler(p*p,300)
-else:
-    assembler = mA.denseMatAssembler()
-opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
-niter = 0
-if solve_method == 'iterative':
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-    gInfo = gmres_info()
-    stol = 1e-7*H*H
+pvec = np.array([4,6,8,10],dtype = np.int64)
+err=np.zeros(shape = (len(pvec),))
+discr_time=np.zeros(shape = (len(pvec),))
+sample_time = np.zeros(shape=(len(pvec),))
+compr_time=np.zeros(shape = (len(pvec),))
+for indp in range(len(pvec)):
+    p = pvec[indp]
+    p_disc = p
+    if hpsalt:
+        formulation = "hpsalt"
+        p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-    if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart=1000)
+    a = np.array([H/8.,1./16,1./16])
+    if HBS:
+        assembler = mA.rkHMatAssembler(p*p,100)
     else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=1000,restart=1000)
-    niter = gInfo.niter
-elif solve_method == 'direct':
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-    T,block = omsdirect.build_block_cyclic_tridiagonal_solver(OMS,S_rk_list,rhs_list,Ntot,nc)
-    uhat  = omsdirect.block_cyclic_tridiagonal_solve(OMS, T, block,rhstot)
+        assembler = mA.denseMatAssembler()
+    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+    OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+    niter = 0
+    if solve_method == 'iterative':
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+        gInfo = gmres_info()
+        stol = 1e-7*H*H
 
-res = Stot@uhat-rhstot
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart=1000)
+        else:
+            uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=1000,restart=1000)
+        niter = gInfo.niter
+    elif solve_method == 'direct':
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+        T,block = omsdirect.build_block_cyclic_tridiagonal_solver(OMS,S_rk_list,rhs_list,Ntot,nc)
+        uhat  = omsdirect.block_cyclic_tridiagonal_solve(OMS, T, block,rhstot)
 
-
-print("=============SUMMARY==============")
-print("H                        = ",'%10.3E'%H)
-print("ord                      = ",p)
-print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-print("GMRES iters              = ", niter)
-print("==================================")
-
-errInf = 0.
-nc = OMS.nc
-
-nx=200
-ny=200
-
-xpts = np.linspace(-4,4,nx)
-ypts = np.linspace(-4,4,ny)
-
-ZZ = np.zeros(shape=(nx*ny,3))
-ZZ[:,0] = np.kron(xpts,np.ones_like(ypts))
-ZZ[:,1] = np.kron(np.ones_like(xpts),ypts)
-
-sliceYY = np.zeros(shape=ZZ.shape)
-sliceYY[:,0] = twisted.y1(ZZ,False)
-sliceYY[:,1] = twisted.y2(ZZ,False)
-sliceYY[:,2] = twisted.y3(ZZ,False)
+    res = Stot@uhat-rhstot
 
 
-I = np.where( (sliceYY[:,0]>=twisted.bnds[0][0]) & (sliceYY[:,0]<=twisted.bnds[1][0]) & (sliceYY[:,1]>=twisted.bnds[0][1]) & (sliceYY[:,1]<=twisted.bnds[1][1]) & (sliceYY[:,2]>=twisted.bnds[0][2]) & (sliceYY[:,2]<=twisted.bnds[1][2]) )[0]
+    print("=============SUMMARY==============")
+    print("H                        = ",'%10.3E'%H)
+    print("ord                      = ",p)
+    print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
+    print("GMRES iters              = ", niter)
+    print("==================================")
+
+    errInf = 0.
+    nc = OMS.nc
+
+    nx=200
+    ny=200
+
+    xpts = np.linspace(-4,4,nx)
+    ypts = np.linspace(-4,4,ny)
+
+    ZZ = np.zeros(shape=(nx*ny,3))
+    ZZ[:,0] = np.kron(xpts,np.ones_like(ypts))
+    ZZ[:,1] = np.kron(np.ones_like(xpts),ypts)
+
+    sliceYY = np.zeros(shape=ZZ.shape)
+    sliceYY[:,0] = twisted.y1(ZZ,False)
+    sliceYY[:,1] = twisted.y2(ZZ,False)
+    sliceYY[:,2] = twisted.y3(ZZ,False)
 
 
-YY = sliceYY[I,:]
-gYY = np.zeros(shape=(YY.shape[0],))
-print("YY shape = ",YY.shape)
-print("gYY shape = ",gYY.shape)
+    I = np.where( (sliceYY[:,0]>=twisted.bnds[0][0]) & (sliceYY[:,0]<=twisted.bnds[1][0]) & (sliceYY[:,1]>=twisted.bnds[0][1]) & (sliceYY[:,1]<=twisted.bnds[1][1]) & (sliceYY[:,2]>=twisted.bnds[0][2]) & (sliceYY[:,2]<=twisted.bnds[1][2]) )[0]
 
 
-sliceZZ = np.zeros(shape=(len(I),3))
-sliceZZ[:,0] = twisted.z1(YY,False)
-sliceZZ[:,1] = twisted.z2(YY,False)
-sliceZZ[:,2] = twisted.z3(YY,False)
+    YY = sliceYY[I,:]
+    gYY = np.zeros(shape=(YY.shape[0],))
+
+
+    sliceZZ = np.zeros(shape=(len(I),3))
+    sliceZZ[:,0] = twisted.z1(YY,False)
+    sliceZZ[:,1] = twisted.z2(YY,False)
+    sliceZZ[:,2] = twisted.z3(YY,False)
 
 
 
-for slabInd in range(len(connectivity)):
-    geom    = np.array(dSlabs[slabInd])
-    I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]) & (YY[:,2]>=geom[0,2]) & (YY[:,2]<=geom[1,2]) )[0]
-    YY0 = YY[I0,:]
-    slab_i  = oms.slab(geom,lambda p : twisted.gb(p,jax_avail,torch_avail))
-    solver  = oms.solverWrap.solverWrapper(opts)
-    solver.construct(geom,pdo_mod)
-    Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+    for slabInd in range(len(connectivity)):
+        geom    = np.array(dSlabs[slabInd])
+        I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]) & (YY[:,2]>=geom[0,2]) & (YY[:,2]<=geom[1,2]) )[0]
+        YY0 = YY[I0,:]
+        slab_i  = oms.slab(geom,lambda p : twisted.gb(p,jax_avail,torch_avail))
+        solver  = oms.solverWrap.solverWrapper(opts)
+        solver.construct(geom,pdo_mod)
+        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
 
-    startL = ((slabInd-1)%N)
-    startR = ((slabInd+1)%N)
-    ul = uhat[startL*nc:(startL+1)*nc]
-    ur = uhat[startR*nc:(startR+1)*nc]
-    g = np.zeros(shape=(XXb.shape[0],))
-    g[Il]=ul
-    g[Ir]=ur
-    g[Igb] = bc(XXb[Igb,:])
-    g=g[:,np.newaxis]
-    uu = solver.solver.solve_dir_full(torch.from_numpy(g))
-    uu=uu.numpy().flatten()
-    ghat = solver.interp(YY0,uu)
-    gYY[I0] = ghat
+        startL = ((slabInd-1)%N)
+        startR = ((slabInd+1)%N)
+        ul = uhat[startL*nc:(startL+1)*nc]
+        ur = uhat[startR*nc:(startR+1)*nc]
+        g = np.zeros(shape=(XXb.shape[0],))
+        g[Il]=ul
+        g[Ir]=ur
+        g[Igb] = bc(XXb[Igb,:])
+        g=g[:,np.newaxis]
+        uu = solver.solver.solve_dir_full(torch.from_numpy(g))
+        uu=uu.numpy().flatten()
+        ghat = solver.interp(YY0,uu)
+        gYY[I0] = ghat
+    
+    g_ref = np.load('ref_sol.npy')
+    print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf))
+    err[indp] = np.linalg.norm(g_ref-gYY,ord=np.inf)
+    sample_time[indp] = OMS.stats.sampl_timing
+    compr_time[indp] = OMS.stats.compr_timing
+    discr_time[indp] = OMS.stats.discr_timing
+
+fileName = 'twistedTorus.csv'
+errMat = np.zeros(shape=(len(pvec),5))
+errMat[:,0] = pvec
+errMat[:,1] = err
+errMat[:,2] = sample_time
+errMat[:,3] = compr_time
+errMat[:,4] = discr_time
+with open(fileName,'w') as f:
+    f.write('p,err,sample,compr,discr\n')
+    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
+   
 '''
-g_ref = np.load('ref_sol.npy')
-print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf))   
-
 triang = tri.Triangulation(sliceZZ[:,0],sliceZZ[:,1])
 tri0 = triang.triangles
 
@@ -215,7 +236,7 @@ b3 = (yy3[:,0]<twisted.bnds[0][0]) | (yy3[:,0]>twisted.bnds[1][0]) | (yy3[:,1]<t
 mask = (b1&b2)|(b1&b3)|(b2&b3)
 triang.set_mask(mask)
 '''
-np.save('ref_sol.npy',gYY)
+#np.save('ref_sol.npy',gYY)
 '''
 plt.figure(5)
 plt.tripcolor(triang, gYY, shading='gouraud',cmap='jet')
