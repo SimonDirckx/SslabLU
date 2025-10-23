@@ -52,7 +52,7 @@ bnds = twisted.bnds
 nwaves = 8.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-
+kh = .15
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
 jax_avail   = False
 torch_avail = True
@@ -61,28 +61,33 @@ hpsalt      = True
 
 if jax_avail:
     def bfield(p,kh):
-        return -kh*kh*jnp.ones_like(p[...,0])
+        return kh*kh*jnp.ones_like(p[...,0])
 elif torch_avail:
     def bfield(p,kh):
-        return -kh*kh*torch.ones(p.shape[0])
+        return kh*kh*torch.ones(p.shape[0])
 else:
     def bfield(p,kh):
-        return -kh*kh*np.ones(shape=(p.shape[0],))
+        return kh*kh*np.ones(shape=(p.shape[0],))
 param_geom=twisted.param_geom(jax_avail=jax_avail, torch_avail=torch_avail, hpsalt=hpsalt)
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 def bc(p):
-    return np.ones_like(p[:,0])
+    zz=np.zeros(shape = p.shape)
+    zz[:,0] = twisted.z1(p,jax_avail,torch_avail)
+    zz[:,1] = twisted.z2(p,jax_avail,torch_avail)
+    zz[:,2] = twisted.z3(p,jax_avail,torch_avail)
+    return np.sin(kh*(zz[:,0]+zz[:,1])/np.sqrt(2))
 
 
-N = 16
+N = 8
 dSlabs,connectivity,H = twisted.dSlabs(N)
 formulation = "hps"
 solve_method = 'iterative'
 #solve_method = 'direct'
-HBS = True
+HBS = False
 
-pvec = np.array([4,6,8,10],dtype = np.int64)
+#pvec = np.array([4,6,8,10],dtype = np.int32)
+pvec = np.array([4],dtype = np.int32)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -94,15 +99,18 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-    a = np.array([H/8.,1./16,1./16])
+    a = np.array([H/8.,1./8,1./8])
     if HBS:
         assembler = mA.rkHMatAssembler(p*p,100)
     else:
         assembler = mA.denseMatAssembler()
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+    
     OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     niter = 0
+
+
     if solve_method == 'iterative':
         Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
@@ -130,6 +138,7 @@ for indp in range(len(pvec)):
 
     errInf = 0.
     nc = OMS.nc
+    
 
     nx=200
     ny=200
@@ -175,34 +184,41 @@ for indp in range(len(pvec)):
         ul = uhat[startL*nc:(startL+1)*nc]
         ur = uhat[startR*nc:(startR+1)*nc]
         g = np.zeros(shape=(XXb.shape[0],))
+        
+        
+
+
         g[Il]=ul
         g[Ir]=ur
+        
         g[Igb] = bc(XXb[Igb,:])
+
+
         g=g[:,np.newaxis]
         uu = solver.solver.solve_dir_full(torch.from_numpy(g))
         uu=uu.numpy().flatten()
         ghat = solver.interp(YY0,uu)
         gYY[I0] = ghat
     
-    g_ref = np.load('ref_sol.npy')
-    print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf))
-    err[indp] = np.linalg.norm(g_ref-gYY,ord=np.inf)
-    sample_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
+    #g_ref = np.load('ref_sol.npy')
+    #print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf))
+    #err[indp] = np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf)
+    #sample_time[indp] = OMS.stats.sampl_timing
+    #compr_time[indp] = OMS.stats.compr_timing
+    #discr_time[indp] = OMS.stats.discr_timing
 
-fileName = 'twistedTorus.csv'
-errMat = np.zeros(shape=(len(pvec),5))
-errMat[:,0] = pvec
-errMat[:,1] = err
-errMat[:,2] = sample_time
-errMat[:,3] = compr_time
-errMat[:,4] = discr_time
-with open(fileName,'w') as f:
-    f.write('p,err,sample,compr,discr\n')
-    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
+#fileName = 'twistedTorus.csv'
+#errMat = np.zeros(shape=(len(pvec),5))
+#errMat[:,0] = pvec
+#errMat[:,1] = err
+#errMat[:,2] = sample_time
+#errMat[:,3] = compr_time
+#errMat[:,4] = discr_time
+#with open(fileName,'w') as f:
+#    f.write('p,err,sample,compr,discr\n')
+#    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
    
-'''
+
 triang = tri.Triangulation(sliceZZ[:,0],sliceZZ[:,1])
 tri0 = triang.triangles
 
@@ -235,13 +251,10 @@ b3 = (yy3[:,0]<twisted.bnds[0][0]) | (yy3[:,0]>twisted.bnds[1][0]) | (yy3[:,1]<t
 
 mask = (b1&b2)|(b1&b3)|(b2&b3)
 triang.set_mask(mask)
-'''
 #np.save('ref_sol.npy',gYY)
-'''
 plt.figure(5)
 plt.tripcolor(triang, gYY, shading='gouraud',cmap='jet')
 plt.axis('equal')
 plt.colorbar()
 plt.savefig('twistedTorus.png',dpi=1000)
 plt.show()
-'''

@@ -153,7 +153,7 @@ class oms:
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
             startCentral += nc
             
-            fgb = bc(XXb[Igb,...])
+            fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
 
