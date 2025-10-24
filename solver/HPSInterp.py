@@ -5,14 +5,14 @@ import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
 import matplotlib.pyplot as plt
 
-def interp(solver,p,f):
+def interp(solver,p,f,typestr):
 
     if solver.ndim==2:
         
-        return interp_2d(solver,p,f)
+        return interp_2d(solver,p,f,typestr)
     elif solver.ndim==3:
         
-        return interp_3d(solver,p,f)
+        return interp_3d(solver,p,f,typestr)
     else:
         raise ValueError("ndim must be 2 or 3")
     
@@ -29,7 +29,7 @@ def interp_2d(solver,pts,f):
         g[I] = local_interp_2d(pts[I,:],f[J],XX,box,ord)
     return g
 
-def interp_3d(solver,pts,f):
+def interp_3d(solver,pts,f,typestr):
     g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_3d(npan_dim,solver.geom)
@@ -38,7 +38,7 @@ def interp_3d(solver,pts,f):
         I = idxs_3d(pts,box)
         J = idxs_3d(solver._XXfull,box)
         XX = solver._XXfull[J,:]
-        g[I] = local_interp_3d(pts[I,:],f[J],XX,box,ord)
+        g[I] = local_interp_3d(pts[I,:],f[J],XX,box,ord,typestr)
     return g
 
 
@@ -147,8 +147,13 @@ def chebInterpFromSamples(xpts,ff,targetpts):
     coeffs[-1,:]  /= 2
     return np.polynomial.chebyshev.chebval(aT(targetpts), coeffs)
 
-def local_interp_3d(pts,f,XX,box,ord0):
-    ord = [ord0[0],ord0[1],ord0[2]]
+def local_interp_3d(pts,f,XX,box,ord0,typestr):
+    if typestr=='hps':
+        ord = [ord0[0]+2,ord0[1]+2,ord0[2]+2]
+    elif typestr=='hpsalt':
+        ord = [ord0[0],ord0[1],ord0[2]]
+    else:
+        raise ValueError("solver type not recognized")
     _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))

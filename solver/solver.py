@@ -164,9 +164,9 @@ class solverWrapper:
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):
         if self.type=='hps':
-            return interp.interp(self.solver,pts,f)
+            return interp.interp(self.solver,pts,f,'hps')
         elif self.type == 'hpsalt':
-            return interp.interp(self.solver,pts,f)
+            return interp.interp(self.solver,pts,f,'hpsalt')
         else:
             raise ValueError("interp not implemented yet")
 

@@ -54,9 +54,9 @@ wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 kh = 2.15
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
-jax_avail   = False
-torch_avail = True
-hpsalt      = True
+jax_avail   = True
+torch_avail = False
+hpsalt      = False
 
 
 if jax_avail:
@@ -72,30 +72,22 @@ param_geom=twisted.param_geom(jax_avail=jax_avail, torch_avail=torch_avail, hpsa
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
 def bc(p):
-    zz=np.zeros(shape = p.shape)
-    zz[:,0] = twisted.z1(p,jax_avail,torch_avail)
-    zz[:,1] = twisted.z2(p,jax_avail,torch_avail)
-    zz[:,2] = twisted.z3(p,jax_avail,torch_avail)
-    rr=np.abs(zz[:,0]-5.)
-    return np.real(np.exp(1j*kh*rr)/(4.*np.pi*rr))
-def bc_np(p):
-    zz=np.zeros(shape = p.shape)
-    zz[:,0] = twisted.z1(p,False,False)
-    zz[:,1] = twisted.z2(p,False,False)
-    zz[:,2] = twisted.z3(p,False,False)
-    rr=np.abs(zz[:,0]-5.)
-    return np.real(np.exp(1j*kh*rr)/(4.*np.pi*rr))
+    z1=twisted.z1(p,jax_avail=jax_avail,torch_avail=torch_avail)
+    z2=twisted.z2(p,jax_avail=jax_avail,torch_avail=torch_avail)
+    z3=twisted.z3(p,jax_avail=jax_avail,torch_avail=torch_avail)
+    rr = np.sqrt((z1-5.)**2+z2**2+z3**2)
+    return np.cos(kh*rr)/(4*np.pi*rr)
 
 
-N = 8
+N = 5
 dSlabs,connectivity,H = twisted.dSlabs(N)
 formulation = "hps"
 solve_method = 'iterative'
 #solve_method = 'direct'
-HBS = True
+HBS = False
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
-pvec = np.array([6],dtype = np.int32)
+pvec = np.array([6],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -113,7 +105,7 @@ for indp in range(len(pvec)):
     else:
         assembler = mA.denseMatAssembler()
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-
+    
     OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     niter = 0
@@ -123,7 +115,6 @@ for indp in range(len(pvec)):
         Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
         stol = 1e-7*H*H
-
         if Version(scipy.__version__)>=Version("1.14"):
             uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=1000,restart=1000)
         else:
@@ -146,6 +137,7 @@ for indp in range(len(pvec)):
 
     errInf = 0.
     nc = OMS.nc
+    
 
     nx=200
     ny=200
@@ -158,9 +150,9 @@ for indp in range(len(pvec)):
     ZZ[:,1] = np.kron(np.ones_like(xpts),ypts)
 
     sliceYY = np.zeros(shape=ZZ.shape)
-    sliceYY[:,0] = twisted.y1(ZZ,False)
-    sliceYY[:,1] = twisted.y2(ZZ,False)
-    sliceYY[:,2] = twisted.y3(ZZ,False)
+    sliceYY[:,0] = twisted.y1(ZZ,False,False)
+    sliceYY[:,1] = twisted.y2(ZZ,False,False)
+    sliceYY[:,2] = twisted.y3(ZZ,False,False)
 
 
     I = np.where( (sliceYY[:,0]>=twisted.bnds[0][0]) & (sliceYY[:,0]<=twisted.bnds[1][0]) & (sliceYY[:,1]>=twisted.bnds[0][1]) & (sliceYY[:,1]<=twisted.bnds[1][1]) & (sliceYY[:,2]>=twisted.bnds[0][2]) & (sliceYY[:,2]<=twisted.bnds[1][2]) )[0]
@@ -171,58 +163,40 @@ for indp in range(len(pvec)):
 
 
     sliceZZ = np.zeros(shape=(len(I),3))
-    sliceZZ[:,0] = twisted.z1(YY,False)
-    sliceZZ[:,1] = twisted.z2(YY,False)
-    sliceZZ[:,2] = twisted.z3(YY,False)
+    sliceZZ[:,0] = twisted.z1(YY,False,False)
+    sliceZZ[:,1] = twisted.z2(YY,False,False)
+    sliceZZ[:,2] = twisted.z3(YY,False,False)
 
+    ucheck = np.zeros(shape=(Stot.shape[0],))
+    rhscheck = np.zeros(shape=(Stot.shape[1],))
 
+    XXcprev = np.zeros(shape=(nc,3))
 
-    for slabInd in range(len(connectivity)):
+    for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
         I0 = np.where(  (YY[:,0]>=geom[0,0]) & (YY[:,0]<=geom[1,0]) & (YY[:,1]>=geom[0,1]) & (YY[:,1]<=geom[1,1]) & (YY[:,2]>=geom[0,2]) & (YY[:,2]<=geom[1,2]) )[0]
         YY0 = YY[I0,:]
-        slab_i  = oms.slab(geom,lambda p : twisted.gb(p,jax_avail,torch_avail))
+        slab_i  = oms.slab(geom,lambda p : twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail))
         solver  = oms.solverWrap.solverWrapper(opts)
         solver.construct(geom,pdo_mod)
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-
         startL = ((slabInd-1)%N)
         startR = ((slabInd+1)%N)
         ul = uhat[startL*nc:(startL+1)*nc]
         ur = uhat[startR*nc:(startR+1)*nc]
-        g = np.zeros(shape=(XXb.shape[0],))
+        print("ul err = ",np.linalg.norm(ul - bc(XXb[Il,:]))/np.linalg.norm(bc(XXb[Il,:])))
+        print("ur err = ",np.linalg.norm(ur - bc(XXb[Ir,:]))/np.linalg.norm(bc(XXb[Ir,:])))
         
-        
-
-
-        g[Il]=bc(XXb[Il,:])
-        g[Ir]=bc(XXb[Ir,:])
-        gl = g[Il]
-        gr = g[Ir]
-        print("ul shape // gl shape = ",ul.shape,"//",gl.shape)
-        print("ur shape // gr shape = ",ur.shape,"//",gr.shape)
-        print("ul err = ",np.linalg.norm(ul-g[Il])/np.linalg.norm(ul))
-        print("ur err = ",np.linalg.norm(ur-g[Ir])/np.linalg.norm(ur))
-
-        g[Igb] = bc(XXb[Igb,:])
-        
-        rhs = solver.Aib @ g
-        print("===================================")
-        ui = -(solver.solver_ii@rhs)
-        uc = ui[Ic]
-        print("uc err = ",np.linalg.norm(uc-bc(XXi[Ic,:]),ord=np.inf))
-
-        g=g[:,np.newaxis]
-        uu = solver.solver.solve_dir_full(torch.from_numpy(g))
-        
-        uu=uu.numpy().flatten()
-        uuhat = bc(solver.XXfull)
-        print("total err = ",np.linalg.norm(uu-uuhat,ord=np.inf))
-        ghat = solver.interp(YY0,uu)
-        print("interp err = ",np.linalg.norm(ghat - bc_np(YY0),np.inf))
-        print("===================================")
+        g = np.zeros(shape=(XXb.shape[0],1))
+        g[Il,0]=ul
+        g[Ir,0]=ur
+        g[Igb,0] = bc(XXb[Igb,:])
+        if hpsalt:
+            g=torch.from_numpy(g)
+        uu = solver.solver.solve_dir_full(g)
+        uu=uu.flatten()
+        ghat = solver.interp(YY0,np.array(uu))
         gYY[I0] = ghat
-    
     #g_ref = np.load('ref_sol.npy')
     #print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf))
     #err[indp] = np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf)
