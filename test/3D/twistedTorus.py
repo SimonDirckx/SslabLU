@@ -49,10 +49,10 @@ bnds = twisted.bnds
 #
 ################################################################
 
-nwaves = 8.24
+nwaves = 2.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-kh = 2.15
+kh = 1.6
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
 jax_avail   = True
 torch_avail = False
@@ -87,7 +87,7 @@ solve_method = 'iterative'
 HBS = False
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
-pvec = np.array([6],dtype = np.int64)
+pvec = np.array([4],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -197,6 +197,7 @@ for indp in range(len(pvec)):
         uu=uu.flatten()
         ghat = solver.interp(YY0,np.array(uu))
         gYY[I0] = ghat
+        print("slab ",slabInd," done")
     #g_ref = np.load('ref_sol.npy')
     #print("err_I = ",np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf))
     #err[indp] = np.linalg.norm(g_ref-gYY,ord=np.inf)/np.linalg.norm(g_ref,ord=np.inf)
