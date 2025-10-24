@@ -52,7 +52,7 @@ bnds = twisted.bnds
 nwaves = 8.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-kh = .15
+kh = 2.15
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
 jax_avail   = False
 torch_avail = True
@@ -61,13 +61,13 @@ hpsalt      = True
 
 if jax_avail:
     def bfield(p,kh):
-        return kh*kh*jnp.ones_like(p[...,0])
+        return -kh*kh*jnp.ones_like(p[...,0])
 elif torch_avail:
     def bfield(p,kh):
-        return kh*kh*torch.ones(p.shape[0])
+        return -kh*kh*torch.ones(p.shape[0])
 else:
     def bfield(p,kh):
-        return kh*kh*np.ones(shape=(p.shape[0],))
+        return -kh*kh*np.ones(shape=(p.shape[0],))
 param_geom=twisted.param_geom(jax_avail=jax_avail, torch_avail=torch_avail, hpsalt=hpsalt)
 pdo_mod = param_geom.transform_helmholtz_pdo(bfield,kh)
 
@@ -76,7 +76,15 @@ def bc(p):
     zz[:,0] = twisted.z1(p,jax_avail,torch_avail)
     zz[:,1] = twisted.z2(p,jax_avail,torch_avail)
     zz[:,2] = twisted.z3(p,jax_avail,torch_avail)
-    return np.sin(kh*(zz[:,0]+zz[:,1])/np.sqrt(2))
+    rr=np.abs(zz[:,0]-5.)
+    return np.real(np.exp(1j*kh*rr)/(4.*np.pi*rr))
+def bc_np(p):
+    zz=np.zeros(shape = p.shape)
+    zz[:,0] = twisted.z1(p,False,False)
+    zz[:,1] = twisted.z2(p,False,False)
+    zz[:,2] = twisted.z3(p,False,False)
+    rr=np.abs(zz[:,0]-5.)
+    return np.real(np.exp(1j*kh*rr)/(4.*np.pi*rr))
 
 
 N = 8
@@ -84,10 +92,10 @@ dSlabs,connectivity,H = twisted.dSlabs(N)
 formulation = "hps"
 solve_method = 'iterative'
 #solve_method = 'direct'
-HBS = False
+HBS = True
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
-pvec = np.array([4],dtype = np.int32)
+pvec = np.array([6],dtype = np.int32)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -105,7 +113,7 @@ for indp in range(len(pvec)):
     else:
         assembler = mA.denseMatAssembler()
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-    
+
     OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     niter = 0
@@ -138,7 +146,6 @@ for indp in range(len(pvec)):
 
     errInf = 0.
     nc = OMS.nc
-    
 
     nx=200
     ny=200
@@ -188,16 +195,32 @@ for indp in range(len(pvec)):
         
 
 
-        g[Il]=ul
-        g[Ir]=ur
-        
-        g[Igb] = bc(XXb[Igb,:])
+        g[Il]=bc(XXb[Il,:])
+        g[Ir]=bc(XXb[Ir,:])
+        gl = g[Il]
+        gr = g[Ir]
+        print("ul shape // gl shape = ",ul.shape,"//",gl.shape)
+        print("ur shape // gr shape = ",ur.shape,"//",gr.shape)
+        print("ul err = ",np.linalg.norm(ul-g[Il])/np.linalg.norm(ul))
+        print("ur err = ",np.linalg.norm(ur-g[Ir])/np.linalg.norm(ur))
 
+        g[Igb] = bc(XXb[Igb,:])
+        
+        rhs = solver.Aib @ g
+        print("===================================")
+        ui = -(solver.solver_ii@rhs)
+        uc = ui[Ic]
+        print("uc err = ",np.linalg.norm(uc-bc(XXi[Ic,:]),ord=np.inf))
 
         g=g[:,np.newaxis]
         uu = solver.solver.solve_dir_full(torch.from_numpy(g))
+        
         uu=uu.numpy().flatten()
+        uuhat = bc(solver.XXfull)
+        print("total err = ",np.linalg.norm(uu-uuhat,ord=np.inf))
         ghat = solver.interp(YY0,uu)
+        print("interp err = ",np.linalg.norm(ghat - bc_np(YY0),np.inf))
+        print("===================================")
         gYY[I0] = ghat
     
     #g_ref = np.load('ref_sol.npy')
