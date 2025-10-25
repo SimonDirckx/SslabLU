@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 
 const_theta = 1./(2.*np.pi)
-bnds = [[0.,0.,0.],[1.,1.,1.]]
+bnds = [[0,0,0],[1.,1.,1.]]
 
 
 ####################################
@@ -23,7 +23,7 @@ z2_np   = lambda zz: np.multiply( 1 + 1 * zz[:,1], np.sin(zz[:,0]/const_theta) )
 z3_np   = lambda zz: zz[:,2]
 
 
-y1_np   = lambda zz: const_theta* np.atan2(zz[:,1],zz[:,0])
+y1_np   = lambda zz: (const_theta* np.atan2(zz[:,1],zz[:,0]))+.5
 y2_np   = lambda zz: r_np(zz) - 1
 y3_np   = lambda zz: zz[:,2]
 
@@ -55,7 +55,7 @@ z2_jnp = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.sin(zz[...,0]/const_the
 z3_jnp = lambda zz: zz[...,2]
 
 
-y1_jnp = lambda zz: const_theta*jnp.atan2(zz[...,1],zz[...,0])
+y1_jnp = lambda zz: (const_theta*jnp.atan2(zz[...,1],zz[...,0]))+.5
 y2_jnp = lambda zz: r_jnp(zz) - 1
 y3_jnp = lambda zz: zz[...,2]
 
@@ -89,7 +89,7 @@ z2_torch = lambda zz: torch.mul( 1 + 1 * zz[:,1], torch.sin(zz[:,0]/const_theta)
 z3_torch = lambda zz: zz[:,2]
 
 
-y1_torch = lambda zz: const_theta* torch.atan2(zz[:,1],zz[:,0])
+y1_torch = lambda zz: (const_theta* torch.atan2(zz[:,1],zz[:,0]))+.5
 y2_torch = lambda zz: r_np(zz) - 1
 y3_torch = lambda zz: zz[:,2]
 

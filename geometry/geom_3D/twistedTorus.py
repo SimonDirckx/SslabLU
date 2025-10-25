@@ -8,7 +8,7 @@ from solver.spectralmultidomain.hps.geom              import ParametrizedGeometr
 from solver.hpsmultidomain.hpsmultidomain.geom import ParametrizedGeometry3D as ParametrizedGeometry3Dalt
 
 R = 1.5
-bnds = [[-1.,-1.,-1.],[1.,1.,1.]]
+bnds = [[0,0,0],[1.,1.,1.]]
 
 
 ####################################
@@ -16,31 +16,32 @@ bnds = [[-1.,-1.,-1.],[1.,1.,1.]]
 ####################################
 
 def z1_np(p):
-    c=np.cos(np.pi*p[:,0])
-    s=np.sin(np.pi*p[:,0])
+    q = 2*p-1
+    c=np.cos(np.pi*q[:,0])
+    s=np.sin(np.pi*q[:,0])
     c2 = np.multiply(c,c)
     cs = np.multiply(c,s)
-    q = np.multiply(c2,p[:,1])-np.multiply(cs,p[:,2])+c*(R+1)
-    return q
+    z1 = np.multiply(c2,q[:,1])-np.multiply(cs,q[:,2])+c*(R+1)
+    return z1
 
 def z2_np(p):
-    c=np.cos(np.pi*p[:,0])
-    s=np.sin(np.pi*p[:,0])
+    q = 2*p-1
+    c=np.cos(np.pi*q[:,0])
+    s=np.sin(np.pi*q[:,0])
     s2 = np.multiply(s,s)
     cs = np.multiply(c,s)
-    q = np.multiply(cs,p[:,1])-np.multiply(s2,p[:,2])+s*(R+1)
-    return q
+    z2 = np.multiply(cs,q[:,1])-np.multiply(s2,q[:,2])+s*(R+1)
+    return z2
 def z3_np(p):
-    c=np.cos(np.pi*p[:,0])
-    s=np.sin(np.pi*p[:,0])
-    q = np.multiply(s,p[:,1])+np.multiply(c,p[:,2])
-    return q
-
-
+    q=2*p-1
+    c=np.cos(np.pi*q[:,0])
+    s=np.sin(np.pi*q[:,0])
+    z3 = np.multiply(s,q[:,1])+np.multiply(c,q[:,2])
+    return z3
 
 def y1_np(p):
     th = np.arctan2(p[:,1],p[:,0])
-    return th/np.pi
+    return ((th/np.pi)+1)/2
 
 def y2_np(p):
     # p is a vector of points, Nx3
@@ -50,7 +51,7 @@ def y2_np(p):
     c2 = np.multiply(c,c)
     cs = np.multiply(c,s)
     q = np.multiply(p[:,0],c2)+np.multiply(p[:,1],cs)-(R+1)*c + np.multiply(s,p[:,2])
-    return q
+    return (q+1)/2
 
 
 def y3_np(p):
@@ -60,7 +61,7 @@ def y3_np(p):
     s2 = np.multiply(s,s)
     cs = np.multiply(c,s)
     q = -np.multiply(p[:,0],cs)-np.multiply(p[:,1],s2)+(R+1)*s+np.multiply(c,p[:,2])
-    return q
+    return (q+1)/2
 
 #verified
 def y2_d1_np(p):
@@ -71,16 +72,16 @@ def y2_d1_np(p):
     c   = np.cos(th)
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]**2 - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
-    return (c2t+1)/2. + A/r2
+    return ((c2t+1)/2 + A/r2)/2
 
 #verified
 def y1_d1_np(p):
     r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
-    return -(p[:,1]/r2)/np.pi
+    return -((p[:,1]/r2)/np.pi)/2
 #verified
 def y1_d2_np(p):
     r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
-    return (p[:,0]/r2)/np.pi
+    return ((p[:,0]/r2)/np.pi)/2
 
 #verified
 def y2_d2_np(p):
@@ -91,11 +92,11 @@ def y2_d2_np(p):
     c   = np.cos(th)
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
-    return s2t/2. + A/r2
+    return (s2t/2. + A/r2)/2
 
 def y2_d3_np(p):
     th = np.arctan2(p[:,1],p[:,0])
-    return np.sin(th)
+    return (np.sin(th))/2
 
 
 
@@ -108,7 +109,7 @@ def y3_d1_np(p):
     c   = np.cos(th)
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (c2t*p[:,0]*p[:,1] + s2t*p[:,1]**2 - (R+1)*c*p[:,1] + p[:,2]*p[:,1]*s)
-    return -s2t/2. + A/r2
+    return (-s2t/2. + A/r2)/2
 
 def y3_d2_np(p):
     th = np.arctan2(p[:,1],p[:,0])
@@ -118,21 +119,21 @@ def y3_d2_np(p):
     c   = np.cos(th)
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (s2t*p[:,0]*p[:,1] + c2t*p[:,0]*p[:,0] - (R+1)*c*p[:,0] + p[:,2]*p[:,0]*s)
-    return (c2t-1)/2. - A/r2
+    return ((c2t-1)/2. - A/r2)/2
 #verified
 def y3_d3_np(p):
     th = np.arctan2(p[:,1],p[:,0])
-    return np.cos(th)
+    return np.cos(th)/2
 
 
 #verified
 def y1_d1d1_np(p):
     r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
-    return (2*p[:,1]*p[:,0]/r2)/(r2*np.pi)
+    return ((2*p[:,1]*p[:,0]/r2)/(r2*np.pi))/2
 #verified
 def y1_d2d2_np(p):
     r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
-    return -2*(p[:,0]*p[:,1]/r2)/(r2*np.pi)
+    return -(2*(p[:,0]*p[:,1]/r2)/(r2*np.pi))/2
 
 #verified
 def y2_d1d1_np(p):
@@ -144,7 +145,7 @@ def y2_d1d1_np(p):
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]*p[:,1] - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
     dA = p[:,1]*s2t-(2*c2t*p[:,0]*(p[:,1]**2)+2*s2t*p[:,1]**3-(R+1)*c*p[:,1]**2 + p[:,2]*s*(p[:,1]**2) )/r2
-    return (p[:,1]*s2t + dA - 2*A*p[:,0]/r2 )/r2
+    return ((p[:,1]*s2t + dA - 2*A*p[:,0]/r2 )/r2)/2
 #verified
 def y2_d2d2_np(p):
     th = np.arctan2(p[:,1],p[:,0])
@@ -155,7 +156,7 @@ def y2_d2d2_np(p):
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
     dA  = p[:,0]*c2t-(2*s2t*p[:,1]*p[:,0]**2+2*c2t*(p[:,0]**3)-(R+1)*c*(p[:,0]**2)+p[:,2]*s*(p[:,0]**2))/r2
-    return (c2t*p[:,0] + dA - 2*A*p[:,1]/r2 )/r2
+    return ((c2t*p[:,0] + dA - 2*A*p[:,1]/r2 )/r2)/2
 
 
 #verified
@@ -168,7 +169,7 @@ def y3_d1d1_np(p):
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (c2t*p[:,0]*p[:,1] + s2t*p[:,1]**2 - (R+1)*c*p[:,1] + p[:,2]*p[:,1]*s)
     dA  = p[:,1]*c2t+(2*p[:,0]*(p[:,1]**2)*s2t-2*(p[:,1]**3)*c2t-(R+1)*(p[:,1]**2)*s-p[:,2]*(p[:,1]**2)*c)/r2
-    return (c2t*p[:,1] + dA - 2*p[:,0]*A/r2)/r2
+    return ((c2t*p[:,1] + dA - 2*p[:,0]*A/r2)/r2)/2
 #verified
 def y3_d2d2_np(p):
     th = np.arctan2(p[:,1],p[:,0])
@@ -179,7 +180,7 @@ def y3_d2d2_np(p):
     r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
     A   = (s2t*p[:,0]*p[:,1] + c2t*p[:,0]*p[:,0] - (R+1)*c*p[:,0] + p[:,2]*p[:,0]*s)
     dA  = p[:,0]*s2t+(2*(p[:,0]**2)*p[:,1]*c2t-2*(p[:,0]**3)*s2t + (R+1)*(p[:,0]**2)*s + p[:,2]*(p[:,0]**2)*c)/r2
-    return -(s2t*p[:,0] + dA - 2*p[:,1]*A/r2)/r2
+    return -((s2t*p[:,0] + dA - 2*p[:,1]*A/r2)/r2)/2
 def gb_np(p):
     return ((np.abs(p[:,1]-bnds[0][1]))<1e-14) | ((np.abs(p[:,1]-bnds[1][1]))<1e-14) | (np.abs(p[:,2]-bnds[0][2])<1e-14) | (np.abs(p[:,2]-bnds[1][2])<1e-14)
 
@@ -189,31 +190,32 @@ def gb_np(p):
 ####################################
 
 def z1_jnp(p):
-    c=jnp.cos(jnp.pi*p[...,0])
-    s=jnp.sin(jnp.pi*p[...,0])
+    q = 2*p-1
+    c=jnp.cos(jnp.pi*q[...,0])
+    s=jnp.sin(jnp.pi*q[...,0])
     c2 = jnp.multiply(c,c)
     cs = jnp.multiply(c,s)
-    q = jnp.multiply(c2,p[...,1])-jnp.multiply(cs,p[...,2])+c*(R+1)
-    return q
+    z1 = jnp.multiply(c2,q[...,1])-jnp.multiply(cs,q[...,2])+c*(R+1)
+    return z1
 
 def z2_jnp(p):
-    c=jnp.cos(jnp.pi*p[...,0])
-    s=jnp.sin(jnp.pi*p[...,0])
+    q = 2*p-1
+    c=jnp.cos(jnp.pi*q[...,0])
+    s=jnp.sin(jnp.pi*q[...,0])
     s2 = jnp.multiply(s,s)
     cs = jnp.multiply(c,s)
-    q = jnp.multiply(cs,p[...,1])-jnp.multiply(s2,p[...,2])+s*(R+1)
-    return q
+    z2 = jnp.multiply(cs,q[...,1])-jnp.multiply(s2,q[...,2])+s*(R+1)
+    return z2
 def z3_jnp(p):
-    c=jnp.cos(jnp.pi*p[...,0])
-    s=jnp.sin(jnp.pi*p[...,0])
-    q = jnp.multiply(s,p[...,1])+jnp.multiply(c,p[...,2])
-    return q
-
-
+    q=2*p-1
+    c=jnp.cos(jnp.pi*q[...,0])
+    s=jnp.sin(jnp.pi*q[...,0])
+    z3 = jnp.multiply(s,q[...,1])+jnp.multiply(c,q[...,2])
+    return z3
 
 def y1_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
-    return th/jnp.pi
+    return ((th/jnp.pi)+1)/2
 
 def y2_jnp(p):
     # p is a vector of points, Nx3
@@ -223,7 +225,7 @@ def y2_jnp(p):
     c2 = jnp.multiply(c,c)
     cs = jnp.multiply(c,s)
     q = jnp.multiply(p[...,0],c2)+jnp.multiply(p[...,1],cs)-(R+1)*c + jnp.multiply(s,p[...,2])
-    return q
+    return (q+1)/2
 
 
 def y3_jnp(p):
@@ -233,7 +235,7 @@ def y3_jnp(p):
     s2 = jnp.multiply(s,s)
     cs = jnp.multiply(c,s)
     q = -jnp.multiply(p[...,0],cs)-jnp.multiply(p[...,1],s2)+(R+1)*s+jnp.multiply(c,p[...,2])
-    return q
+    return (q+1)/2
 
 #verified
 def y2_d1_jnp(p):
@@ -244,16 +246,16 @@ def y2_d1_jnp(p):
     c   = jnp.cos(th)
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]**2 - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
-    return (c2t+1)/2. + A/r2
+    return ((c2t+1)/2. + A/r2)/2
 
 #verified
 def y1_d1_jnp(p):
     r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return -(p[...,1]/r2)/jnp.pi
+    return -((p[...,1]/r2)/jnp.pi)/2
 #verified
 def y1_d2_jnp(p):
     r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return (p[...,0]/r2)/jnp.pi
+    return ((p[...,0]/r2)/jnp.pi)/2
 
 #verified
 def y2_d2_jnp(p):
@@ -264,11 +266,11 @@ def y2_d2_jnp(p):
     c   = jnp.cos(th)
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
-    return s2t/2. + A/r2
+    return (s2t/2. + A/r2)/2
 
 def y2_d3_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
-    return jnp.sin(th)
+    return (jnp.sin(th))/2
 
 
 
@@ -281,7 +283,7 @@ def y3_d1_jnp(p):
     c   = jnp.cos(th)
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
-    return -s2t/2. + A/r2
+    return (-s2t/2. + A/r2)/2
 
 def y3_d2_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
@@ -291,21 +293,21 @@ def y3_d2_jnp(p):
     c   = jnp.cos(th)
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
-    return (c2t-1)/2. - A/r2
+    return ((c2t-1)/2. - A/r2)/2
 #verified
 def y3_d3_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
-    return jnp.cos(th)
+    return jnp.cos(th)/2
 
 
 #verified
 def y1_d1d1_jnp(p):
     r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return (2*p[...,1]*p[...,0]/r2)/(r2*jnp.pi)
+    return ((2*p[...,1]*p[...,0]/r2)/(r2*jnp.pi))/2
 #verified
 def y1_d2d2_jnp(p):
     r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return -2*(p[...,0]*p[...,1]/r2)/(r2*jnp.pi)
+    return -(2*(p[...,0]*p[...,1]/r2)/(r2*jnp.pi))/2
 
 #verified
 def y2_d1d1_jnp(p):
@@ -317,7 +319,7 @@ def y2_d1d1_jnp(p):
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]*p[...,1] - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
     dA = p[...,1]*s2t-(2*c2t*p[...,0]*(p[...,1]**2)+2*s2t*p[...,1]**3-(R+1)*c*p[...,1]**2 + p[...,2]*s*(p[...,1]**2) )/r2
-    return (p[...,1]*s2t + dA - 2*A*p[...,0]/r2 )/r2
+    return ((p[...,1]*s2t + dA - 2*A*p[...,0]/r2 )/r2)/2
 #verified
 def y2_d2d2_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
@@ -328,7 +330,7 @@ def y2_d2d2_jnp(p):
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
     dA  = p[...,0]*c2t-(2*s2t*p[...,1]*p[...,0]**2+2*c2t*(p[...,0]**3)-(R+1)*c*(p[...,0]**2)+p[...,2]*s*(p[...,0]**2))/r2
-    return (c2t*p[...,0] + dA - 2*A*p[...,1]/r2 )/r2
+    return ((c2t*p[...,0] + dA - 2*A*p[...,1]/r2 )/r2)/2
 
 
 #verified
@@ -341,7 +343,7 @@ def y3_d1d1_jnp(p):
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
     dA  = p[...,1]*c2t+(2*p[...,0]*(p[...,1]**2)*s2t-2*(p[...,1]**3)*c2t-(R+1)*(p[...,1]**2)*s-p[...,2]*(p[...,1]**2)*c)/r2
-    return (c2t*p[...,1] + dA - 2*p[...,0]*A/r2)/r2
+    return ((c2t*p[...,1] + dA - 2*p[...,0]*A/r2)/r2)/2
 #verified
 def y3_d2d2_jnp(p):
     th = jnp.arctan2(p[...,1],p[...,0])
@@ -352,7 +354,7 @@ def y3_d2d2_jnp(p):
     r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
     A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
     dA  = p[...,0]*s2t+(2*(p[...,0]**2)*p[...,1]*c2t-2*(p[...,0]**3)*s2t + (R+1)*(p[...,0]**2)*s + p[...,2]*(p[...,0]**2)*c)/r2
-    return -(s2t*p[...,0] + dA - 2*p[...,1]*A/r2)/r2
+    return -((s2t*p[...,0] + dA - 2*p[...,1]*A/r2)/r2)/2
 def gb_jnp(p):
     return ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) | (jnp.abs(p[...,2]-bnds[0][2])<1e-14) | (jnp.abs(p[...,2]-bnds[1][2])<1e-14)
 
@@ -362,170 +364,171 @@ def gb_jnp(p):
 ####################################
 
 def z1_torch(p):
-    c=torch.cos(torch.pi*p[...,0])
-    s=torch.sin(torch.pi*p[...,0])
+    q = 2*p-1
+    c=torch.cos(torch.pi*q[:,0])
+    s=torch.sin(torch.pi*q[:,0])
     c2 = torch.multiply(c,c)
     cs = torch.multiply(c,s)
-    q = torch.multiply(c2,p[...,1])-torch.multiply(cs,p[...,2])+c*(R+1)
-    return q
+    z1 = torch.multiply(c2,q[:,1])-torch.multiply(cs,q[:,2])+c*(R+1)
+    return z1
 
 def z2_torch(p):
-    c=torch.cos(torch.pi*p[...,0])
-    s=torch.sin(torch.pi*p[...,0])
+    q = 2*p-1
+    c=torch.cos(torch.pi*q[:,0])
+    s=torch.sin(torch.pi*q[:,0])
     s2 = torch.multiply(s,s)
     cs = torch.multiply(c,s)
-    q = torch.multiply(cs,p[...,1])-torch.multiply(s2,p[...,2])+s*(R+1)
-    return q
+    z2 = torch.multiply(cs,q[:,1])-torch.multiply(s2,q[:,2])+s*(R+1)
+    return z2
 def z3_torch(p):
-    c=torch.cos(torch.pi*p[...,0])
-    s=torch.sin(torch.pi*p[...,0])
-    q = torch.multiply(s,p[...,1])+torch.multiply(c,p[...,2])
-    return q
-
-
+    q=2*p-1
+    c=torch.cos(torch.pi*q[:,0])
+    s=torch.sin(torch.pi*q[:,0])
+    z3 = torch.multiply(s,q[:,1])+torch.multiply(c,q[:,2])
+    return z3
 
 def y1_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
-    return th/torch.pi
+    th = torch.arctan2(p[:,1],p[:,0])
+    return ((th/torch.pi)+1)/2
 
 def y2_torch(p):
     # p is a vector of points, Nx3
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c=torch.cos(th)
     s=torch.sin(th)
     c2 = torch.multiply(c,c)
     cs = torch.multiply(c,s)
-    q = torch.multiply(p[...,0],c2)+torch.multiply(p[...,1],cs)-(R+1)*c + torch.multiply(s,p[...,2])
-    return q
+    q = torch.multiply(p[:,0],c2)+torch.multiply(p[:,1],cs)-(R+1)*c + torch.multiply(s,p[:,2])
+    return (q+1)/2
 
 
 def y3_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c=torch.cos(th)
     s=torch.sin(th)
     s2 = torch.multiply(s,s)
     cs = torch.multiply(c,s)
-    q = -torch.multiply(p[...,0],cs)-torch.multiply(p[...,1],s2)+(R+1)*s+torch.multiply(c,p[...,2])
-    return q
+    q = -torch.multiply(p[:,0],cs)-torch.multiply(p[:,1],s2)+(R+1)*s+torch.multiply(c,p[:,2])
+    return (q+1)/2
 
 #verified
 def y2_d1_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]**2 - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
-    return (c2t+1)/2. + A/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]**2 - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
+    return ((c2t+1)/2. + A/r2)/2
 
 #verified
 def y1_d1_torch(p):
-    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return -(p[...,1]/r2)/torch.pi
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return -((p[:,1]/r2)/torch.pi)/2
 #verified
 def y1_d2_torch(p):
-    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return (p[...,0]/r2)/torch.pi
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return ((p[:,0]/r2)/torch.pi)/2
 
 #verified
 def y2_d2_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
-    return s2t/2. + A/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
+    return (s2t/2. + A/r2)/2
 
 def y2_d3_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
-    return torch.sin(th)
+    th = torch.arctan2(p[:,1],p[:,0])
+    return (torch.sin(th))/2
 
 
 
 
 def y3_d1_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
-    return -s2t/2. + A/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (c2t*p[:,0]*p[:,1] + s2t*p[:,1]**2 - (R+1)*c*p[:,1] + p[:,2]*p[:,1]*s)
+    return (-s2t/2. + A/r2)/2
 
 def y3_d2_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
-    return (c2t-1)/2. - A/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] + c2t*p[:,0]*p[:,0] - (R+1)*c*p[:,0] + p[:,2]*p[:,0]*s)
+    return ((c2t-1)/2. - A/r2)/2
 #verified
 def y3_d3_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
-    return torch.cos(th)
+    th = torch.arctan2(p[:,1],p[:,0])
+    return torch.cos(th)/2
 
 
 #verified
 def y1_d1d1_torch(p):
-    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return (2*p[...,1]*p[...,0]/r2)/(r2*torch.pi)
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return ((2*p[:,1]*p[:,0]/r2)/(r2*torch.pi))/2
 #verified
 def y1_d2d2_torch(p):
-    r2 = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    return -2*(p[...,0]*p[...,1]/r2)/(r2*torch.pi)
+    r2 = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    return -(2*(p[:,0]*p[:,1]/r2)/(r2*torch.pi))/2
 
 #verified
 def y2_d1d1_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (s2t*p[...,0]*p[...,1] - c2t*p[...,1]*p[...,1] - (R+1)*s*p[...,1] - p[...,2]*p[...,1]*c)
-    dA = p[...,1]*s2t-(2*c2t*p[...,0]*(p[...,1]**2)+2*s2t*p[...,1]**3-(R+1)*c*p[...,1]**2 + p[...,2]*s*(p[...,1]**2) )/r2
-    return (p[...,1]*s2t + dA - 2*A*p[...,0]/r2 )/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] - c2t*p[:,1]*p[:,1] - (R+1)*s*p[:,1] - p[:,2]*p[:,1]*c)
+    dA = p[:,1]*s2t-(2*c2t*p[:,0]*(p[:,1]**2)+2*s2t*p[:,1]**3-(R+1)*c*p[:,1]**2 + p[:,2]*s*(p[:,1]**2) )/r2
+    return ((p[:,1]*s2t + dA - 2*A*p[:,0]/r2 )/r2)/2
 #verified
 def y2_d2d2_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = ( c2t*p[...,0]*p[...,1] - s2t*p[...,0]*p[...,0] + (R+1)*s*p[...,0] + p[...,2]*p[...,0]*c)
-    dA  = p[...,0]*c2t-(2*s2t*p[...,1]*p[...,0]**2+2*c2t*(p[...,0]**3)-(R+1)*c*(p[...,0]**2)+p[...,2]*s*(p[...,0]**2))/r2
-    return (c2t*p[...,0] + dA - 2*A*p[...,1]/r2 )/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = ( c2t*p[:,0]*p[:,1] - s2t*p[:,0]*p[:,0] + (R+1)*s*p[:,0] + p[:,2]*p[:,0]*c)
+    dA  = p[:,0]*c2t-(2*s2t*p[:,1]*p[:,0]**2+2*c2t*(p[:,0]**3)-(R+1)*c*(p[:,0]**2)+p[:,2]*s*(p[:,0]**2))/r2
+    return ((c2t*p[:,0] + dA - 2*A*p[:,1]/r2 )/r2)/2
 
 
 #verified
 def y3_d1d1_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (c2t*p[...,0]*p[...,1] + s2t*p[...,1]**2 - (R+1)*c*p[...,1] + p[...,2]*p[...,1]*s)
-    dA  = p[...,1]*c2t+(2*p[...,0]*(p[...,1]**2)*s2t-2*(p[...,1]**3)*c2t-(R+1)*(p[...,1]**2)*s-p[...,2]*(p[...,1]**2)*c)/r2
-    return (c2t*p[...,1] + dA - 2*p[...,0]*A/r2)/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (c2t*p[:,0]*p[:,1] + s2t*p[:,1]**2 - (R+1)*c*p[:,1] + p[:,2]*p[:,1]*s)
+    dA  = p[:,1]*c2t+(2*p[:,0]*(p[:,1]**2)*s2t-2*(p[:,1]**3)*c2t-(R+1)*(p[:,1]**2)*s-p[:,2]*(p[:,1]**2)*c)/r2
+    return ((c2t*p[:,1] + dA - 2*p[:,0]*A/r2)/r2)/2
 #verified
 def y3_d2d2_torch(p):
-    th = torch.arctan2(p[...,1],p[...,0])
+    th = torch.arctan2(p[:,1],p[:,0])
     c2t = torch.cos(2*th)
     s2t = torch.sin(2*th)
     s   = torch.sin(th)
     c   = torch.cos(th)
-    r2  = p[...,0]*p[...,0]+p[...,1]*p[...,1]
-    A   = (s2t*p[...,0]*p[...,1] + c2t*p[...,0]*p[...,0] - (R+1)*c*p[...,0] + p[...,2]*p[...,0]*s)
-    dA  = p[...,0]*s2t+(2*(p[...,0]**2)*p[...,1]*c2t-2*(p[...,0]**3)*s2t + (R+1)*(p[...,0]**2)*s + p[...,2]*(p[...,0]**2)*c)/r2
-    return -(s2t*p[...,0] + dA - 2*p[...,1]*A/r2)/r2
+    r2  = p[:,0]*p[:,0]+p[:,1]*p[:,1]
+    A   = (s2t*p[:,0]*p[:,1] + c2t*p[:,0]*p[:,0] - (R+1)*c*p[:,0] + p[:,2]*p[:,0]*s)
+    dA  = p[:,0]*s2t+(2*(p[:,0]**2)*p[:,1]*c2t-2*(p[:,0]**3)*s2t + (R+1)*(p[:,0]**2)*s + p[:,2]*(p[:,0]**2)*c)/r2
+    return -((s2t*p[:,0] + dA - 2*p[:,1]*A/r2)/r2)/2
 
 
 ####################################
