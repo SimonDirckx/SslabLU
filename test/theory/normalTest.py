@@ -57,21 +57,9 @@ def c22(p):
 def c12(p):
     return .1*np.ones_like(p[:,1])+.1*p[:,1]*np.sin(3.*np.pi*p[:,0])
 
-Lapl = pdo.PDO2d(c11=c11,c22=c22,c12=c12)
-bnds = [[0,0],[1,1]]
-Om = stencilGeom.BoxGeometry(np.array(bnds))
+Lapl = pdo.PDO2d(c11=c11,c22=c22)#,c12=c12)
 def bc(p):
     return np.sin(np.pi*p[:,0])*np.sinh(np.pi*p[:,1])
-def gb_vec(P):
-    # P is (N, 2)
-    return (
-        (np.abs(P[:, 0] - bnds[0][0]) < 1e-14) |
-        (np.abs(P[:, 0] - bnds[1][0]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[0][1]) < 1e-14) |
-        (np.abs(P[:, 1] - bnds[1][1]) < 1e-14)  
-    )
-
-Om = stencilGeom.BoxGeometry(np.array([[0,0],[1,1]]))
 
 kvec = [2,3,4,5,6,7]
 errInf = np.zeros(shape=(len(kvec),))
@@ -87,13 +75,11 @@ for indk in range(len(kvec)):
     k = kvec[indk]
     N = (2**k)
     dSlabs,connectivity,H = square.dSlabs(N)
-    print("H = ",H)
-    print("H = ",H)
     Hvec[indk] = H
     if method =='spectral':
-        ordy = 100
+        ordy = 128
     if method =='stencil':
-        ordy = 200
+        ordy = 128
     ordx = int(np.round(2*ordy*H))
     if method == 'spectral':
         if ordx%2:
@@ -107,18 +93,19 @@ for indk in range(len(kvec)):
     opts = solverWrap.solverOptions(method,ord)
     OMS = oms.oms(dSlabs,Lapl,lambda p:square.gb(p,False),opts,connectivity)
     S_op,rhs = OMS.construct_Stot_and_rhstot(bc,assembler)
-    print("S_op done")
-    E = np.identity(S_op.shape[0])
-    S = S_op@E
-    print("S done")
+    S = S_op@np.identity(S_op.shape[0])
+    
     if method=='spectral':
         cc= spectral.clenshaw_curtis_compute(ordy+1)[1]
         w = np.sqrt(cc[1:ordy])
         W = np.diag(w)
         S = np.kron(np.identity(N-1),W)@S@np.kron(np.identity(N-1),np.linalg.inv(W))
     nc = OMS.nc
-    S12 = S[:nc,:][:,nc:2*nc]
-    S21 = S[nc:2*nc,:][:,:nc]
+    
+    
+    IND = (N-1)//2
+    S12 = S[IND*nc:(IND+1)*nc,:][:,(IND+1)*nc:(IND+2)*nc]
+    S21 = S[(IND+1)*nc:(IND+2)*nc,:][:,IND*nc:(IND+1)*nc]
     errBlock[indk] = np.linalg.norm(S12-S21.T,ord=2)
     relerrBlock[indk] = np.linalg.norm(S12-S21.T,ord=2)/np.linalg.norm(S12,ord=2)
     e = np.linalg.eigvals(S)
@@ -129,8 +116,11 @@ for indk in range(len(kvec)):
     errInf[indk] = np.linalg.norm(ae-s,ord=np.inf)
     cond_eig[indk] = ae[-1]/ae[0]
     cond_svd[indk] = s[-1]/s[0]
+    print("============SUMMARY ERRS===============")
     print(cond_svd[indk])
     print(cond_eig[indk])
+    print(errBlock[indk])
+    print("=======================================")
 
 fileName = 'err_svd_eig_'+method+'.csv'
 errMat = np.zeros(shape=(len(kvec),5))
@@ -138,7 +128,7 @@ errMat[:,0] = Hvec
 errMat[:,1] = errInf
 errMat[:,2] = cond_svd
 errMat[:,3] = cond_eig
-errMat[:,3] = errBlock
+errMat[:,4] = errBlock
 with open(fileName,'w') as f:
     f.write('H,err,cond_svd,cond_eig,errBlock\n')
     np.savetxt(f,errMat,fmt='%.8e',delimiter=',')
@@ -161,6 +151,6 @@ plt.loglog(Hvec,cond_svd/cond_eig)
 
 plt.figure(5)
 plt.loglog(Hvec,errBlock)
-plt.loglog(Hvec,Hvec**2)
+plt.loglog(Hvec,Hvec)
 plt.legend(['err','H2'])
 plt.show()

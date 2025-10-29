@@ -9,8 +9,8 @@ import matplotlib.tri as tri
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
-#import solver.spectralmultidomain.hps.pdo as pdo
+#import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
+import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
@@ -33,9 +33,9 @@ class gmres_info(object):
 
 
 
-jax_avail   = False
-torch_avail = True
-hpsalt      = True
+jax_avail   = True
+torch_avail = not jax_avail
+hpsalt      = torch_avail
 kh = 5.
 if jax_avail:
     def c11(p):
@@ -87,7 +87,7 @@ compr_time=np.zeros(shape = (len(pvec),))
 
 #solve_method = 'iterative'
 solve_method = 'direct'
-
+formulation = "hps"
 tridiag = (solve_method=='direct')
 for indp in range(len(pvec)):
     p = pvec[indp]

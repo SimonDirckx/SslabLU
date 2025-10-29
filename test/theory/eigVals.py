@@ -14,15 +14,23 @@ from solver.spectral import spectralSolver as spectral
 import geometry.geom_2D.square as square
 
 kh = 9.80177
-def c11(p):
-    return np.ones_like(p[:,0])#+.5*np.cos(2.*np.pi*p[:,0])
-def c22(p):
-    return np.ones_like(p[:,1])#+.5*np.sin(2.*np.pi*p[:,1])*(p[:,0]**2)
-#def c12(p):
-#    return .1*np.ones_like(p[:,1])+.1*p[:,1]*np.sin(3.*np.pi*p[:,0])
-def c(p):
-    return -kh*kh*np.ones_like(p[:,0])
-Lapl = pdo.PDO2d(c11=c11,c22=c22,c=c)#,c12=c12)
+laplace = False
+
+if laplace:
+    def c11(p):
+        return np.ones_like(p[:,0])
+    def c22(p):
+        return np.ones_like(p[:,0])
+else:
+    def c11(p):
+        return (1.+.5*np.cos(2*np.pi*p[:,0]))
+    def c22(p):
+        return (1.+.5*p[:,0]*p[:,0]*np.sin(3*np.pi*p[:,1]))
+
+diff_op=pdo.PDO2d(c11,c22)
+#def c(p):
+#    return -kh*kh*np.ones_like(p[:,0])
+#Lapl = pdo.PDO2d(c11=c11,c22=c22,c=c)#,c12=c12)
 
 def bc(p):
     return np.sin(np.pi*p[:,0])*np.sinh(np.pi*p[:,1])
@@ -52,7 +60,7 @@ N=(int)(1./H)
 dSlabs,connectivity,H = square.dSlabs(N)
 assembler = mA.denseMatAssembler()
 opts = solverWrap.solverOptions(method,ord)
-OMS = oms.oms(dSlabs,Lapl,lambda p :square.gb(p,True),opts,connectivity)
+OMS = oms.oms(dSlabs,diff_op,lambda p :square.gb(p,True),opts,connectivity)
 Stot,rhstot = OMS.construct_Stot_and_rhstot(bc,assembler,2)
 print("S_op done")
 E = np.identity(Stot.shape[0])
@@ -82,22 +90,22 @@ print("sym e = ",d)
 
 I = np.where(np.abs(np.imag(e))>0)[0]
 
-fileName = 'eig_Helm'+method+'.csv'
-eMat = np.zeros(shape=(len(e),2))
-eMat[:,0] = np.real(e)
-eMat[:,1] = np.imag(e)
-with open(fileName,'w') as f:
-    f.write('real,imag\n')
-    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
+#fileName = 'eig_Helm'+method+'.csv'
+#eMat = np.zeros(shape=(len(e),2))
+#eMat[:,0] = np.real(e)
+#eMat[:,1] = np.imag(e)
+#with open(fileName,'w') as f:
+#    f.write('real,imag\n')
+#    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
 
 
-fileName = 'eig_Helm'+method+'_im.csv'
-eMat = np.zeros(shape=(len(I),2))
-eMat[:,0] = np.real(e[I])
-eMat[:,1] = np.imag(e[I])
-with open(fileName,'w') as f:
-    f.write('real,imag\n')
-    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
+#fileName = 'eig_Helm'+method+'_im.csv'
+#eMat = np.zeros(shape=(len(I),2))
+#eMat[:,0] = np.real(e[I])
+#eMat[:,1] = np.imag(e[I])
+#with open(fileName,'w') as f:
+#    f.write('real,imag\n')
+#    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
 
 plt.figure(1)
 plt.scatter(np.real(e[I]),np.imag(e[I]))

@@ -70,7 +70,6 @@ class stencilSolver(AbstractPDESolver):
 
         self._box_geom = geom.bounds
         ndim = self._box_geom.shape[-1]
-        print("ndim = ",ndim)
         self._geom     = geom
         if  (ndim == 2):
             xpts        = np.linspace(self._box_geom[0][0],self._box_geom[1][0],ord[0])

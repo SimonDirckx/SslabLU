@@ -53,9 +53,9 @@ bnds = domain.bnds
 nwaves = 2.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-kh = 5.6
+kh = 10.6
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
-jax_avail   = True
+jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = not jax_avail
 
@@ -80,12 +80,12 @@ def bc(p):
     return np.ones_like(z1)#np.sin(kh*z1)#np.cos(kh*rr)/(4*np.pi*rr)
 
 
-N = 5
+N = 8
 dSlabs,connectivity,H = domain.dSlabs(N)
 formulation = "hps"
 solve_method = 'iterative'
 #solve_method = 'direct'
-HBS = False
+HBS = True
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
 pvec = np.array([6],dtype = np.int64)
@@ -100,9 +100,9 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-    a = np.array([H/8.,1./16,1./16])
+    a = np.array([H/6.,1./16,1./16])
     if HBS:
-        assembler = mA.rkHMatAssembler(p*p,100)
+        assembler = mA.rkHMatAssembler(p*p,125)
     else:
         assembler = mA.denseMatAssembler()
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
@@ -154,7 +154,8 @@ for indp in range(len(pvec)):
     ZZ[:,0] = domain.z1(YY,False,False)
     ZZ[:,1] = domain.z2(YY,False,False)
     ZZ[:,2] = domain.z3(YY,False,False)
-    fig = plt.figure()
+
+    fig = plt.figure(2)
     ax = fig.add_subplot(projection='3d')
 
     ax.scatter(ZZ[:,0], ZZ[:,1], ZZ[:,2])
@@ -162,7 +163,6 @@ for indp in range(len(pvec)):
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-
     plt.show()
 
 
@@ -173,16 +173,37 @@ for indp in range(len(pvec)):
     YY0[:,1] = domain.y2(ZZ,False,False)
     YY0[:,2] = domain.y3(ZZ,False,False)
 
+    '''
+    ytest =np.zeros(shape = (1,3))
+    ytest[0,0] = 1
+    ytest[0,1] = 1
+    ytest[0,2] = 1
+    
+    ztest =np.zeros(shape = (1,3))
+    z1 = domain.z1(ytest,False,False)
+    z2 = domain.z2(ytest,False,False)
+    z3 = domain.z3(ytest,False,False)
+    print("z1,z2,z3 = ",z1,",",z2,",",z3)
+    ztest[0,0] = z1[0]
+    ztest[0,1] = z2[0]
+    ztest[0,2] = z3[0]
+    print("ztest = ",ztest)
+    y1 = domain.y1(ztest,False,False)
+    y2 = domain.z2(ztest,False,False)
+    y3 = domain.z3(ztest,False,False)
+    print("y1,y2,y3 = ",y1,",",y2,",",y3)
+    '''
     print("YY0 err = ",np.linalg.norm(YY-YY0)/np.linalg.norm(YY))
-    fig = plt.figure()
+    fig = plt.figure(2)
     ax = fig.add_subplot(projection='3d')
 
     ax.scatter(YY0[:,0], YY0[:,1], YY0[:,2])
+    ax.scatter(YY[:,0], YY[:,1], YY[:,2])
 
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-
+    ax.legend(['YY0','YY'])
     plt.show()
 
 
@@ -193,8 +214,8 @@ for indp in range(len(pvec)):
 
 
 
-    xpts = np.linspace(-4,4,nx)
-    ypts = np.linspace(-4,4,ny)
+    xpts = np.linspace(-2,2,nx)
+    ypts = np.linspace(-2,2,ny)
 
     ZZ = np.zeros(shape=(nx*ny,3))
     ZZ[:,0] = np.kron(xpts,np.ones_like(ypts))

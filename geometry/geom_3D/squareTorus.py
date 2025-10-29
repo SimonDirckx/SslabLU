@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 
 const_theta = 1./(2.*np.pi)
-bnds = [[0,0,0],[1.,1.,1.]]
+bnds = [[0,0,0],[1,1,1]]
 
 
 ####################################
@@ -18,14 +18,14 @@ bnds = [[0,0,0],[1.,1.,1.]]
 
 r_np    = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
 
-z1_np   = lambda zz: np.multiply( 1 + 1 * zz[:,1], np.cos(zz[:,0]/const_theta) )
-z2_np   = lambda zz: np.multiply( 1 + 1 * zz[:,1], np.sin(zz[:,0]/const_theta) )
-z3_np   = lambda zz: zz[:,2]
+z1_np   = lambda zz: np.multiply( 1 + 1 * (zz[:,1]-.5), np.cos((zz[:,0]-.5)/const_theta) )
+z2_np   = lambda zz: np.multiply( 1 + 1 * (zz[:,1]-.5), np.sin((zz[:,0]-.5)/const_theta) )
+z3_np   = lambda zz: zz[:,2]-.5
 
 
 y1_np   = lambda zz: (const_theta* np.atan2(zz[:,1],zz[:,0]))+.5
-y2_np   = lambda zz: r_np(zz) - 1
-y3_np   = lambda zz: zz[:,2]
+y2_np   = lambda zz: r_np(zz) - .5
+y3_np   = lambda zz: zz[:,2] +.5
 
 y1_d1_np    = lambda zz: -const_theta     * np.divide(zz[:,1], r_np(zz)**2)
 y1_d2_np    = lambda zz: +const_theta     * np.divide(zz[:,0], r_np(zz)**2)
@@ -50,14 +50,14 @@ def gb_np(p):
 def r_jnp(p):
     return (p[...,0]**2 + p[...,1]**2)**0.5
 
-z1_jnp = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.cos(zz[...,0]/const_theta) )
-z2_jnp = lambda zz: jnp.multiply( 1 + 1 * zz[...,1], jnp.sin(zz[...,0]/const_theta) )
-z3_jnp = lambda zz: zz[...,2]
+z1_jnp = lambda zz: jnp.multiply( 1 + 1 * (zz[...,1]-.5), jnp.cos((zz[...,0]-.5)/const_theta) )
+z2_jnp = lambda zz: jnp.multiply( 1 + 1 * (zz[...,1]-.5), jnp.sin((zz[...,0]-.5)/const_theta) )
+z3_jnp = lambda zz: zz[...,2]-.5
 
 
 y1_jnp = lambda zz: (const_theta*jnp.atan2(zz[...,1],zz[...,0]))+.5
-y2_jnp = lambda zz: r_jnp(zz) - 1
-y3_jnp = lambda zz: zz[...,2]
+y2_jnp = lambda zz: r_jnp(zz) - .5
+y3_jnp = lambda zz: zz[...,2]+.5
 
 y1_d1_jnp    = lambda zz: -const_theta     * jnp.divide(zz[...,1], r_jnp(zz)**2)
 y1_d2_jnp    = lambda zz: +const_theta     * jnp.divide(zz[...,0], r_jnp(zz)**2)
@@ -84,14 +84,14 @@ def gb_jnp(p):
 
 r_torch           = lambda zz: (zz[:,0]**2 + zz[:,1]**2)**0.5
 
-z1_torch = lambda zz: torch.mul( 1 + 1 * zz[:,1], torch.cos(zz[:,0]/const_theta) )
-z2_torch = lambda zz: torch.mul( 1 + 1 * zz[:,1], torch.sin(zz[:,0]/const_theta) )
-z3_torch = lambda zz: zz[:,2]
+z1_torch = lambda zz: torch.mul( 1 + 1 * (zz[:,1]-.5), torch.cos((zz[:,0]-.5)/const_theta) )
+z2_torch = lambda zz: torch.mul( 1 + 1 * (zz[:,1]-.5), torch.sin((zz[:,0]-.5)/const_theta) )
+z3_torch = lambda zz: zz[:,2]-.5
 
 
 y1_torch = lambda zz: (const_theta* torch.atan2(zz[:,1],zz[:,0]))+.5
-y2_torch = lambda zz: r_np(zz) - 1
-y3_torch = lambda zz: zz[:,2]
+y2_torch = lambda zz: r_np(zz) - .5
+y3_torch = lambda zz: zz[:,2]+.5
 
 y1_d1_torch    = lambda zz: -const_theta     * torch.div(zz[:,1], r_np(zz)**2) # r_np works here
 y1_d2_torch    = lambda zz: +const_theta     * torch.div(zz[:,0], r_np(zz)**2)
