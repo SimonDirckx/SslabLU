@@ -106,7 +106,7 @@ for indp in range(len(pvec)):
     Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
     niter = 0
     if solve_method == 'iterative':
-        Stot,rhstot  = OMS.construct_Stot_and_rhstot(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
         stol = 1e-10*H*H
 
