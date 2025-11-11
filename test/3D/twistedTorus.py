@@ -75,7 +75,7 @@ def bc(p):
     z1=twisted.z1(p,jax_avail=jax_avail,torch_avail=torch_avail)
     z2=twisted.z2(p,jax_avail=jax_avail,torch_avail=torch_avail)
     z3=twisted.z3(p,jax_avail=jax_avail,torch_avail=torch_avail)
-    rr = np.sqrt((z1-11.)**2+(z2-11.)**2+(z3-11.)**2)
+    rr = np.sqrt((z1-5.)**2+z2**2+z3**2)
     return np.sin(kh*rr)/(rr)
 
 
