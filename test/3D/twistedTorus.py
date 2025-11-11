@@ -55,8 +55,8 @@ kh = (nwaves/4)*2.*np.pi
 kh = 1.6
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
 jax_avail   = False
-torch_avail = True
-hpsalt      = True
+torch_avail = not jax_avail
+hpsalt      = not jax_avail
 
 
 if jax_avail:
