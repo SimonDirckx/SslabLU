@@ -119,7 +119,7 @@ class solverWrapper:
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         if self.type=='hpsalt':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord[0], d=len(self.ord)) #verbose=verbose)
+            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord)) #verbose=verbose)
             self.solver=solver
             self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True

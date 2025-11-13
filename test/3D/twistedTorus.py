@@ -104,6 +104,7 @@ for indp in range(len(pvec)):
         assembler = mA.rkHMatAssembler(p*p,100)
     else:
         assembler = mA.denseMatAssembler()
+    # CHANGE [p_disc,p_disc,p_disc] to no longer be uniform:
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     
     OMS = oms.oms(dSlabs,pdo_mod,lambda p :twisted.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)

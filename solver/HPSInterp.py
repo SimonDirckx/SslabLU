@@ -34,6 +34,8 @@ def interp_3d(solver,pts,f,typestr):
     npan_dim = solver.npan_dim
     boxes = construct_boxes_3d(npan_dim,solver.geom)
     ord=[solver.p,solver.p,solver.p]
+    if typestr == "hpsalt":
+        ord = solver.p
     for box in boxes:
         I = idxs_3d(pts,box)
         J = idxs_3d(solver._XXfull,box)
@@ -151,11 +153,11 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
     if typestr=='hps':
         ord = [ord0[0]+2,ord0[1]+2,ord0[2]+2]
     elif typestr=='hpsalt':
-        ord = [ord0[0],ord0[1],ord0[2]]
+        ord = ord0
     else:
         raise ValueError("solver type not recognized")
     _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
-    f0      = f[I0]
+    f0    = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
     
     core,U0,U1,U2 = tucker_tol(F,1e-12)
