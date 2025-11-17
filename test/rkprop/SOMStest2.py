@@ -25,7 +25,7 @@ def bc_helmholtz(p,kh):
     return special.yn(0,kh*r)/4
 
 
-pvec = np.array([4,8,16,32],dtype=np.int64)
+pvec = np.array([10,12,14,16,18,20],dtype=np.int64)
 condvecS_L = np.zeros(shape=(len(pvec),))
 condvecT_L = np.zeros(shape=(len(pvec),))
 condvecS_H = np.zeros(shape=(len(pvec),))
@@ -41,9 +41,9 @@ Nvec = np.zeros(shape=(len(pvec),))
 for indp in range(len(pvec)):
     px = pvec[indp]
     py = pvec[indp]
-    nby = 8
-    nbx = 8
-    kh = 5.
+    nby = 16
+    nbx = 16
+    kh = 50.
 
     ####################################################
     # compare laplace problem: accuracy and conditioning
@@ -55,10 +55,10 @@ for indp in range(len(pvec)):
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby)
+    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,0.,2,1)
     toc = time.time()-tic
     print("elapsed time S = ",toc)
-    condS = np.linalg.cond(Sii)
+    condS = 1.#np.linalg.cond(Sii)
     condvecS_L[indp] = condS
     print("condS = ",condS)
     u = bc_laplace(XX)
@@ -68,7 +68,7 @@ for indp in range(len(pvec)):
     print("S sol err. = ",err)
     errvecS_L[indp] = err
 
-    bnds = np.array([[0,0],[1,1]])
+    bnds = np.array([[0,0],[2,1]])
     geom = hpsaltGeom.BoxGeometry(bnds)
     xl = geom.bounds[0,0]
     xr = geom.bounds[1,0]
@@ -89,9 +89,9 @@ for indp in range(len(pvec)):
     Aii = np.array(solver.Aii.todense())
     Aib = np.array(solver.Aix.todense())
     print("elapsed time T = ",toc)
-    condT = np.linalg.cond(Aii)
+    condT = 1.#np.linalg.cond(Aii)
     condvecT_L[indp] = condT
-    print("condT = ",np.linalg.cond(Aii))
+    print("condT = ",condT)
     XX = solver.XX
     Ii = solver._Ji
     Ib = solver._Jx
@@ -111,11 +111,11 @@ for indp in range(len(pvec)):
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh)
+    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh,2,1)
     toc = time.time()-tic
     print("elapsed time S = ",toc)
     print("Sii shape = ",Sii.shape)
-    condS = np.linalg.cond(Sii)
+    condS = 1.#np.linalg.cond(Sii)
     condvecS_H[indp] = condS
     print("condS = ",condS)
     u = bc_helmholtz(XX,kh)
@@ -125,7 +125,7 @@ for indp in range(len(pvec)):
     errvecS_H[indp] = err
 
 
-    bnds = np.array([[0,0],[1,1]])
+    bnds = np.array([[0,0],[2,1]])
     geom = hpsaltGeom.BoxGeometry(bnds)
     xl = geom.bounds[0,0]
     xr = geom.bounds[1,0]
@@ -150,7 +150,7 @@ for indp in range(len(pvec)):
     Aib = np.array(solver.Aix.todense())
     print("elapsed time T = ",toc)
     print("DOFS T = ",Aii.shape[0])
-    condT = np.linalg.cond(Aii)
+    condT = 1.#np.linalg.cond(Aii)
     condvecT_H[indp] = condT
     print("condT = ",condT)
     XX = solver.XX
