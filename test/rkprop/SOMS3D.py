@@ -5,13 +5,39 @@ import matplotlib.pyplot as plt
 import scipy.linalg as sclinalg
 import time
 
-kh = 10.
+kh = 5.
 
 def bc(p,kh):
     r=np.sqrt((p[:,0]+.1)**2+(p[:,1]+.1)**2+(p[:,2]+.1)**2)
     return np.sin(kh*r)/(4.*np.pi*r)
 
-def L_op(dir,px,py,pz,scl_x,scl_y,scl_z):
+def L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
+    """
+    Construct differential operator for 2x1 joined block set-up for the Helmholtz equation at kappa = kh
+
+    ----------------------------------------------------------------------------------------
+    | 'joined' refers to (attributes of) block with the dimensions of two 1x1 blocks glued |
+    | together BUT                                                                         |
+    | with the DOFS on the faces along the glued dimension NOT two tiles of 2-d cheb pts,  |
+    | but instead one 2-d cheb grid                                                        |
+    ----------------------------------------------------------------------------------------
+
+    INPUT:  - dir (in [0,1,2])      :    whether joined block is in x-dir (0), y-dir (1), z-dir (2)
+            - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
+            - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
+            - kh                    :    wave number
+    
+    OUTPUT: - L_joined_dir                  : diff op for the joined block
+            - Ijl,Ijf,Ijd,Iju,Ijb,Ijr       : joined DOFS corresponding to left, front, down, up, back and right face (as subsets of boundary dofs)
+            - Ic_dir                        : joined interior DOFs corresponding to the interior central interface
+            - Ibox_joined_dir               : union of Ijl,Ijf,Ijd,Iju,Ijb,Ijr, in that order
+            - Ii_dir,Ib_dir                 : interior and boundary dofs for the joined block  
+            - XY_joined_dir                 : spatial locations of the total DOFs
+    
+    """
+
+
+
     Dx,xpts = spectral.cheb(px)
     Dy,ypts = spectral.cheb(py)
     Dz,zpts = spectral.cheb(pz)
@@ -135,6 +161,41 @@ def L_op(dir,px,py,pz,scl_x,scl_y,scl_z):
 
 def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
 
+
+    """
+    Construct interpolation operators from joined dofs to unjoined dofs
+
+    ----------------------------------------------------------------------------------------
+    | 'joined' refers to (attributes of) block with the dimensions of two 1x1 blocks glued |
+    | together BUT                                                                         |
+    | with the DOFS on the faces along the glued dimension NOT two tiles of 2-d cheb pts,  |
+    | but instead one 2-d cheb grid                                                        |
+    ----------------------------------------------------------------------------------------
+
+    INPUT:  - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
+            - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
+    
+    OUTPUT: - Interp_x,Interp_y,Interp_z    : Interpolation operators associated to (px,scl_x) etc
+
+
+    DESCRIPTION:
+                        
+                                              Interp                         
+    |* *  *   *   *  * *|* *  *   *   *  * *| <-------------------------------- |* *  *   *    *    *    *    *   *  * *|
+            (scl,p)             (scl,p)                                                         (2*scl,3*p/2)
+    
+
+    Interp is the map that takes ~3*p/2 cheb grid sample on the interval [0,2*scl] 
+    and interpolates underlying poly to the two pieces of p cheb pts, on [0,scl] and [scl,2*scl] respectively 
+
+    """
+
+
+
+    # sorry for this notation, it sucks
+    # x2 = 2 sets of p-1 cheb pts stuck next to each other
+    # xpts2 = 1 set op pjoined-1 cheb pts on the double-wide interval
+
     Dx,xpts = spectral.cheb(px)
     Dy,ypts = spectral.cheb(py)
     Dz,zpts = spectral.cheb(pz)
@@ -196,6 +257,15 @@ def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
     nypts2 = len(ypts2)
     nzpts2 = len(zpts2)
 
+
+    # E is evaluation from cheb coeffs to points
+    # Interpolation map is now E_x2*E_xpts2^-1
+    # you can check that this is correct by chasing diagrams:
+    #       E_x2        E_xpts2
+    # x2 <----- coeffs ---------> xpts2
+    #   <-------------------------|
+    #           Interp_x
+
     E_x2 = np.zeros(shape = (nx2,nxpts2))
     E_y2 = np.zeros(shape = (ny2,nypts2))
     E_z2 = np.zeros(shape = (nz2,nzpts2))
@@ -223,11 +293,38 @@ def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
         Ti = chebpoly.Chebyshev(ci,domain=[0,2*scl_z])
         E_z2[:,indcoeff] = Ti(z2)
         E_zpts2[:,indcoeff] = Ti(zpts2)
+
+
+
     Interp_x = np.linalg.solve(E_xpts2.T,E_x2.T).T
     Interp_y = np.linalg.solve(E_ypts2.T,E_y2.T).T
     Interp_z = np.linalg.solve(E_zpts2.T,E_z2.T).T
     return Interp_x,Interp_y,Interp_z
+
 def XYU(dir,px,py,pz,scl_x,scl_y,scl_z):
+
+
+    """
+    Construct unjoined DOFs
+
+    ----------------------------------------------------------------------------------------
+    | 'unjoined' refers to (attributes of) two 1x1 blocks stuck together along a direction |
+    | with their touching face DOFs identified                                             |
+    ----------------------------------------------------------------------------------------
+
+    INPUT:  - dir (in [0,1,2])      :    whether two blocks are stacked together in x-dir (0), y-dir (1), z-dir (2)
+            - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
+            - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
+    
+    OUTPUT: - XYu                       :   spatial coordinates of the unjoined DOFs
+            - Iul,Iuf,Iud,Iuu,Iub,Iur   :   faces (left, front, down, up, back, right) as subsets of the boundary
+
+
+    NOTE: edges of the faces are removed
+
+    """
+
+
     Dx,xpts = spectral.cheb(px)
     Dy,ypts = spectral.cheb(py)
     Dz,zpts = spectral.cheb(pz)
@@ -316,6 +413,31 @@ def XYU(dir,px,py,pz,scl_x,scl_y,scl_z):
     return XYu,Iul,Iuf,Iud,Iuu,Iub,Iur
 
 def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
+    """
+    Construct global reduced DOFs
+
+    ----------------------------------------------------------------------------------------
+    | 'reduced' the union of all cuboid boundaries in the provided tiling i.e.             |
+    |  the DOFs interior to the cuboids are removed                                        |
+    ----------------------------------------------------------------------------------------
+
+    INPUT:  - tiling (1x3 int array)    :   the tiling defining the underlying non-overlapping domain decomp
+            - (px,py,pz)                :    polynomial orders for each 1x1 block
+            - (Lx,Ly,Lz)                :    length scales of the global domain
+    
+    OUTPUT: - XYtot                     :   spatial coordinates of the global DOFs
+            - md_vec                    :   int vec with length the number of cuboid faces
+                                            'missing direction vector', equals 2 for an xy face, 1 for an xz face, 0 for a yz face
+            - b_vec                     :   bool vec with length the number of cuboid faces
+                                            'boundary vec', 1 for a face on the global boundary, zero otherwise
+            -nxy,nyz,nxz                :   number of points per face of each cuboid
+                                            for example, the bottom and top face have nxy points etc.
+            -indx_vec,indy_vec,indz_vec :   int vecs with length the number of cuboid faces
+                                            correspond to the loop indexes at which face is added
+
+
+
+    """
     Lx0 = tiling[0]
     Ly0 = tiling[1]
     Lz0 = tiling[2]
@@ -398,8 +520,26 @@ def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
     return XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec
 
 def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,uXY,Sx,Sy,Sz):
-    ctr = 0
+    """
+    Construct global SOMS system
 
+    
+    INPUT:  - nxy,nyz,nxz               :   number of points for the xy-faces (down and up) etc.
+            - md_vec                    :   vec indication direction of each face (xy=2,xz=1,yz=0)
+            - b_vec                     :   vec indicating if corresponding face is on global boundary
+            - XYtot                     :   spatial locations of global DOFs
+            - tiling                    :   underlying non-overlapping domain decomp tiling
+            - indx_vec,indy_vec,indz_vec:   hard to explain, sorry
+            - uXY                       :   solution on XYtot, for testing purposes
+            - Sx,Sy,Sz                  :   Local solve-and-restrict maps, one for each direction
+    
+    OUTPUT: - Stot                      :   total S system
+
+
+
+    """
+    ctr = 0
+    max_block_err = 0.
     nFYZ = tiling[1]*tiling[2]*nyz
     nFXZ = tiling[2]*nxz
     nFXY = (tiling[2]+1)*nxy
@@ -434,7 +574,7 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
                     Stot[np.ix_(target,source)]=-Sz
                     ub_loc = uXY[source]
                     uc_loc = uXY[target]
-                    print("S err = ",np.linalg.norm(uc_loc-Sz@ub_loc)/np.linalg.norm(uc_loc))
+                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sz@ub_loc)/np.linalg.norm(uc_loc))
                 
                 
 
@@ -476,7 +616,7 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
                     Stot[np.ix_(target,source)]=-Sy
                     ub_loc = uXY[source]
                     uc_loc = uXY[target]
-                    print("S err = ",np.linalg.norm(uc_loc-Sy@ub_loc)/np.linalg.norm(uc_loc))
+                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sy@ub_loc)/np.linalg.norm(uc_loc))
                     
 
             case 0:
@@ -515,24 +655,41 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
                     Stot[np.ix_(target,source)]=-Sx
                     ub_loc = uXY[source]
                     uc_loc = uXY[target]
-                    print("S err = ",np.linalg.norm(uc_loc-Sx@ub_loc)/np.linalg.norm(uc_loc))
-        
+                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sx@ub_loc)/np.linalg.norm(uc_loc))
+    print("max_block_err = ",max_block_err)
     return Stot
 
 def local_S(dir,px,py,pz,scl_x,scl_y,scl_z):
+    """
+    Construct local SOMS system
+
+    
+    INPUT:  - dir                       :   direction in {0,1,2} in which blocks are stacked/joined
+            - (px,py,pz)                :   polynomial orders for each 1x1 block
+            - (scl_x,scl_y,scl_z)       :   length scales of 1x1 blocks
+    
+    OUTPUT: - S_dir                     :   local S-block in direction dir
+
+
+
+    """
     Dx,xpts = spectral.cheb(px)
     Dy,ypts = spectral.cheb(py)
     Dz,zpts = spectral.cheb(pz)
     nx = len(xpts)
     ny = len(ypts)
     nz = len(zpts)
-    L_joined_dir,Ijl,Ijf,Ijd,Iju,Ijb,Ijr,Ic_dir,Ibox_joined_dir,Ii_dir,Ib_dir,XY_joined_dir = L_op(dir,px,py,pz,scl_x,scl_y,scl_z)
+    L_joined_dir,Ijl,Ijf,Ijd,Iju,Ijb,Ijr,Ic_dir,Ibox_joined_dir,Ii_dir,Ib_dir,XY_joined_dir = L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh)
     XY_joined_dir_i = XY_joined_dir[Ii_dir,:]
     XY_joined_dir_b = XY_joined_dir[Ib_dir,:]
 
     Lii_joined_dir = L_joined_dir[Ii_dir,:][:,Ii_dir]
     Lib_joined_dir = L_joined_dir[Ii_dir,:][:,Ib_dir]
     Lib_joined_dir_box = Lib_joined_dir[:,Ibox_joined_dir]
+
+
+    # fiddle with interp since kronecker is not respected by global disc
+    # inv_inter_xy is interpolation for the two xy-faces etc.
 
     Interp_x,Interp_y,Interp_z=interp_ops(px,py,pz,scl_x,scl_y,scl_z)
     if dir == 0:
@@ -558,7 +715,8 @@ def local_S(dir,px,py,pz,scl_x,scl_y,scl_z):
         inv_inter_xz2 = np.kron(np.identity(nx-2),iIz[:,(nz-2):])
         inv_inter_xz = np.append(inv_inter_xz1,inv_inter_xz2,axis=1)
     XYu,Iul,Iuf,Iud,Iuu,Iub,Iur = XYU(dir,px,py,pz,scl_x,scl_y,scl_z)
-
+    
+    # C_dir is total inverse interpolation matrix, i.e. over the 6 faces
 
 
     C_dir = np.zeros( shape = ( len(Ibox_joined_dir) , XYu.shape[0] ) )
@@ -580,41 +738,57 @@ Lx = 1.
 Ly = 1.
 Lz = 1.
 
-px = 8
-py = 8
-pz = 8
+pvec = np.array([4,6,8,10,12],dtype = np.int64)
+condvec = np.zeros(shape = pvec.shape)
+Nvec = np.zeros(shape = pvec.shape)
+for indp in range(len(pvec)):
+    p = pvec[indp]
+    px = p
+    py = p
+    pz = p
 
 
 
-tiling = [4,4,4] #non-overlapping (!!!) tiling
-#tiling[dir] = 3
-Lx0 = tiling[0]
-Ly0 = tiling[1]
-Lz0 = tiling[2]
+    tiling = [4,4,4] #non-overlapping (!!!) tiling
+    #tiling[dir] = 3
+    Lx0 = tiling[0]
+    Ly0 = tiling[1]
+    Lz0 = tiling[2]
 
-scl_z = Lz/Lz0
-scl_y = Ly/Ly0
-scl_x = Lx/Lx0
+    scl_z = Lz/Lz0
+    scl_y = Ly/Ly0
+    scl_x = Lx/Lx0
 
-XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec = global_dofs(tiling,px,py,pz,Lx,Ly,Lz)
+    XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec = global_dofs(tiling,px,py,pz,Lx,Ly,Lz)
 
 
 
-uXY = bc(XYtot,kh)
-S_x = local_S(0,px,py,pz,scl_x,scl_y,scl_z)
-S_y = local_S(1,px,py,pz,scl_x,scl_y,scl_z)
-S_z = local_S(2,px,py,pz,scl_x,scl_y,scl_z)
-Stot = construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,uXY,S_x,S_y,S_z)
-print("SOMS construction DONE")
-print("data = ",Stot.nbytes/1e6)
-Ib = np.where((np.abs(XYtot[:,0])<1e-10)|(np.abs(XYtot[:,0]-Lx)<1e-10) | (np.abs(XYtot[:,1])<1e-10)|(np.abs(XYtot[:,1]-Ly)<1e-10)|(np.abs(XYtot[:,2])<1e-10)|(np.abs(XYtot[:,2]-Lz)<1e-10))[0]
-Ii = [i for i in range(XYtot.shape[0]) if not i in Ib]
-ui = bc(XYtot[Ii,:],kh)
-ub = bc(XYtot[Ib,:],kh)
-print("solving:")
-uhat = -np.linalg.solve(Stot[Ii,:][:,Ii],Stot[Ii,:][:,Ib]@ub)
+    uXY = bc(XYtot,kh)
+    S_x = local_S(0,px,py,pz,scl_x,scl_y,scl_z)
+    S_y = local_S(1,px,py,pz,scl_x,scl_y,scl_z)
+    S_z = local_S(2,px,py,pz,scl_x,scl_y,scl_z)
+    Stot = construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,uXY,S_x,S_y,S_z)
+    print("SOMS construction DONE")
+    print("data = ",Stot.nbytes/1e6)
+    Ib = np.where((np.abs(XYtot[:,0])<1e-10)|(np.abs(XYtot[:,0]-Lx)<1e-10) | (np.abs(XYtot[:,1])<1e-10)|(np.abs(XYtot[:,1]-Ly)<1e-10)|(np.abs(XYtot[:,2])<1e-10)|(np.abs(XYtot[:,2]-Lz)<1e-10))[0]
+    Ii = [i for i in range(XYtot.shape[0]) if not i in Ib]
+    ui = bc(XYtot[Ii,:],kh)
+    ub = bc(XYtot[Ib,:],kh)
+    print("solving:")
+    Sii = Stot[Ii,:][:,Ii]
+    uhat = -np.linalg.solve(Sii,Stot[Ii,:][:,Ib]@ub)
 
-print("S err final = ",np.linalg.norm(uhat-ui)/np.linalg.norm(ui))
-fig = plt.figure(1)
-plt.spy(Stot[Ii,:][:,Ii])
+    print("S err final = ",np.linalg.norm(uhat-ui)/np.linalg.norm(ui))
+    condS = np.linalg.cond(Sii)
+    print("condS = ",condS)
+    N= px*py*pz*tiling[0]*tiling[1]*tiling[2]
+    print("N = ",N)
+    Nvec[indp] = N
+    condvec[indp] = condS
+
+condfit = (1+np.log(Nvec))**3
+condfit *= condvec[-1]/condfit[-1]
+plt.figure(1)
+plt.loglog(Nvec,condvec)
+plt.loglog(Nvec,condfit,linestyle='dashed')
 plt.show()
