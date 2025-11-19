@@ -5,11 +5,10 @@ import matplotlib.pyplot as plt
 import scipy.linalg as sclinalg
 import time
 
-kh = 5.
-
-def bc(p,kh):
-    r=np.sqrt((p[:,0]+.1)**2+(p[:,1]+.1)**2+(p[:,2]+.1)**2)
-    return np.sin(kh*r)/(4.*np.pi*r)
+def bc(p):
+    r = np.sqrt(((p[:,0]+.1)**2)+((p[:,1]+.1)**2)+((p[:,2]+.1)**2))
+    
+    return 1./(4*np.pi*r)
 
 def L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
     """
@@ -416,10 +415,6 @@ def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
     """
     Construct global reduced DOFs
 
-    ----------------------------------------------------------------------------------------
-    | 'reduced' the union of all cuboid boundaries in the provided tiling i.e.             |
-    |  the DOFs interior to the cuboids are removed                                        |
-    ----------------------------------------------------------------------------------------
 
     INPUT:  - tiling (1x3 int array)    :   the tiling defining the underlying non-overlapping domain decomp
             - (px,py,pz)                :    polynomial orders for each 1x1 block
@@ -519,7 +514,7 @@ def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
                     
     return XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec
 
-def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,uXY,Sx,Sy,Sz):
+def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,Sx,Sy,Sz):
     """
     Construct global SOMS system
 
@@ -539,7 +534,6 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
 
     """
     ctr = 0
-    max_block_err = 0.
     nFYZ = tiling[1]*tiling[2]*nyz
     nFXZ = tiling[2]*nxz
     nFXY = (tiling[2]+1)*nxy
@@ -572,9 +566,6 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
                 
                 if not b_vec[indxyz]:
                     Stot[np.ix_(target,source)]=-Sz
-                    ub_loc = uXY[source]
-                    uc_loc = uXY[target]
-                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sz@ub_loc)/np.linalg.norm(uc_loc))
                 
                 
 
@@ -614,9 +605,6 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
             
                 if not b_vec[indxyz]:
                     Stot[np.ix_(target,source)]=-Sy
-                    ub_loc = uXY[source]
-                    uc_loc = uXY[target]
-                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sy@ub_loc)/np.linalg.norm(uc_loc))
                     
 
             case 0:
@@ -653,13 +641,9 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
                 
                 if not b_vec[indxyz]:
                     Stot[np.ix_(target,source)]=-Sx
-                    ub_loc = uXY[source]
-                    uc_loc = uXY[target]
-                    max_block_err = max(max_block_err,np.linalg.norm(uc_loc-Sx@ub_loc)/np.linalg.norm(uc_loc))
-    print("max_block_err = ",max_block_err)
     return Stot
 
-def local_S(dir,px,py,pz,scl_x,scl_y,scl_z):
+def local_S(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
     """
     Construct local SOMS system
 
@@ -730,65 +714,31 @@ def local_S(dir,px,py,pz,scl_x,scl_y,scl_z):
 
     S_dir = -(np.linalg.solve(Lii_joined_dir,Lib_joined_dir[:,Ibox_joined_dir]@C_dir))[Ic_dir,:]
     return S_dir
-
-
-
-
-Lx = 1.
-Ly = 1.
-Lz = 1.
-
-pvec = np.array([4,6,8,10,12],dtype = np.int64)
-condvec = np.zeros(shape = pvec.shape)
-Nvec = np.zeros(shape = pvec.shape)
-for indp in range(len(pvec)):
-    p = pvec[indp]
-    px = p
-    py = p
-    pz = p
-
-
-
-    tiling = [4,4,4] #non-overlapping (!!!) tiling
-    #tiling[dir] = 3
+def SOMS_solver(px,py,pz,nbx,nby,nbz,Lx=1.,Ly=1.,Lz=1.,kh=0,dbg = 0):
+    tiling = [nbx,nby,nbz]
     Lx0 = tiling[0]
     Ly0 = tiling[1]
     Lz0 = tiling[2]
 
-    scl_z = Lz/Lz0
-    scl_y = Ly/Ly0
     scl_x = Lx/Lx0
+    scl_y = Ly/Ly0
+    scl_z = Lz/Lz0
 
+    Sx = local_S(0,px,py,pz,scl_x,scl_y,scl_z,kh)
+    Sy = local_S(1,px,py,pz,scl_x,scl_y,scl_z,kh)
+    Sz = local_S(2,px,py,pz,scl_x,scl_y,scl_z,kh)
     XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec = global_dofs(tiling,px,py,pz,Lx,Ly,Lz)
-
-
-
-    uXY = bc(XYtot,kh)
-    S_x = local_S(0,px,py,pz,scl_x,scl_y,scl_z)
-    S_y = local_S(1,px,py,pz,scl_x,scl_y,scl_z)
-    S_z = local_S(2,px,py,pz,scl_x,scl_y,scl_z)
-    Stot = construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,uXY,S_x,S_y,S_z)
-    print("SOMS construction DONE")
-    print("data = ",Stot.nbytes/1e6)
-    Ib = np.where((np.abs(XYtot[:,0])<1e-10)|(np.abs(XYtot[:,0]-Lx)<1e-10) | (np.abs(XYtot[:,1])<1e-10)|(np.abs(XYtot[:,1]-Ly)<1e-10)|(np.abs(XYtot[:,2])<1e-10)|(np.abs(XYtot[:,2]-Lz)<1e-10))[0]
+    Stot = construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,Sx,Sy,Sz)
+    
+    Ib = np.where((np.abs(XYtot[:,0])<1e-10)|(np.abs(XYtot[:,0]-Lx)<1e-10)|(np.abs(XYtot[:,1])<1e-10)|(np.abs(XYtot[:,1]-Ly)<1e-10)|(np.abs(XYtot[:,2])<1e-10)|(np.abs(XYtot[:,2]-Lz)<1e-10))[0]
     Ii = [i for i in range(XYtot.shape[0]) if not i in Ib]
-    ui = bc(XYtot[Ii,:],kh)
-    ub = bc(XYtot[Ib,:],kh)
-    print("solving:")
+    fig = plt.figure(1)
+    
+    if dbg>0:
+        print("S made, subselecting")
     Sii = Stot[Ii,:][:,Ii]
-    uhat = -np.linalg.solve(Sii,Stot[Ii,:][:,Ib]@ub)
+    Sib = Stot[Ii,:][:,Ib]
+    return Sii,Sib,XYtot,Ii,Ib
 
-    print("S err final = ",np.linalg.norm(uhat-ui)/np.linalg.norm(ui))
-    condS = np.linalg.cond(Sii)
-    print("condS = ",condS)
-    N= px*py*pz*tiling[0]*tiling[1]*tiling[2]
-    print("N = ",N)
-    Nvec[indp] = N
-    condvec[indp] = condS
 
-condfit = (1+np.log(Nvec))**3
-condfit *= condvec[-1]/condfit[-1]
-plt.figure(1)
-plt.loglog(Nvec,condvec)
-plt.loglog(Nvec,condfit,linestyle='dashed')
-plt.show()
+
