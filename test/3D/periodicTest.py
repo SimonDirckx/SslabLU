@@ -102,6 +102,19 @@ uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, 
 end_time     = time.perf_counter()
 elapsed_time_direct_solve = end_time - start_time
 
+RB, SiM, SiP = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
+uhat_RB = omsdirectsolve.block_RB_solve(OMS, RB, SiM, SiP, rhstot)
+
+print("Length of the elements:", len(RB[0]),len(RB[1]), len(RB[2]))
+
+print("Compare cyclic block tridiagonal to RB:")
+m = S_rk_list[0][0].shape[0]
+for i in range(N):
+    print(np.linalg.norm(uhat_RB[i*m:(i+1)*m] - uhat_direct[i*m:(i+1)*m]) / np.linalg.norm(uhat_direct[i*m:(i+1)*m]))
+
+print(np.linalg.norm(uhat_RB - uhat_direct) / np.linalg.norm(uhat_direct))
+
+"""
 gInfo = gmres_info()
 stol = 1e-8*H*H
 
@@ -161,4 +174,4 @@ for slabInd in range(len(connectivity)):
     errInf = np.max([errInf,errI])
     print(errI)
 print("sup norm error = ",errInf)
-
+"""
