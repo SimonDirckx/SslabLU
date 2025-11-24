@@ -102,10 +102,12 @@ uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, 
 end_time     = time.perf_counter()
 elapsed_time_direct_solve = end_time - start_time
 
-RB, SiM, SiP = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
-uhat_RB = omsdirectsolve.block_RB_solve(OMS, RB, SiM, SiP, rhstot)
+RB = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
+uhat_RB = omsdirectsolve.block_RB_solve(RB, rhstot)
 
-print("Length of the elements:", len(RB[0]),len(RB[1]), len(RB[2]))
+print("Length of the elements:", len(RB[0]),len(RB[1]),len(RB[2]))
+
+print("Length of last RB things:", len(RB[2][0]),len(RB[2][1]),len(RB[2][2]))
 
 print("Compare cyclic block tridiagonal to RB:")
 m = S_rk_list[0][0].shape[0]

@@ -221,13 +221,16 @@ def build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=False):
         SiM[0] = zero_operator
         SiP[-1] = zero_operator
 
-    RB = build_block_RB_solver_level(m, nSlabs, SiM, SiP)
+    RB = [(SiM, [np.eye(m, dtype=SiM[0].dtype) for _ in range(nSlabs)], SiP)]
 
-    return RB, SiM, SiP
+    RB.append(build_block_RB_solver_level(m, nSlabs, RB[-1]))
+    RB.append(build_block_RB_solver_level(m, int(nSlabs/2), RB[-1]))
+
+    return RB
 
 
 # Construct a solver for the red-black scheme. This one is not periodic (aka not cyclical)
-def build_block_RB_solver_level(m, nSlabs, SiM, SiP):
+def build_block_RB_solver_level(m, nSlabs, RB_level):
     """
     
     [  I   ] [ S_12 ] [  0   ] [  E?  ]
@@ -245,6 +248,9 @@ def build_block_RB_solver_level(m, nSlabs, SiM, SiP):
     3. For i odd, the factorized system  A_i' = (B_i') \ S_{i,i-1} S_{i-1,i-2}
     4. For i odd, the factorized system  C_i' = (B_i') \ S_{i,i+1} S_{i+1,i+2}
     """
+
+    SiM = RB_level[0]
+    SiP = RB_level[2]
 
     # First let's build 2, B_i:
     I   = np.eye(m, dtype=SiM[0].dtype)
@@ -264,7 +270,7 @@ def build_block_RB_solver_level(m, nSlabs, SiM, SiP):
     return (A_i, B_i, C_i)
 
 
-def block_RB_solve(OMS, RB, SiM, SiP, v):
+def block_RB_solve(RB, v):
     """
     [  I   ] [ S_12 ] [  0   ] [  E?  ]
     [ S_21 ] [  I   ] [ S_23 ] [  0   ]
@@ -273,41 +279,60 @@ def block_RB_solve(OMS, RB, SiM, SiP, v):
 
     Solves using the Red-Black factorization. Assumes we have RB = (A_i, B_i, C_i) and v of size m * nSlabs
     """
-    (A_i, B_i, C_i) = RB
-
-    m        = A_i[0].shape[0]
-    nReduced = len(B_i)
-    nSlabs   = 2 * nReduced
-
-    # Set up S:
-    S = np.eye(m*nReduced, dtype=A_i[0].dtype)
-    for i in range(nReduced):
-        prev = (i - 1) % nReduced
-        next = (i + 1) % nReduced
-        S[i*m:(i+1)*m, prev*m:(prev+1)*m] = -A_i[i]
-        S[i*m:(i+1)*m, next*m:(next+1)*m] = -C_i[i]
-    
-    S = lu_factor(S, overwrite_a=True)
+    m = RB[0][0][0].shape[0]
+    # Building the RHS:
+    vPrimes = [v.copy()]
+    Smats   = []
 
     # Now build the RHS:
-    vPrime = np.zeros(m*nReduced)
-    for j in range(nReduced):
-        i    = 2 * j
-        prev = (i - 1) % nSlabs
-        next = (i + 1) % nSlabs
-        vPrime[j*m:(j+1)*m] = v[i*m:(i+1)*m] + SiM[i] @ v[prev*m:(prev+1)*m] + SiP[i] @ v[next*m:(next+1)*m]
-        vPrime[j*m:(j+1)*m] = lu_solve(B_i[j], vPrime[j*m:(j+1)*m])
+    for l in range(len(RB) - 1):
+        (SiM, _, SiP)   = RB[l]
+        (_, B_i, _) = RB[l+1]
 
-    vPrime = lu_solve(S, vPrime)
+        nSlabs   = len(SiM)
+        nReduced = int(nSlabs / 2)
+        vPrime   = np.zeros(m*nReduced)
+        vPrev    = vPrimes[-1]
+
+        for j in range(nReduced):
+            i    = 2 * j
+            prev = (i - 1) % nSlabs
+            next = (i + 1) % nSlabs
+            vPrime[j*m:(j+1)*m] = vPrev[i*m:(i+1)*m] + SiM[i] @ vPrev[prev*m:(prev+1)*m] + SiP[i] @ vPrev[next*m:(next+1)*m]
+            vPrime[j*m:(j+1)*m] = lu_solve(B_i[j], vPrime[j*m:(j+1)*m])
+
+        vPrimes.append(vPrime)
+
+        # Set up S:
+        (A_i, _, C_i) = RB[l+1]
+        S = np.eye(m*nReduced, dtype=A_i[0].dtype)
+        for i in range(nReduced):
+            prev = (i - 1) % nReduced
+            next = (i + 1) % nReduced
+            S[i*m:(i+1)*m, prev*m:(prev+1)*m] += -A_i[i]
+            S[i*m:(i+1)*m, next*m:(next+1)*m] += -C_i[i]
+        
+        Smats.append(lu_factor(S, overwrite_a=True))
+
+    # Now get u:
     u      = np.zeros(v.shape)
+    vPrimes[1] = lu_solve(Smats[0], vPrimes[1])
+    vPrimes[2] = lu_solve(Smats[1], vPrimes[2])
 
+    (SiM, _, SiP)   = RB[0]
+    nReduced = 4
     for j in range(nReduced):
         i = 2 * j
         # We fill in the odd segments of u
-        u[i*m:(i+1)*m] = vPrime[j*m:(j+1)*m]
+        u[i*m:(i+1)*m] = vPrimes[1][j*m:(j+1)*m]
         
         # Here we compute the even segments of u:
         next = (j + 1) % nReduced
-        u[(i+1)*m:(i+2)*m] = SiM[i] @ vPrime[j*m:(j+1)*m] + v[(i+1)*m:(i+2)*m] + SiP[i] @ vPrime[next*m:(next+1)*m]
+        u[(i+1)*m:(i+2)*m] = SiM[i] @ vPrimes[1][j*m:(j+1)*m] + v[(i+1)*m:(i+2)*m] + SiP[i] @ vPrimes[1][next*m:(next+1)*m]
+
+    u[:m] = vPrimes[2][:m]
+    u[4*m:5*m] = vPrimes[2][m:]
+
+    print("length of vPrimes[2]", len(vPrimes[2]))
 
     return u
