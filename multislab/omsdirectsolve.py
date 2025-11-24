@@ -309,30 +309,26 @@ def block_RB_solve(RB, v):
         for i in range(nReduced):
             prev = (i - 1) % nReduced
             next = (i + 1) % nReduced
-            S[i*m:(i+1)*m, prev*m:(prev+1)*m] += -A_i[i]
-            S[i*m:(i+1)*m, next*m:(next+1)*m] += -C_i[i]
+            S[i*m:(i+1)*m, prev*m:(prev+1)*m] -= A_i[i]
+            S[i*m:(i+1)*m, next*m:(next+1)*m] -= C_i[i]
         
         Smats.append(lu_factor(S, overwrite_a=True))
 
     # Now get u:
-    u      = np.zeros(v.shape)
-    vPrimes[1] = lu_solve(Smats[0], vPrimes[1])
+    #vPrimes[1] = lu_solve(Smats[0], vPrimes[1])
     vPrimes[2] = lu_solve(Smats[1], vPrimes[2])
+    
+    for l in range(len(RB) - 1, 0, -1):
+        (SiM, _, SiP)   = RB[l-1]
+        nReduced = int(len(SiM) / 2)
+        print("l, nReduced:", l, nReduced)
+        for j in range(nReduced):
+            i = 2 * j
+            # We fill in the odd segments of u
+            vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
+            
+            # Here we compute the even segments of u:
+            next = (j + 1) % nReduced
+            vPrimes[l-1][(i+1)*m:(i+2)*m] += SiM[i+1] @ vPrimes[l][j*m:(j+1)*m] + SiP[i+1] @ vPrimes[l][next*m:(next+1)*m]
 
-    (SiM, _, SiP)   = RB[0]
-    nReduced = 4
-    for j in range(nReduced):
-        i = 2 * j
-        # We fill in the odd segments of u
-        u[i*m:(i+1)*m] = vPrimes[1][j*m:(j+1)*m]
-        
-        # Here we compute the even segments of u:
-        next = (j + 1) % nReduced
-        u[(i+1)*m:(i+2)*m] = SiM[i] @ vPrimes[1][j*m:(j+1)*m] + v[(i+1)*m:(i+2)*m] + SiP[i] @ vPrimes[1][next*m:(next+1)*m]
-
-    u[:m] = vPrimes[2][:m]
-    u[4*m:5*m] = vPrimes[2][m:]
-
-    print("length of vPrimes[2]", len(vPrimes[2]))
-
-    return u
+    return vPrimes[0]
