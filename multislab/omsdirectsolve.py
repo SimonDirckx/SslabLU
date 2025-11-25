@@ -294,7 +294,6 @@ def block_RB_solve(RBS, v):
     m = RB[0][0][0].shape[0]
     # Building the RHS:
     vPrimes = [v.copy()]
-    Smats   = []
 
     # Now build the RHS:
     for l in range(len(RB) - 1):

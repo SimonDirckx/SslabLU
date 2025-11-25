@@ -92,7 +92,11 @@ S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
 Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
 
-# TEST: zero out select S_rk_list.
+# TEST: specific structure:
+m = S_rk_list[1][0].shape[0]
+S_rk_list = [[-0.25 * np.eye(m)] * 2 for _ in range(N)]
+#S_rk_list[0][0] = np.zeros((m, m))
+S_rk_list[-1][-1] = np.zeros((m, m)) # Problem block
 
 start_time   = time.perf_counter()
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
@@ -119,7 +123,7 @@ for i in range(N):
 
 print(np.linalg.norm(uhat_RB - uhat_direct) / np.linalg.norm(uhat_direct))
 
-
+"""
 gInfo = gmres_info()
 stol = 1e-8*H*H
 
@@ -141,7 +145,7 @@ for i in range(N):
 
 print(np.linalg.norm(uhat_RB - uhat) / np.linalg.norm(uhat))
 
-"""
+
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
