@@ -223,10 +223,20 @@ def build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=False):
 
     RB = [(SiM, [np.eye(m, dtype=SiM[0].dtype) for _ in range(nSlabs)], SiP)]
 
-    RB.append(build_block_RB_solver_level(m, nSlabs, RB[-1]))
-    RB.append(build_block_RB_solver_level(m, int(nSlabs/2), RB[-1]))
+    l = nSlabs
+    while l > 1:
+        RB.append(build_block_RB_solver_level(m, l, RB[-1]))
+        l = int(l / 2)
 
-    return RB
+    # Set up S:
+    (A_i, _, C_i) = RB[-1]
+    S = np.eye(m, dtype=A_i[0].dtype)
+    S -= A_i[0]
+    S -= C_i[0]
+
+    S = lu_factor(S, overwrite_a=True)
+
+    return (RB, S)
 
 
 # Construct a solver for the red-black scheme. This one is not periodic (aka not cyclical)
@@ -270,7 +280,7 @@ def build_block_RB_solver_level(m, nSlabs, RB_level):
     return (A_i, B_i, C_i)
 
 
-def block_RB_solve(RB, v):
+def block_RB_solve(RBS, v):
     """
     [  I   ] [ S_12 ] [  0   ] [  E?  ]
     [ S_21 ] [  I   ] [ S_23 ] [  0   ]
@@ -279,6 +289,8 @@ def block_RB_solve(RB, v):
 
     Solves using the Red-Black factorization. Assumes we have RB = (A_i, B_i, C_i) and v of size m * nSlabs
     """
+    (RB, S) = RBS
+
     m = RB[0][0][0].shape[0]
     # Building the RHS:
     vPrimes = [v.copy()]
@@ -303,20 +315,8 @@ def block_RB_solve(RB, v):
 
         vPrimes.append(vPrime)
 
-        # Set up S:
-        (A_i, _, C_i) = RB[l+1]
-        S = np.eye(m*nReduced, dtype=A_i[0].dtype)
-        for i in range(nReduced):
-            prev = (i - 1) % nReduced
-            next = (i + 1) % nReduced
-            S[i*m:(i+1)*m, prev*m:(prev+1)*m] -= A_i[i]
-            S[i*m:(i+1)*m, next*m:(next+1)*m] -= C_i[i]
-        
-        Smats.append(lu_factor(S, overwrite_a=True))
-
     # Now get u:
-    #vPrimes[1] = lu_solve(Smats[0], vPrimes[1])
-    vPrimes[2] = lu_solve(Smats[1], vPrimes[2])
+    vPrimes[-1] = lu_solve(S, vPrimes[-1])
     
     for l in range(len(RB) - 1, 0, -1):
         (SiM, _, SiP)   = RB[l-1]

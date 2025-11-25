@@ -91,6 +91,9 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torc
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
 Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+
+# TEST: zero out select S_rk_list.
+
 start_time   = time.perf_counter()
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
 end_time     = time.perf_counter()
@@ -102,8 +105,8 @@ uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, 
 end_time     = time.perf_counter()
 elapsed_time_direct_solve = end_time - start_time
 
-RB = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
-uhat_RB = omsdirectsolve.block_RB_solve(RB, rhstot)
+RB, S = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
+uhat_RB = omsdirectsolve.block_RB_solve((RB, S), rhstot)
 
 print("Length of the elements:", len(RB[0]),len(RB[1]),len(RB[2]))
 
@@ -116,7 +119,7 @@ for i in range(N):
 
 print(np.linalg.norm(uhat_RB - uhat_direct) / np.linalg.norm(uhat_direct))
 
-"""
+
 gInfo = gmres_info()
 stol = 1e-8*H*H
 
@@ -131,7 +134,14 @@ elapsed_time_iterative = end_time - start_time
 stop_solve = time.time()
 res = Stot@uhat-rhstot
 
+print("Compare GMRES to RB:")
+m = S_rk_list[0][0].shape[0]
+for i in range(N):
+    print(np.linalg.norm(uhat_RB[i*m:(i+1)*m] - uhat[i*m:(i+1)*m]) / np.linalg.norm(uhat[i*m:(i+1)*m]))
 
+print(np.linalg.norm(uhat_RB - uhat) / np.linalg.norm(uhat))
+
+"""
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 
