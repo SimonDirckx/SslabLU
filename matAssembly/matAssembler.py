@@ -9,7 +9,18 @@ import time
 import matplotlib.pyplot as plt
 from matAssembly.HBS.simpleoctree import simpletree as tree
 import torch
+
+
+# Classes for matrix assembly
+
+
+
 def compute_c0_L0(XX):
+    """
+    compute the center and charasteristic length of the domain to be clustered
+    (this is necessary only becuase there is a bug in simpletree)
+    
+    """
     N,ndim = XX.shape
     XX_np = XX
     if torch.is_tensor(XX):
@@ -20,6 +31,16 @@ def compute_c0_L0(XX):
 class matAssemblerOptions:
     """
     Options for matrix constuction
+
+    method: dense(default), epsHBS (deprecated), rkHPS (rank based HBS compression)
+    tol:    tolerance for HBS construction (deprecated)
+    leaf_size: #DOFs per leaf (default = 8)
+    maxRank: maximal HBS rank
+    tree:   if specified, use this cluster tree set-up
+    ndim:   dimension of the interfaces (2 if problem is 3D, 1 if problem is 1D)
+    reduced: (deprecated, default false)
+
+
     """
     def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,reduced=False):
         #todo: add checks of str!='dense'
@@ -31,6 +52,11 @@ class matAssemblerOptions:
         self.ndim = 3
         self.reduced    = reduced
 class matAssemblerStats:
+    """
+    Stats of matrix constuction (only for dbg putposes)
+    
+    """
+    
     def __init__(self):
         self.timeSample     = 0
         self.timeCompress   = 0
@@ -40,6 +66,14 @@ class matAssemblerStats:
 class matAssembler:
     """
     Wrapper class for the construction of matrices
+
+    input
+        matOpts:matAssemblerOptions, specifies the assembly options
+    
+    output
+        either dense or HBS approx of operator, in linOp form (scipy compat)
+
+
     """
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
