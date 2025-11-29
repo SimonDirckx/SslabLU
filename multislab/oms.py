@@ -17,7 +17,7 @@ import scipy.sparse.linalg as splinalg
 
 class slab:
     """
-    Class encoding source-target maps
+    Class encoding source-target maps (left and right)
 
     @param
     geom: local geometry
