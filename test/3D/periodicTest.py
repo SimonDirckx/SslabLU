@@ -74,11 +74,11 @@ def u_exact(p):
     z=squareTorus.z1(p,jax_avail=jax_avail,torch_avail=torch_avail)
     return np.sin(kh*z)
 
-N = 8
+N = 4
 dSlabs,connectivity,H = squareTorus.dSlabs(N)
 
 formulation = "hps"
-p = 10
+p = 8
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -90,13 +90,16 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torc
 
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
-Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-
 # TEST: specific structure:
 m = S_rk_list[1][0].shape[0]
-S_rk_list = [[-0.25 * np.eye(m)] * 2 for _ in range(N)]
+#S_rk_list = [[-0.005 * np.eye(m)] * 2 for _ in range(N)]
 #S_rk_list[0][0] = np.zeros((m, m))
-S_rk_list[-1][-1] = np.zeros((m, m)) # Problem block
+#S_rk_list[-1][-1] = np.zeros((m, m)) # Problem block
+#for i in range(len(S_rk_list)):
+    #S_rk_list[i][0] = np.zeros((m, m))
+    #S_rk_list[i][-1] = np.zeros((m, m))
+
+Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
 
 start_time   = time.perf_counter()
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
@@ -105,16 +108,16 @@ end_time     = time.perf_counter()
 elapsed_time_direct_factor = end_time - start_time
 
 start_time   = time.perf_counter()
-uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
+uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot.copy())
 end_time     = time.perf_counter()
 elapsed_time_direct_solve = end_time - start_time
 
 RB, S = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
-uhat_RB = omsdirectsolve.block_RB_solve((RB, S), rhstot)
+uhat_RB = omsdirectsolve.block_RB_solve(OMS, (RB, S), rhstot.copy(), S_rk_list, uhat_direct)
 
-print("Length of the elements:", len(RB[0]),len(RB[1]),len(RB[2]))
+#print("Length of the elements:", len(RB[0]),len(RB[1]),len(RB[2]))
 
-print("Length of last RB things:", len(RB[2][0]),len(RB[2][1]),len(RB[2][2]))
+print("Length of last RB things:", len(RB[-1][0]),len(RB[-1][1]),len(RB[-1][2]))
 
 print("Compare cyclic block tridiagonal to RB:")
 m = S_rk_list[0][0].shape[0]
@@ -123,7 +126,7 @@ for i in range(N):
 
 print(np.linalg.norm(uhat_RB - uhat_direct) / np.linalg.norm(uhat_direct))
 
-"""
+
 gInfo = gmres_info()
 stol = 1e-8*H*H
 
@@ -145,7 +148,14 @@ for i in range(N):
 
 print(np.linalg.norm(uhat_RB - uhat) / np.linalg.norm(uhat))
 
+print("Compare cyclic block tridiagonal to GMRES:")
+m = S_rk_list[0][0].shape[0]
+for i in range(N):
+    print(np.linalg.norm(uhat_direct[i*m:(i+1)*m] - uhat[i*m:(i+1)*m]) / np.linalg.norm(uhat[i*m:(i+1)*m]))
 
+print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
+
+"""
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
 

@@ -280,7 +280,7 @@ def build_block_RB_solver_level(m, nSlabs, RB_level):
     return (A_i, B_i, C_i)
 
 
-def block_RB_solve(RBS, v):
+def block_RB_solve(OMS, RBS, v, S_rk_list, utrue):
     """
     [  I   ] [ S_12 ] [  0   ] [  E?  ]
     [ S_21 ] [  I   ] [ S_23 ] [  0   ]
@@ -289,8 +289,39 @@ def block_RB_solve(RBS, v):
 
     Solves using the Red-Black factorization. Assumes we have RB = (A_i, B_i, C_i) and v of size m * nSlabs
     """
+    print("OMS.glob_source_dofs", OMS.glob_source_dofs)
+    print("OMS.glob_target_dofs", OMS.glob_target_dofs)
+
     (RB, S) = RBS
 
+    SiM, _, SiP = RB[0]
+
+    m      = SiM[0].shape[0]
+    nSlabs = len(SiM)
+
+    print("m, nSlabs", m ,nSlabs)
+
+    Sfull = np.eye(m*nSlabs)
+
+    I = np.eye(m)
+    
+    for i in range(nSlabs):
+        prev = (i - 1) % nSlabs
+        next = (i + 1) % nSlabs
+        print("Source1, Source2, Target:", prev*m, next*m, i*m)
+        Sfull[i*m:(i+1)*m, prev*m:(prev+1)*m] -= SiM[i] @ I #-S_rk_list[i][0] 
+        Sfull[i*m:(i+1)*m, next*m:(next+1)*m] -= SiP[i] @ I #-S_rk_list[i][1]
+
+    v_adjusted = Sfull @ utrue
+
+    print("Error for Sfull as a forward operator:")
+    for i in range(nSlabs):
+        print(np.linalg.norm(v_adjusted[i*m:(i+1)*m] - v[i*m:(i+1)*m]) / np.linalg.norm(v[i*m:(i+1)*m]))
+    print(np.linalg.norm(v_adjusted - v) / np.linalg.norm(v))
+    
+    return np.linalg.solve(Sfull, v)
+
+    """
     m = RB[0][0][0].shape[0]
     # Building the RHS:
     vPrimes = [v.copy()]
@@ -331,3 +362,4 @@ def block_RB_solve(RBS, v):
             vPrimes[l-1][(i+1)*m:(i+2)*m] += SiM[i+1] @ vPrimes[l][j*m:(j+1)*m] + SiP[i+1] @ vPrimes[l][next*m:(next+1)*m]
 
     return vPrimes[0]
+    """
