@@ -246,6 +246,6 @@ def SOMS_solver(px,py,nbx,nby,kh=0.,Lx=1,Ly=1):
     Ib = np.where((np.abs(XYtot[:,0])<1e-14) | (np.abs(XYtot[:,0]-Lx)<1e-14) | (np.abs(XYtot[:,1])<1e-14) | (np.abs(XYtot[:,1]-Ly)<1e-14))[0]
     Ii = [i for i in range(XYtot.shape[0]) if not i in Ib]
 
-    Sii = Stot[Ii,:][:,Ii]
-    Sib = Stot[Ii,:][:,Ib]
-    return Sii,Sib,XYtot,Ii,Ib
+    #Sii = Stot[Ii,:][:,Ii]
+    #Sib = Stot[Ii,:][:,Ib]
+    return Stot,XYtot,Ii,Ib

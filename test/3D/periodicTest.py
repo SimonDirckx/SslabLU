@@ -52,7 +52,7 @@ kh = (nwaves/4)*2.*np.pi
 jax_avail    = False
 torch_avail  = True
 hpsalt       = True
-direct_solve = False
+direct_solve = True
 
 if jax_avail:
     def bfield(p,kh):
@@ -91,9 +91,6 @@ OMS = oms.oms(dSlabs,pdo_mod,lambda p :squareTorus.gb(p,jax_avail=jax_avail,torc
 S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
 
 Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-
-# TEST: zero out select S_rk_list.
-
 start_time   = time.perf_counter()
 T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
 end_time     = time.perf_counter()
@@ -104,21 +101,6 @@ start_time   = time.perf_counter()
 uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
 end_time     = time.perf_counter()
 elapsed_time_direct_solve = end_time - start_time
-
-RB, S = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
-uhat_RB = omsdirectsolve.block_RB_solve((RB, S), rhstot)
-
-print("Length of the elements:", len(RB[0]),len(RB[1]),len(RB[2]))
-
-print("Length of last RB things:", len(RB[2][0]),len(RB[2][1]),len(RB[2][2]))
-
-print("Compare cyclic block tridiagonal to RB:")
-m = S_rk_list[0][0].shape[0]
-for i in range(N):
-    print(np.linalg.norm(uhat_RB[i*m:(i+1)*m] - uhat_direct[i*m:(i+1)*m]))# / np.linalg.norm(uhat_direct[i*m:(i+1)*m]))
-
-#print(np.linalg.norm(uhat_RB - uhat_direct,ord=np.inf) / np.linalg.norm(uhat_direct,ord=np.inf))
-
 
 gInfo = gmres_info()
 stol = 1e-8*H*H
@@ -134,39 +116,9 @@ elapsed_time_iterative = end_time - start_time
 stop_solve = time.time()
 res = Stot@uhat-rhstot
 
-print("Compare GMRES to RB:")
-m = S_rk_list[0][0].shape[0]
-for i in range(N):
-    print(np.linalg.norm(uhat_RB[i*m:(i+1)*m] - uhat[i*m:(i+1)*m],ord=np.inf))# / np.linalg.norm(uhat[i*m:(i+1)*m],ord=np.inf))
-
-#print(np.linalg.norm(uhat_RB - uhat) / np.linalg.norm(uhat))
-
-print("Compare GMRES to cyclic block tridiagonal:")
-m = S_rk_list[0][0].shape[0]
-for i in range(N):
-    print(np.linalg.norm(uhat_direct[i*m:(i+1)*m] - uhat[i*m:(i+1)*m],ord=np.inf))# / np.linalg.norm(uhat[i*m:(i+1)*m],ord=np.inf))
-
-print("\nLet's look at minima (close to 0):\n")
-print("GMRES:", np.min(np.abs(uhat)))
-for i in range(N):
-    print(np.min(np.abs(uhat[i*m:(i+1)*m])))
-
-print("Cyclic Diagonal:", np.min(np.abs(uhat_direct)))
-for i in range(N):
-    print(np.min(np.abs(uhat_direct[i*m:(i+1)*m])))
-
-print("Red-Black:", np.min(np.abs(uhat_RB)))
-for i in range(N):
-    print(np.min(np.abs(uhat_RB[i*m:(i+1)*m])))
-
-#print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
-
 
 print("Relative error of iterative solve vs direct solve with Thomas Algorithm plus SMW:")
 print(np.linalg.norm(uhat_direct - uhat) / np.linalg.norm(uhat))
-
-print("Relative error of iterative solve vs direct solve with Red-Black Algorithm:")
-print(np.linalg.norm(uhat_RB - uhat) / np.linalg.norm(uhat))
 
 print(f"Elapsed time for iterative solve: {elapsed_time_iterative} seconds")
 print(f"Elapsed time for direct factorization: {elapsed_time_direct_factor} seconds")
@@ -199,32 +151,6 @@ for slabInd in range(len(connectivity)):
     g = np.zeros(shape=(XXb.shape[0],))
     g[Il]=ul
     g[Ir]=ur
-
-    ul_true = bc(XXb[Il,:])
-    ur_true = bc(XXb[Ir,:])
-
-    err_gmresL = np.linalg.norm(ul - ul_true.detach().cpu().numpy(),ord=np.inf)
-    err_gmresR = np.linalg.norm(ur - ur_true.detach().cpu().numpy(),ord=np.inf)
-
-    ul_RB = uhat_RB[startL*nc:(startL+1)*nc]
-    ur_RB = uhat_RB[startR*nc:(startR+1)*nc]
-
-    ul_direct = uhat_direct[startL*nc:(startL+1)*nc]
-    ur_direct = uhat_direct[startR*nc:(startR+1)*nc]
-
-    err_directL = np.linalg.norm(ul_direct - ul_true.detach().cpu().numpy(),ord=np.inf)
-    err_directR = np.linalg.norm(ur_direct - ur_true.detach().cpu().numpy(),ord=np.inf)
-
-    err_RBL = np.linalg.norm(ul_RB - ul_true.detach().cpu().numpy(),ord=np.inf)
-    err_RBR = np.linalg.norm(ur_RB - ur_true.detach().cpu().numpy(),ord=np.inf)
-
-    print("GMRES errL, errR:", err_gmresL, err_gmresR)
-    print("Cyclic errL, errR:", err_directL, err_directR)
-    print("Red-black errL, errR:", err_RBL, err_RBR)
-
-
-
-    """
     g[Igb] = bc(XXb[Igb,:])
     g=g[:,np.newaxis]
     g = torch.from_numpy(g)
@@ -234,6 +160,5 @@ for slabInd in range(len(connectivity)):
     errI=np.linalg.norm(uu-uu0,ord=np.inf)
     errInf = np.max([errInf,errI])
     print(errI)
-    """
-#print("sup norm error = ",errInf)
+print("sup norm error = ",errInf)
 

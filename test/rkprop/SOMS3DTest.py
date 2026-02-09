@@ -14,6 +14,31 @@ from solver.hpsmultidomain.hpsmultidomain import pdo as pdoalt
 #             TESTS OF SOMS
 #######################################
 
+
+def my_condest(A):
+    #estim norm A:
+    v = np.random.standard_normal(size=(A.shape[1],))
+    v = v/np.linalg.norm(v)
+    Niter = 50#(int)(np.sqrt(A.shape[0]))
+    for i in range(Niter):
+        w = A.T@v
+        w = w/np.linalg.norm(w)
+        v = A@w
+        v = v/np.linalg.norm(v)
+    nrmA = np.abs(v.T@(A@w))
+    #estim norm for Ai
+    v = np.random.standard_normal(size=(A.shape[1],))
+    v = v/np.linalg.norm(v)
+    Niter = 50#(int)(np.sqrt(A.shape[0]))
+    for i in range(Niter):
+        w = np.linalg.solve(A.T,v)
+        w = w/np.linalg.norm(w)
+        v = np.linalg.solve(A,w)
+        v = v/np.linalg.norm(v)
+    
+    nrmAi = np.abs(v.T@(np.linalg.solve(A,w)))
+    return nrmA*nrmAi
+
 def bc_laplace(p):
     r = np.sqrt(((p[:,0]+.1)**2)+((p[:,1]+.1)**2)+((p[:,2]+.1)**2))
     
@@ -25,7 +50,7 @@ def bc_helmholtz(p,kh):
     return np.sin(kh*r)/(4*np.pi*r)
 
 
-pvec = np.array([4,6,8,10],dtype=np.int64)
+pvec = np.array([4,6,8],dtype=np.int64)
 condvecS_L = np.zeros(shape=(len(pvec),))
 condvecT_L = np.zeros(shape=(len(pvec),))
 condvecS_H = np.zeros(shape=(len(pvec),))
@@ -61,9 +86,15 @@ for indp in range(len(pvec)):
     toc = time.time()-tic
     print("elapsed time S = ",toc)
     print("Sii shape = ",Sii.shape)
+    tic = time.time()
     condS = np.linalg.cond(Sii)
+    toc_cond = time.time()-tic
+    tic = time.time()
+    condestS = my_condest(Sii)
+    toc_cond_est = time.time()-tic
     condvecS_L[indp] = condS
-    print("condS = ",condS)
+    print("condS,condestS = ",condS,',',condestS)
+    print("t,t_est = ",toc_cond,',',toc_cond_est)
     u = bc_laplace(XX)
     uhat = -np.linalg.solve(Sii,Sib@u[Ib])
     err = np.linalg.norm(u[Ii]-uhat)/np.linalg.norm(u[Ii])
@@ -96,8 +127,9 @@ for indp in range(len(pvec)):
     print("elapsed time T = ",toc)
     print("Tii shape = ",Sii.shape)
     condT = np.linalg.cond(Aii)
+    condestT = my_condest(Aii)
     condvecT_L[indp] = condT
-    print("condT = ",condT)
+    print("condT,condestT = ",condT,',',condestT)
     XX = solver.XX
     Ii = solver._Ji
     Ib = solver._Jx
