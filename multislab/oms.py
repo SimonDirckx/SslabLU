@@ -16,6 +16,15 @@ import scipy.sparse.linalg as splinalg
 
 
 class slab:
+    """
+    Class encoding source-target maps (left and right)
+
+    @param
+    geom: local geometry
+    gb_vec: local boundary dirichlet data
+    transform: local transform into global domain
+
+    """
     def __init__(self,geom,gb_vec,transform=None):
         self.geom       =   geom
         self.transform  =   transform
@@ -28,6 +37,7 @@ class slab:
             raise ValueError ("Input gb needs to accept inputs of size numpoints x ndim") 
 
     def compute_idxs_and_pts(self,solver):
+        # computes indices needed for source-target maps (left, center, right, boundary, interior)
         XX = solver.XX
         XXb = XX[solver.Ib,...]
         XXi = XX[solver.Ii,...]
@@ -42,6 +52,7 @@ class slab:
 
         return Il,Ir,Ic,Igb,XXi,XXb
 class omsStats:
+    # stats for debugging and performance chacks
     def __init__(self):
         self.compression = None
         self.compr_timing = None
@@ -49,6 +60,15 @@ class omsStats:
         self.sampl_timing = None
 
 class oms:
+    """
+    overlapping multislab class
+    @param
+    slablist: list of double-wide slabs
+    pdo:    global partial differntial operator
+    solver_opts: solver options (h and p specs)
+    connectivity: encodes which double slabs are connected to which
+    
+    """
     def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity):
         self.slabList=slabList
         self.pdo = pdo
@@ -62,6 +82,7 @@ class oms:
         self.densebytes = 0 
         self.stats = omsStats()
     def compute_global_dofs(self):
+        # bookkeeping: keep track of how local double slab dofs relate to the 'global' dofs of reduced S-system
         if not self.glob_source_dofs:
             glob_source_dofs=[]
             if self.glob_target_dofs:
@@ -77,6 +98,7 @@ class oms:
         self.glob_source_dofs=glob_source_dofs
 
     def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
+        # compute the source-target maps, in linear operator form
         A_solver = solver.solver_ii
         def smatmat(v,I,J,transpose=False):
             

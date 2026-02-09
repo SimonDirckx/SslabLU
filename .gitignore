@@ -162,5 +162,3 @@ cython_debug/
 #.idea/
 
 # 'obscure' test folders
-
-test/rkprop/
