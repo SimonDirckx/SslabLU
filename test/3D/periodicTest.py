@@ -44,7 +44,7 @@ bnds = squareTorus.bnds
 #
 ################################################################
 
-nwaves = 10.24
+nwaves = 15.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
@@ -78,7 +78,7 @@ N = 8
 dSlabs,connectivity,H = squareTorus.dSlabs(N)
 
 formulation = "hps"
-p = 10
+p = 14
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -135,9 +135,9 @@ print(f"Elapsed time for direct solve with cyclic tridiagonal: {elapsed_time_dir
 print(f"Elapsed time for direct factorization with red-black: {elapsed_time_direct_factor_RB} seconds")
 print(f"Elapsed time for direct solve with cyclic red-black: {elapsed_time_direct_solve_RB} seconds")
 
-if direct_solve:
-    print("We'll use solution from direct solver to get overall result:")
-    uhat = uhat_RB
+#if direct_solve:
+#    print("We'll use solution from direct solver to get overall result:")
+#    uhat = uhat_RB
 
 print("=============SUMMARY==============")
 print("H                        = ",'%10.3E'%H)
@@ -146,7 +146,9 @@ print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
 print("==================================")
 
-errInf = 0.
+errInf_iterative = 0.
+errInf_direct = 0.
+errInf_RB = 0.
 nc = OMS.nc
 for slabInd in range(len(connectivity)):
     geom    = np.array(dSlabs[slabInd])
@@ -157,19 +159,54 @@ for slabInd in range(len(connectivity)):
 
     startL = ((slabInd-1)%N)
     startR = ((slabInd+1)%N)
-    ul = uhat[startL*nc:(startL+1)*nc]
-    ur = uhat[startR*nc:(startR+1)*nc]
-    g = np.zeros(shape=(XXb.shape[0],))
-    g[Il]=ul
-    g[Ir]=ur
-    g[Igb] = bc(XXb[Igb,:])
-    g=g[:,np.newaxis]
-    g = torch.from_numpy(g)
-    uu = solver.solver.solve_dir_full(g)
-    uu0 = bc(solver.XXfull)
-    uu=uu.flatten()
-    errI=np.linalg.norm(uu-uu0,ord=np.inf)
-    errInf = np.max([errInf,errI])
-    print(errI)
 
-print("sup norm error = ",errInf)
+    ul_iterative = uhat[startL*nc:(startL+1)*nc]
+    ur_iterative = uhat[startR*nc:(startR+1)*nc]
+    g_iterative = np.zeros(shape=(XXb.shape[0],))
+    g_iterative[Il]=ul_iterative
+    g_iterative[Ir]=ur_iterative
+    g_iterative[Igb] = bc(XXb[Igb,:])
+    g_iterative=g_iterative[:,np.newaxis]
+    g_iterative = torch.from_numpy(g_iterative)
+    uu_iterative = solver.solver.solve_dir_full(g_iterative)
+
+    ul_direct = uhat_direct[startL*nc:(startL+1)*nc]
+    ur_direct = uhat_direct[startR*nc:(startR+1)*nc]
+    g_direct = np.zeros(shape=(XXb.shape[0],))
+    g_direct[Il]=ul_direct
+    g_direct[Ir]=ur_direct
+    g_direct[Igb] = bc(XXb[Igb,:])
+    g_direct=g_direct[:,np.newaxis]
+    g_direct = torch.from_numpy(g_direct)
+    uu_direct = solver.solver.solve_dir_full(g_direct)
+
+    ul_RB = uhat_RB[startL*nc:(startL+1)*nc]
+    ur_RB = uhat_RB[startR*nc:(startR+1)*nc]
+    g_RB = np.zeros(shape=(XXb.shape[0],))
+    g_RB[Il]=ul_RB
+    g_RB[Ir]=ur_RB
+    g_RB[Igb] = bc(XXb[Igb,:])
+    g_RB=g_RB[:,np.newaxis]
+    g_RB = torch.from_numpy(g_RB)
+    uu_RB = solver.solver.solve_dir_full(g_RB)
+
+    uu0 = bc(solver.XXfull)
+
+    uu_iterative=uu_iterative.flatten()
+    errI_iterative=np.linalg.norm(uu_iterative-uu0,ord=np.inf)
+    errInf_iterative = np.max([errInf_iterative,errI_iterative])
+    print(errI_iterative)
+
+    uu_direct=uu_direct.flatten()
+    errI_direct=np.linalg.norm(uu_direct-uu0,ord=np.inf)
+    errInf_direct = np.max([errInf_direct,errI_direct])
+    print(errI_direct)
+
+    uu_RB=uu_RB.flatten()
+    errI_RB=np.linalg.norm(uu_RB-uu0,ord=np.inf)
+    errInf_RB = np.max([errInf_RB,errI_RB])
+    print(errI_RB)
+
+print("sup norm error for iterative u = ",errInf_iterative)
+print("sup norm error for direct cyclic tridiagonal u = ",errInf_direct)
+print("sup norm error for direct red-black u = ",errInf_RB)
