@@ -21,7 +21,7 @@ Constructed in two ways: overlapping and non-overlapping
 
 """
 
-k = 2
+k = 3
 Lx = 2
 Ly = 1
 Lz = 1
@@ -46,9 +46,9 @@ nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
-px = 20
-py = 10
-pz = 10
+px = 24
+py = 12
+pz = 12
 
 
 print("px,py,pz = ",px," , ",py," , ",pz)
@@ -85,7 +85,6 @@ print("err hps = ",np.linalg.norm(ui-ui_hat)/np.linalg.norm(ui))
 
 
 rhsT = bc(XXb).cpu().detach().numpy()
-rhsT = rhsT/np.linalg.norm(rhsT)
 uT = bc(XXi[Jc,:]).cpu().detach().numpy()
 
 ST = -np.linalg.solve(Aii,Aib[:,Jl])[Jc,:]
@@ -134,12 +133,17 @@ print("Jl len = ",len(Jl))
 nex = 5
 ney = 5
 e_known = np.zeros(shape = (nex*ney,))
+inds = np.zeros(shape = (nex*ney,2))
 for i in range(nex):
     for j in range(ney):
         kx = np.sqrt((i+1)*(i+1)+(j+1)*(j+1))
         e_known[i+j*nex] = np.sinh(np.pi*kx)/np.sinh(2*np.pi*kx)
-
-e_known = np.sort(e_known)[::-1]
+        inds[i+j*nex] = [i,j]
+p = np.argsort(e_known)
+p = p[::-1]
+e_known = e_known[p]
+inds = inds[p,:]
+#print(1+inds[:25,:])
 eS = np.sort(np.abs(eS))[::-1]
 eT = np.sort(np.abs(eT))[::-1]
 
