@@ -68,8 +68,8 @@ for indp in range(len(pvec)):
     py = pvec[indp]
     pz = pvec[indp]
     nbx = 4
-    nby = 4
-    nbz = 4
+    nby = 1
+    nbz = 1
     kh = 0.
 
     ####################################################
@@ -119,7 +119,7 @@ for indp in range(len(pvec)):
     ay = .5/nby
     az = .5/nbz
     tic = time.time()
-    solver = hpsalt.Domain_Driver(geom, diff_op, 0, np.array([ax,ay,az]), px+1, 3)
+    solver = hpsalt.Domain_Driver(geom, diff_op, 0, np.array([ax,ay,az]), [px+1,px+1,px+1], 3)
     solver.build("reduced_cpu", "MUMPS",verbose=False)
     toc = time.time()-tic
     Aii = np.array(solver.Aii.todense())

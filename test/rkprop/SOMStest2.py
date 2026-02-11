@@ -55,8 +55,10 @@ for indp in range(len(pvec)):
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,0.,2,1)
+    Stot,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,0.,2,1)
     toc = time.time()-tic
+    Sii = Stot[Ii,:][:,Ii]
+    Sib = Stot[Ii,:][:,Ib]
     print("elapsed time S = ",toc)
     condS = 1.#np.linalg.cond(Sii)
     condvecS_L[indp] = condS
@@ -83,7 +85,7 @@ for indp in range(len(pvec)):
     ax = .5/nbx
     ay = .5/nby
     tic = time.time()
-    solver = hpsalt.Domain_Driver(geom, diff_op, 0, np.array([ax,ay]), px+1, 2)
+    solver = hpsalt.Domain_Driver(geom, diff_op, 0, np.array([ax,ay]), [px+1,py+1], 2)
     solver.build("reduced_cpu", "MUMPS",verbose=False)
     toc = time.time()-tic
     Aii = np.array(solver.Aii.todense())
