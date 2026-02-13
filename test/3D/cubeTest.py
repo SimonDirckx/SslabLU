@@ -9,7 +9,7 @@ import matplotlib.tri as tri
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
-#import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
 import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
@@ -32,8 +32,8 @@ class gmres_info(object):
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
 
-
-jax_avail   = True
+#### TOGGLE FOR HPSMULTIDOMAIN (SEE KUMP ET AL.)
+jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
 kh = 5.
@@ -53,12 +53,12 @@ elif torch_avail:
     def c11(p):
         return torch.ones_like(p[:,0])
     def c22(p):
-        return torch.ones_like(p[:,0])
+        return torch.ones_like(p[:,1])
     def c33(p):
-        return torch.ones_like(p[:,0])
+        return torch.ones_like(p[:,2])
     def c(p):
         return -kh*kh*torch.ones_like(p[:,0])
-    Helm=pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
+    Helm=pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
 else:
     def c11(p):
@@ -96,8 +96,7 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/8,1/32,1/32])
-    assembler = mA.rkHMatAssembler(p*p,75)
-    #assembler = mA.denseMatAssembler() #ref sol & conv test for no HBS
+    assembler = mA.rkHMatAssembler((p-1)*(p-1),75)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
@@ -159,7 +158,7 @@ for indp in range(len(pvec)):
     print("err_tot = ",err_tot)
     print("===============================================")
     err[indp] = err_tot
-    sample_time[indp] = OMS.stats.sample_timing
+    sample_time[indp] = OMS.stats.sampl_timing
     compr_time[indp] = OMS.stats.compr_timing
     discr_time[indp] = OMS.stats.discr_timing
 
