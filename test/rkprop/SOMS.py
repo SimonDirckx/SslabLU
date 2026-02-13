@@ -26,8 +26,8 @@ def SOMS_solver(px,py,nbx,nby,kh=0.,Lx=1,Ly=1):
     ny = len(ypts)
 
 
-    px_joined = 2*px#(3*px)//2
-    py_joined = 2*py#(3*py)//2
+    px_joined = 2*px-2#(3*px)//2
+    py_joined = 2*py-2#(3*py)//2
 
     px_joined = px_joined-px_joined%2
     py_joined = py_joined-py_joined%2
@@ -198,16 +198,28 @@ def gluing_mat(x,xhat,ny):
     nx2 = len(x2)
     xhat = xhat[1:nxhat-1]
     nxhat = len(xhat)
-    E_x2 = np.zeros(shape = (nx2,nxhat))
-    E_xhat = np.zeros(shape = (nxhat,nxhat))
-    for indcoeff in range(nxhat):
-        ci = np.zeros(shape = (nxhat,))
-        ci[indcoeff] = 1.
-        Ti = chebpoly.Chebyshev(ci,domain=[0,2*sclx])
-        E_x2[:,indcoeff] = Ti(x2)
-        E_xhat[:,indcoeff] = Ti(xhat)
-    Interp = np.linalg.solve(E_xhat.T,E_x2.T).T
+    #E_x2 = np.zeros(shape = (nx2,nxhat))
+    E_x2 = chebpoly.chebvander((x2-sclx)/sclx,nxhat-1).T
+    #E_xhat = np.zeros(shape = (nxhat,nxhat))
+    E_xhat = chebpoly.chebvander((xhat-sclx)/sclx,nxhat-1).T
 
+    #for indcoeff in range(nxhat):
+    #    ci = np.zeros(shape = (nxhat,))
+    #    ci[indcoeff] = 1.
+    #    Ti = chebpoly.Chebyshev(ci,domain=[0,2*sclx])
+    #    E_x2[:,indcoeff] = Ti(x2)
+    #    E_xhat[:,indcoeff] = Ti(xhat)
+
+
+    [U,s,V] = np.linalg.svd(E_xhat)
+    k = sum(s>1e-15*s[0])
+    Uk = U[:,:k].T
+    Vk = V[:k,:].T
+    sk = s[:k]
+    Sk = np.diag(sk**(-1))
+    Interp = (Vk@(Sk@(Uk@(E_x2)))).T
+    #Interp = np.linalg.solve(E_xhat.T,E_x2.T).T
+    #Interp = np.linalg.solve(E_xhat,E_x2).T
     C = np.zeros(shape = (2*len(xhat)+2*(ny-2),4*(nx-2)+2*(ny-2)))
 
     C[np.ix_(np.arange(0,ny-2),np.arange(0,ny-2))] = np.identity(ny-2)

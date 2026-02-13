@@ -8,6 +8,9 @@ import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 import SOMS3D
 import solver.spectral.spectralSolver as spectral
 
+import matAssembly.matAssembler as mA
+import solver.solver as solver
+
 """
 script that illustrates the 2-box problem in 3D
 
@@ -22,10 +25,10 @@ Constructed in two ways: overlapping and non-overlapping
 
 """
 
-ky = 4
-kz = 1
+ky = 2
+kz = 2
 kx = np.sqrt(ky**2+kz**2)
-Lx = 2
+Lx = 1/8
 Ly = 1
 Lz = 1
 def  c11(p):
@@ -43,28 +46,27 @@ Lapl = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
 cx = Lx/2
 bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nbz = 2
-nby = 2
-nbx = 4
+nbz = 16
+nby = 16
+nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
-px = 10
-py = 5
-pz = 5
-
+px = 6
+py = 6
+pz = 6
 
 print("px,py,pz = ",px," , ",py," , ",pz)
 
 
-solver = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
-solver.build("reduced_cpu", "MUMPS",verbose=False)
+solver_hps = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
+solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
 
-XX = solver.XX
-XXfull = solver.XXfull
+XX = solver_hps.XX
+XXfull = solver_hps.XXfull
 
-Jb = solver._Jx
-Ji = solver.Ji
+Jb = solver_hps._Jx
+Ji = solver_hps.Ji
 
 print("Ji size = ",len(Ji))
 print("Jb size = ",len(Jb))
@@ -75,8 +77,8 @@ XXb = XX[Jb,:]
 Jc = np.where(XXi[:,0]==cx)[0]
 Jl = np.where((XXb[:,0]==0))[0]
 
-Aii = np.array(solver.Aii.todense())
-Aib = np.array(solver.Aix.todense())
+Aii = np.array(solver_hps.Aii.todense())
+Aib = np.array(solver_hps.Aix.todense())
 
 
 #test if I set it up correctly
@@ -123,58 +125,17 @@ uhat_S = SS@rhsS[Jl]
 
 print("err2 = ",np.linalg.norm(uhat_S-uS,ord=2)/np.linalg.norm(uS,ord=2))
 
+assembler = mA.rkHMatAssembler((py-2)*(pz-2),10,tree=None,ndim=3)
 
-# The continuum eigenvalues are known, they are k^2, k \in Nat
+SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
+STmap = solver.stMap(ST,XXb[Jl,:],XXi[Jc,:])
 
-N = len(Jl)
+SSlinop = assembler.assemble(SSmap)
+STlinop = assembler.assemble(STmap)
 
-[US,eS,VS] = np.linalg.svd(SS)
-[UT,eT,VT] = np.linalg.svd(ST)
-print("SS shape = ",SS.shape)
-print("Jl len = ",len(Jl))
-nex = 20
-ney = 20
-e_known = np.zeros(shape = (nex*ney,))
-inds = np.zeros(shape = (nex*ney,2))
-for i in range(nex):
-    for j in range(ney):
-        kx = np.sqrt((i+1)*(i+1)+(j+1)*(j+1))
-        e_known[i+j*nex] = np.sinh(np.pi*kx)/np.sinh(2*np.pi*kx)
-        inds[i+j*nex] = [i,j]
-p = np.argsort(e_known)
-p = p[::-1]
-e_known = e_known[p]
-inds = inds[p,:]
-#print(1+inds[:25,:])
+E = np.identity(SS.shape[1])
+SSHdense = SSlinop@E
+STHdense = STlinop@E
 
-#eeS = np.zeros(shape = eS.shape)
-#eeT = np.zeros(shape = eS.shape)
-#for i in range(len(e_known)):
-    
-pS = np.argsort(np.abs(eS))
-pS = pS[::-1]
-eS = eS[pS]
-
-
-eS = np.sort(np.abs(eS))[::-1]
-eT = np.sort(np.abs(eT))[::-1]
-
-
-fileName = 'eigvalsST3D'+str(nbx)+'.csv'
-eMat = np.zeros(shape=(25,4))
-eMat[:,0] = np.arange(0,25)
-eMat[:,1] = e_known[:25]
-eMat[:,2] = eS[:25]
-eMat[:,3] = eT[:25]
-with open(fileName,'w') as f:
-    f.write('ind,e,eS,eT\n')
-    np.savetxt(f,eMat,fmt='%.16e',delimiter=',')
-
-
-plt.figure(1)
-plt.semilogy(eS[:50])
-plt.semilogy(eT[:50])
-plt.semilogy(e_known[:50])
-plt.legend(['eS','eT','e'])
-plt.show()
-
+print("Hmat err SS = ",np.linalg.norm(SS-SSHdense)/np.linalg.norm(SS))
+print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))

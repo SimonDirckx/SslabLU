@@ -43,7 +43,7 @@ for indp in range(len(pvec)):
     py = pvec[indp]
     nby = 16
     nbx = 16
-    kh = 50.
+    kh = 10.
 
     ####################################################
     # compare laplace problem: accuracy and conditioning
@@ -60,7 +60,7 @@ for indp in range(len(pvec)):
     Sii = Stot[Ii,:][:,Ii]
     Sib = Stot[Ii,:][:,Ib]
     print("elapsed time S = ",toc)
-    condS = 1.#np.linalg.cond(Sii)
+    condS = np.linalg.cond(Sii)
     condvecS_L[indp] = condS
     print("condS = ",condS)
     u = bc_laplace(XX)
@@ -91,7 +91,7 @@ for indp in range(len(pvec)):
     Aii = np.array(solver.Aii.todense())
     Aib = np.array(solver.Aix.todense())
     print("elapsed time T = ",toc)
-    condT = 1.#np.linalg.cond(Aii)
+    condT = np.linalg.cond(Aii)
     condvecT_L[indp] = condT
     print("condT = ",condT)
     XX = solver.XX
@@ -113,11 +113,13 @@ for indp in range(len(pvec)):
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh,2,1)
+    S,XX,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh,2,1)
+    Sii = S[Ii,:][:,Ii]
+    Sib = S[Ii,:][:,Ib]
     toc = time.time()-tic
     print("elapsed time S = ",toc)
     print("Sii shape = ",Sii.shape)
-    condS = 1.#np.linalg.cond(Sii)
+    condS = np.linalg.cond(Sii)
     condvecS_H[indp] = condS
     print("condS = ",condS)
     u = bc_helmholtz(XX,kh)
@@ -144,7 +146,7 @@ for indp in range(len(pvec)):
     ax = .5/nbx
     ay = .5/nby
     tic = time.time()
-    solver = hpsalt.Domain_Driver(geom, diff_op, kh, np.array([ax,ay]), px+1, 2)
+    solver = hpsalt.Domain_Driver(geom, diff_op, kh, np.array([ax,ay]), [px+1,py+1], 2)
     solver.build("reduced_cpu", "MUMPS")
     toc = time.time()-tic
     Aii = np.array(solver.Aii.todense())
@@ -152,7 +154,7 @@ for indp in range(len(pvec)):
     Aib = np.array(solver.Aix.todense())
     print("elapsed time T = ",toc)
     print("DOFS T = ",Aii.shape[0])
-    condT = 1.#np.linalg.cond(Aii)
+    condT = np.linalg.cond(Aii)
     condvecT_H[indp] = condT
     print("condT = ",condT)
     XX = solver.XX
