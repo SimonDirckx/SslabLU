@@ -46,9 +46,9 @@ Lapl = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
 cx = Lx/2
 bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nbz = 16
-nby = 16
-nbx = 2
+nbz = 8
+nby = 8
+nbx = 4
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
@@ -124,18 +124,24 @@ uhat_S = SS@rhsS[Jl]
 
 
 print("err2 = ",np.linalg.norm(uhat_S-uS,ord=2)/np.linalg.norm(uS,ord=2))
+#rk = (px-1)*min(nby*(py-1),nbz*(pz-1))
+rk = 200
+print("rank = ",rk)
 
-assembler = mA.rkHMatAssembler((py-2)*(pz-2),10,tree=None,ndim=3)
+assemblerS = mA.rkHMatAssembler((py-1)*(pz-1),rk,tree=None,ndim=3)
+assemblerT = mA.rkHMatAssembler((py-1)*(pz-1),rk,tree=None,ndim=3)
+
 
 SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
-STmap = solver.stMap(ST,XXb[Jl,:],XXi[Jc,:])
+#STmap = solver.stMap(ST,XXb[Jl,:],XXi[Jc,:])
 
-SSlinop = assembler.assemble(SSmap)
-STlinop = assembler.assemble(STmap)
+SSlinop = assemblerS.assemble(SSmap)
+#STlinop = assemblerT.assemble(STmap)
 
 E = np.identity(SS.shape[1])
+#STHdense = STlinop@E
 SSHdense = SSlinop@E
-STHdense = STlinop@E
+
 
 print("Hmat err SS = ",np.linalg.norm(SS-SSHdense)/np.linalg.norm(SS))
-print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))
+#print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))

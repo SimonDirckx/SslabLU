@@ -41,17 +41,19 @@ def null_torch(x,k):
 
 class HBSMAT:
 
-    def __init__(self,tree,Om,Psi,Y,Z,rk,reduced=False):
+    def __init__(self,tree,Om,Psi,Y,Z,rk,reduced_qr=False):
         self.U_list  = [[] for _ in range(tree.nlevels)]
         self.V_list  = [[] for _ in range(tree.nlevels)]
         self.D_list  = [[] for _ in range(tree.nlevels)]
         self.perm = []
+        self.reduced_qr = False
         for leaf in tree.get_leaves():
             self.perm += tree.get_box_inds(leaf).tolist()
         self.construct(tree,Om,Psi,Y,Z,rk,1e-7)
         self.nbytes=sum([sum([U.nbytes for U in self.U_list[i]]) for i in range(len(self.U_list))])+\
                     sum([sum([V.nbytes for V in self.V_list[i]]) for i in range(len(self.V_list))])+\
                     sum([sum([D.nbytes for D in self.D_list[i]]) for i in range(len(self.D_list))])       
+        
     
     def construct(self,t,Om,Psi,Y,Z,rk,eps=0.):
         s = Om.shape[1]
@@ -98,29 +100,32 @@ class HBSMAT:
                     rk0 = rk
                     #if level==t.nlevels-1:
                     #   rk0 = len(t.get_box_inds(box))                    
-                    #Ptau = null_torch(Omtau,rk0)
-                    #Qtau = null_torch(Psitau,rk0)
                     
-                    qom,rom = tla.qr(Omtau.T,mode='reduced')
-                    qpsi,rpsi = tla.qr(Psitau.T,mode='reduced')
-                    YP = (Ytau@qom)
-                    ZQ = (Ztau@qpsi)
+                    if self.reduced_qr:
+                        qom,rom = tla.qr(Omtau.T,mode='reduced')
+                        qpsi,rpsi = tla.qr(Psitau.T,mode='reduced')
+                        YP = (Ytau@qom)
+                        ZQ = (Ztau@qpsi)
                     
-                    Utau = qr_col_torch(Ytau-YP@qom.T,rk0)
-                    Vtau = qr_col_torch(Ztau-ZQ@qpsi.T,rk0)
+                        Utau = qr_col_torch(Ytau-YP@qom.T,rk0)
+                        Vtau = qr_col_torch(Ztau-ZQ@qpsi.T,rk0)
                     
-                    #PP,RP = qr_col_torch_full(Omtau.T)
-                    #QQ,RQ = qr_col_torch_full(Psitau.T)
-                    #YP = Ytau@PP
-                    #ZQ = Ztau@QQ
-                    #Utau = qr_col_torch(Ytau-YP@PP.T,rk0,reduce)
-                    #Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0,reduce)
 
 
-                    YO  =   tla.lstsq(rom,YP.T)[0].T
-                    ZP  =   tla.lstsq(rpsi,ZQ.T)[0].T
-                    #YO=Ytau@tla.pinv(Omtau)
-                    #ZP=Ztau@tla.pinv(Psitau)
+                        YO  =   tla.lstsq(rom,YP.T)[0].T
+                        ZP  =   tla.lstsq(rpsi,ZQ.T)[0].T
+                    else:
+                        #Ptau = null_torch(Omtau,rk0)
+                        #Qtau = null_torch(Psitau,rk0)
+                        YO=Ytau@tla.pinv(Omtau)
+                        ZP=Ztau@tla.pinv(Psitau)
+                        PP,RP = qr_col_torch_full(Omtau.T)
+                        QQ,RQ = qr_col_torch_full(Psitau.T)
+                        YP = Ytau@PP
+                        ZQ = Ztau@QQ
+                        Utau = qr_col_torch(Ytau-YP@PP.T,rk0)
+                        Vtau = qr_col_torch(Ztau-ZQ@QQ.T,rk0)
+                    
                     Dtau = (YO-Utau@(Utau.T@YO))\
                         +Utau@(Utau.T@((ZP-Vtau@(Vtau.T@ZP)).T))
                     self.U_list[level]+=[Utau]

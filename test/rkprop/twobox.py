@@ -245,7 +245,7 @@ e_known = np.sinh(np.arange(1,N)*np.pi*(Lx/2))/np.sinh(np.arange(1,N)*np.pi*Lx)
 eS = np.sort(np.abs(eS))[::-1]
 eT = np.sort(np.abs(eT))[::-1]
 
-#fileName = 'eigvalsST2D.csv'
+#fileNam = 'HBSerrs'fileName = 'eigvalsST2D.csv'
 #eMat = np.zeros(shape=(10,4))
 #eMat[:,0] = np.arange(0,9)
 #eMat[:,1] = e_known[:10]

@@ -101,6 +101,17 @@ class matAssembler:
             else:
                 c0,L0 = compute_c0_L0(stMap.XXI)
                 tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
+                # in case tree clusters to be plotted
+                #print("tree info:")
+                #L = tree0.nlevels
+                #plt.figure(1)
+                #for l in range(L):
+                #    boxes = tree0.get_boxes_level(l)
+                #    for box in boxes:
+                #        inds = tree0.get_box_inds(box)
+                #        plt.scatter(stMap.XXI[inds,1],stMap.XXI[inds,2])
+                #    plt.show()
+                
             toc_tree  = time.time() - start
 
             start = time.time()
@@ -109,7 +120,7 @@ class matAssembler:
             if self.matOpts.ndim==3:
                 s=5*(self.matOpts.maxRank+10)
             if self.matOpts.ndim==2:
-                s=4*(self.matOpts.maxRank+10)
+                s=3*(self.matOpts.maxRank+10)
             #s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))

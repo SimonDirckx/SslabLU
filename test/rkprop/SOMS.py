@@ -26,8 +26,8 @@ def SOMS_solver(px,py,nbx,nby,kh=0.,Lx=1,Ly=1):
     ny = len(ypts)
 
 
-    px_joined = 2*px-2#(3*px)//2
-    py_joined = 2*py-2#(3*py)//2
+    px_joined = (3*px)//2
+    py_joined = (3*py)//2
 
     px_joined = px_joined-px_joined%2
     py_joined = py_joined-py_joined%2

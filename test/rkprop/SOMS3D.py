@@ -55,7 +55,7 @@ def L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
     nz = len(zpts)
 
 
-    px_joined = (3*px)//2
+    px_joined = 2*px
     py_joined = (3*py)//2
     pz_joined = (3*pz)//2
 
@@ -222,7 +222,7 @@ def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
     nz2 = len(z2)
 
 
-    px_joined = (3*px)//2
+    px_joined = 2*px
     py_joined = (3*py)//2
     pz_joined = (3*pz)//2
 

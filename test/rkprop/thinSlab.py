@@ -147,31 +147,36 @@ Constructed in two ways: overlapping and non-overlapping
 """
 
 k = 2
-Lx = 1/8
+Lx = 1/16
 Ly = 1
+kh = 20
 def  c11(p):
     return torch.ones_like(p[:,0])
 def  c22(p):
     return torch.ones_like(p[:,1])
+def  c(p):
+    return kh*torch.ones_like(p[:,1])
+def  c_alt(p,kh):
+    return kh*torch.ones_like(p[:,1])
 def  bc(p):
     return torch.sin(np.pi*k*p[:,1])*torch.sinh(k*np.pi*(Lx-p[:,0]))/np.sinh(k*np.pi*Lx)
 def  bc_np(p):
     return np.sin(np.pi*k*p[:,1])*np.sinh(k*np.pi*(Lx-p[:,0]))/np.sinh(k*np.pi*Lx)
-Lapl = pdoalt.PDO_2d(c11=c11,c22=c22)
+HH = pdoalt.PDO_2d(c11=c11,c22=c22,c=c)
 
 cx = Lx/2
 bnds = np.array([[0,0],[Lx,Ly]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nby = 16
+nby = 32
 nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 #isotropic disc
-py=8
-px=8
+py=16
+px=16
 print("px,py = ",px," , ",py)
 
-solver_hps = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay]), [px+1,py+1], 2)
+solver_hps = hpsalt.Domain_Driver(Om, HH, kh, np.array([ax,ay]), [px+1,py+1], 2)
 solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
 
 XX = solver_hps.XX
@@ -201,7 +206,7 @@ print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
 
 
 
-Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,0.,Lx,Ly)
+Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh,Lx,Ly)
 
 
 XXi = XYtot[Ii,:]
@@ -255,20 +260,26 @@ plt.legend(['sS','sT'])
 plt.show()
 ##
 
-assembler = mA.rkHMatAssembler(py-2,10,tree=None,ndim=2)
+assemblerS = mA.rkHMatAssembler(py-1,10,tree=None,ndim=2)
+assemblerT = mA.rkHMatAssembler(py-1,10,tree=None,ndim=2)
 
-SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
 STmap = solver.stMap(ST,XXb[Jl,:],XXi[Jc,:])
+SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
 
-SSlinop = assembler.assemble(SSmap)
-STlinop = assembler.assemble(STmap)
 
-E = np.identity(SS.shape[1])
-SSHdense = SSlinop@E
-STHdense = STlinop@E
+STlinop = assemblerT.assemble(STmap)
+SSlinop = assemblerS.assemble(SSmap)
 
-print("Hmat err SS = ",np.linalg.norm(SS-SSHdense)/np.linalg.norm(SS))
-print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))
+
+ES = np.identity(SS.shape[1])
+ET = np.identity(ST.shape[1])
+STHdense = STlinop@ET
+SSHdense = SSlinop@ES
+
+
+print("Hmat err ST = ",np.linalg.norm(ST-STHdense,ord=2)/np.linalg.norm(ST,ord=2))
+print("Hmat err SS = ",np.linalg.norm(SS-SSHdense,ord=2)/np.linalg.norm(SS,ord=2))
+
 
 
 
