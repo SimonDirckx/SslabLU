@@ -132,24 +132,10 @@ def clenshaw_curtis_compute ( n ):
 
 
 
-"""
-script that illustrates the 2-box problem
-
-     ___________ __________
-    |           |           |
-    |   tau     |   sig     |
-  ul|         uc|           |
-    |___________|___________|
-
-Solution map S: ul-> uc has known eigenvalues and eigenfunction, both for Laplace and Helmholtz
-Constructed in two ways: overlapping and non-overlapping
-
-"""
-
 k = 2
 Lx = 1/8
 Ly = 1
-kh = 20
+kh = 2
 def  c11(p):
     return torch.ones_like(p[:,0])
 def  c22(p):
@@ -162,7 +148,7 @@ def  bc(p):
     return torch.sin(np.pi*k*p[:,1])*torch.sinh(k*np.pi*(Lx-p[:,0]))/np.sinh(k*np.pi*Lx)
 def  bc_np(p):
     return np.sin(np.pi*k*p[:,1])*np.sinh(k*np.pi*(Lx-p[:,0]))/np.sinh(k*np.pi*Lx)
-HH = pdoalt.PDO_2d(c11=c11,c22=c22,c=c)
+HH = pdoalt.PDO_2d(c11=c11,c22=c22)
 
 cx = Lx/2
 bnds = np.array([[0,0],[Lx,Ly]])
@@ -176,7 +162,7 @@ py=10
 px=10
 print("px,py = ",px," , ",py)
 
-solver_hps = hpsalt.Domain_Driver(Om, HH, kh, np.array([ax,ay]), [px+1,py+1], 2)
+solver_hps = hpsalt.Domain_Driver(Om, HH, 0, np.array([ax,ay]), [px+1,py+1], 2)
 solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
 
 XX = solver_hps.XX
@@ -204,9 +190,7 @@ uhat_T = ST@rhsT[Jl]
 
 print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
 
-
-
-Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,Lx,Ly,kh)
+Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,Lx,Ly,0)
 
 
 XXi = XYtot[Ii,:]
@@ -231,7 +215,7 @@ SS = -np.linalg.solve(AiiS,AibS[:,Jl])[Jc,:]
 uhat_S = SS@rhsS[Jl]
 
 
-print("err2 = ",np.linalg.norm(uhat_S-uS,ord=2)/np.linalg.norm(uS,ord=2))
+print("err2 = ",np.linalg.norm(uhat_S-uS)/np.linalg.norm(uS))
 
 
 condSS = np.linalg.cond(SS)

@@ -48,13 +48,13 @@ bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
 nbz = 8
 nby = 8
-nbx = 4
+nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
-px = 6
-py = 6
-pz = 6
+px = 8
+py = 8
+pz = 8
 
 print("px,py,pz = ",px," , ",py," , ",pz)
 
@@ -125,7 +125,7 @@ uhat_S = SS@rhsS[Jl]
 
 print("err2 = ",np.linalg.norm(uhat_S-uS,ord=2)/np.linalg.norm(uS,ord=2))
 #rk = (px-1)*min(nby*(py-1),nbz*(pz-1))
-rk = 200
+rk = 150
 print("rank = ",rk)
 
 assemblerS = mA.rkHMatAssembler((py-1)*(pz-1),rk,tree=None,ndim=3)
@@ -139,9 +139,9 @@ SSlinop = assemblerS.assemble(SSmap)
 #STlinop = assemblerT.assemble(STmap)
 
 E = np.identity(SS.shape[1])
-#STHdense = STlinop@E
-SSHdense = SSlinop@E
+v=np.random.standard_normal(size=(SS.shape[1],))
+Sv1 = SSlinop@v
+Sv2 = SS@v
 
-
-print("Hmat err SS = ",np.linalg.norm(SS-SSHdense)/np.linalg.norm(SS))
+print("Hmat err SS = ",np.linalg.norm(Sv1-Sv2)/np.linalg.norm(Sv2))
 #print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))

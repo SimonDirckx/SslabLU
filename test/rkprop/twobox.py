@@ -161,7 +161,7 @@ cx = Lx/2
 bnds = np.array([[0,0],[Lx,Ly]])
 Om = hpsaltGeom.BoxGeometry(bnds)
 nby = 2
-nbx = 4
+nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 #isotropic disc
@@ -207,7 +207,7 @@ print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
 
 
 
-Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,0.,Lx,Ly)
+Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,Lx,Ly,0)
 
 
 XXi = XYtot[Ii,:]
