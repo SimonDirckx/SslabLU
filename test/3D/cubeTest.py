@@ -33,74 +33,69 @@ class gmres_info(object):
 
 
 #### TOGGLE FOR HPSMULTIDOMAIN (SEE KUMP ET AL.)
-jax_avail   = False
-torch_avail = not jax_avail
-hpsalt      = torch_avail
+def compare_cube(nwaves, N, p):
+    jax_avail   = False
+    torch_avail = not jax_avail
+    hpsalt      = torch_avail
 
-nwaves = 15
-kh     = 2. * np.pi * nwaves
+    #nwaves = 15
+    kh     = 2. * np.pi * nwaves
 
-if jax_avail:
-    def c11(p):
-        return jnp.ones_like(p[...,0])
-    def c22(p):
-        return jnp.ones_like(p[...,0])
-    def c33(p):
-        return jnp.ones_like(p[...,0])
-    def c(p):
-        return -kh*kh*jnp.ones_like(p[...,0])
-    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
-
-
-elif torch_avail:
-    def c11(p):
-        return torch.ones_like(p[:,0])
-    def c22(p):
-        return torch.ones_like(p[:,1])
-    def c33(p):
-        return torch.ones_like(p[:,2])
-    def c(p):
-        return -kh*kh*torch.ones_like(p[:,0])
-    Helm=pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
-
-else:
-    def c11(p):
-        return np.ones_like(p[:,0])
-    def c22(p):
-        return np.ones_like(p[:,0])
-    def c33(p):
-        return np.ones_like(p[:,0])
-    def c(p):
-        return -kh*kh*np.ones_like(p[:,0])
-    Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
-def bc(p):
-    source_loc = np.array([-.5,-.2,1])
-    rr = np.linalg.norm(p-source_loc.T,axis=1)
-    return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
-    #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
+    if jax_avail:
+        def c11(p):
+            return jnp.ones_like(p[...,0])
+        def c22(p):
+            return jnp.ones_like(p[...,0])
+        def c33(p):
+            return jnp.ones_like(p[...,0])
+        def c(p):
+            return -kh*kh*jnp.ones_like(p[...,0])
+        Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
 
 
-N = 9
-dSlabs,connectivity,H = cube.dSlabs(N)
+    elif torch_avail:
+        def c11(p):
+            return torch.ones_like(p[:,0])
+        def c22(p):
+            return torch.ones_like(p[:,1])
+        def c33(p):
+            return torch.ones_like(p[:,2])
+        def c(p):
+            return -kh*kh*torch.ones_like(p[:,0])
+        Helm=pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
-pvec = np.array([10],dtype = np.int64)
-err=np.zeros(shape = (len(pvec),))
-discr_time=np.zeros(shape = (len(pvec),))
-sample_time = np.zeros(shape=(len(pvec),))
-compr_time=np.zeros(shape = (len(pvec),))
+    else:
+        def c11(p):
+            return np.ones_like(p[:,0])
+        def c22(p):
+            return np.ones_like(p[:,0])
+        def c33(p):
+            return np.ones_like(p[:,0])
+        def c(p):
+            return -kh*kh*np.ones_like(p[:,0])
+        Helm=pdo.PDO3d(c11=c11,c22=c22,c33=c33,c=c)
+    def bc(p):
+        source_loc = np.array([-.5,-.2,1])
+        rr = np.linalg.norm(p-source_loc.T,axis=1)
+        return np.real(np.exp(1j*kh*rr)/(4*np.pi*rr))
+        #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
-#solve_method = 'iterative'
-solve_method = 'direct'
-formulation = "hps"
-tridiag = (solve_method=='direct')
-for indp in range(len(pvec)):
-    p = pvec[indp]
+
+    N = 9
+    dSlabs,connectivity,H = cube.dSlabs(N)
+
+    #solve_method = 'iterative'
+    solve_method = 'direct'
+    formulation = "hps"
+    tridiag = (solve_method=='direct')
+
     p_disc = p
+
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/8,1/8,1/8])
-    assembler = mA.rkHMatAssembler((p-1)*(p-1),75)
+    assembler = mA.rkHMatAssembler(p*p,75)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
@@ -225,25 +220,8 @@ for indp in range(len(pvec)):
     print("err_tot red-black = ", err_tot_redblack)
     print("===============================================")
 
-"""    
-    err[indp] = err_tot
-    sample_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
+    return err_tot_iter, err_tot_tridiagonal, err_tot_redblack, elapsed_time_iterative, elapsed_time_direct_factor_cyclical, elapsed_time_direct_solve_cyclical, elapsed_time_direct_factor_RB, elapsed_time_direct_solve_RB
 
+outputs = compare_cube(10, 9, 8)
 
-fileName = 'cube.csv'
-errMat = np.zeros(shape=(len(pvec),5))
-errMat[:,0] = pvec
-errMat[:,1] = err
-errMat[:,2] = sample_time
-errMat[:,3] = compr_time
-errMat[:,4] = discr_time
-with open(fileName,'w') as f:
-    f.write('p,err,sample,compr,discr\n')
-    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
-
-plt.figure(0)
-plt.semilogy(pvec,err)
-plt.show()
-"""
+print(outputs)
