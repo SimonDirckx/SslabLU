@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
 
+import pickle
+
 import geometry.geom_3D.cube as cube
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -222,6 +224,30 @@ def compare_cube(N, p, nwaves):
 
     return err_iterative, err_tridiagonal, err_redblack, elapsed_time_iterative, elapsed_time_direct_factor_tridiagonal, elapsed_time_direct_solve_tridiagonal, elapsed_time_direct_factor_redblack, elapsed_time_direct_solve_redblack
 
-outputs = compare_cube(10, 9, 8)
+output_list = ["err_iterative", "err_tridiagonal", "err_redblack", "elapsed_time_iterative", "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal", "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack"]
 
-print(outputs)
+N_list = np.array([8, 16])
+p_list = np.array([8, 10, 12, 14])
+nwaves_list = np.array([5, 10, 15, 20, 25, 30])
+
+output_fields = dict([(_, np.zeros((N_list.shape[0], p_list.shape[0], nwaves_list.shape[0]))) for _ in output_list] + [("N", N_list), ("p", p_list), ("nwaves", nwaves_list)])
+
+for i in range(N_list.shape[0]):
+    for j in range(p_list.shape[0]):
+        for k in range(nwaves_list.shape[0]):
+            N = N_list[i]
+            p = p_list[j]
+            nwaves = nwaves_list[k]
+
+            output = compare_cube(N, p, nwaves)
+
+            for thing in output_list:
+                output_fields[thing][i,j,k] = output[thing]
+
+print(output_fields)
+
+file_loc = "output_torus_comparison.pkl"
+
+f = open(file_loc, "wb+")
+pickle.dump(output_fields, f)
+f.close()
