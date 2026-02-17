@@ -41,24 +41,23 @@ def  c33(p):
     return torch.ones_like(p[:,2])
 def  c(p):
     return kh*torch.ones_like(p[:,1])
-HH = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
+OP = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
 
 cx = Lx/2
 bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nby = 16
-nbz = 16
-nbx = 2
+nby = 8
+nbz = 8
+nbx = 4
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
-#isotropic disc
-py=8
-px=8
-pz=8
+px=5
+py=9
+pz=9
 
-solver_hps = hpsalt.Domain_Driver(Om, HH, kh, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
+solver_hps = hpsalt.Domain_Driver(Om, OP, 0., np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
 solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
 
 XX = (solver_hps.XX).cpu().detach().numpy()
@@ -91,6 +90,11 @@ for leaf in tree0.get_leaves():
     perm += tree0.get_box_inds(leaf).tolist()
 
 Sp = SS[perm,:][:,perm]
+
+XXlp = XXl[perm,:]
+XXcp = XXc[perm,:]
+
+
 v = np.random.standard_normal(size=(Sp.shape[1],))
 vperm = v[perm]
 u = Sp@vperm
@@ -104,7 +108,7 @@ leaves = tree0.get_leaves()
 N = SS.shape[0]
 Nleaves = len(leaves)
 print("Nleaves = ",Nleaves)
-k = 2*(py-1)*(pz-1)
+k = (py-1)*(pz-1)
 print("rank = ",k)
 nl = (py-1)*(pz-1)
 
@@ -129,7 +133,40 @@ for leaf in leaves:
     s0 = np.linalg.svd(SS[:,inds][indsc0,:],compute_uv=False)
     rk = sum(s>s[0]*1e-6)
     rk0 = sum(s0>s0[0]*1e-6)
-    print("=============")
-    print("rk = ",rk)
-    print("rk0 = ",rk0)
-    print("=============")
+    #U = compute_col_space(Sp[inds,:][:,indsc],k)
+    #V = compute_col_space(Sp[indsc,:][:,inds].T,k)
+
+
+#boxes = tree0.get_boxes_level(tree0.nlevels-2)
+#nl = (py-1)*(pz-1)
+#for ind in range(len(boxes)):
+    #inds = np.arange(ind*4*nl,(ind+1)*4*nl)
+    #inds1 = inds[:nl]
+    #inds2 = inds[nl:2*nl]
+    #inds3 = inds[2*nl:3*nl]
+    #inds4 = inds[3*nl:]
+    #indsc = [i for i in range(N) if i not in inds]
+
+    #U1 = compute_col_space(Sp[inds1,:][:,indsc],k)
+    #U2 = compute_col_space(Sp[inds2,:][:,indsc],k)
+    #U3 = compute_col_space(Sp[inds3,:][:,indsc],k)
+    #U4 = compute_col_space(Sp[inds4,:][:,indsc],k)
+    #Utot = np.append(U1,U2,axis=0)
+    #Utot = np.append(Utot,U3,axis=0)
+    #Utot = np.append(Utot,U4,axis=0)
+    #K = Sp[inds,:][:,indsc]-Utot@(Utot.T@Sp[inds,:][:,indsc])
+    #s = np.linalg.svd(K,compute_uv=False)
+    #print("rk = ",sum(s>s[0]*1e-6))
+    #plt.figure(1)
+    #plt.semilogy(s)
+    #plt.show()
+
+assembler = mA.rkHMatAssembler((py-1)*(pz-1),(py-1)*(pz-1),tree=None,ndim=3)
+SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
+SSlinop = assembler.assemble(SSmap)
+
+
+ES = np.identity(SS.shape[1])
+SSHdense = SSlinop@ES
+print("Hmat err SS = ",np.linalg.norm(SS-SSHdense,ord=2)/np.linalg.norm(SS,ord=2))
+        
