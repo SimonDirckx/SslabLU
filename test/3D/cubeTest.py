@@ -25,13 +25,13 @@ import geometry.geom_3D.cube as cube
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
-        self.niter = 0
+        self.niterations = 0
         self.resList=[]
     def __call__(self, rk=None):
-        self.niter += 1
+        self.niterations += 1
         self.resList+=[rk]
         if self._disp:
-            print('iter %3i\trk = %s' % (self.niter, str(rk)))
+            print('iter %3i\trk = %s' % (self.niterations, str(rk)))
 
 
 #### TOGGLE FOR HPSMULTIDOMAIN (SEE KUMP ET AL.)
@@ -96,7 +96,7 @@ def compare_cube(N, p, nwaves):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/8,1/8])
+    a = np.array([H/6,1/8,1/8])
     assembler = mA.rkHMatAssembler(p*p,75)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -104,7 +104,7 @@ def compare_cube(N, p, nwaves):
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     print("done")
     Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
-    niter = 0
+    niterations = 0
 
     Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
     gInfo = gmres_info()
@@ -118,7 +118,7 @@ def compare_cube(N, p, nwaves):
     end_time = time.perf_counter()
     elapsed_time_iterative = end_time - start_time
 
-    niter = gInfo.niter
+    niterations = gInfo.niterations
 
     rhstot = np.zeros(shape = (Ntot,))
     for i in range(len(rhs_list)):
@@ -144,9 +144,13 @@ def compare_cube(N, p, nwaves):
     end_time = time.perf_counter()
     elapsed_time_direct_solve_redblack = end_time - start_time
     
-    res_iter   = Stot @ uhat_iter   - rhstot
+    res_iterative   = Stot @ uhat_iter   - rhstot
     res_tridiagonal = Stot @ uhat_tridiagonal - rhstot
-    res_RB = Stot @ uhat_redblack - rhstot
+    res_redblack = Stot @ uhat_redblack - rhstot
+
+    res_iterative   = np.linalg.norm(res_iterative)/np.linalg.norm(rhstot)
+    res_tridiagonal = np.linalg.norm(res_tridiagonal)/np.linalg.norm(rhstot)
+    res_redblack = np.linalg.norm(res_redblack)/np.linalg.norm(rhstot)
 
     print(f"Elapsed time for iterative solve: {elapsed_time_iterative} seconds")
     print(f"Elapsed time for direct factorization with tridiagonal: {elapsed_time_direct_factor_tridiagonal} seconds")
@@ -158,10 +162,10 @@ def compare_cube(N, p, nwaves):
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
-    print("L2 rel. res iterative    = ", np.linalg.norm(res_iter)/np.linalg.norm(rhstot))
-    print("L2 rel. res tridiagonal  = ", np.linalg.norm(res_tridiagonal)/np.linalg.norm(rhstot))
-    print("L2 rel. res red-black    = ", np.linalg.norm(res_RB)/np.linalg.norm(rhstot))
-    print("GMRES iters              = ", niter)
+    print("L2 rel. res iterative    = ", res_iterative)
+    print("L2 rel. res tridiagonal  = ", res_tridiagonal)
+    print("L2 rel. res red-black    = ", res_redblack)
+    print("GMRES iters              = ", niterations)
     print("==================================")
 
     nc = OMS.nc
@@ -229,13 +233,21 @@ def compare_cube(N, p, nwaves):
                 elapsed_time_direct_factor_tridiagonal=elapsed_time_direct_factor_tridiagonal,
                 elapsed_time_direct_solve_tridiagonal=elapsed_time_direct_solve_tridiagonal,
                 elapsed_time_direct_factor_redblack=elapsed_time_direct_factor_redblack,
-                elapsed_time_direct_solve_redblack=elapsed_time_direct_solve_redblack)
+                elapsed_time_direct_solve_redblack=elapsed_time_direct_solve_redblack,
+                res_iterative   = res_iterative,
+                res_tridiagonal = res_tridiagonal,
+                res_redblack    = res_redblack,
+                niterations = niterations)
 
-output_list = ["err_iterative", "err_tridiagonal", "err_redblack", "elapsed_time_iterative", "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal", "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack"]
+output_list = ["err_iterative", "err_tridiagonal", "err_redblack",
+               "elapsed_time_iterative",
+               "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal",
+               "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack",
+               "res_iterative", "res_tridiagonal", "res_redblack", "niterations"]
 
 N_list = np.array([8])
 p_list = np.array([8, 10, 12, 14])
-nwaves_list = np.array([5, 10, 15, 20, 25, 30])
+nwaves_list = np.array([2, 5, 10, 15, 20]) #, 25, 30])
 
 output_fields = dict([(_, np.zeros((N_list.shape[0], p_list.shape[0], nwaves_list.shape[0]))) for _ in output_list] + [("N", N_list), ("p", p_list), ("nwaves", nwaves_list)])
 
@@ -253,7 +265,7 @@ for i in range(N_list.shape[0]):
 
 print(output_fields)
 
-file_loc = "output_cube_comparison.pkl"
+file_loc = "output_cube_comparison_6boxSlab.pkl"
 
 f = open(file_loc, "wb+")
 pickle.dump(output_fields, f)

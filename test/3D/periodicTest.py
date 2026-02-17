@@ -237,7 +237,7 @@ def compare_torus(N, p, nwaves):
 
 output_list = ["err_iterative", "err_tridiagonal", "err_redblack", "elapsed_time_iterative", "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal", "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack"]
 
-N_list = np.array([8, 16])
+N_list = np.array([8])
 p_list = np.array([8, 10, 12, 14])
 nwaves_list = np.array([5, 10, 15, 20, 25, 30])
 
