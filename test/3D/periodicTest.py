@@ -19,6 +19,8 @@ import geometry.geom_3D.squareTorus as squareTorus
 
 import torch
 
+import pickle
+
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -44,7 +46,7 @@ bnds = squareTorus.bnds
 #
 ################################################################
 
-def compare_torus(nwaves, N, p):
+def compare_torus(N, p, nwaves):
     #nwaves = 15
     #wavelength = 4/nwaves
     kh = (nwaves/4)*2.*np.pi
@@ -98,22 +100,22 @@ def compare_torus(nwaves, N, p):
     start_time   = time.perf_counter()
     T, smw_block = omsdirectsolve.build_block_cyclic_tridiagonal_solver(OMS, S_rk_list, rhs_list, Ntot, nc)
     end_time     = time.perf_counter()
-    elapsed_time_direct_factor_cyclical = end_time - start_time
+    elapsed_time_direct_factor_tridiagonal = end_time - start_time
 
     start_time   = time.perf_counter()
     uhat_direct  = omsdirectsolve.block_cyclic_tridiagonal_solve(OMS, T, smw_block, rhstot)
     end_time     = time.perf_counter()
-    elapsed_time_direct_solve_cyclical = end_time - start_time
+    elapsed_time_direct_solve_tridiagonal = end_time - start_time
 
     start_time   = time.perf_counter()
     RB, S = omsdirectsolve.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=True)
     end_time     = time.perf_counter()
-    elapsed_time_direct_factor_RB = end_time - start_time
+    elapsed_time_direct_factor_redblack = end_time - start_time
 
     start_time   = time.perf_counter()
     uhat_RB = omsdirectsolve.block_RB_solve((RB, S), rhstot)
     end_time     = time.perf_counter()
-    elapsed_time_direct_solve_RB = end_time - start_time
+    elapsed_time_direct_solve_redblack = end_time - start_time
 
 
     gInfo = gmres_info()
@@ -131,10 +133,10 @@ def compare_torus(nwaves, N, p):
     res = Stot@uhat-rhstot
 
     print(f"Elapsed time for iterative solve: {elapsed_time_iterative} seconds")
-    print(f"Elapsed time for direct factorization with cyclic tridiagonal: {elapsed_time_direct_factor_cyclical} seconds")
-    print(f"Elapsed time for direct solve with cyclic tridiagonal: {elapsed_time_direct_solve_cyclical} seconds")
-    print(f"Elapsed time for direct factorization with red-black: {elapsed_time_direct_factor_RB} seconds")
-    print(f"Elapsed time for direct solve with cyclic red-black: {elapsed_time_direct_solve_RB} seconds")
+    print(f"Elapsed time for direct factorization with cyclic tridiagonal: {elapsed_time_direct_factor_tridiagonal} seconds")
+    print(f"Elapsed time for direct solve with cyclic tridiagonal: {elapsed_time_direct_solve_tridiagonal} seconds")
+    print(f"Elapsed time for direct factorization with red-black: {elapsed_time_direct_factor_redblack} seconds")
+    print(f"Elapsed time for direct solve with cyclic red-black: {elapsed_time_direct_solve_redblack} seconds")
 
     #if direct_solve:
     #    print("We'll use solution from direct solver to get overall result:")
@@ -148,8 +150,8 @@ def compare_torus(nwaves, N, p):
     print("==================================")
 
     err_iterative = 0.
-    err_direct = 0.
-    err_RB = 0.
+    err_tridiagonal = 0.
+    err_redblack = 0.
 
     uu0_total_norm = 0.
 
@@ -206,26 +208,57 @@ def compare_torus(nwaves, N, p):
 
         uu_direct=uu_direct.flatten()
         errI_direct=np.linalg.norm(uu_direct-uu0)
-        err_direct += errI_direct**2
+        err_tridiagonal += errI_direct**2
         print(errI_direct / uu0_norm)
 
         uu_RB=uu_RB.flatten()
         errI_RB=np.linalg.norm(uu_RB-uu0)
-        err_RB += errI_RB**2
+        err_redblack += errI_RB**2
         print(errI_RB/ uu0_norm)
 
     uu0_total_norm = np.sqrt(uu0_total_norm)
 
     err_iterative = np.sqrt(err_iterative) / uu0_total_norm
-    err_direct = np.sqrt(err_direct) / uu0_total_norm
-    err_RB = np.sqrt(err_RB) / uu0_total_norm
+    err_tridiagonal = np.sqrt(err_tridiagonal) / uu0_total_norm
+    err_redblack = np.sqrt(err_redblack) / uu0_total_norm
 
     print("2 norm error for iterative u = ", err_iterative)
-    print("2 norm error for direct cyclic tridiagonal u = ", err_direct)
-    print("2 norm error for direct red-black u = ", err_RB)
+    print("2 norm error for direct cyclic tridiagonal u = ", err_tridiagonal)
+    print("2 norm error for direct red-black u = ", err_redblack)
 
-    return err_iterative, err_direct, err_RB, elapsed_time_iterative, elapsed_time_direct_factor_cyclical, elapsed_time_direct_solve_cyclical, elapsed_time_direct_factor_RB, elapsed_time_direct_solve_RB
+    return dict(err_iterative=err_iterative,
+                err_tridiagonal=err_tridiagonal,
+                err_redblack=err_redblack,
+                elapsed_time_iterative=elapsed_time_iterative,
+                elapsed_time_direct_factor_tridiagonal=elapsed_time_direct_factor_tridiagonal,
+                elapsed_time_direct_solve_tridiagonal=elapsed_time_direct_solve_tridiagonal,
+                elapsed_time_direct_factor_redblack=elapsed_time_direct_factor_redblack,
+                elapsed_time_direct_solve_redblack=elapsed_time_direct_solve_redblack)
 
-outputs = compare_torus(10, 8, 8)
+output_list = ["err_iterative", "err_tridiagonal", "err_redblack", "elapsed_time_iterative", "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal", "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack"]
 
-print(outputs)
+N_list = np.array([8, 16])
+p_list = np.array([8, 10, 12, 14])
+nwaves_list = np.array([5, 10, 15, 20, 25, 30])
+
+output_fields = dict([(_, np.zeros((N_list.shape[0], p_list.shape[0], nwaves_list.shape[0]))) for _ in output_list] + [("N", N_list), ("p", p_list), ("nwaves", nwaves_list)])
+
+for i in range(N_list.shape[0]):
+    for j in range(p_list.shape[0]):
+        for k in range(nwaves_list.shape[0]):
+            N = N_list[i]
+            p = p_list[j]
+            nwaves = nwaves_list[k]
+
+            output = compare_torus(N, p, nwaves)
+
+            for thing in output_list:
+                output_fields[thing][i,j,k] = output[thing]
+
+print(output_fields)
+
+file_loc = "output_torus_comparison.pkl"
+
+f = open(file_loc, "wb+")
+pickle.dump(output_fields, f)
+f.close()

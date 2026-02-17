@@ -33,7 +33,7 @@ class gmres_info(object):
 
 
 #### TOGGLE FOR HPSMULTIDOMAIN (SEE KUMP ET AL.)
-def compare_cube(nwaves, N, p):
+def compare_cube(N, p, nwaves):
     jax_avail   = False
     torch_avail = not jax_avail
     hpsalt      = torch_avail
@@ -125,32 +125,32 @@ def compare_cube(nwaves, N, p):
     start_time = time.perf_counter()
     T = omsdirect.build_block_tridiagonal_solver(S_rk_list)
     end_time = time.perf_counter()
-    elapsed_time_direct_factor_cyclical = end_time - start_time
+    elapsed_time_direct_factor_tridiagonal = end_time - start_time
 
     start_time = time.perf_counter()
     uhat_tridiagonal  = omsdirect.block_tridiagonal_solve(OMS, T, rhstot)
     end_time = time.perf_counter()
-    elapsed_time_direct_solve_cyclical = end_time - start_time
+    elapsed_time_direct_solve_tridiagonal = end_time - start_time
 
     start_time = time.perf_counter()
     RB, S = omsdirect.build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=False)
     end_time = time.perf_counter()
-    elapsed_time_direct_factor_RB = end_time - start_time
+    elapsed_time_direct_factor_redblack = end_time - start_time
 
     start_time = time.perf_counter()
     uhat_redblack = omsdirect.block_RB_solve((RB, S), rhstot)
     end_time = time.perf_counter()
-    elapsed_time_direct_solve_RB = end_time - start_time
+    elapsed_time_direct_solve_redblack = end_time - start_time
     
     res_iter   = Stot @ uhat_iter   - rhstot
     res_tridiagonal = Stot @ uhat_tridiagonal - rhstot
     res_RB = Stot @ uhat_redblack - rhstot
 
     print(f"Elapsed time for iterative solve: {elapsed_time_iterative} seconds")
-    print(f"Elapsed time for direct factorization with tridiagonal: {elapsed_time_direct_factor_cyclical} seconds")
-    print(f"Elapsed time for direct solve with tridiagonal: {elapsed_time_direct_solve_cyclical} seconds")
-    print(f"Elapsed time for direct factorization with red-black: {elapsed_time_direct_factor_RB} seconds")
-    print(f"Elapsed time for direct solve with cyclic red-black: {elapsed_time_direct_solve_RB} seconds")
+    print(f"Elapsed time for direct factorization with tridiagonal: {elapsed_time_direct_factor_tridiagonal} seconds")
+    print(f"Elapsed time for direct solve with tridiagonal: {elapsed_time_direct_solve_tridiagonal} seconds")
+    print(f"Elapsed time for direct factorization with red-black: {elapsed_time_direct_factor_redblack} seconds")
+    print(f"Elapsed time for direct solve with cyclic red-black: {elapsed_time_direct_solve_redblack} seconds")
 
     
     print("=============SUMMARY==============")
@@ -163,9 +163,9 @@ def compare_cube(nwaves, N, p):
     print("==================================")
 
     nc = OMS.nc
-    err_tot_iter   = 0
-    err_tot_tridiagonal = 0
-    err_tot_redblack = 0
+    err_iterative   = 0
+    err_tridiagonal = 0
+    err_redblack = 0
 
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
@@ -200,13 +200,13 @@ def compare_cube(nwaves, N, p):
         g = bc(XXb)
 
         err_loc_iter = np.linalg.norm(ghat_iter-g)/np.linalg.norm(g)
-        err_tot_iter = np.max([err_loc_iter,err_tot_iter])
+        err_iterative = np.max([err_loc_iter,err_iterative])
 
         err_loc_tridiagonal = np.linalg.norm(ghat_tridiagonal-g)/np.linalg.norm(g)
-        err_tot_tridiagonal = np.max([err_loc_tridiagonal,err_tot_tridiagonal])
+        err_tridiagonal = np.max([err_loc_tridiagonal,err_tridiagonal])
 
         err_loc_redblack = np.linalg.norm(ghat_redblack-g)/np.linalg.norm(g)
-        err_tot_redblack = np.max([err_loc_redblack,err_tot_redblack])
+        err_redblack = np.max([err_loc_redblack,err_redblack])
 
         print("===================LOCAL ERR===================")
         print("err ghat iterative = ", err_loc_iter)
@@ -215,12 +215,12 @@ def compare_cube(nwaves, N, p):
         print("===============================================")
     
     print("===================GLOBAL ERR===================")
-    print("err_tot iterative = ",err_tot_iter)
-    print("err_tot tridiagonal = ", err_tot_tridiagonal)
-    print("err_tot red-black = ", err_tot_redblack)
+    print("err_tot iterative = ",err_iterative)
+    print("err_tot tridiagonal = ", err_tridiagonal)
+    print("err_tot red-black = ", err_redblack)
     print("===============================================")
 
-    return err_tot_iter, err_tot_tridiagonal, err_tot_redblack, elapsed_time_iterative, elapsed_time_direct_factor_cyclical, elapsed_time_direct_solve_cyclical, elapsed_time_direct_factor_RB, elapsed_time_direct_solve_RB
+    return err_iterative, err_tridiagonal, err_redblack, elapsed_time_iterative, elapsed_time_direct_factor_tridiagonal, elapsed_time_direct_solve_tridiagonal, elapsed_time_direct_factor_redblack, elapsed_time_direct_solve_redblack
 
 outputs = compare_cube(10, 9, 8)
 
