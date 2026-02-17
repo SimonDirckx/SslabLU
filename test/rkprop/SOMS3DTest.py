@@ -82,7 +82,7 @@ for indp in range(len(pvec)):
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,1.,1.,1.,0.,1)
+    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,1.,1.,1.,0.)
     toc = time.time()-tic
     print("elapsed time S = ",toc)
     print("Sii shape = ",Sii.shape)

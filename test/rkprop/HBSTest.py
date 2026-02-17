@@ -29,7 +29,7 @@ def compute_c0_L0(XX):
     return c0,L0+1e-5
 
 k = 2
-Lx = 1/8
+Lx = 1/4
 Ly = 1
 Lz = 1
 kh = 2.
@@ -54,9 +54,9 @@ ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
 #isotropic disc
-py=6
-px=6
-pz=6
+py=8
+px=8
+pz=8
 
 solver_hps = hpsalt.Domain_Driver(Om, HH, kh, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
 solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
@@ -104,81 +104,32 @@ leaves = tree0.get_leaves()
 N = SS.shape[0]
 Nleaves = len(leaves)
 print("Nleaves = ",Nleaves)
-k = (py-1)*(pz-1)
-nl = k
+k = 2*(py-1)*(pz-1)
+print("rank = ",k)
+nl = (py-1)*(pz-1)
+
 Utot = np.zeros(shape=(N,Nleaves*k))
 Vtot = np.zeros(shape=(N,Nleaves*k))
 Dtot = np.zeros(shape=(N,N))
 Ktot = np.zeros(shape = (Nleaves*k,Nleaves*k))
+
 print("tot MATS made")
 def compute_col_space(M,k):
     [Q,_,_] = sclinalg.qr(M,mode='economic',pivoting=True)
-    return Q[:,:k]
+    k0 = min(k,Q.shape[1])
+    return Q[:,:k0]
 
-for ind in range(Nleaves):
-    inds = np.arange(ind*nl,(ind+1)*nl)
+for leaf in leaves:
+    neigh_inds = tree0.get_neigh_inds(leaf)
+    inds = tree0.get_box_inds(leaf)
+    inds0 = np.append(inds,neigh_inds)
     indsc = [i for i in range(N) if i not in inds]
-    U = compute_col_space(Sp[:,indsc][inds,:],k)
-    V = compute_col_space(Sp[:,inds][indsc,:].T,k)
-    D = Sp[inds,:][:,inds]-U@(U.T@Sp[inds,:][:,inds]@V)@V.T
-    Utot[ind*nl:(ind+1)*nl,:][:,ind*k:(ind+1)*k] = U
-    Vtot[ind*nl:(ind+1)*nl,:][:,ind*k:(ind+1)*k] = V
-    Dtot[ind*nl:(ind+1)*nl,:][:,ind*nl:(ind+1)*nl] = D
-Ktot = Utot.T@(Sp@Vtot)
-
-# check if rep is accurate
-v = np.random.standard_normal(size=(N,))
-u = Sp@v
-
-uhat = Utot@(Ktot@(Vtot.T@v)) + Dtot@v
-
-print("Err rep = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-
-# level 2 approx:
-Nb = len(tree0.get_boxes_level(tree0.nlevels-2))
-print("Nb = ",Nb)
-print("Ktot shape = ",Ktot.shape)
-
-#k = 2*k
-
-Utot2 = np.zeros(shape=(Nleaves*k,(Nleaves//2)*k))
-Vtot2 = np.zeros(shape=(Nleaves*k,(Nleaves//2)*k))
-Dtot2 = np.zeros(shape=(Nleaves*k,Nleaves*k))
-
-
-XXlperm = XXl[perm,:]
-XXcperm = XXc[perm,:]
-
-for ind in range(Nleaves//2):
-    inds = np.arange(2*ind*k,2*(ind+1)*k)
-    indsc = [i for i in range(Ktot.shape[0]) if i not in inds]
-    plt.show()
-    U = compute_col_space(Ktot[:,indsc][inds,:],k)
-    V = compute_col_space(Ktot[:,inds][indsc,:].T,k)
-    print("U col space err = ",np.linalg.norm(Ktot[:,indsc][inds,:]-U@(U.T@Ktot[:,indsc][inds,:])))
-    print("V col space err = ",np.linalg.norm(Ktot[:,inds][indsc,:].T-V@(V.T@Ktot[:,inds][indsc,:].T)))
-    D = Ktot[inds,:][:,inds]-U@(U.T@Ktot[inds,:][:,inds]@V)@V.T
-    Utot2[2*ind*k:2*(ind+1)*k,:][:,ind*k:(ind+1)*k] = U
-    Vtot2[2*ind*k:2*(ind+1)*k,:][:,ind*k:(ind+1)*k] = V
-    Dtot2[2*ind*k:2*(ind+1)*k,:][:,2*ind*k:2*(ind+1)*k] = D
-Ktot2 = Utot2.T@(Ktot@Vtot2)
-Dtot2test = Dtot2
-Dtot2 = Ktot-Utot2@Ktot2@Vtot2.T
-
-v = np.random.standard_normal(size=(N,))
-u = Sp@v
-Ktothat = Utot2@(Ktot2@Vtot2.T) + Dtot2
-uhat = Utot@(Ktothat@(Vtot.T@v)) + Dtot@v
-
-print("Err rep = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-
-
-
-
-
-
-
-
-
-
-
+    indsc0 = [i for i in range(N) if i not in inds0]
+    s = np.linalg.svd(SS[:,inds][indsc,:],compute_uv=False)
+    s0 = np.linalg.svd(SS[:,inds][indsc0,:],compute_uv=False)
+    rk = sum(s>s[0]*1e-6)
+    rk0 = sum(s0>s0[0]*1e-6)
+    print("=============")
+    print("rk = ",rk)
+    print("rk0 = ",rk0)
+    print("=============")

@@ -25,7 +25,7 @@ Constructed in two ways: overlapping and non-overlapping
 ky = 4
 kz = 1
 kx = np.sqrt(ky**2+kz**2)
-Lx = 2
+Lx = 1
 Ly = 1
 Lz = 1
 def  c11(p):
@@ -43,63 +43,63 @@ Lapl = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
 cx = Lx/2
 bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nbz = 2
-nby = 2
-nbx = 4
+nbz = 3
+nby = 3
+nbx = 3
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
-px = 10
-py = 5
-pz = 5
+px = 8
+py = 8
+pz = 8
 
 
 print("px,py,pz = ",px," , ",py," , ",pz)
 
 
-solver = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
-solver.build("reduced_cpu", "MUMPS",verbose=False)
+#solver = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
+#solver.build("reduced_cpu", "MUMPS",verbose=False)
 
-XX = solver.XX
-XXfull = solver.XXfull
+#XX = solver.XX
+#XXfull = solver.XXfull
 
-Jb = solver._Jx
-Ji = solver.Ji
+#Jb = solver._Jx
+#Ji = solver.Ji
 
-print("Ji size = ",len(Ji))
-print("Jb size = ",len(Jb))
+#print("Ji size = ",len(Ji))
+#print("Jb size = ",len(Jb))
 
-XXi = XX[Ji,:]
-XXb = XX[Jb,:]
+#XXi = XX[Ji,:]
+#XXb = XX[Jb,:]
 
-Jc = np.where(XXi[:,0]==cx)[0]
-Jl = np.where((XXb[:,0]==0))[0]
+#Jc = np.where(XXi[:,0]==cx)[0]
+#Jl = np.where((XXb[:,0]==0))[0]
 
-Aii = np.array(solver.Aii.todense())
-Aib = np.array(solver.Aix.todense())
+#Aii = np.array(solver.Aii.todense())
+#Aib = np.array(solver.Aix.todense())
 
 
 #test if I set it up correctly
-ui = bc(XXi).cpu().detach().numpy()
-rhs = bc(XXb).cpu().detach().numpy()
-ui_hat = -np.linalg.solve(Aii,Aib@rhs)
+#ui = bc(XXi).cpu().detach().numpy()
+#rhs = bc(XXb).cpu().detach().numpy()
+#ui_hat = -np.linalg.solve(Aii,Aib@rhs)
 
-print("err hps = ",np.linalg.norm(ui-ui_hat)/np.linalg.norm(ui))
-
-
-rhsT = bc(XXb).cpu().detach().numpy()
-uT = bc(XXi[Jc,:]).cpu().detach().numpy()
-
-ST = -np.linalg.solve(Aii,Aib[:,Jl])[Jc,:]
-print("ST shape = ",ST.shape)
-uhat_T = ST@rhsT[Jl]
+#print("err hps = ",np.linalg.norm(ui-ui_hat)/np.linalg.norm(ui))
 
 
+#rhsT = bc(XXb).cpu().detach().numpy()
+#uT = bc(XXi[Jc,:]).cpu().detach().numpy()
+
+#ST = -np.linalg.solve(Aii,Aib[:,Jl])[Jc,:]
+#print("ST shape = ",ST.shape)
+#uhat_T = ST@rhsT[Jl]
 
 
-print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
 
-Sii,Sib,XYtot,Ii,Ib = SOMS3D.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
+
+#print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
+
+Sii,Sib,XYtot,Ii,Ib = SOMS3D.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0)
 
 
 XXi = XYtot[Ii,:]

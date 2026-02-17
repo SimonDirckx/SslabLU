@@ -147,7 +147,7 @@ Constructed in two ways: overlapping and non-overlapping
 """
 
 k = 2
-Lx = 1/16
+Lx = 1/8
 Ly = 1
 kh = 20
 def  c11(p):
@@ -167,13 +167,13 @@ HH = pdoalt.PDO_2d(c11=c11,c22=c22,c=c)
 cx = Lx/2
 bnds = np.array([[0,0],[Lx,Ly]])
 Om = hpsaltGeom.BoxGeometry(bnds)
-nby = 32
+nby = 16
 nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 #isotropic disc
-py=16
-px=16
+py=10
+px=10
 print("px,py = ",px," , ",py)
 
 solver_hps = hpsalt.Domain_Driver(Om, HH, kh, np.array([ax,ay]), [px+1,py+1], 2)
@@ -206,7 +206,7 @@ print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
 
 
 
-Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,kh,Lx,Ly)
+Stot,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,nbx,nby,Lx,Ly,kh)
 
 
 XXi = XYtot[Ii,:]

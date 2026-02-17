@@ -6,7 +6,7 @@ import scipy.linalg as sclinalg
 import time
 
 
-def SOMS_solver(px,py,nbx,nby,kh=0.,Lx=1,Ly=1):
+def SOMS_solver(px,py,nbx,nby,Lx=1,Ly=1,kh=0.):
     tiling = [nbx,nby] #non-overlapping (!!!) tiling
     Lx0 = tiling[0]
     Ly0 = tiling[1]
@@ -211,20 +211,18 @@ def gluing_mat(x,xhat,ny):
     #    E_xhat[:,indcoeff] = Ti(xhat)
 
 
-    [U,s,V] = np.linalg.svd(E_xhat)
-    k = sum(s>1e-15*s[0])
-    Uk = U[:,:k].T
+    [U,s,V] = np.linalg.svd(E_x2.T)
+    k = sum(s>1e-13*s[0])
+    Uk = U[:,:k]
     Vk = V[:k,:].T
     sk = s[:k]
     Sk = np.diag(sk**(-1))
-    Interp = (Vk@(Sk@(Uk@(E_x2)))).T
-    #Interp = np.linalg.solve(E_xhat.T,E_x2.T).T
-    #Interp = np.linalg.solve(E_xhat,E_x2).T
+    cc = ((E_xhat.T@Vk)@Sk)@Uk.T
     C = np.zeros(shape = (2*len(xhat)+2*(ny-2),4*(nx-2)+2*(ny-2)))
 
     C[np.ix_(np.arange(0,ny-2),np.arange(0,ny-2))] = np.identity(ny-2)
-    C[np.ix_(np.arange(ny-2,ny-2+len(xhat)),np.arange(ny-2,ny-2+2*(nx-2)))] = np.linalg.pinv(Interp,rcond = 1e-14)
-    C[np.ix_(np.arange(ny-2+len(xhat),ny-2+2*len(xhat)),np.arange(ny-2+2*(nx-2),ny-2+4*(nx-2)))] = np.linalg.pinv(Interp,rcond = 1e-14)
+    C[np.ix_(np.arange(ny-2,ny-2+len(xhat)),np.arange(ny-2,ny-2+2*(nx-2)))] = cc
+    C[np.ix_(np.arange(ny-2+len(xhat),ny-2+2*len(xhat)),np.arange(ny-2+2*(nx-2),ny-2+4*(nx-2)))] = cc
     C[np.ix_(np.arange(ny-2+2*len(xhat),2*(ny-2)+2*len(xhat)),np.arange(ny-2+4*(nx-2),2*(ny-2)+4*(nx-2)))] = np.identity(ny-2)
 
 
