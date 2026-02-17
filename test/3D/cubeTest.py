@@ -253,7 +253,7 @@ for i in range(N_list.shape[0]):
 
 print(output_fields)
 
-file_loc = "output_torus_comparison.pkl"
+file_loc = "output_cube_comparison.pkl"
 
 f = open(file_loc, "wb+")
 pickle.dump(output_fields, f)
