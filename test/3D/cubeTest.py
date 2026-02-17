@@ -222,11 +222,18 @@ def compare_cube(N, p, nwaves):
     print("err_tot red-black = ", err_redblack)
     print("===============================================")
 
-    return err_iterative, err_tridiagonal, err_redblack, elapsed_time_iterative, elapsed_time_direct_factor_tridiagonal, elapsed_time_direct_solve_tridiagonal, elapsed_time_direct_factor_redblack, elapsed_time_direct_solve_redblack
+    return dict(err_iterative=err_iterative,
+                err_tridiagonal=err_tridiagonal,
+                err_redblack=err_redblack,
+                elapsed_time_iterative=elapsed_time_iterative,
+                elapsed_time_direct_factor_tridiagonal=elapsed_time_direct_factor_tridiagonal,
+                elapsed_time_direct_solve_tridiagonal=elapsed_time_direct_solve_tridiagonal,
+                elapsed_time_direct_factor_redblack=elapsed_time_direct_factor_redblack,
+                elapsed_time_direct_solve_redblack=elapsed_time_direct_solve_redblack)
 
 output_list = ["err_iterative", "err_tridiagonal", "err_redblack", "elapsed_time_iterative", "elapsed_time_direct_factor_tridiagonal", "elapsed_time_direct_solve_tridiagonal", "elapsed_time_direct_factor_redblack", "elapsed_time_direct_solve_redblack"]
 
-N_list = np.array([8, 16])
+N_list = np.array([8])
 p_list = np.array([8, 10, 12, 14])
 nwaves_list = np.array([5, 10, 15, 20, 25, 30])
 
