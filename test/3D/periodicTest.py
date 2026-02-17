@@ -44,7 +44,7 @@ bnds = squareTorus.bnds
 #
 ################################################################
 
-nwaves = 15.24
+nwaves = 15
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
 
@@ -78,7 +78,7 @@ N = 8
 dSlabs,connectivity,H = squareTorus.dSlabs(N)
 
 formulation = "hps"
-p = 14
+p = 10
 p_disc = p
 if hpsalt:
     formulation = "hpsalt"
@@ -146,9 +146,12 @@ print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
 print("GMRES iters              = ", gInfo.niter)
 print("==================================")
 
-errInf_iterative = 0.
-errInf_direct = 0.
-errInf_RB = 0.
+err_iterative = 0.
+err_direct = 0.
+err_RB = 0.
+
+uu0_total_norm = 0.
+
 nc = OMS.nc
 for slabInd in range(len(connectivity)):
     geom    = np.array(dSlabs[slabInd])
@@ -192,21 +195,30 @@ for slabInd in range(len(connectivity)):
 
     uu0 = bc(solver.XXfull)
 
+    uu0_norm = np.linalg.norm(uu0)
+    uu0_total_norm += uu0_norm**2
+
     uu_iterative=uu_iterative.flatten()
-    errI_iterative=np.linalg.norm(uu_iterative-uu0,ord=np.inf)
-    errInf_iterative = np.max([errInf_iterative,errI_iterative])
-    print(errI_iterative)
+    errI_iterative=np.linalg.norm(uu_iterative-uu0)
+    err_iterative += errI_iterative**2
+    print(errI_iterative / uu0_norm)
 
     uu_direct=uu_direct.flatten()
-    errI_direct=np.linalg.norm(uu_direct-uu0,ord=np.inf)
-    errInf_direct = np.max([errInf_direct,errI_direct])
-    print(errI_direct)
+    errI_direct=np.linalg.norm(uu_direct-uu0)
+    err_direct += errI_direct**2
+    print(errI_direct / uu0_norm)
 
     uu_RB=uu_RB.flatten()
-    errI_RB=np.linalg.norm(uu_RB-uu0,ord=np.inf)
-    errInf_RB = np.max([errInf_RB,errI_RB])
-    print(errI_RB)
+    errI_RB=np.linalg.norm(uu_RB-uu0)
+    err_RB += errI_RB**2
+    print(errI_RB/ uu0_norm)
 
-print("sup norm error for iterative u = ",errInf_iterative)
-print("sup norm error for direct cyclic tridiagonal u = ",errInf_direct)
-print("sup norm error for direct red-black u = ",errInf_RB)
+err_iterative = np.sqrt(err_iterative)
+err_direct = np.sqrt(err_direct)
+err_RB = np.sqrt(err_RB)
+
+uu0_total_norm = np.sqrt(uu0_total_norm)
+
+print("2 norm error for iterative u = ", err_iterative / uu0_total_norm)
+print("2 norm error for direct cyclic tridiagonal u = ", err_direct / uu0_total_norm)
+print("2 norm error for direct red-black u = ", err_RB / uu0_total_norm)

@@ -218,10 +218,10 @@ def build_block_RB_solver(OMS, S_rk_list, rhs_list, Ntot, nc, cyclic=False):
                 rmatmat=rmatmat,
                 dtype=dtype,
             )
-        SiM[0] = zero_operator
-        SiP[-1] = zero_operator
+        SiM[0] = np.zeros((m,m)) #zero_operator
+        SiP[-1] = np.zeros((m,m)) #zero_operator
 
-    RB = [(SiM, [np.eye(m, dtype=SiM[0].dtype) for _ in range(nSlabs)], SiP)]
+    RB = [(SiM, [np.eye(m, dtype=SiM[1].dtype) for _ in range(nSlabs)], SiP)]
 
     l = nSlabs
     while l > 1:
@@ -263,19 +263,19 @@ def build_block_RB_solver_level(m, nSlabs, RB_level):
     SiP = RB_level[2]
 
     # First let's build 2, B_i:
-    I   = np.eye(m, dtype=SiM[0].dtype)
+    I   = np.eye(m, dtype=SiM[1].dtype)
     B_i = [I for _ in range(0, nSlabs, 2)]
     for i in range(0, nSlabs, 2):
         j = int(i/2)
-        B_i[j] = B_i[j] - SiM[i] @ SiP[(i-1) % nSlabs] @ I - SiP[i] @ SiM[(i+1) % nSlabs] @ I
+        B_i[j] = B_i[j] - SiM[i] @ (SiP[(i-1) % nSlabs] @ I) - SiP[i] @ (SiM[(i+1) % nSlabs] @ I)
 
     # Now we factorize every B_i:
     B_i = [lu_factor(_, overwrite_a=True) for _ in B_i]
 
     # Next let's build 3, A_i:
-    A_i = [lu_solve(B_i[int(_ / 2)], SiM[_] @ SiM[(_ - 1) % nSlabs] @ I) for _ in range(0, nSlabs, 2)]
+    A_i = [lu_solve(B_i[int(_ / 2)], SiM[_] @ (SiM[(_ - 1) % nSlabs] @ I)) for _ in range(0, nSlabs, 2)]
     # And finally build 4, C_i:
-    C_i = [lu_solve(B_i[int(_ / 2)], SiP[_] @ SiP[(_ + 1) % nSlabs] @ I) for _ in range(0, nSlabs, 2)]
+    C_i = [lu_solve(B_i[int(_ / 2)], SiP[_] @ (SiP[(_ + 1) % nSlabs] @ I)) for _ in range(0, nSlabs, 2)]
 
     return (A_i, B_i, C_i)
 
@@ -296,8 +296,12 @@ def block_RB_solve(RBS, v):
     vPrimes = [v.copy()]
     Smats   = []
 
+    print("m = ", m)
+
     # Now build the RHS:
     for l in range(len(RB) - 1):
+        print("l = ", l)
+
         (SiM, _, SiP)   = RB[l]
         (_, B_i, _) = RB[l+1]
 
@@ -321,7 +325,6 @@ def block_RB_solve(RBS, v):
     for l in range(len(RB) - 1, 0, -1):
         (SiM, _, SiP)   = RB[l-1]
         nReduced = int(len(SiM) / 2)
-        print("l, nReduced:", l, nReduced)
         for j in range(nReduced):
             i = 2 * j
             # We fill in the odd segments of u
