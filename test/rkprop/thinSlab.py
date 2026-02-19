@@ -263,6 +263,7 @@ SSHdense = SSlinop@ES
 
 print("Hmat err ST = ",np.linalg.norm(ST-STHdense,ord=2)/np.linalg.norm(ST,ord=2))
 print("Hmat err SS = ",np.linalg.norm(SS-SSHdense,ord=2)/np.linalg.norm(SS,ord=2))
+print("Hmat compression = ",assemblerS.stats.nbytes/(SS.nbytes))
 
 
 

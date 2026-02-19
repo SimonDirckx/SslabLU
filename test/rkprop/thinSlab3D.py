@@ -144,4 +144,5 @@ Sv1 = SSlinop@v
 Sv2 = SS@v
 
 print("Hmat err SS = ",np.linalg.norm(Sv1-Sv2)/np.linalg.norm(Sv2))
+print("Hmat compression = ",assemblerS.stats.nbytes/(SS.nbytes))
 #print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))
