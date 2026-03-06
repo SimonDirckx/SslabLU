@@ -15,8 +15,10 @@ def block_null(A,rk,Nb):
     kA = A.shape[1]
     B = np.zeros(shape = (kA*Nb,rk))
     for i in range(Nb):
-        
-        V,_ = np.linalg.qr(A[i*nA:(i+1)*nA,:].T,mode='reduced')
+        Q,_ = np.linalg.qr(A[i*nA:(i+1)*nA,:].T,mode='reduced')
+        Om = np.random.standard_normal(size = (Q.shape[0],rk))
+        Om-=Q@(Q.T@Om)
+        V,_ = np.linalg.qr(Om,mode='reduced')
         nV = V.shape[1]
         B[i*kA:(i+1)*kA,:] = V[:,nV-rk:]
     return B
@@ -29,12 +31,9 @@ def block_solve_r(A,B,Nb):
     C = np.zeros(shape = (A.shape[0],nb))
     for i in range(Nb):
         [U,s,Vh] = np.linalg.svd(B[i*nb:(i+1)*nb,:],full_matrices=False)
-        k = sum(s>s[0]*1e-12)
-        Uk = U[:,:k]
-        Vh = Vh.T
-        Vk = Vh[:,:k]
-        Sk = np.diag(1./s[:k])
-        C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vk)@Sk)@Uk.T
+        k = sum(s>s[0]*1e-8)
+        Vh = Vh[:k,:].T
+        C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vh)/s[:k])@U[:,:k].T
     return C
 
 def block_orth_proj(A,B,Nb,compl=True):

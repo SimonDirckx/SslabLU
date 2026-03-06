@@ -65,7 +65,7 @@ bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
 nby = 8
 nbz = 8
-nbx = 4
+nbx = 2
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
@@ -217,11 +217,11 @@ for lvl in range(len(Umats)-1,-1,-1):
     SHBS = Umats[lvl]@SHBS@Vmats[lvl].T+Dmats[lvl]
 
 
-print(" SHBS err ",np.linalg.norm(SHBS-Sp)/np.linalg.norm(Sp))
+print(" SHBS err ",np.linalg.norm(SHBS-Sp,ord=2)/np.linalg.norm(Sp,ord=2))
 SHBSperm = np.zeros(shape=SHBS.shape)
 SHBSperm[:,perm] = SHBS
 SHBSperm[perm,:] = SHBSperm
-
+print(" SS err ",np.linalg.norm(SHBSperm-SS,ord=2)/np.linalg.norm(SS,ord=2))
 
 
 v = np.random.standard_normal(size=(SS.shape[1],))
