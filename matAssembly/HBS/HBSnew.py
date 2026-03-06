@@ -6,7 +6,7 @@ def block_col(A,rk,Nb):
     n = A.shape[0]//Nb
     for i in range(Nb):
         #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        U,_,_ = splinalg.qr(A[i*n:(i+1)*n,:],pivoting=True,mode='economic')
+        U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
         B[i*n:(i+1)*n,:] = U[:,:rk]
     return B
 
@@ -14,11 +14,9 @@ def block_null(A,rk,Nb):
     nA = A.shape[0]//Nb
     kA = A.shape[1]
     B = np.zeros(shape = (kA*Nb,rk))
-    
     for i in range(Nb):
-        #[_,_,V] = np.linalg.svd(A[i*nA:(i+1)*nA,:],full_matrices=False)
-        V,_ = splinalg.qr(A[i*nA:(i+1)*nA,:].T,pivoting=True,mode='raw')[0]
-        #V=V.T
+        
+        V,_ = np.linalg.qr(A[i*nA:(i+1)*nA,:].T,mode='reduced')
         nV = V.shape[1]
         B[i*kA:(i+1)*kA,:] = V[:,nV-rk:]
     return B
@@ -30,8 +28,7 @@ def block_solve_r(A,B,Nb):
     n = A.shape[0]//Nb
     C = np.zeros(shape = (A.shape[0],nb))
     for i in range(Nb):
-        Bsub = B[i*nb:(i+1)*nb,:]
-        [U,s,Vh] = np.linalg.svd(Bsub,full_matrices=False)
+        [U,s,Vh] = np.linalg.svd(B[i*nb:(i+1)*nb,:],full_matrices=False)
         k = sum(s>s[0]*1e-12)
         Uk = U[:,:k]
         Vh = Vh.T
@@ -113,25 +110,22 @@ class HBSMAT:
         self.blockSolveTime = 0
         self.nullTime = 0
         self.setupTime = 0
+        self.DTime = 0
     
     def construct(self,rk):
-        tic = time.time()
         # we compute an HBS compression of permuted op
+        
+        tic = time.time()
         Om = np.random.standard_normal(size = (self.shape[1],6*rk+10))
         Psi = np.random.standard_normal(size = (self.shape[0],6*rk+10))
         Omprime = np.zeros(shape = Om.shape)
-        Psiprime = np.zeros(shape = Psi.shape)
-        
         Omprime[self.perm,:] = Om
+        Psiprime = np.zeros(shape = Psi.shape)
         Psiprime[self.perm,:] = Psi
-        
-        Yprime = self.A@Omprime
-        Zprime = self.A.T@Psiprime
-        Y = np.zeros(shape = Yprime.shape)
-        Z = np.zeros(shape = Zprime.shape)
-        Y = (Yprime[self.perm,:])
-        Z = (Zprime[self.perm,:])
-        
+        Y = self.A@Omprime
+        Z = self.A.T@Psiprime
+        Y = Y[self.perm,:]
+        Z = Z[self.perm,:]
         boxes = self.tree.get_leaves()
         Nb = len(boxes)
         nl = len(self.tree.get_box_inds(boxes[0]))
@@ -172,11 +166,13 @@ class HBSMAT:
                 YO = block_solve_r(Y_ell,Om_ell,Nb)
                 ZP = block_solve_r(Z_ell,Psi_ell,Nb)
                 self.blockSolveTime+=time.time()-tic
+                tic = time.time()
                 D_ell = block_orth_proj(U_ell,YO,Nb)
                 Dtemp = block_orth_proj(V_ell,ZP,Nb)
                 Dtemp = block_transpose(Dtemp,Nb)
                 Dtemp = block_orth_proj(U_ell,Dtemp,Nb,compl=False)
                 D_ell += Dtemp
+                self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
                 self.Vmats+=[V_ell]
@@ -185,5 +181,42 @@ class HBSMAT:
                 D_ell = block_solve_r(Y_ell,Om_ell,Nb)
                 self.blockSolveTime+=time.time()-tic
                 self.Dmats+=[D_ell]
+    def matvec(self,v,mode='N'):
+        if v.ndim==1:
+            vperm = v[self.perm,np.newaxis]    
+        else:
+            vperm= v[self.perm,:]
+        VV = []
+        Nb = len(self.tree.get_leaves())
+        if mode=='N':
+            VV+=[vperm]
+            for lvl in range(len(self.Vmats)):
+                v_lvl = block_mult(self.Vmats[lvl],VV[lvl],Nb,mode='T')
+                VV+=[v_lvl]
+                Nb=Nb//4
+            uperm = block_mult(self.Dmats[-1],VV[-1],Nb)
+            for lvl in range(len(self.Umats)-1,-1,-1):
+                uperm = block_mult(self.Umats[lvl],uperm,4*Nb)+ block_mult(self.Dmats[lvl],VV[lvl],4*Nb)
+                Nb=Nb*4
+            u = np.zeros(shape = uperm.shape)
+            u[self.perm,:] = uperm
+
+        elif mode=='T':
+            VV+=[vperm]
+            for lvl in range(len(self.Umats)):
+                v_lvl = block_mult(self.Umats[lvl],VV[lvl],Nb,mode='T')
+                VV+=[v_lvl]
+                Nb=Nb//4
+            uperm = block_mult(self.Dmats[-1],VV[-1],Nb,mode='T')
+            for lvl in range(len(self.Vmats)-1,-1,-1):
+                uperm = block_mult(self.Vmats[lvl],uperm,4*Nb)+ block_mult(self.Dmats[lvl],VV[lvl],4*Nb,mode='T')
+                Nb=Nb*4            
+            u = np.zeros(shape = uperm.shape)
+            u[self.perm,:] = uperm
+        else:
+            raise ValueError("mode not recognized")
+        if v.ndim==1:
+            u = u.flatten()
+        return u
             
             

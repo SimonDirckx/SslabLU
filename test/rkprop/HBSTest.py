@@ -65,14 +65,14 @@ bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
 nby = 8
 nbz = 8
-nbx = 2
+nbx = 4
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
-px=9
-py=9
-pz=9
+px=7
+py=7
+pz=7
 
 
 Sii,Sib,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
@@ -107,21 +107,9 @@ for leaf in tree0.get_leaves():
     perm += tree0.get_box_inds(leaf).tolist()
 
 Sp = SS[perm,:][:,perm]
-xprime = np.random.standard_normal(size=(Sp.shape[1],))
-x = xprime.copy()
-xprime[perm] = xprime
-y = SS@xprime
-y = y[perm]
-yhat = Sp@x
-print("perm err = ",np.linalg.norm(y-yhat))
 
-XXlp = XXl[perm,:]
-XXcp = XXc[perm,:]
 
-leaves = tree0.get_leaves()
-N = Sp.shape[0]
-Nleaves = len(leaves)
-k = (py-1)*(pz-1)
+k = 2*(py-1)*(pz-1)
 nl = (py-1)*(pz-1)
 
 HBSmat = HBSnew.HBSMAT(SS,tree0)
@@ -132,7 +120,22 @@ print("HBS construct time = ",toc-tic)
 print("Block solve time = ",HBSmat.blockSolveTime)
 print("Null time = ",HBSmat.nullTime)
 print("set-up time = ",HBSmat.setupTime)
+print("D time = ",HBSmat.DTime)
 
+
+v = np.random.standard_normal(size=(SS.shape[1],))
+u = SS@v
+utest = HBSmat.matvec(v)
+print("matvec err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
+v = np.random.standard_normal(size=(SS.shape[0],))
+u = SS.T@v
+utest = HBSmat.matvec(v,mode='T')
+print("matvecT err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
+
+
+Umats = []
+Vmats = []
+Dmats = []
 
 U0 = HBSmat.Umats[0]
 V0 = HBSmat.Vmats[0]
@@ -149,12 +152,13 @@ for i in range(Nb):
     Umat[i*n:(i+1)*n,:][:,i*k0:(i+1)*k0] = U0[i*n:(i+1)*n,:]
     Vmat[i*n:(i+1)*n,:][:,i*k0:(i+1)*k0] = V0[i*n:(i+1)*n,:]
     Dmat[i*k0:(i+1)*k0,:][:,i*k0:(i+1)*k0] = D0[i*k0:(i+1)*k0,:]
-Dtest = Sp - Umat@Umat.T@Sp@Vmat@Vmat.T
 
-print("D err = ",np.linalg.norm(Dtest-Dmat,ord=2)/np.linalg.norm(Sp,ord=2))
+Umats+=[Umat]
+Vmats+=[Vmat]
+Dmats+=[Dmat]
 
-############################
-A = Umat.T@Sp@Vmat
+################################
+
 U1 = HBSmat.Umats[1]
 V1 = HBSmat.Vmats[1]
 D1 = HBSmat.Dmats[1]
@@ -170,13 +174,11 @@ for i in range(Nb):
     Vmat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = V1[i*n:(i+1)*n,:]
     Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D1[i*n:(i+1)*n,:]
 
-print("================================")
-
-Dtest1 = A - Umat@(Umat.T@A@Vmat)@Vmat.T
-print("D err = ",np.linalg.norm(Dtest1-Dmat,ord=2)/np.linalg.norm(A,ord=2))
+Umats+=[Umat]
+Vmats+=[Vmat]
+Dmats+=[Dmat]
 
 ############################
-A = Umat.T@A@Vmat
 U2 = HBSmat.Umats[2]
 V2 = HBSmat.Vmats[2]
 D2 = HBSmat.Dmats[2]
@@ -192,14 +194,11 @@ for i in range(Nb):
     Vmat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = V2[i*n:(i+1)*n,:]
     Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D2[i*n:(i+1)*n,:]
 
-
-print("================================")
-Dtest2 = A - Umat@(Umat.T@A@Vmat)@Vmat.T
-print("D err = ",np.linalg.norm(Dtest2-Dmat,ord=2)/np.linalg.norm(A,ord=2))
-
+Umats+=[Umat]
+Vmats+=[Vmat]
+Dmats+=[Dmat]
 
 ############################
-A = Umat.T@A@Vmat
 D3 = HBSmat.Dmats[3]
 
 Nb = len(tree0.get_boxes_level(0))
@@ -209,10 +208,25 @@ for i in range(Nb):
     Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D3[i*n:(i+1)*n,:]
 
 
-print("================================")
-Dtest3 = A
-print("D err = ",np.linalg.norm(Dtest3-Dmat,ord=2)/np.linalg.norm(Sp,ord=2))
+Dmats+=[Dmat]
 
 
+SHBS = Dmats[-1]
+
+for lvl in range(len(Umats)-1,-1,-1):
+    SHBS = Umats[lvl]@SHBS@Vmats[lvl].T+Dmats[lvl]
+
+
+print(" SHBS err ",np.linalg.norm(SHBS-Sp)/np.linalg.norm(Sp))
+SHBSperm = np.zeros(shape=SHBS.shape)
+SHBSperm[:,perm] = SHBS
+SHBSperm[perm,:] = SHBSperm
+
+
+
+v = np.random.standard_normal(size=(SS.shape[1],))
+u = SHBSperm@v
+utest = HBSmat.matvec(v)
+print("matvec err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
 

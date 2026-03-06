@@ -135,7 +135,7 @@ tree_perm =  tree.BalancedTree(XXlp,(py-1)*(pz-1))
 leaves = tree_perm.get_leaves()
 N = Sp.shape[0]
 Nleaves = len(leaves)
-k = (py-1)*(pz-1)
+k = (py-1)*(pz-1)//2
 k0 = (py-1)*(pz-1)
 nl = (py-1)*(pz-1)
 
@@ -317,6 +317,10 @@ Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec
 
 SS = Qtotmat@SHBS@Wtotmat
 plt.figure(1)
+plt.spy(Qtotmat.T,precision = 1e-8)
+plt.figure(2)
+plt.spy(Wtotmat,precision = 1e-8)
+plt.figure(3)
 plt.spy(SS,precision = 1e-8)
 plt.show()
 
