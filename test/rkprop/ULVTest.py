@@ -125,8 +125,8 @@ print("number of levels = ",tree_perm.nlevels)
 N = Sp.shape[0]
 Nleaves = len(leaves)
 #print("Nleaves = ",Nleaves)
-k = (py-1)*(pz-1)//4
-k0 = min((py-1)*(pz-1),k)
+k = (py-1)*(pz-1)*2
+k0 = (py-1)*(pz-1)
 #k=75
 #print("rank = ",k)
 nl = (py-1)*(pz-1)
@@ -234,7 +234,7 @@ Nbvec = [len(tree_perm.get_boxes_level(tree_perm.nlevels-1)),len(tree_perm.get_b
 
 Qtest,Rtest,Wtest = ULVdense.compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec,SHBS)
 
-SS = SHBS@Wtest
+SS = Qtest.T@SHBS@Wtest
 plt.figure(11)
 plt.spy(SS,precision = 1e-8)
 plt.show()

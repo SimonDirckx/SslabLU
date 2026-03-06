@@ -12,12 +12,12 @@ import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
 import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 import SOMS3D as SOMS
 import matAssembly.matAssembler as mA
+import matAssembly.HBS.HBSnew as HBSnew
 import solver.solver as solver
 import scipy.linalg as sclinalg
 from matplotlib.colors import ListedColormap
 
-import ULVdense
-import ULVsparse
+import matAssembly.HBS.ULVsparse as ULVsparse
 import time
 
 
@@ -107,6 +107,26 @@ for leaf in tree0.get_leaves():
     perm += tree0.get_box_inds(leaf).tolist()
 
 Sp = SS[perm,:][:,perm]
+xprime = np.random.standard_normal(size=(Sp.shape[1],))
+x = xprime.copy()
+xprime[perm] = xprime
+y = SS@xprime
+y = y[perm]
+yhat = Sp@x
+print("perm err = ",np.linalg.norm(y-yhat))
+
+
+#xprime = np.random.standard_normal(size=(Sp.shape[1],))
+#x = np.zeros(shape = xprime.shape)
+#x[perm] = xprime
+#y = SS.T@x
+#yprime = y[perm]
+#yprimehat = Sp.T@xprime
+#print("perm err = ",np.linalg.norm(yprime-yprimehat))
+
+
+
+
 
 XXlp = XXl[perm,:]
 XXcp = XXc[perm,:]
@@ -115,9 +135,13 @@ tree_perm =  tree.BalancedTree(XXlp,(py-1)*(pz-1))
 leaves = tree_perm.get_leaves()
 N = Sp.shape[0]
 Nleaves = len(leaves)
-k = (py-1)*(pz-1)*2
+k = (py-1)*(pz-1)
 k0 = (py-1)*(pz-1)
 nl = (py-1)*(pz-1)
+
+
+
+
 dataHBS=0
 
 Utot1 = np.zeros(shape=(N,Nleaves*k0))
@@ -164,6 +188,8 @@ for ind_box in range(Nb):
     D = Ktot1[inds,:][:,inds]- U@(U.T@Ktot1[inds,:][:,inds]@V)@V.T
     Dtot2[4*ind_box*k0:4*(ind_box+1)*k0,:][:,4*ind_box*k0:4*(ind_box+1)*k0] = D 
     dataHBS += U.nbytes+V.nbytes+D.nbytes
+
+
 Ktot2 = Utot2.T@Ktot1@Vtot2
 
 boxes = tree_perm.get_boxes_level(tree_perm.nlevels-3)
@@ -263,7 +289,7 @@ Nbvec = [len(tree_perm.get_boxes_level(tree_perm.nlevels-1)),len(tree_perm.get_b
          len(tree_perm.get_boxes_level(tree_perm.nlevels-3)),len(tree_perm.get_boxes_level(tree_perm.nlevels-4))]
 
 ticULV = time.time()
-Qtot,Rtot,Wtot,NNvec,NNQvec,NNRvec,NNWvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec)
+Qtot,Rtot,Wtot,NNvec,NNQvec,NNRvec,NNWvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,Nbvec)
 tocULV = time.time()
 
 x= np.random.standard_normal(size=(SHBS.shape[1],2))
@@ -291,7 +317,7 @@ Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec
 
 SS = Qtotmat@SHBS@Wtotmat
 plt.figure(1)
-plt.spy(SS,precision = 1e-10)
+plt.spy(SS,precision = 1e-8)
 plt.show()
 
 

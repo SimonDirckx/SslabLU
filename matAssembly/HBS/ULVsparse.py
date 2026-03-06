@@ -130,7 +130,7 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         NN = R.shape[0]
     else:
         k = Vtot.shape[1]
-        n = Dtot.shape[0]//Nb
+        n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
         Q1 = np.zeros(shape = (Nb*n,n-k))
         Q2 = np.zeros(shape = (Nb*n,k))
@@ -141,8 +141,9 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         R22 = np.zeros(shape = (Nb*k,k))
         for box_ind in range(Nb):
             V       = Vtot[box_ind*n:(box_ind+1)*n,:]
-            [Vr,_]  = np.linalg.qr(np.identity(n)-V@V.T,mode='reduced')
-            Vr      = Vr[:,:n-k]
+            [_,_,Ur] = np.linalg.svd(V.T)#svd needed here, otherwise accuracy not guaranteed
+            Vr = Ur.T
+            Vr = Vr[:,k:]
             W       = np.append(Vr,V,axis=1)
             D       = Dtot[box_ind*n:(box_ind+1)*n,:]
             [Q,R]   = np.linalg.qr(D@W)
@@ -402,19 +403,25 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         if i==0:
             Rprime = Dmats[0]
             Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
-            U = Umats[0].shape
+            print("W1 shape = ",W1.shape)
+            print("W2 shape = ",W2.shape)
+            U = np.zeros(shape = Umats[0].shape)
             U[:NN,:] = sparse_block_mult(Q1,Umats[0],Nbvec[0],Nbvec[0],mode='T')
             U[NN:,:] = sparse_block_mult(Q2,Umats[0],Nbvec[0],Nbvec[0],mode='T')
             QQ = Q1.copy()
             Qprev = Q2.copy()
+
             WW = W1.copy()
             Wprev = W2.copy()
         else:
             Rprime = compute_Rprime(U,Dmats[i],Rr,NNvec,Nbvec[i])
             Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime[NNvec[-1]:,:],Vmats[i],Nbvec[i])
+            
             QQ = sparse_block_mult(Qprev,Q1,Nbvec[i-1],Nbvec[i]).copy()
             WW = sparse_block_mult(Wprev,W1,Nbvec[i-1],Nbvec[i]).copy()
             if i<len(Dmats)-1:
+                print("W1 shape = ",W1.shape)
+                print("W2 shape = ",W2.shape)
                 Qprev = sparse_block_mult(Qprev,Q2,Nbvec[i-1],Nbvec[i]).copy()
                 Wprev = sparse_block_mult(Wprev,W2,Nbvec[i-1],Nbvec[i]).copy()
                 U = update_U(Q1,Q2,U,Umats[i],NNvec,Nbvec[i])
