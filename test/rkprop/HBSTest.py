@@ -70,9 +70,9 @@ ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
-px=7
-py=7
-pz=7
+px=8
+py=8
+pz=8
 
 
 Sii,Sib,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
@@ -109,7 +109,7 @@ for leaf in tree0.get_leaves():
 Sp = SS[perm,:][:,perm]
 
 
-k = 2*(py-1)*(pz-1)
+k = (py-1)*(pz-1)
 nl = (py-1)*(pz-1)
 
 HBSmat = HBSnew.HBSMAT(SS,tree0)
@@ -214,12 +214,12 @@ Dmats+=[Dmat]
 SHBS = Dmats[-1]
 
 for lvl in range(len(Umats)-1,-1,-1):
-    SHBS = Umats[lvl]@SHBS@Vmats[lvl].T+Dmats[lvl]
+    SHBS = Umats[lvl]@SHBS@(Vmats[lvl].T)+Dmats[lvl]
 
 
 print(" SHBS err ",np.linalg.norm(SHBS-Sp,ord=2)/np.linalg.norm(Sp,ord=2))
 SHBSperm = np.zeros(shape=SHBS.shape)
-SHBSperm[:,perm] = SHBS
+SHBSperm[:,perm] = SHBS.copy()
 SHBSperm[perm,:] = SHBSperm
 print(" SS err ",np.linalg.norm(SHBSperm-SS,ord=2)/np.linalg.norm(SS,ord=2))
 
@@ -229,4 +229,12 @@ u = SHBSperm@v
 utest = HBSmat.matvec(v)
 print("matvec err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
+
+HBSmat_test = HBSnew.HBSMAT(SHBSperm,tree0)
+HBSmat_test.construct(k)
+
+v = np.random.standard_normal(size=(SS.shape[1],))
+utest = HBSmat_test.matvec(v)
+u = SHBSperm@v
+print("matvec HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 

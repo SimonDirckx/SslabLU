@@ -316,12 +316,11 @@ Qtotmat = ULVsparse.apply_cbd(Qtot,np.identity(Qtot.shape[0]),Nbvec,NNvec,NNQvec
 Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec)
 
 SS = Qtotmat@SHBS@Wtotmat
-plt.figure(1)
-plt.spy(Qtotmat.T,precision = 1e-8)
-plt.figure(2)
-plt.spy(Wtotmat,precision = 1e-8)
-plt.figure(3)
+SW = SHBS@Wtotmat
+plt.figure(10)
 plt.spy(SS,precision = 1e-8)
+plt.figure(11)
+plt.spy(SW,precision = 1e-8)
 plt.show()
 
 

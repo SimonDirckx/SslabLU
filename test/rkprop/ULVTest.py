@@ -235,8 +235,11 @@ Nbvec = [len(tree_perm.get_boxes_level(tree_perm.nlevels-1)),len(tree_perm.get_b
 Qtest,Rtest,Wtest = ULVdense.compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec,SHBS)
 
 SS = Qtest.T@SHBS@Wtest
+SW = SHBS@Wtest
 plt.figure(11)
 plt.spy(SS,precision = 1e-8)
+plt.figure(12)
+plt.spy(SW,precision = 1e-8)
 plt.show()
 
 

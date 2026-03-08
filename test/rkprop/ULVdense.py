@@ -54,6 +54,7 @@ def compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec,SHBS):
     Rtot = np.zeros(shape = (Dmats[0].shape[0],0))
     Qtot = np.identity(Dmats[0].shape[0])
     Wtot = np.identity(Dmats[0].shape[1])
+    
     NNvec = np.zeros(shape=(0,),dtype=np.int64)
     NNvec = np.append(NNvec,0)
     for i in range(len(Dmats)):
@@ -79,7 +80,7 @@ def compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec,SHBS):
         NNvec = np.append(NNvec,NN) 
         Rtot = np.append(Rtot,Rprime[:,:NN],axis=1)
         plt.figure(1)
-        plt.spy(Qtot.T@SHBS@Wtot,precision=1e-8)
+        plt.spy(SHBS@Wtot,precision=1e-8)
         plt.show()
     return Qtot,Rtot,Wtot
 

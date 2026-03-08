@@ -5,8 +5,8 @@ def block_col(A,rk,Nb):
     B = np.zeros(shape = (A.shape[0],rk))
     n = A.shape[0]//Nb
     for i in range(Nb):
-        #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
+        [U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
+        #U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
         B[i*n:(i+1)*n,:] = U[:,:rk]
     return B
 
@@ -31,7 +31,7 @@ def block_solve_r(A,B,Nb):
     C = np.zeros(shape = (A.shape[0],nb))
     for i in range(Nb):
         [U,s,Vh] = np.linalg.svd(B[i*nb:(i+1)*nb,:],full_matrices=False)
-        k = sum(s>s[0]*1e-8)
+        k = sum(s>s[0]*1e-14)
         Vh = Vh[:k,:].T
         C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vh)/s[:k])@U[:,:k].T
     return C
@@ -50,7 +50,7 @@ def block_orth_proj(A,B,Nb,compl=True):
     return C
 
 
-    return 0
+
 def block_transpose(A,Nb):
     
     #note: this is one of ONLY TWO places where uniformity of B ito blocks is assumed!
@@ -75,6 +75,18 @@ def block_mult(A,B,Nb,mode='N'):
             C[i*kA:(i+1)*kA,:]=A[i*n:(i+1)*n,:].T@B[i*n:(i+1)*n,:]
     else:
         raise ValueError("mode not recognized")
+    return C
+def construct_D(U_ell,V_ell,YO,ZP,Nb):
+    C = np.zeros(shape = (U_ell.shape[0],YO.shape[1]))
+    n = U_ell.shape[0]//Nb
+    for i in range(Nb):
+        Usub = U_ell[i*n:(i+1)*n,:]
+        Vsub = V_ell[i*n:(i+1)*n,:]
+        YOsub = YO[i*n:(i+1)*n,:]
+        ZPsub = ZP[i*n:(i+1)*n,:]
+
+        C[i*n:(i+1)*n,:] = YOsub-Usub@Usub.T@YOsub\
+                            +Usub@(Usub.T@((ZPsub-Vsub@(Vsub.T@ZPsub)).T))
     return C
 
 
@@ -142,12 +154,12 @@ class HBSMAT:
                 Y_ell       -=block_mult(D_ell,Om_ell,Nb)
                 Y_ell       = block_mult(U_ell,Y_ell,Nb,mode='T')
 
-                Z_ell       -= block_mult(D_ell,Psi_ell,Nb)
+                Z_ell       -= block_mult(D_ell,Psi_ell,Nb,mode='T')
                 Z_ell       = block_mult(V_ell,Z_ell,Nb,mode='T')
-
-
                 Om_ell      = block_mult(V_ell,Om_ell,Nb,mode='T')
                 Psi_ell     = block_mult(U_ell,Psi_ell,Nb,mode='T')
+
+                
                 Nb = Nb//4
                 rkm = rk
             
@@ -166,11 +178,7 @@ class HBSMAT:
                 ZP = block_solve_r(Z_ell,Psi_ell,Nb)
                 self.blockSolveTime+=time.time()-tic
                 tic = time.time()
-                D_ell = block_orth_proj(U_ell,YO,Nb)
-                Dtemp = block_orth_proj(V_ell,ZP,Nb)
-                Dtemp = block_transpose(Dtemp,Nb)
-                Dtemp = block_orth_proj(U_ell,Dtemp,Nb,compl=False)
-                D_ell += Dtemp
+                D_ell = construct_D(U_ell,V_ell,YO,ZP,Nb)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
