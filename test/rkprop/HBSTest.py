@@ -70,9 +70,9 @@ ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
-px=8
-py=8
-pz=8
+px=7
+py=7
+pz=7
 
 
 Sii,Sib,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
@@ -237,4 +237,9 @@ v = np.random.standard_normal(size=(SS.shape[1],))
 utest = HBSmat_test.matvec(v)
 u = SHBSperm@v
 print("matvec HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
+
+v = np.random.standard_normal(size=(SS.shape[1],))
+utest = HBSmat_test.matvec(v,mode='T')
+u = SHBSperm.T@v
+print("matvecT HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
