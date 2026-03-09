@@ -19,6 +19,7 @@ from matplotlib.colors import ListedColormap
 
 import matAssembly.HBS.ULVsparse as ULVsparse
 import time
+import stree
 
 
 cmap = ListedColormap([
@@ -65,54 +66,72 @@ bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
 Om = hpsaltGeom.BoxGeometry(bnds)
 nby = 8
 nbz = 8
-nbx = 2
+nbx = 4
 ax = .5*(bnds[1,0]/nbx)
 ay = .5*(bnds[1,1]/nby)
 az = .5*(bnds[1,2]/nbz)
 
-px=7
-py=7
-pz=7
+px=11
+py=11
+pz=11
 
 
-Sii,Sib,XYtot,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
 
+solver_S = hpsalt.Domain_Driver(Om, OP, 0, a=np.array([ax,ay,az]), p=np.array([px+1,py+1,pz+1]), d=3)
+solver_S.build("reduced_cpu", "MUMPS", verbose=False)
 
-XXi = XYtot[Ii,:]
-XXb = XYtot[Ib,:]
+XX = solver_S.XX
+XXfull = solver_S._XXfull
+Ii = solver_S._Ji
+Jb = solver_S._Jx
+Sib = solver_S.Aix
+solver_S.setup_solver_Aii()
+solver_ii = solver_S.solver_Aii
 
+XXi = solver_S.XX[Ii,:]
+XXb = solver_S.XX[Jb,:]
 
 Jc = np.where(XXi[:,0]==cx)[0]
 Jl = np.where((XXb[:,0]==0))[0]
 
-XXi = XYtot[Ii,:]
-XXb = XYtot[Ib,:]
+
+
+def smatmat(v,I,J,transpose=False):        
+    if (v.ndim == 1):
+        v_tmp = v[:,np.newaxis]
+    else:
+        v_tmp = v
+
+    if (not transpose):
+        result = (solver_ii@(Sib[:,J]@v_tmp))[I,:]
+    else:
+        result      = np.zeros(shape=(len(Ii),v_tmp.shape[1]))
+        result[I,:] = v_tmp
+        result      = Sib[:,J].T @ (solver_ii.T@(result))
+    if (v.ndim == 1):
+        result = result.flatten()
+    return result
 
 
 
-Jc = np.where(np.abs(XXi[:,0]-cx)<1e-14)[0]
-Jl = np.where((XXb[:,0]==0))[0]
+SS = LinearOperator(shape=(len(Jc),len(Jl)),\
+        matvec = lambda v:smatmat(v,Jc,Jl), rmatvec = lambda v:smatmat(v,Jc,Jl,transpose=True),\
+        matmat = lambda v:smatmat(v,Jc,Jl), rmatmat = lambda v:smatmat(v,Jc,Jl,transpose=True))
 
-Aib = Sib
-SS = -(np.linalg.solve(Sii,Sib[:,Jl]))[Jc,:]
-XXl = XXb[Jl,:]
-XXc = XXi[Jc,:]
-XXb2d = XXb[Jl,1:3]
-
-tree0 =  tree.BalancedTree(XXl,(py-1)*(pz-1))
-
-perm = []
-
-for leaf in tree0.get_leaves():
-    perm += tree0.get_box_inds(leaf).tolist()
-
-Sp = SS[perm,:][:,perm]
-
-
-k = (py-1)*(pz-1)
+XXl = XXb[Jl,:].detach().cpu().numpy()
+XXc = XXi[Jc,:].detach().cpu().numpy()
+k = 2*(py-1)*(pz-1)
 nl = (py-1)*(pz-1)
 
-HBSmat = HBSnew.HBSMAT(SS,tree0)
+quad=False
+if quad:
+    tree0 =  tree.BalancedTree(XXl,(py-1)*(pz-1))
+else:
+    tree0  = stree.stree(XXl,nl)
+#print("L = ",tree_test.nlevels)
+
+
+HBSmat = HBSnew.HBSMAT(SS,tree0,quad)
 tic = time.time()
 HBSmat.construct(k)
 toc= time.time()
@@ -133,83 +152,54 @@ utest = HBSmat.matvec(v,mode='T')
 print("matvecT err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
 
+
+HBSmat.compute_ULV()
+
+x = np.random.standard_normal(size = (SS.shape[0],))
+b = SS@x
+xhat = HBSmat.solve_ULV(b)
+print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
+print("solve res = ",np.linalg.norm(b-SS@xhat)/np.linalg.norm(b))
+
+print("cond(S) = ",np.linalg.cond(SS@np.identity(SS.shape[1])))
+
+'''
+
+##################################################################################
+
 Umats = []
 Vmats = []
 Dmats = []
+L = tree0.nlevels
 
-U0 = HBSmat.Umats[0]
-V0 = HBSmat.Vmats[0]
-D0 = HBSmat.Dmats[0]
+for lvl in range(L-1):
+    
+    Ul = HBSmat.Umats[lvl]
+    Vl = HBSmat.Vmats[lvl]
+    Dl = HBSmat.Dmats[lvl]
+    Nb = len(tree0.get_boxes_level(L-lvl-1))
+    print("lvl//Nb = ",lvl,"//",Nb)
+    n = Ul.shape[0]//Nb
+    k = Ul.shape[1]
+    Umat = np.zeros(shape = (Ul.shape[0],Nb*k))
+    Vmat = np.zeros(shape = (Vl.shape[0],Nb*k))
+    Dmat = np.zeros(shape = (Nb*n,Nb*n))
+    for i in range(Nb):
+        Umat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = Ul[i*n:(i+1)*n,:]
+        Vmat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = Vl[i*n:(i+1)*n,:]
+        Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = Dl[i*n:(i+1)*n,:]
+    Umats+=[Umat]
+    Vmats+=[Vmat]
+    Dmats+=[Dmat]
 
-Nb = len(tree0.get_leaves())
-
-n = U0.shape[0]//Nb
-k0 = U0.shape[1]
-Umat = np.zeros(shape = (U0.shape[0],Nb*k0))
-Vmat = np.zeros(shape = (V0.shape[0],Nb*k0))
-Dmat = np.zeros(shape = (Nb*k0,Nb*k0))
-for i in range(Nb):
-    Umat[i*n:(i+1)*n,:][:,i*k0:(i+1)*k0] = U0[i*n:(i+1)*n,:]
-    Vmat[i*n:(i+1)*n,:][:,i*k0:(i+1)*k0] = V0[i*n:(i+1)*n,:]
-    Dmat[i*k0:(i+1)*k0,:][:,i*k0:(i+1)*k0] = D0[i*k0:(i+1)*k0,:]
-
-Umats+=[Umat]
-Vmats+=[Vmat]
-Dmats+=[Dmat]
-
-################################
-
-U1 = HBSmat.Umats[1]
-V1 = HBSmat.Vmats[1]
-D1 = HBSmat.Dmats[1]
-
-Nb = len(tree0.get_boxes_level(2))
-n = U1.shape[0]//Nb
-k = U1.shape[1]
-Umat = np.zeros(shape = (U1.shape[0],Nb*k))
-Vmat = np.zeros(shape = (V1.shape[0],Nb*k))
-Dmat = np.zeros(shape = (Nb*n,Nb*n))
-for i in range(Nb):
-    Umat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = U1[i*n:(i+1)*n,:]
-    Vmat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = V1[i*n:(i+1)*n,:]
-    Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D1[i*n:(i+1)*n,:]
-
-Umats+=[Umat]
-Vmats+=[Vmat]
-Dmats+=[Dmat]
-
-############################
-U2 = HBSmat.Umats[2]
-V2 = HBSmat.Vmats[2]
-D2 = HBSmat.Dmats[2]
-
-Nb = len(tree0.get_boxes_level(1))
-n = U2.shape[0]//Nb
-k = U2.shape[1]
-Umat = np.zeros(shape = (U2.shape[0],Nb*k))
-Vmat = np.zeros(shape = (V2.shape[0],Nb*k))
-Dmat = np.zeros(shape = (Nb*n,Nb*n))
-for i in range(Nb):
-    Umat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = U2[i*n:(i+1)*n,:]
-    Vmat[i*n:(i+1)*n,:][:,i*k:(i+1)*k] = V2[i*n:(i+1)*n,:]
-    Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D2[i*n:(i+1)*n,:]
-
-Umats+=[Umat]
-Vmats+=[Vmat]
-Dmats+=[Dmat]
-
-############################
-D3 = HBSmat.Dmats[3]
-
+D0 = HBSmat.Dmats[L-1]
 Nb = len(tree0.get_boxes_level(0))
-n = D3.shape[1]
+n = D0.shape[1]
 Dmat = np.zeros(shape = (Nb*n,Nb*n))
 for i in range(Nb):
-    Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D3[i*n:(i+1)*n,:]
-
+    Dmat[i*n:(i+1)*n,:][:,i*n:(i+1)*n] = D0[i*n:(i+1)*n,:]
 
 Dmats+=[Dmat]
-
 
 SHBS = Dmats[-1]
 
@@ -217,11 +207,15 @@ for lvl in range(len(Umats)-1,-1,-1):
     SHBS = Umats[lvl]@SHBS@(Vmats[lvl].T)+Dmats[lvl]
 
 
-print(" SHBS err ",np.linalg.norm(SHBS-Sp,ord=2)/np.linalg.norm(Sp,ord=2))
+perm = []
+
+for leaf in tree0.get_leaves():
+    perm += tree0.get_box_inds(leaf).tolist()
+
 SHBSperm = np.zeros(shape=SHBS.shape)
 SHBSperm[:,perm] = SHBS.copy()
 SHBSperm[perm,:] = SHBSperm
-print(" SS err ",np.linalg.norm(SHBSperm-SS,ord=2)/np.linalg.norm(SS,ord=2))
+#print(" SS err ",np.linalg.norm(SHBSperm-SS,ord=2)/np.linalg.norm(SS,ord=2))
 
 
 v = np.random.standard_normal(size=(SS.shape[1],))
@@ -236,10 +230,18 @@ HBSmat_test.construct(k)
 v = np.random.standard_normal(size=(SS.shape[1],))
 utest = HBSmat_test.matvec(v)
 u = SHBSperm@v
-print("matvec HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
+print("rec matvec HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
 v = np.random.standard_normal(size=(SS.shape[1],))
 utest = HBSmat_test.matvec(v,mode='T')
 u = SHBSperm.T@v
-print("matvecT HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
+print("rec matvecT HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 
+
+
+x = np.random.standard_normal(size = (SS.shape[0],))
+b = SHBSperm@x
+HBSmat_test.compute_ULV()
+xhat = HBSmat_test.solve_ULV(b)
+print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
+'''

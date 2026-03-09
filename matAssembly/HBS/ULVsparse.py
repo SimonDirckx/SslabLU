@@ -240,7 +240,7 @@ def block_diag_add(A,B,NbA,NbB):
         raise(ValueError("put smol frist"))
     return C
 
-def update_U(Q1,Q2,U,Umat,NNvec,Nb):
+def update_U(Q1,Q2,U,Umat,NNvec,Nb,fac=4):
 
     '''
     Update U matrix
@@ -257,8 +257,8 @@ def update_U(Q1,Q2,U,Umat,NNvec,Nb):
     
     U_tmp = np.zeros(shape=(U.shape[0],Umat.shape[1]))
     for i in range(len(NNvec)-1):
-        U_tmp[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],Umat,4*Nb,Nb)
-    U_tmp[NNvec[-1]:,:] = sparse_block_mult(U[NNvec[-1]:,:],Umat,4*Nb,Nb)
+        U_tmp[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],Umat,fac*Nb,Nb)
+    U_tmp[NNvec[-1]:,:] = sparse_block_mult(U[NNvec[-1]:,:],Umat,fac*Nb,Nb)
     U = U_tmp.copy()
     NNtot = NNvec[-1]
     NNu = Q1.shape[1]*Nb
@@ -280,14 +280,14 @@ def compute_Rl(Rprime,W1,R11,NNvec,Nb):
     Rl[NNvec[-2]:NNvec[-1],:] = R11
     return Rl
 
-def compute_Rprime(U,D,Rr,NNvec,Nb):
+def compute_Rprime(U,D,Rr,NNvec,Nb,fac=4):
     Rprime                           = np.zeros(shape = (U.shape[0],D.shape[1]))
     for i in range(len(NNvec)-1):
-        Rprime[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],D,4*Nb,Nb)
-        Rprime[NNvec[i]:NNvec[i+1],:] = block_diag_add(Rprime[NNvec[i]:NNvec[i+1],:],Rr[NNvec[i]:NNvec[i+1],:],Nb,4*Nb)
+        Rprime[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],D,fac*Nb,Nb)
+        Rprime[NNvec[i]:NNvec[i+1],:] = block_diag_add(Rprime[NNvec[i]:NNvec[i+1],:],Rr[NNvec[i]:NNvec[i+1],:],Nb,fac*Nb)
     
-    Rprime[NNvec[-1]:,:]            = sparse_block_mult(U[NNvec[-1]:,:],D,4*Nb,Nb)
-    Rprime[NNvec[-1]:,:]            = block_diag_add(Rprime[NNvec[-1]:,:],Rr[NNvec[-1]:,:],Nb,4*Nb)
+    Rprime[NNvec[-1]:,:]            = sparse_block_mult(U[NNvec[-1]:,:],D,fac*Nb,Nb)
+    Rprime[NNvec[-1]:,:]            = block_diag_add(Rprime[NNvec[-1]:,:],Rr[NNvec[-1]:,:],Nb,fac*Nb)
 
     return Rprime
 
@@ -399,6 +399,8 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     NNRvec = np.append(NNRvec,0)
     NNWvec = np.zeros(shape=(0,),dtype=np.int64)
     NNWvec = np.append(NNWvec,0)
+    fac = Nbvec[-2]//Nbvec[-1]
+    print("fac = ",fac)
     for i in range(len(Dmats)):
         if i==0:
             Rprime = Dmats[0]
@@ -414,9 +416,11 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
             WW = W1.copy()
             Wprev = W2.copy()
         else:
-            Rprime = compute_Rprime(U,Dmats[i],Rr,NNvec,Nbvec[i])
-            Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime[NNvec[-1]:,:],Vmats[i],Nbvec[i])
-            
+            Rprime = compute_Rprime(U,Dmats[i],Rr,NNvec,Nbvec[i],fac)
+            if i<len(Dmats)-1:
+                Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime[NNvec[-1]:,:],Vmats[i],Nbvec[i])
+            else:
+                Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime[NNvec[-1]:,:],np.array(1.),Nbvec[i])
             QQ = sparse_block_mult(Qprev,Q1,Nbvec[i-1],Nbvec[i]).copy()
             WW = sparse_block_mult(Wprev,W1,Nbvec[i-1],Nbvec[i]).copy()
             if i<len(Dmats)-1:
@@ -424,7 +428,7 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
                 print("W2 shape = ",W2.shape)
                 Qprev = sparse_block_mult(Qprev,Q2,Nbvec[i-1],Nbvec[i]).copy()
                 Wprev = sparse_block_mult(Wprev,W2,Nbvec[i-1],Nbvec[i]).copy()
-                U = update_U(Q1,Q2,U,Umats[i],NNvec,Nbvec[i])
+                U = update_U(Q1,Q2,U,Umats[i],NNvec,Nbvec[i],fac)
         
         NNvec = np.append(NNvec,NN+NNvec[-1])
         Qtot = np.append(Qtot,QQ,axis=1)
