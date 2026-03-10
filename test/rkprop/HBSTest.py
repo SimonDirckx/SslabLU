@@ -157,7 +157,7 @@ HBSmat.compute_ULV()
 
 x = np.random.standard_normal(size = (SS.shape[0],))
 b = SS@x
-xhat = HBSmat.solve_ULV(b)
+xhat = HBSmat.solve(b)
 print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
 print("solve res = ",np.linalg.norm(b-SS@xhat)/np.linalg.norm(b))
 
@@ -242,6 +242,6 @@ print("rec matvecT HBS err = ",np.linalg.norm(u-utest)/np.linalg.norm(u))
 x = np.random.standard_normal(size = (SS.shape[0],))
 b = SHBSperm@x
 HBSmat_test.compute_ULV()
-xhat = HBSmat_test.solve_ULV(b)
+xhat = HBSmat_test.solve(b)
 print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
 '''

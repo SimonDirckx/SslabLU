@@ -338,12 +338,21 @@ def apply_Rblock(R,A,lvl,Nbvec,NNvec,NNRvec):
     B[NNsub[-2]:NNsub[-1],:] = apply_sparse_block(Rsub[NNsub[-2]:NNsub[-1],:],A,Nbvec[lvl])
     return B
 
-def apply_Rblock_off_diag(R,A,lvl,Nbvec,NNvec,NNRvec):
-    Rsub = R[:,NNRvec[lvl]:NNRvec[lvl+1]]
-    B =np.zeros(shape = (Rsub.shape[0],A.shape[1]))
-    NNsub = NNvec[:lvl+2]
-    for i in range(len(NNsub)-2):
-        B[NNsub[i]:NNsub[i+1],:] = apply_sparse_block(Rsub[NNsub[i]:NNsub[i+1],:],A,Nbvec[lvl])
+def apply_Rblock_off_diag(R,A,lvl,Nbvec,NNvec,NNRvec,mode='N'):
+    if mode=='N':
+        Rsub = R[:,NNRvec[lvl]:NNRvec[lvl+1]]
+        B =np.zeros(shape = (Rsub.shape[0],A.shape[1]))
+        NNsub = NNvec[:lvl+2]
+        for i in range(len(NNsub)-2):
+            B[NNsub[i]:NNsub[i+1],:] = apply_sparse_block(Rsub[NNsub[i]:NNsub[i+1],:],A,Nbvec[lvl])
+    elif mode=='T':
+        Rsub = R[:,NNRvec[lvl]:NNRvec[lvl+1]]
+        B =np.zeros(shape = (Rsub.shape[1]*Nbvec[lvl],A.shape[1]))
+        NNsub = NNvec[:lvl+2]
+        for i in range(len(NNsub)-2):
+            B += apply_sparse_block(Rsub[NNsub[i]:NNsub[i+1],:],A,Nbvec[lvl],mode='T')
+    else:
+        raise ValueError("mode not recognized")
     return B
 def block_solve(A,B,Nb):
     
@@ -353,17 +362,37 @@ def block_solve(A,B,Nb):
         C[i*n:(i+1)*n,:] = np.linalg.solve(A[i*n:(i+1)*n,:],B[i*n:(i+1)*n,:])
     return C
 
-def solve_R(R,RHS,Nbvec,NNvec,NNRvec):
-    if not RHS.shape[1]:
-        RHS0 = RHS[:,np.newaxis]
+def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N'):
+    if mode=='N':
+        if RHS.ndim==1:
+            RHS0 = RHS[:,np.newaxis]
+        else:
+            RHS0 = RHS
+        u = np.zeros(shape = (NNvec[-1],RHS.shape[1]))
+        u[NNvec[-2]:NNvec[-1],:]=block_solve(R[NNvec[-2]:NNvec[-1],:][:,NNRvec[-2]:NNRvec[-1]],RHS0[NNvec[-2]:NNvec[-1],:],Nbvec[-1])
+        lvl = len(NNvec)-2
+        if lvl>0:
+            RHS00 = (RHS0 - apply_Rblock_off_diag(R,u[NNvec[-2]:NNvec[-1],:],lvl,Nbvec,NNvec,NNRvec)).copy()
+            u[:NNvec[-2],:] = solve_R(R[:,:NNRvec[-2]],RHS00,Nbvec[:lvl],NNvec[:lvl+1],NNRvec[:lvl+1])
+    elif mode == 'T':
+        if RHS.ndim==1:
+            RHS0 = RHS[:,np.newaxis]
+        else:
+            RHS0 = RHS
+        
+        u = np.zeros(shape = (NNvec[1]-NNvec[0],RHS.shape[1]))
+        u[NNvec[0]:NNvec[1],:]=block_solve(R[NNvec[0]:NNvec[1],:][:,NNRvec[0]:NNRvec[1]],RHS0[NNvec[0]:NNvec[1],:],Nbvec[0])
+        lvl = len(NNvec)-2
+        print("lvl = ",lvl)
+        if lvl>0:
+            RHS00 = RHS0.copy()
+            rhat = apply_Rblock_off_diag(R,u[NNvec[0]:NNvec[1],:],lvl,Nbvec,NNvec,NNRvec,mode='T')
+            print("rhat shape = ",rhat.shape)
+            print("NNvec = ",NNvec)
+            RHS00[NNvec[1]:NNvec[2],:] -= rhat
+            u[NNvec[1]:,:] = solve_R(R[:,NNRvec[1]:],RHS00,Nbvec[:lvl],NNvec[:lvl+1],NNRvec[:lvl+1],mode='T')
     else:
-        RHS0 = RHS
-    u = np.zeros(shape = (NNvec[-1],RHS.shape[1]))
-    u[NNvec[-2]:NNvec[-1],:]=block_solve(R[NNvec[-2]:NNvec[-1],:][:,NNRvec[-2]:NNRvec[-1]],RHS0[NNvec[-2]:NNvec[-1],:],Nbvec[-1])
-    lvl = len(NNvec)-2
-    if lvl>0:
-        RHS00 = (RHS0 - apply_Rblock_off_diag(R,u[NNvec[-2]:NNvec[-1],:],lvl,Nbvec,NNvec,NNRvec)).copy()
-        u[:NNvec[-2],:] = solve_R(R[:,:NNRvec[-2]],RHS00,Nbvec[:lvl],NNvec[:lvl+1],NNRvec[:lvl+1])    
+        raise ValueError("mode not recognized")
     return u
 
 

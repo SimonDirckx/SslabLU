@@ -131,6 +131,8 @@ class HBSMAT:
             self.fac = 4
         else:
             self.fac = 2
+        self.shape = A.shape
+        self.dtype = A.dtype
     
     def construct(self,rk):
         # we compute an HBS compression of permuted op
@@ -240,16 +242,31 @@ class HBSMAT:
     def compute_ULV(self):
         self.Qtot,self.Rtot,self.Wtot,self.NNvec,self.NNQvec,self.NNRvec,self.NNWvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
-    def solve_ULV(self,b):
-        if b.ndim==1:
-            bperm = b[self.perm,np.newaxis]    
+    def solve(self,b,mode='N'):
+        if mode=='N':
+            if b.ndim==1:
+                bperm = b[self.perm,np.newaxis]    
+            else:
+                bperm= b[self.perm,:]
+            rhs = ULVsparse.apply_cbd(self.Qtot,bperm,self.Nbvec,self.NNvec,self.NNQvec,mode='T')
+            uhat = ULVsparse.solve_R(self.Rtot,rhs,self.Nbvec,self.NNvec,self.NNRvec)
+            uperm = ULVsparse.apply_cbd(self.Wtot,uhat,self.Nbvec,self.NNvec,self.NNQvec)
+            u = np.zeros(shape = uperm.shape)
+            u[self.perm,:] = uperm
+            if b.ndim==1:
+                u = u.flatten()
+        elif mode == 'T':
+            if b.ndim==1:
+                bperm = b[self.perm,np.newaxis]    
+            else:
+                bperm= b[self.perm,:]
+            rhs = ULVsparse.apply_cbd(self.Wtot,bperm,self.Nbvec,self.NNvec,self.NNQvec,mode='T')
+            uhat = ULVsparse.solve_R(self.Rtot,rhs,self.Nbvec,self.NNvec,self.NNRvec,mode='T')
+            uperm = ULVsparse.apply_cbd(self.Qtot,uhat,self.Nbvec,self.NNvec,self.NNQvec)
+            u = np.zeros(shape = uperm.shape)
+            u[self.perm,:] = uperm
+            if b.ndim==1:
+                u = u.flatten()
         else:
-            bperm= b[self.perm,:]
-        rhs = ULVsparse.apply_cbd(self.Qtot,bperm,self.Nbvec,self.NNvec,self.NNQvec,mode='T')
-        uhat = ULVsparse.solve_R(self.Rtot,rhs,self.Nbvec,self.NNvec,self.NNRvec)
-        uperm = ULVsparse.apply_cbd(self.Wtot,uhat,self.Nbvec,self.NNvec,self.NNQvec)
-        u = np.zeros(shape = uperm.shape)
-        u[self.perm,:] = uperm
-        if b.ndim==1:
-            u = u.flatten()
+            raise ValueError("mode not recognized")
         return u

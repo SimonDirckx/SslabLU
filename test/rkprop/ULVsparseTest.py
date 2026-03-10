@@ -297,6 +297,14 @@ b = SHBS@x
 
 
 
+Qtotmat = ULVsparse.apply_cbd(Qtot,np.identity(Qtot.shape[0]),Nbvec,NNvec,NNQvec,mode='T')
+Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec)
+
+SS = Qtotmat@SHBS@Wtotmat
+plt.figure(10)
+plt.spy(SS.T,precision = 1e-8)
+plt.show()
+
 ticSolve = time.time()
 u = np.linalg.solve(SHBS,b)
 tocSolve = time.time()
@@ -304,6 +312,7 @@ tocSolve = time.time()
 ticSolveULV = time.time()
 rhs = ULVsparse.apply_cbd(Qtot,b,Nbvec,NNvec,NNQvec,mode='T')
 uhat = ULVsparse.solve_R(Rtot,rhs,Nbvec,NNvec,NNRvec)
+uhat0 = ULVsparse.solve_R(Rtot,rhs,Nbvec,NNvec,NNRvec,mode='T')
 u = ULVsparse.apply_cbd(Wtot,uhat,Nbvec,NNvec,NNQvec)
 tocSolveULV = time.time()
 
@@ -312,15 +321,6 @@ print("solve time = ", tocSolve-ticSolve)
 print("solve ULV time = ", tocSolveULV-ticSolveULV)
 print("ULV fact. time = ", tocULV-ticULV)
 
-Qtotmat = ULVsparse.apply_cbd(Qtot,np.identity(Qtot.shape[0]),Nbvec,NNvec,NNQvec,mode='T')
-Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec)
 
-SS = Qtotmat@SHBS@Wtotmat
-SW = SHBS@Wtotmat
-plt.figure(10)
-plt.spy(SS,precision = 1e-8)
-plt.figure(11)
-plt.spy(SW,precision = 1e-8)
-plt.show()
 
 
