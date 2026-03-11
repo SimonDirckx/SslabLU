@@ -354,12 +354,19 @@ def apply_Rblock_off_diag(R,A,lvl,Nbvec,NNvec,NNRvec,mode='N'):
     else:
         raise ValueError("mode not recognized")
     return B
-def block_solve(A,B,Nb):
-    
-    n = A.shape[0]//Nb
-    C = np.zeros(shape = (A.shape[0],B.shape[1]))
-    for i in range(Nb):
-        C[i*n:(i+1)*n,:] = np.linalg.solve(A[i*n:(i+1)*n,:],B[i*n:(i+1)*n,:])
+def block_solve(A,B,Nb,mode='N'):
+    if mode == 'N':
+        n = A.shape[0]//Nb
+        C = np.zeros(shape = (A.shape[0],B.shape[1]))
+        for i in range(Nb):
+            C[i*n:(i+1)*n,:] = np.linalg.solve(A[i*n:(i+1)*n,:],B[i*n:(i+1)*n,:])
+    elif mode=='T':
+        n = A.shape[0]//Nb
+        C = np.zeros(shape = (A.shape[0],B.shape[1]))
+        for i in range(Nb):
+            C[i*n:(i+1)*n,:] = np.linalg.solve(A[i*n:(i+1)*n,:].T,B[i*n:(i+1)*n,:])
+    else:
+        raise ValueError("Mode not recognized")
     return C
 
 def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N'):
@@ -379,18 +386,19 @@ def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N'):
             RHS0 = RHS[:,np.newaxis]
         else:
             RHS0 = RHS
-        
-        u = np.zeros(shape = (NNvec[1]-NNvec[0],RHS.shape[1]))
-        u[NNvec[0]:NNvec[1],:]=block_solve(R[NNvec[0]:NNvec[1],:][:,NNRvec[0]:NNRvec[1]],RHS0[NNvec[0]:NNvec[1],:],Nbvec[0])
-        lvl = len(NNvec)-2
-        print("lvl = ",lvl)
-        if lvl>0:
-            RHS00 = RHS0.copy()
+        u = np.zeros(shape = (NNvec[-1],RHS.shape[1]) )#R is assumed square
+        u[NNvec[0]:NNvec[1],:]=block_solve(R[NNvec[0]:NNvec[1],:][:,NNRvec[0]:NNRvec[1]],RHS0[NNvec[0]:NNvec[1],:],Nbvec[0],mode='T')
+        lvl = 1
+        if lvl<len(NNvec)-1:
             rhat = apply_Rblock_off_diag(R,u[NNvec[0]:NNvec[1],:],lvl,Nbvec,NNvec,NNRvec,mode='T')
             print("rhat shape = ",rhat.shape)
             print("NNvec = ",NNvec)
-            RHS00[NNvec[1]:NNvec[2],:] -= rhat
-            u[NNvec[1]:,:] = solve_R(R[:,NNRvec[1]:],RHS00,Nbvec[:lvl],NNvec[:lvl+1],NNRvec[:lvl+1],mode='T')
+            start = NNvec[1]
+            stop = NNvec[2]
+            print("start = ",start)
+            print("stop = ",stop)
+            RHS0[start:stop,:] -= rhat
+            u[NNvec[1]:,:] = solve_R(R[:,NNRvec[1]:],RHS0,Nbvec[1:],NNvec[1:],NNRvec[1:],mode='T')
     else:
         raise ValueError("mode not recognized")
     return u
