@@ -369,7 +369,7 @@ def block_solve(A,B,Nb,mode='N'):
         raise ValueError("Mode not recognized")
     return C
 
-def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N'):
+def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N',lvl=0):
     if mode=='N':
         if RHS.ndim==1:
             RHS0 = RHS[:,np.newaxis]
@@ -386,19 +386,11 @@ def solve_R(R,RHS,Nbvec,NNvec,NNRvec,mode='N'):
             RHS0 = RHS[:,np.newaxis]
         else:
             RHS0 = RHS
-        u = np.zeros(shape = (NNvec[-1],RHS.shape[1]) )#R is assumed square
-        u[NNvec[0]:NNvec[1],:]=block_solve(R[NNvec[0]:NNvec[1],:][:,NNRvec[0]:NNRvec[1]],RHS0[NNvec[0]:NNvec[1],:],Nbvec[0],mode='T')
-        lvl = 1
-        if lvl<len(NNvec)-1:
-            rhat = apply_Rblock_off_diag(R,u[NNvec[0]:NNvec[1],:],lvl,Nbvec,NNvec,NNRvec,mode='T')
-            print("rhat shape = ",rhat.shape)
-            print("NNvec = ",NNvec)
-            start = NNvec[1]
-            stop = NNvec[2]
-            print("start = ",start)
-            print("stop = ",stop)
-            RHS0[start:stop,:] -= rhat
-            u[NNvec[1]:,:] = solve_R(R[:,NNRvec[1]:],RHS0,Nbvec[1:],NNvec[1:],NNRvec[1:],mode='T')
+        u = np.zeros(shape = (NNvec[-1]-NNvec[lvl],RHS.shape[1]) )#R is assumed square
+        u[:NNvec[lvl+1]-NNvec[lvl],:] = block_solve(R[NNvec[lvl]:NNvec[lvl+1],:][:,NNRvec[lvl]:NNRvec[lvl+1]],RHS0[NNvec[lvl]:NNvec[lvl+1],:],Nbvec[lvl],mode='T')
+        if lvl<len(NNvec)-2:
+            RHS0[NNvec[lvl+1]:NNvec[lvl+2],:] -= apply_Rblock_off_diag(R,u,lvl+1,Nbvec,NNvec,NNRvec,mode='T')
+            u[NNvec[lvl+1]-NNvec[lvl]:,:] = solve_R(R,RHS0,Nbvec,NNvec,NNRvec,mode='T',lvl=lvl+1)
     else:
         raise ValueError("mode not recognized")
     return u
@@ -475,8 +467,12 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         NNWvec=np.append(NNWvec,NNWvec[-1]+WW.shape[1])
         
         Rl = compute_Rl(Rprime,W1,R11,NNvec,Nbvec[i])
-
         Rtot = np.append(Rtot,Rl,axis=1)
+        plt.figure(111)
+        plt.spy(Rl,precision=1e-8)
+        plt.figure(112)
+        plt.spy(Rtot,precision=1e-8)
+        plt.show()
         NNRvec=np.append(NNRvec,NNRvec[-1]+Rl.shape[1])
         if i<len(Dmats)-1:
             Rr = compute_Rr(Rprime,R12,R22,W2,NNvec,Nbvec[i])

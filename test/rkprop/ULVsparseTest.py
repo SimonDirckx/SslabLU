@@ -301,8 +301,13 @@ Qtotmat = ULVsparse.apply_cbd(Qtot,np.identity(Qtot.shape[0]),Nbvec,NNvec,NNQvec
 Wtotmat = ULVsparse.apply_cbd(Wtot,np.identity(Wtot.shape[0]),Nbvec,NNvec,NNQvec)
 
 SS = Qtotmat@SHBS@Wtotmat
+rhsT = SS.T@x
+#uhatT = ULVsparse.solve_R(Rtot,rhsT,Nbvec,NNvec,NNRvec,mode='T')
+#print("T err = ",np.linalg.norm(uhatT-x))
+#print("T nrm = ",np.linalg.norm(uhatT))
+
 plt.figure(10)
-plt.spy(SS.T,precision = 1e-8)
+plt.spy(SS,precision = 1e-8)
 plt.show()
 
 ticSolve = time.time()
@@ -312,7 +317,7 @@ tocSolve = time.time()
 ticSolveULV = time.time()
 rhs = ULVsparse.apply_cbd(Qtot,b,Nbvec,NNvec,NNQvec,mode='T')
 uhat = ULVsparse.solve_R(Rtot,rhs,Nbvec,NNvec,NNRvec)
-uhat0 = ULVsparse.solve_R(Rtot,rhs,Nbvec,NNvec,NNRvec,mode='T')
+
 u = ULVsparse.apply_cbd(Wtot,uhat,Nbvec,NNvec,NNQvec)
 tocSolveULV = time.time()
 
