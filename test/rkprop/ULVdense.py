@@ -47,40 +47,38 @@ def compute_QRW(Dtot,Vtot,Nb):
 
 
 
-def compute_ULV(Umats,Dmats,Vmats,nl,k0,n,k,Nbvec,SHBS):
-    
-    
-    U = np.identity(Umats[0].shape[0])
-    Rtot = np.zeros(shape = (Dmats[0].shape[0],0))
-    Qtot = np.identity(Dmats[0].shape[0])
-    Wtot = np.identity(Dmats[0].shape[1])
+def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     
     NNvec = np.zeros(shape=(0,),dtype=np.int64)
     NNvec = np.append(NNvec,0)
+    Qlist = []
+    Wlist = []
+    Ulist  = []
+    Rlist = []
+    R_off_list = []
     for i in range(len(Dmats)):
+        print("lvl = ",i)
         
         if i==0:
             Rprime = Dmats[0]
             Q,W,R_11,R_12,R_22,NN = compute_QRW(Rprime,Vmats[0],Nbvec[0])
         else:
-            Rprime = U@Dmats[i]+Rprime[:,NN:]
-            Q,W,R_11,R_12,R_22,NN = compute_QRW(Rprime[NNtot+NN:,:],Vmats[i],Nbvec[i])
+            
+            Rhat = (Ulist[-1]@Dmats[i]+R_22)
+            if i<len(Vmats):
+                Q,W,R_11,R_12,R_22,NN = compute_QRW(Rhat,Vmats[i],Nbvec[i])
+            else:
+                Q,W,R_11,R_12,R_22,NN = compute_QRW(Rhat,None,Nbvec[i])
         
-        U = U@Umats[i]
-        NNtot = np.sum(NNvec)
-        U[NNtot:,:] = Q.T@U[NNtot:,:]        
-        plt.figure(1)
-        plt.spy(U,precision = 1e-8)
-        plt.show()
-        Rprime[NNtot:,:] = Q.T@Rprime[NNtot:,:]
-        Rprime = Rprime@W
-        
-        Qtot[:,NNtot:] = Qtot[:,NNtot:]@Q
-        Wtot[:,NNtot:] = Wtot[:,NNtot:]@W
-        NNvec = np.append(NNvec,NN) 
-        Rtot = np.append(Rtot,Rprime[:,:NN],axis=1)
-        plt.figure(1)
-        plt.spy(SHBS@Wtot,precision=1e-8)
-        plt.show()
-    return Qtot,Rtot,Wtot
+        NNvec = np.append(NNvec,NNvec[-1]+NN)
+        if i<len(Umats):
+            if i == 0:
+                Ulist+=[Q[:,NNvec[-1]:].T@Umats[0]]
+            else:
+                Ulist+=[Q[:,NNvec[-1]-NNvec[-2]:].T@Ulist[-1]@Umats[i]]
+        Qlist+=[Q]
+        Wlist+=[W]
+        Rlist+=[R_11]
+        R_off_list+=[R_12]
+    return Qlist,Wlist,Ulist,Rlist,R_off_list,NNvec
 

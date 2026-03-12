@@ -149,13 +149,13 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         R22 = np.zeros(shape = (Nb*k,k))
         tinit = time.time()-tic
         for box_ind in range(Nb):
-            V       = Vtot[box_ind*n:(box_ind+1)*n,:]
+            Vt       = torch.from_numpy(Vtot[box_ind*n:(box_ind+1)*n,:])
             tic = time.time()
-            [_,_,Ur] = np.linalg.svd(V.T)#svd needed here, otherwise accuracy not guaranteed
+            Vr,_ = tla.qr(Vt,mode='complete')#svd needed here, otherwise accuracy not guaranteed
             tVc += time.time()-tic
-            Vr = Ur.T
+            Vr = (Vr.detach().cpu().numpy())
             Vr = Vr[:,k:]
-            W       = np.append(Vr,V,axis=1)
+            W       = np.append(Vr,Vtot[box_ind*n:(box_ind+1)*n,:],axis=1)
             D       = torch.from_numpy((Dtot[box_ind*n:(box_ind+1)*n,:]@W))
             tic = time.time()
             [Q,R]   = tla.qr(D,mode = 'reduced')
