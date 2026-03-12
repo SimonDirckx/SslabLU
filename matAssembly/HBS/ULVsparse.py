@@ -117,6 +117,10 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
 
     '''
     
+    tVc = 0
+    tQ = 0
+    tmv = 0
+    tinit = 0
     if Nb==1:
         D = Dtot
         [Q,R] = np.linalg.qr(D)
@@ -132,6 +136,7 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         NN = R.shape[0]
 
     else:
+        tic = time.time()
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
@@ -142,16 +147,20 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         R11 = np.zeros(shape = (NN,n-k))
         R12 = np.zeros(shape = (NN,k))
         R22 = np.zeros(shape = (Nb*k,k))
-        
+        tinit = time.time()-tic
         for box_ind in range(Nb):
             V       = Vtot[box_ind*n:(box_ind+1)*n,:]
-            Vt = torch.from_numpy(V.T)
-            [_,_,Ur] = tla.svd(Vt)#svd needed here, otherwise accuracy not guaranteed
+            tic = time.time()
+            [_,_,Ur] = np.linalg.svd(V.T)#svd needed here, otherwise accuracy not guaranteed
+            tVc += time.time()-tic
             Vr = Ur.T
             Vr = Vr[:,k:]
             W       = np.append(Vr,V,axis=1)
-            D       = torch.from_numpy((Dtot[box_ind*n:(box_ind+1)*n,:]@W))# torch qr much faster
+            D       = torch.from_numpy((Dtot[box_ind*n:(box_ind+1)*n,:]@W))
+            tic = time.time()
             [Q,R]   = tla.qr(D,mode = 'reduced')
+            tQ+=time.time()-tic
+            tic = time.time()
             Q1[box_ind*n:(box_ind+1)*n,:]           = Q[:,:n-k]
             Q2[box_ind*n:(box_ind+1)*n,:]           = Q[:,n-k:]
             W1[box_ind*n:(box_ind+1)*n,:]           = W[:,:n-k]
@@ -159,7 +168,8 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
             R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,:n-k][:n-k,:]
             R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,n-k:][:n-k,:]
             R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
-            
+            tmv += time.time()-tic
+    print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
     return Q1,Q2,W1,W2,R11,R12,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
@@ -460,11 +470,16 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         tic_step1 = time.time()
         if i==0:
             Rprime = Dmats[0]
+            tic_QRW1 = time.time()
             Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            toc_QRW1 = time.time()
+            print(" time QRW 1 = ",toc_QRW1-tic_QRW1)
+            tic_U1 = time.time()
             U = np.zeros(shape = Umats[0].shape)
             U[:NN,:] = sparse_block_mult(Q1,Umats[0],Nbvec[0],Nbvec[0],mode='T')
             U[NN:,:] = sparse_block_mult(Q2,Umats[0],Nbvec[0],Nbvec[0],mode='T')
-            
+            toc_U1 = time.time()
+            print(" time U1 = ",toc_U1-tic_U1)
             QQ = Q1
             Qprev = Q2
 
@@ -482,6 +497,9 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
                 Qprev = sparse_block_mult(Qprev,Q2,Nbvec[i-1],Nbvec[i])
                 Wprev = sparse_block_mult(Wprev,W2,Nbvec[i-1],Nbvec[i])
                 U = update_U(Q1,Q2,U,Umats[i],NNvec,Nbvec[i],fac)
+        toc_step1 = time.time()
+        print(" time step 1 = ",toc_step1-tic_step1)
+        tic_step2 = time.time()
         NNvec = np.append(NNvec,NN+NNvec[-1])
         Qtot = np.append(Qtot,QQ,axis=1)
         NNQvec=np.append(NNQvec,NNQvec[-1]+QQ.shape[1])
@@ -494,8 +512,8 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         NNRvec=np.append(NNRvec,NNRvec[-1]+Rl.shape[1])
         if i<len(Dmats)-1:
             Rr = compute_Rr(Rprime,R12,R22,W2,NNvec,Nbvec[i])
-        
-        
+        toc_step2 = time.time()
+        print(" time step 2 = ",toc_step2-tic_step2)
         
     return Qtot,Rtot,Wtot,NNvec,NNQvec,NNRvec,NNWvec
 

@@ -19,10 +19,10 @@ from matplotlib.colors import ListedColormap
 
 import matAssembly.HBS.ULVsparse as ULVsparse
 import time
-N = 2**18
+N = 2**16
 nl = 16*16
 Nleaves = N//nl
-k = 128
+k = 32
 k0 = min(nl,k)
 L = (int)(np.log2(Nleaves))//2 + 1
 
