@@ -1,7 +1,10 @@
 
 import numpy as np
+import scipy.linalg as splinalg
 import matplotlib.pyplot as plt
-
+import time
+import torch
+import torch.linalg as tla
 
 
 '''
@@ -114,7 +117,6 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
 
     '''
     
-
     if Nb==1:
         D = Dtot
         [Q,R] = np.linalg.qr(D)
@@ -128,6 +130,7 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         W1 = np.identity(R.shape[1])
         W2 = 0
         NN = R.shape[0]
+
     else:
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
@@ -139,15 +142,16 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         R11 = np.zeros(shape = (NN,n-k))
         R12 = np.zeros(shape = (NN,k))
         R22 = np.zeros(shape = (Nb*k,k))
+        
         for box_ind in range(Nb):
             V       = Vtot[box_ind*n:(box_ind+1)*n,:]
-            [_,_,Ur] = np.linalg.svd(V.T)#svd needed here, otherwise accuracy not guaranteed
+            Vt = torch.from_numpy(V.T)
+            [_,_,Ur] = tla.svd(Vt)#svd needed here, otherwise accuracy not guaranteed
             Vr = Ur.T
             Vr = Vr[:,k:]
             W       = np.append(Vr,V,axis=1)
-            D       = Dtot[box_ind*n:(box_ind+1)*n,:]
-            [Q,R]   = np.linalg.qr(D@W,mode='reduced')
-            
+            D       = torch.from_numpy((Dtot[box_ind*n:(box_ind+1)*n,:]@W))# torch qr much faster
+            [Q,R]   = tla.qr(D,mode = 'reduced')
             Q1[box_ind*n:(box_ind+1)*n,:]           = Q[:,:n-k]
             Q2[box_ind*n:(box_ind+1)*n,:]           = Q[:,n-k:]
             W1[box_ind*n:(box_ind+1)*n,:]           = W[:,:n-k]
@@ -155,6 +159,7 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
             R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,:n-k][:n-k,:]
             R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,n-k:][:n-k,:]
             R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
+            
     return Q1,Q2,W1,W2,R11,R12,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
@@ -259,12 +264,11 @@ def update_U(Q1,Q2,U,Umat,NNvec,Nb,fac=4):
     for i in range(len(NNvec)-1):
         U_tmp[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],Umat,fac*Nb,Nb)
     U_tmp[NNvec[-1]:,:] = sparse_block_mult(U[NNvec[-1]:,:],Umat,fac*Nb,Nb)
-    U = U_tmp
+    U = U_tmp.copy()
     NNtot = NNvec[-1]
     NNu = Q1.shape[1]*Nb
     U[NNtot:NNtot+NNu,:] = sparse_block_mult(Q1,U_tmp[NNtot:,:],Nb,Nb,mode='T')
     U[NNtot+NNu:,:] = sparse_block_mult(Q2,U_tmp[NNtot:,:],Nb,Nb,mode='T')
-    
     return U
 def compute_Rr(Rprime,R12,R22,W2,NNvec,Nb):
     Rr = np.zeros(shape = (Rprime.shape[0],R12.shape[1]))
@@ -392,7 +396,6 @@ def solve_R(R,RHS0,Nbvec,NNvec,NNRvec,mode='N'):
         u = np.zeros(shape = (NNvec[-1],RHS.shape[1]))
         for lvl in range(len(NNRvec)-2,-1,-1):
             if lvl == len(NNRvec)-2:
-                
                 u[NNvec[lvl]:NNvec[lvl+1],:]=block_solve(R[NNvec[lvl]:NNvec[lvl+1],:][:,NNRvec[lvl]:NNRvec[lvl+1]],RHS[NNvec[lvl]:NNvec[lvl+1],:],Nbvec[lvl])
             else:
                 
@@ -454,12 +457,14 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     fac = Nbvec[-2]//Nbvec[-1]
     
     for i in range(len(Dmats)):
+        tic_step1 = time.time()
         if i==0:
             Rprime = Dmats[0]
             Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
             U = np.zeros(shape = Umats[0].shape)
             U[:NN,:] = sparse_block_mult(Q1,Umats[0],Nbvec[0],Nbvec[0],mode='T')
             U[NN:,:] = sparse_block_mult(Q2,Umats[0],Nbvec[0],Nbvec[0],mode='T')
+            
             QQ = Q1
             Qprev = Q2
 
@@ -477,7 +482,6 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
                 Qprev = sparse_block_mult(Qprev,Q2,Nbvec[i-1],Nbvec[i])
                 Wprev = sparse_block_mult(Wprev,W2,Nbvec[i-1],Nbvec[i])
                 U = update_U(Q1,Q2,U,Umats[i],NNvec,Nbvec[i],fac)
-        
         NNvec = np.append(NNvec,NN+NNvec[-1])
         Qtot = np.append(Qtot,QQ,axis=1)
         NNQvec=np.append(NNQvec,NNQvec[-1]+QQ.shape[1])
@@ -490,6 +494,8 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         NNRvec=np.append(NNRvec,NNRvec[-1]+Rl.shape[1])
         if i<len(Dmats)-1:
             Rr = compute_Rr(Rprime,R12,R22,W2,NNvec,Nbvec[i])
+        
+        
         
     return Qtot,Rtot,Wtot,NNvec,NNQvec,NNRvec,NNWvec
 
