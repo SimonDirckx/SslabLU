@@ -227,8 +227,8 @@ print("compression = ",dataHBS/Sp.nbytes)
 
 n = 4*k
 Dmats = [Dtot1,Dtot2,Dtot3,Dtot4]
-Vmats = [Vtot1,Vtot2,Vtot3,1]
-Umats = [Utot1,Utot2,Utot3,np.identity(n)]
+Vmats = [Vtot1,Vtot2,Vtot3]
+Umats = [Utot1,Utot2,Utot3]
 Nbvec = [len(tree_perm.get_boxes_level(tree_perm.nlevels-1)),len(tree_perm.get_boxes_level(tree_perm.nlevels-2)),\
          len(tree_perm.get_boxes_level(tree_perm.nlevels-3)),len(tree_perm.get_boxes_level(tree_perm.nlevels-4))]
 

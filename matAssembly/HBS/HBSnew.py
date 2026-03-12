@@ -111,29 +111,42 @@ class HBSMAT:
 
     """
 
-    def __init__(self,A,tree,quad=True):
+    def __init__(self,A=None,tree=None,quad=True):
         self.Umats  =   []
         self.Vmats  =   []
         self.Dmats  =   []
         self.nbytes =   0
-        self.A      =   A
-        self.shape  =   self.A.shape
-        self.perm   =   tree.perm_leaf
+        if A is not None:
+            self.A      =   A
+            self.shape  =   self.A.shape
+            self.shape = A.shape
+            self.dtype = A.dtype
+
+        if tree is not None:
+            self.perm   =   tree.perm_leaf
+            self.Nb = tree.nleaves
+            self.nl = self.A.shape[0]//self.Nb
+            self.L = tree.nlevels
         self.blockSolveTime = 0
         self.nullTime = 0
         self.setupTime = 0
         self.DTime = 0
-        self.Nb = tree.nleaves
-        self.nl = self.A.shape[0]//self.Nb
-        self.L = tree.nlevels
+        
         self.Nbvec = []
         if quad:
             self.fac = 4
         else:
             self.fac = 2
-        self.shape = A.shape
-        self.dtype = A.dtype
-    
+        
+    def set_mats(self,Umats,Dmats,Vmats,Nbvec,fac=4):
+        self.Umats = Umats
+        self.Dmats = Dmats
+        self.Vmats = Vmats
+        self.perm = np.arange(Dmats[0].shape[0])
+        self.fac = fac
+        self.Nbvec = Nbvec
+        self.Nb = Nbvec[0]
+        self.shape = [Dmats[0].shape[0],Dmats[0].shape[0]]
     def construct(self,rk):
         # we compute an HBS compression of permuted op
         
