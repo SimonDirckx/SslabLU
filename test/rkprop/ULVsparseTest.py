@@ -21,14 +21,14 @@ import matAssembly.HBS.ULVsparse as ULVsparse
 import ULVdense
 import time
 
-nl = 8*8
-L = 8
+nl = 16*16
+L = 7
 N = (4**(L-1))*nl
 
 Nleaves = N//nl
 Lcheck = (int)(np.log2(Nleaves))//2 + 1
 print("L-Lcheck = ",L-Lcheck)
-k = nl
+k = 32
 k0 = min(nl,k)
 
 

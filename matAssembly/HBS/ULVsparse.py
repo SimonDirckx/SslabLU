@@ -15,6 +15,15 @@ Q,R,W given in reduced format
 
 '''
 
+def block_qr(A,n,k,Nb):
+    C = torch.zeros(size = (n*Nb,n-k))
+    for i in range(Nb):
+        Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
+        C[i*n:(i+1)*n,:] = Q[:,k:]
+    return C
+
+
+
 
 def compute_QRW_sparse(Dtot,Vtot,Nb):
     
@@ -51,28 +60,32 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         Q1 = np.zeros(shape = (Nb*n,n-k))
         Q2 = np.zeros(shape = (Nb*n,k))
         W1 = np.zeros(shape = (Nb*n,n-k))
-        W2 = np.zeros(shape = (Nb*n,k))
+        W2 = Vtot[:,:k]
         R11 = np.zeros(shape = (NN,n-k))
         R12 = np.zeros(shape = (NN,k))
         R22 = np.zeros(shape = (Nb*k,k))
         tinit = time.time()-tic
+        tic = time.time()
+        print("n = ",n)
+        print("k = ",k)
+        if n>k:
+            W1 = (block_qr(torch.from_numpy(W2),n,k,Nb)).detach().cpu().numpy()
+        else:
+            W1 = np.zeros(shape=(n*Nb,0))
+        tVc+=time.time()-tic
         for box_ind in range(Nb):
-            Vt       = torch.from_numpy(Vtot[box_ind*n:(box_ind+1)*n,:])
             tic = time.time()
-            Vr,_ = tla.qr(Vt,mode='complete')#svd needed here, otherwise accuracy not guaranteed
-            tVc += time.time()-tic
-            Vr = (Vr.detach().cpu().numpy())
-            Vr = Vr[:,k:]
-            W       = np.append(Vr,Vtot[box_ind*n:(box_ind+1)*n,:],axis=1)
-            D       = torch.from_numpy((Dtot[box_ind*n:(box_ind+1)*n,:]@W))
-            tic = time.time()
-            [Q,R]   = tla.qr(D,mode = 'reduced')
+            if n>k:
+                D = Dtot[box_ind*n:(box_ind+1)*n,:]@np.append(W1[box_ind*n:(box_ind+1)*n,:],W2[box_ind*n:(box_ind+1)*n,:],axis = 1)
+            else:
+                D = Dtot[box_ind*n:(box_ind+1)*n,:]@W2[box_ind*n:(box_ind+1)*n,:]
+            [Q,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
+            Q = (Q.detach().cpu().numpy())
+            R = (R.detach().cpu().numpy())
             tQ+=time.time()-tic
             tic = time.time()
             Q1[box_ind*n:(box_ind+1)*n,:]           = Q[:,:n-k]
             Q2[box_ind*n:(box_ind+1)*n,:]           = Q[:,n-k:]
-            W1[box_ind*n:(box_ind+1)*n,:]           = W[:,:n-k]
-            W2[box_ind*n:(box_ind+1)*n,:]           = W[:,n-k:]
             R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,:n-k][:n-k,:]
             R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,n-k:][:n-k,:]
             R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
