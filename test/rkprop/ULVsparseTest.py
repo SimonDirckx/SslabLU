@@ -18,14 +18,18 @@ import scipy.linalg as sclinalg
 from matplotlib.colors import ListedColormap
 
 import matAssembly.HBS.ULVsparse as ULVsparse
+import ULVdense
 import time
 
-N = 2**18
-nl = 16*16
+nl = 8*8
+L = 8
+N = (4**(L-1))*nl
+
 Nleaves = N//nl
-k = 32
+Lcheck = (int)(np.log2(Nleaves))//2 + 1
+print("L-Lcheck = ",L-Lcheck)
+k = nl
 k0 = min(nl,k)
-L = (int)(np.log2(Nleaves))//2 + 1
 
 
 Nb = Nleaves
@@ -64,8 +68,10 @@ for ind in range(1,L):
     Dmats += [Dtot_sparse]
 
 
+SHBS0 = HBSnew.HBSMAT()
+SHBS0.set_mats(Umats,Dmats,Vmats,Nbvec)
 ticULV = time.time()
-Qtot,Rtot,Wtot,NNvec,NNQvec,NNRvec,NNWvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,Nbvec)
+Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,Nbvec)
 tocULV = time.time()
 
 
@@ -74,20 +80,11 @@ SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
 x= np.random.standard_normal(size=(SHBS.shape[1],2))
 b = SHBS.matvec(x)
 
-
 ticSolveULV = time.time()
-rhs = ULVsparse.apply_cbd(Qtot,b,Nbvec,NNvec,NNQvec,mode='T')
-uhat = ULVsparse.solve_R(Rtot,rhs,Nbvec,NNvec,NNRvec)
-u = ULVsparse.apply_cbd(Wtot,uhat,Nbvec,NNvec,NNQvec)
+xhat = ULVsparse.solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,b)
 tocSolveULV = time.time()
 
-
-
-print("solve err = ",np.linalg.norm(u-x)/np.linalg.norm(x))
+print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
 print("solve ULV time = ", tocSolveULV-ticSolveULV)
 print("ULV fact. time = ", tocULV-ticULV)
 print("Ndofs = ", SHBS.shape[0])
-
-
-
-

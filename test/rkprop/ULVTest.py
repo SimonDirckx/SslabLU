@@ -16,12 +16,16 @@ import scipy.linalg as sclinalg
 
 import ULVdense
 
-N = 2**12
-nl = 8*8
+nl = 4*4
+L = 5
+N = (4**(L-1))*nl
+
 Nleaves = N//nl
+Lcheck = (int)(np.log2(Nleaves))//2 + 1
+print("L-Lcheck = ",L-Lcheck)
 k = nl//4
 k0 = min(nl,k)
-L = (int)(np.log2(Nleaves))//2 + 1
+
 
 
 Nb = Nleaves
@@ -66,39 +70,13 @@ for i in range(len(Vmats)-1,-1,-1):
     SHBS= Umats[i]@SHBS@Vmats[i].T+Dmats[i]
 
 
-Qlist,Wlist,Ulist,Rlist,R_off_list,NNvec = ULVdense.compute_ULV(Umats,Dmats,Vmats,Nbvec)
+Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec = ULVdense.compute_ULV(Umats,Dmats,Vmats,Nbvec)
 
+x = np.random.standard_normal(size=(SHBS.shape[0],5))
+rhs = SHBS@x
+y = ULVdense.solve_ULV(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec,rhs)
+print("solve err = ",np.linalg.norm(x-y)/np.linalg.norm(x))
 
-SS = SHBS
-for i in range(len(Qlist)):
-    SS[:,NNvec[i]:] = SS[:,NNvec[i]:]@Wlist[i]
-    SS[NNvec[i]:,:] = Qlist[i].T@SS[NNvec[i]:,:]
-for i in range(len(Ulist)):
-    plt.figure(1)
-    plt.spy(Ulist[i],precision=1e-8)
-    plt.show()
-    print("NNZ = ",np.count_nonzero(abs(Ulist[i])>1e-8))
-    print("NNZ U = ",np.count_nonzero(abs(Umats[i])>1e-8))
 plt.figure(1)
-plt.spy(SS,precision=1e-8)
+plt.plot(x-y)
 plt.show()
-for i in range(len(Ulist)):
-    plt.figure(1)
-    mtest = Ulist[i]@Dmats[i+1]@Wlist[i+1]
-    plt.spy(mtest,precision=1e-8)
-    plt.figure(2)
-    plt.spy(SS[NNvec[i]:NNvec[i+1],:][:,NNvec[i+1]:NNvec[i+2]],precision=1e-8)
-    plt.figure(3)
-    plt.spy(SS,precision=1e-8)
-    plt.show()
-
-#plt.figure(1)
-#mtest = Ulist[1][NNvec[0]:NNvec[1],:]@Dmats[2]@Wlist[2][:,:NNvec[3]-NNvec[2]]+Ulist[0][NNvec[0]:NNvec[1],:]@Dmats[1]@Wlist[1][:,NNvec[2]-NNvec[1]:]@Wlist[2][:,:NNvec[3]-NNvec[2]]+R_off_list[0]@Wlist[1][:,NNvec[2]-NNvec[1]:]@Wlist[2][:,:NNvec[3]-NNvec[2]]
-#plt.spy(mtest,precision=1e-8)
-#plt.figure(2)
-#plt.spy(SS[NNvec[0]:NNvec[1],:][:,NNvec[2]:NNvec[3]]-mtest,precision=1e-8)
-#plt.show()
-
-
-
-

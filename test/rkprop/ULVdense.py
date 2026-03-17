@@ -53,7 +53,7 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     NNvec = np.append(NNvec,0)
     Qlist = []
     Wlist = []
-    Ulist  = []
+    Uulist  = []
     Rlist = []
     R_off_list = []
     for i in range(len(Dmats)):
@@ -63,8 +63,17 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
             Rprime = Dmats[0]
             Q,W,R_11,R_12,R_22,NN = compute_QRW(Rprime,Vmats[0],Nbvec[0])
         else:
-            
-            Rhat = (Ulist[-1]@Dmats[i]+R_22)
+            print(Nbvec)
+            Rhat = (Uhat@Dmats[i]+R_22)
+            plt.figure(1)
+            plt.spy(Uhat,precision = 1e-8)
+            plt.figure(2)
+            plt.spy(Dmats[i],precision = 1e-8)
+            plt.figure(3)
+            plt.spy(Uhat@Dmats[i],precision = 1e-8)
+            plt.figure(4)
+            plt.spy(R_22,precision = 1e-8)
+            plt.show()
             if i<len(Vmats):
                 Q,W,R_11,R_12,R_22,NN = compute_QRW(Rhat,Vmats[i],Nbvec[i])
             else:
@@ -73,12 +82,38 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         NNvec = np.append(NNvec,NNvec[-1]+NN)
         if i<len(Umats):
             if i == 0:
-                Ulist+=[Q[:,NNvec[-1]:].T@Umats[0]]
+                U0 = Q.T@Umats[0]
+                Uulist+=[U0[:NNvec[-1],:]]
+                Uhat=U0[NNvec[-1]:,:]
+                
             else:
-                Ulist+=[Q[:,NNvec[-1]-NNvec[-2]:].T@Ulist[-1]@Umats[i]]
+                U0=Q.T@Uhat@Umats[i]
+                Uulist+=[U0[:NNvec[-1]-NNvec[-2],:]]
+                Uhat=U0[NNvec[-1]-NNvec[-2]:,:]
+                
         Qlist+=[Q]
         Wlist+=[W]
         Rlist+=[R_11]
         R_off_list+=[R_12]
-    return Qlist,Wlist,Ulist,Rlist,R_off_list,NNvec
+        
+    return Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec
 
+def solve_ULV(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec,rhs):
+    L = len(Dmats)
+    if rhs.ndim == 1:
+        rhshat = rhs[:,np.newaxis]
+    else:
+        rhshat = rhs
+    for i in range(len(Qlist)):
+        rhshat[NNvec[i]:,:] = Qlist[i].T@rhshat[NNvec[i]:,:]
+    y = np.zeros(shape=rhshat.shape)
+    y[NNvec[L-1]:,:] = np.linalg.solve(Rlist[L-1],rhshat[NNvec[L-1]:,:])
+    v = (Dmats[L-1]@y[NNvec[L-1]:,:]).copy()
+
+    for i in range(L-2,-1,-1):
+        y[NNvec[i]:NNvec[i+1],:] = np.linalg.solve(Rlist[i],rhshat[NNvec[i]:NNvec[i+1],:]-Uulist[i]@v-R_off_list[i]@y[NNvec[i+1]:,:])
+        y[NNvec[i]:,:] = Wlist[i]@y[NNvec[i]:,:]
+        v = Umats[i]@v+Dmats[i]@y[NNvec[i]:,:]
+    if rhs.ndim == 1:
+        y = y.flatten()
+    return y
