@@ -18,6 +18,19 @@ def block_qr(A,n,k,Nb):
         Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
         C[i*n:(i+1)*n,:] = Q[:,k:]
     return C
+def block_Q_and_R(W1,W2,Dtot,Nb):
+    k = W2.shape[1]
+    n = Dtot.shape[1]
+    Q = torch.zeros(size = (n*Nb,n))
+    R = torch.zeros(size = (n*Nb,n))
+    D = sparse_block_mult(Dtot,torch.cat((W1,W2),axis=1),Nb,Nb)
+    for i in range(Nb):
+        #D = Dtot[i*n:(i+1)*n,:]@torch.cat((W1[i*n:(i+1)*n,:],W2[i*n:(i+1)*n,:]),axis = 1)
+        [Q[i*n:(i+1)*n,:],R[i*n:(i+1)*n,:]]   = tla.qr(D[i*n:(i+1)*n,:],mode = 'reduced')
+        # = Q0
+        # = R0
+    return Q,R
+
 
 
 
@@ -38,9 +51,6 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
     if Nb==1:
         D = Dtot
         [Q,R] = tla.qr(D,mode='reduced')
-        Q1 = Q
-        Q2 = 0
-        
         R11 = R
         
         R12=0
@@ -48,6 +58,8 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         W1 = torch.eye(R.shape[1])
         W2 = 0
         NN = R.shape[0]
+        n = Dtot.shape[0]//Nb
+        k = Dtot.shape[1]
 
     else:
         tic = time.time()
@@ -56,37 +68,29 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         NN = (n-k)*Nb
         Q1 = torch.zeros(size = (Nb*n,n-k))
         Q2 = torch.zeros(size = (Nb*n,k))
-        W1 = torch.zeros(size = (Nb*n,n-k))
+        #W1 = torch.zeros(size = (Nb*n,n-k))
         W2 = Vtot[:,:k]
         R11 = torch.zeros(size = (NN,n-k))
         R12 = torch.zeros(size = (NN,k))
         R22 = torch.zeros(size = (Nb*k,k))
         tinit = time.time()-tic
         tic = time.time()
-        print("n = ",n)
-        print("k = ",k)
-        if n>k:
-            W1 = block_qr(W2,n,k,Nb)
-        else:
-            W1 = torch.zeros(size=(n*Nb,0))
+        #if n>k:
+        W1 = block_qr(W2,n,k,Nb)
+        #else:
+        #    W1 = torch.zeros(size=(n*Nb,0))
         tVc+=time.time()-tic
+        tic = time.time()
+        Q,R = block_Q_and_R(W1,W2,Dtot,Nb)
+        tQ += time.time()-tic
+        tic = time.time()
         for box_ind in range(Nb):
-            tic = time.time()
-            if n>k:
-                D = Dtot[box_ind*n:(box_ind+1)*n,:]@torch.cat((W1[box_ind*n:(box_ind+1)*n,:],W2[box_ind*n:(box_ind+1)*n,:]),axis = 1)
-            else:
-                D = Dtot[box_ind*n:(box_ind+1)*n,:]@W2[box_ind*n:(box_ind+1)*n,:]
-            [Q,R]   = tla.qr(D,mode = 'reduced')
-            tQ+=time.time()-tic
-            tic = time.time()
-            Q1[box_ind*n:(box_ind+1)*n,:]           = Q[:,:n-k]
-            Q2[box_ind*n:(box_ind+1)*n,:]           = Q[:,n-k:]
-            R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,:n-k][:n-k,:]
-            R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,n-k:][:n-k,:]
-            R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
-            tmv += time.time()-tic
+            R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[box_ind*n:(box_ind+1)*n,:n-k][:n-k,:]
+            R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[box_ind*n:(box_ind+1)*n,n-k:][:n-k,:]
+            R22[box_ind*k:(box_ind+1)*k,:]          = R[box_ind*n:(box_ind+1)*n,n-k:][n-k:,:]
+        tmv += time.time()-tic
     print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
-    return Q1,Q2,W1,W2,R11,R12,R22,NN
+    return Q,W1,W2,R11,R12,R22,NN,n,k
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
     '''
@@ -238,8 +242,8 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     
     NNvec = [0]
     #NNvec = torch.cat((NNvec,torch.tensor(0)))
-    Q1list = []
-    Q2list = []
+    #Q1list = []
+    Qlist = []
     W1list = []
     W2list = []
     Uulist  = []
@@ -251,40 +255,40 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         
         if i==0:
             Rprime = Dmats[0]
-            Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
         else:
             Rhat = sparse_block_mult(Uhat,Dmats[i],Nbvec[i-1],Nbvec[i])
             Rhat = block_diag_add(Rhat,R_22,Nbvec[i],Nbvec[i-1])
             if i<len(Vmats):
-                Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
             else:
-                Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i])
+                Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rhat,None,Nbvec[i])
         NNvec += [NNvec[-1]+NN]#torch.cat((NNvec,torch.tensor(NNvec[-1]+NN)))
 
 
 
         if i<len(Umats):
             if i == 0:
-                Uu = sparse_block_mult(Q1,Umats[0],Nbvec[0],Nbvec[0],mode='T')
-                Ud = sparse_block_mult(Q2,Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Uu = sparse_block_mult(Q[:,:n-k],Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Ud = sparse_block_mult(Q[:,n-k:],Umats[0],Nbvec[0],Nbvec[0],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
                 
             else:
                 Uhat = sparse_block_mult(Uhat,Umats[i],Nbvec[i-1],Nbvec[i])
-                Uu = sparse_block_mult(Q1,Uhat,Nbvec[i],Nbvec[i],mode='T')
-                Ud = sparse_block_mult(Q2,Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Uu = sparse_block_mult(Q[:,:n-k],Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Ud = sparse_block_mult(Q[:,n-k:],Uhat,Nbvec[i],Nbvec[i],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
                 
-        Q1list+=[Q1]
-        Q2list+=[Q2]
+        Qlist+=[Q]
+        #Q2list+=[Q2]
         W1list+=[W1]
         W2list+=[W2]
         Rlist+=[R_11]
         R_off_list+=[R_12]
         
-    return Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec
+    return Qlist,W1list,W2list,Uulist,Rlist,R_off_list,NNvec
 
 def solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,rhs):
     L = len(Dmats)

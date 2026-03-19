@@ -92,32 +92,32 @@ for indN in range(len(Nvec)):
         print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
         print("solve ULV time = ", t_solve_vec[indN])
         print("ULV fact. time = ", t_ULV_vec[indN])
-        print("Ndofs = ", SHBS.shape[0])
+        print("Ndofs = ", Dmats[0].shape[0])
     else:
         Dmats_torch = [torch.from_numpy(D) for D in Dmats]
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
         Nbvec_torch = torch.from_numpy(np.array(Nbvec,dtype=np.int64))
         ticULV = time.time()
-        Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec = ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch)
+        Qlist,W1list,W2list,Uulist,Rlist,R_off_list,NNvec = ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch)
         tocULV = time.time()
-        SHBS = HBSnew.HBSMAT()
-        SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
-        x= np.random.standard_normal(size=(SHBS.shape[1],2))
-        b = SHBS.matvec(x)
-        print(NNvec)
-        NNvec = [int(N) for N in NNvec]
-        ticSolveULV = time.time()
-        xhat = ULVsparse_torch.solve(Umats_torch,Dmats_torch,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,torch.from_numpy(b))
-        tocSolveULV = time.time()
-        xhat = xhat.detach().cpu().numpy()
+        #SHBS = HBSnew.HBSMAT()
+        #SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
+        #x= np.random.standard_normal(size=(SHBS.shape[1],2))
+        #b = SHBS.matvec(x)
+        #print(NNvec)
+        #NNvec = [int(N) for N in NNvec]
+        #ticSolveULV = time.time()
+        #xhat = ULVsparse_torch.solve(Umats_torch,Dmats_torch,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,torch.from_numpy(b))
+        #tocSolveULV = time.time()
+        #xhat = xhat.detach().cpu().numpy()
         
-        t_solve_vec[indN] = tocSolveULV-ticSolveULV
+        #t_solve_vec[indN] = tocSolveULV-ticSolveULV
         t_ULV_vec[indN] = tocULV-ticULV
-        print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
-        print("solve ULV time = ", t_solve_vec[indN])
+        #print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
+        #print("solve ULV time = ", t_solve_vec[indN])
         print("ULV fact. time = ", t_ULV_vec[indN])
-        print("Ndofs = ", SHBS.shape[0])
+        print("Ndofs = ", Dmats[0].shape[0])
 plt.figure(1)
 plt.loglog(Nvec,t_ULV_vec)
 plt.loglog(Nvec,Nvec*1.1*(t_ULV_vec[0]/Nvec[0]),linestyle='dashed')
