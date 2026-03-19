@@ -15,8 +15,9 @@ Q,R,W given in reduced format
 def block_qr(V,n,k,Nb):
     C = torch.zeros(size = (n*Nb,n-k))
     for i in range(Nb):
-        Q,_ = tla.qr(V[i*n:(i+1)*n,:],mode='complete')
-        C[i*n:(i+1)*n,:] = Q[:,k:]
+        a,tau = torch.geqrf(V[i*n:(i+1)*n,:])
+        Q = torch.ormqr(a, tau, torch.cat((torch.zeros(size=(k,n-k)),torch.eye(n-k)),axis=0))
+        C[i*n:(i+1)*n,:] = Q
     return C
 def block_Q_and_R(W1,W2,Dtot,Nb):
     k = W2.shape[1]
