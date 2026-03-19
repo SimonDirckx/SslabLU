@@ -12,24 +12,24 @@ Q,R,W given in reduced format
 
 '''
 
-def block_qr(A,n,k,Nb):
+def block_qr(V,n,k,Nb):
     C = torch.zeros(size = (n*Nb,n-k))
     for i in range(Nb):
-        Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
+        Q,_ = tla.qr(V[i*n:(i+1)*n,:],mode='complete')
         C[i*n:(i+1)*n,:] = Q[:,k:]
     return C
 def block_Q_and_R(W1,W2,Dtot,Nb):
     k = W2.shape[1]
     n = Dtot.shape[1]
     Q = torch.zeros(size = (n*Nb,n))
-    R = torch.zeros(size = (n*Nb,n))
-    D = sparse_block_mult(Dtot,torch.cat((W1,W2),axis=1),Nb,Nb)
+    Ru = torch.zeros(size = ((n-k)*Nb,n))
+    R22 = torch.zeros(size = (k*Nb,k))
     for i in range(Nb):
-        #D = Dtot[i*n:(i+1)*n,:]@torch.cat((W1[i*n:(i+1)*n,:],W2[i*n:(i+1)*n,:]),axis = 1)
-        [Q[i*n:(i+1)*n,:],R[i*n:(i+1)*n,:]]   = tla.qr(D[i*n:(i+1)*n,:],mode = 'reduced')
-        # = Q0
-        # = R0
-    return Q,R
+        D = Dtot[i*n:(i+1)*n,:]@torch.cat((W1[i*n:(i+1)*n,:],W2[i*n:(i+1)*n,:]),axis = 1)
+        [Q[i*n:(i+1)*n,:],R]   = tla.qr(D,mode = 'reduced')
+        Ru[i*(n-k):(i+1)*(n-k),:] = R[:n-k,:]
+        R22[i*k:(i+1)*k,:]= R[n-k:,:][:,n-k:]
+    return Q,Ru,R22
 
 
 
@@ -51,46 +51,26 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
     if Nb==1:
         D = Dtot
         [Q,R] = tla.qr(D,mode='reduced')
-        R11 = R
-        
-        R12=0
+        Ru = R
         R22=0
         W1 = torch.eye(R.shape[1])
-        W2 = 0
         NN = R.shape[0]
         n = Dtot.shape[0]//Nb
         k = Dtot.shape[1]
 
     else:
-        tic = time.time()
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
-        Q1 = torch.zeros(size = (Nb*n,n-k))
-        Q2 = torch.zeros(size = (Nb*n,k))
-        #W1 = torch.zeros(size = (Nb*n,n-k))
-        W2 = Vtot[:,:k]
-        R11 = torch.zeros(size = (NN,n-k))
-        R12 = torch.zeros(size = (NN,k))
-        R22 = torch.zeros(size = (Nb*k,k))
-        tinit = time.time()-tic
+        
         tic = time.time()
-        #if n>k:
-        W1 = block_qr(W2,n,k,Nb)
-        #else:
-        #    W1 = torch.zeros(size=(n*Nb,0))
+        W1 = block_qr(Vtot,n,k,Nb)
         tVc+=time.time()-tic
         tic = time.time()
-        Q,R = block_Q_and_R(W1,W2,Dtot,Nb)
+        Q,Ru,R22 = block_Q_and_R(W1,Vtot,Dtot,Nb)
         tQ += time.time()-tic
-        tic = time.time()
-        for box_ind in range(Nb):
-            R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[box_ind*n:(box_ind+1)*n,:n-k][:n-k,:]
-            R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[box_ind*n:(box_ind+1)*n,n-k:][:n-k,:]
-            R22[box_ind*k:(box_ind+1)*k,:]          = R[box_ind*n:(box_ind+1)*n,n-k:][n-k:,:]
-        tmv += time.time()-tic
-    print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
-    return Q,W1,W2,R11,R12,R22,NN,n,k
+    print("tVc//tQ = ",tVc,"//",tQ)
+    return Q,W1,Ru,R22,NN,n,k
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
     '''
@@ -245,25 +225,24 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     #Q1list = []
     Qlist = []
     W1list = []
-    W2list = []
     Uulist  = []
     Rlist = []
-    R_off_list = []
+    
     for i in range(len(Dmats)):
         print("lvl = ",i)
         print("Nbvec = ",Nbvec)
         
         if i==0:
             Rprime = Dmats[0]
-            Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
         else:
             Rhat = sparse_block_mult(Uhat,Dmats[i],Nbvec[i-1],Nbvec[i])
             Rhat = block_diag_add(Rhat,R_22,Nbvec[i],Nbvec[i-1])
             if i<len(Vmats):
-                Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
             else:
-                Q,W1,W2,R_11,R_12,R_22,NN,n,k = compute_QRW_sparse(Rhat,None,Nbvec[i])
-        NNvec += [NNvec[-1]+NN]#torch.cat((NNvec,torch.tensor(NNvec[-1]+NN)))
+                Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rhat,None,Nbvec[i])
+        NNvec += [NNvec[-1]+NN]
 
 
 
@@ -282,13 +261,10 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
                 Uhat=Ud
                 
         Qlist+=[Q]
-        #Q2list+=[Q2]
         W1list+=[W1]
-        W2list+=[W2]
-        Rlist+=[R_11]
-        R_off_list+=[R_12]
+        Rlist+=[Ru]
         
-    return Qlist,W1list,W2list,Uulist,Rlist,R_off_list,NNvec
+    return Qlist,W1list,Uulist,Rlist,NNvec
 
 def solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,rhs):
     L = len(Dmats)
