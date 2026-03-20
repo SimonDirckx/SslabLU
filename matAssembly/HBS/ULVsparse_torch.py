@@ -14,17 +14,17 @@ Q,R,W given in reduced format
 def convert_to_torch_tens(A,Nb):
     n = A.shape[0]//Nb
     k = A.shape[1]
-    B = torch.zeros(size = (n,k,Nb))
+    B = torch.zeros(size = (Nb,n,k))
     for i in range(Nb):
-        B[:,:,i] = A[i*n:(i+1)*n,:]
+        B[i,:,:] = A[i*n:(i+1)*n,:]
     return B
 def convert_to_blkdiag(A):
-    n = A.shape[0]
-    k = A.shape[1]
-    Nb = A.shape[2]
+    n = A.shape[1]
+    k = A.shape[2]
+    Nb = A.shape[0]
     B = torch.zeros(size = (n*Nb,k))
     for i in range(Nb):
-        B[i*n:(i+1)*n,:] = A[:,:,i]
+        B[i*n:(i+1)*n,:] = A[i,:,:]
     return B
 
 def block_qr(A,n,k,Nb):
