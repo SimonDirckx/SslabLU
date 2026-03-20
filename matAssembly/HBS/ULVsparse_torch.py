@@ -55,18 +55,15 @@ def block_Q_and_R(W1,W2,Dtot,Nb):
         # = Q0
         # = R0
     return Q,R
-def block_Q_and_R_tens(W1,W2,Dtot):
+def block_Q_and_R_tens(W12,Dtot,device):
     n = Dtot.shape[1]
     Nb = Dtot.shape[0]
-    k = W2.shape[2]
+    k = W12.shape[2]-n
     Q = torch.zeros(size = (Nb,n,n))
     R = torch.zeros(size = (Nb,n,n))
     
     for i in range(Nb):
-        D = Dtot[i,:,:]@W1[i,:,:]
-        a,tau   = torch.geqrf(D)
-        R[i,:,:] = torch.ormqr(a, tau, torch.cat((Dtot[i,:,:]@W1[i,:,:],Dtot[i,:,:]@W2[i,:,:]),axis=1),left=True, transpose=True)
-        Q[i,:,:] = torch.ormqr(a, tau, torch.eye(n))
+        [Q[i,:,:],R[i,:,:]]   = tla.qr(W12[i,:,:])
     return Q,R
 
 
@@ -105,13 +102,14 @@ def compute_QRW_sparse(Dtot,Vtot,Nb,device):
         VV = convert_to_torch_tens(Vtot[:,:k],Nb).to(device)
         tic = time.time()
         if n>k:
-            Wprime = block_qr_tens(VV)
+            Wprime = block_qr_tens(VV).to(device)
         else:
-            Wprime = torch.zeros(size=(n*Nb,0))
+            Wprime = torch.zeros(size=(n*Nb,0)).to(device)
         tVc+=time.time()-tic
         Dprime = convert_to_torch_tens(Dtot,Nb).to(device)
+        W12 = torch.cat((Wprime,VV),axis=2)
         tic = time.time()
-        Q,R = block_Q_and_R_tens(Wprime,VV,Dprime)
+        Q,R = block_Q_and_R_tens(W12,Dprime.to(device),device)
         tQ += time.time()-tic
         W1 = convert_to_blkdiag(Wprime)
         Q = convert_to_blkdiag(Q)

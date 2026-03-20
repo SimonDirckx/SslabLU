@@ -11,7 +11,7 @@ import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 
 torchbool = True
 nl = 16*16
-Nvec = np.array([2**14,2**16,2**18],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+Nvec = np.array([2**14,2**16,2**18,2**20],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
