@@ -11,12 +11,36 @@ with R upper triangular
 Q,R,W given in reduced format
 
 '''
+def convert_to_torch_tens(A,Nb):
+    n = A.shape[0]//Nb
+    k = A.shape[1]
+    B = torch.zeros(size = (n,k,Nb))
+    for i in range(Nb):
+        B[:,:,i] = A[i*n:(i+1)*n,:]
+    return B
+def convert_to_blkdiag(A):
+    n = A.shape[0]
+    k = A.shape[1]
+    Nb = A.shape[2]
+    B = torch.zeros(size = (n*Nb,k))
+    for i in range(Nb):
+        B[i*n:(i+1)*n,:] = A[:,:,i]
+    return B
 
 def block_qr(A,n,k,Nb):
     C = torch.zeros(size = (n*Nb,n-k))
     for i in range(Nb):
         Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
         C[i*n:(i+1)*n,:] = Q[:,k:]
+    return C
+def block_qr_tens(A):
+    n = A.shape[0]
+    k = A.shape[1]
+    Nb = A.shape[2]
+    C = torch.zeros(size = (n,n-k,Nb))
+    for i in range(Nb):
+        Q,_ = tla.qr(A[:,:,i],mode='complete')
+        C[:,:,i] = Q[:,k:]
     return C
 def block_Q_and_R(W1,W2,Dtot,Nb):
     k = W2.shape[1]
@@ -64,12 +88,14 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         Ru = torch.zeros(size = (NN,n))
         R22 = torch.zeros(size = (Nb*k,k))
         tinit = time.time()-tic
+        VV = convert_to_torch_tens(Vtot[:,:k],Nb)
         tic = time.time()
         if n>k:
-            W1 = block_qr(Vtot[:,:k],n,k,Nb)
+            Wprime = block_qr_tens(VV)
         else:
-            W1 = torch.zeros(size=(n*Nb,0))
+            Wprime = torch.zeros(size=(n*Nb,0))
         tVc+=time.time()-tic
+        W1 = convert_to_blkdiag(Wprime)
         tic = time.time()
         Q,R = block_Q_and_R(W1,Vtot[:,:k],Dtot,Nb)
         tQ += time.time()-tic
