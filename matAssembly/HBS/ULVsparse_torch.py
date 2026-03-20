@@ -102,8 +102,8 @@ def compute_QRW_sparse(Dtot,Vtot,Nb,device):
         else:
             W1 = torch.zeros(size=(Nb,n,0)).to(device)
         tVc+=time.time()-tic
-        W12 = torch.cat((W1,Vtot),axis=2)
         tic = time.time()
+        W12 = torch.cat((W1,Vtot),axis=2)
         Q,R = block_Q_and_R_tens(W12,Dtot.to(device))
         tQ += time.time()-tic
         tic = time.time()
@@ -192,15 +192,15 @@ def sparse_block_mult_tens(A,B,mode='N'):
         
         #startA=0
         for i in range(NbB):
-            Asub = torch.zeros(size = (fac*na,fac*ka))
+            Asub = torch.zeros(size = (fac*na,fac*ka)).to(A.get_device())
             Bsub = B[i,:,:]
             for j in range(fac):
                 Asub[j*na:(j+1)*na,:][:,j*ka:(j+1)*ka] = A[fac*i+j,:,:]#startA+j*na:startA+(j+1)*na,:]
-            C[i,:,:] = Asub@Bsub
+            C[i,:,:] = Asub@B[i,:,:]
             #startA+=fac*na
     elif mode=='T':
         # this assumes NbB=NbA
-        C = torch.zeros(size = (NbA,ka,kb))
+        C = torch.zeros(size = (NbA,ka,kb)).to(A.get_device())
         for i in range(NbA):
             C[i,:,:] = A[i,:,:].T@B[i,:,:]
 
@@ -337,37 +337,43 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec,device,Utens,Dtens,Vtens):
         
         if i==0:
             Rprime = Dtens[0]
-            Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime,Vtens[0],Nbvec[0],device)
+            tic = time.time()
+            Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime.to(device),Vtens[0].to(device),Nbvec[0],device)
+            print("TIME = ",time.time()-tic)
             n = Vtens[0].shape[1]
             k = Vtens[0].shape[2]
         else:
-            Rhat = sparse_block_mult_tens(Uhat,Dtens[i])
+            Rhat = sparse_block_mult_tens(Uhat.to(device),Dtens[i].to(device))
             Rhat = block_diag_add_tens(Rhat,R_22)
             
             if i<len(Vtens):
-                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vtens[i],Nbvec[i],device)
+                tic = time.time()
+                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vtens[i].to(device),Nbvec[i],device)
+                print("TIME = ",time.time()-tic)
                 n = Vtens[i].shape[1]
                 k = Vtens[i].shape[2]
             else:
+                tic = time.time()
                 Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i],device)
+                print("TIME = ",time.time()-tic)
         NNvec += [NNvec[-1]+NN]
 
-
-
+        tic = time.time()
         if i<len(Umats):
             W1list+=[W1]
             if i == 0:
-                Uu = sparse_block_mult_tens(Q[:,:,:(n-k)],Utens[0],mode='T')
-                Ud = sparse_block_mult_tens(Q[:,:,(n-k):],Utens[0],mode='T')
+                Uu = sparse_block_mult_tens(Q[:,:,:(n-k)].to(device),Utens[0].to(device),mode='T')
+                Ud = sparse_block_mult_tens(Q[:,:,(n-k):].to(device),Utens[0].to(device),mode='T')
                 Uulist+=[Uu]
-                Uhat=Ud
+                Uhat=Ud.to(device)
                 
             else:
-                Uhat = sparse_block_mult_tens(Uhat,Utens[i])
-                Uu = sparse_block_mult_tens(Q[:,:,:(n-k)],Uhat,mode='T')
-                Ud = sparse_block_mult_tens(Q[:,:,(n-k):],Uhat,mode='T')
+                Uhat = sparse_block_mult_tens(Uhat,Utens[i].to(device))
+                Uu = sparse_block_mult_tens(Q[:,:,:(n-k)].to(device),Uhat.to(device),mode='T')
+                Ud = sparse_block_mult_tens(Q[:,:,(n-k):].to(device),Uhat.to(device),mode='T')
                 Uulist+=[Uu]
-                Uhat=Ud
+                Uhat=Ud.to(device)
+        print("TIME UU = ",time.time()-tic)
         Rlist+=[Ru]
         Qlist+=[Q]
         

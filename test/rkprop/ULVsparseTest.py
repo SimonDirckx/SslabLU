@@ -10,8 +10,8 @@ import matAssembly.HBS.ULVsparse as ULVsparse
 import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 
 torchbool = True
-nl = 16*16
-Nvec = np.array([2**14,2**16,2**18,2**20],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+nl = 8*8
+Nvec = np.array([2**14,2**16,2**18,2**20,2**22],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
@@ -82,7 +82,7 @@ for indN in range(len(Nvec)):
     else:
         torch.set_default_dtype(torch.float64)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("CUDA available? ",torch.cuda.is_available())
+        print("#CUDAs available: ",torch.cuda.device_count())
         Dmats_torch = [torch.from_numpy(D) for D in Dmats]
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
@@ -94,13 +94,11 @@ for indN in range(len(Nvec)):
         Nbvec_torch = torch.from_numpy(np.array(Nbvec,dtype=np.int64))
         ticULV = time.time()
         Qlist,W1list,Uulist,Rlist,NNvec= ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch,device,Utens,Dtens,Vtens)
-        
+        tocULV = time.time()
         Qlist = [ULVsparse_torch.convert_to_blkdiag(Q) for Q in Qlist]
         W1list = [ULVsparse_torch.convert_to_blkdiag(W) for W in W1list]
         Uulist = [ULVsparse_torch.convert_to_blkdiag(U) for U in Uulist]
         Rlist = [ULVsparse_torch.convert_to_blkdiag(R) for R in Rlist]
-        
-        tocULV = time.time()
         SHBS = HBSnew.HBSMAT()
         SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
         x= np.random.standard_normal(size=(SHBS.shape[1],2))
