@@ -1,27 +1,13 @@
-from scipy.sparse.linalg   import LinearOperator
 import numpy as np
-from matAssembly.HBS import HBSTree as HBS
-import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
-from matAssembly.HBS.simpleoctree import simpletree as tree
 import torch
 
-from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
-import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
-import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
-import SOMS3D as SOMS
-import matAssembly.matAssembler as mA
 import matAssembly.HBS.HBSnew as HBSnew
-import solver.solver as solver
 import scipy.linalg as sclinalg
-from matplotlib.colors import ListedColormap
 
 import matAssembly.HBS.ULVsparse as ULVsparse
 import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
-import ULVdense
-import time
-import torch
 
 torchbool = True
 nl = 16*16
@@ -94,6 +80,9 @@ for indN in range(len(Nvec)):
         print("ULV fact. time = ", t_ULV_vec[indN])
         print("Ndofs = ", Dmats[0].shape[0])
     else:
+        torch.set_default_dtype(torch.float64)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print("CUDA available? ",torch.cuda.is_available())
         Dmats_torch = [torch.from_numpy(D) for D in Dmats]
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
