@@ -12,25 +12,24 @@ Q,R,W given in reduced format
 
 '''
 
-def block_qr(V,n,k,Nb):
+def block_qr(A,n,k,Nb):
     C = torch.zeros(size = (n*Nb,n-k))
     for i in range(Nb):
-        a,tau = torch.geqrf(V[i*n:(i+1)*n,:])
-        Q = torch.ormqr(a, tau, torch.cat((torch.zeros(size=(k,n-k)),torch.eye(n-k)),axis=0))
-        C[i*n:(i+1)*n,:] = Q
+        Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
+        C[i*n:(i+1)*n,:] = Q[:,k:]
     return C
 def block_Q_and_R(W1,W2,Dtot,Nb):
     k = W2.shape[1]
     n = Dtot.shape[1]
     Q = torch.zeros(size = (n*Nb,n))
-    Ru = torch.zeros(size = ((n-k)*Nb,n))
-    R22 = torch.zeros(size = (k*Nb,k))
+    R = torch.zeros(size = (n*Nb,n))
+    
     for i in range(Nb):
         D = Dtot[i*n:(i+1)*n,:]@torch.cat((W1[i*n:(i+1)*n,:],W2[i*n:(i+1)*n,:]),axis = 1)
-        [Q[i*n:(i+1)*n,:],R]   = tla.qr(D,mode = 'reduced')
-        Ru[i*(n-k):(i+1)*(n-k),:] = R[:n-k,:]
-        R22[i*k:(i+1)*k,:]= R[n-k:,:][:,n-k:]
-    return Q,Ru,R22
+        [Q[i*n:(i+1)*n,:],R[i*n:(i+1)*n,:]]   = tla.qr(D,mode = 'reduced')
+        # = Q0
+        # = R0
+    return Q,R
 
 
 
@@ -51,27 +50,36 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
     tinit = 0
     if Nb==1:
         D = Dtot
-        [Q,R] = tla.qr(D,mode='reduced')
-        Ru = R
+        [Q,Ru] = tla.qr(D,mode='reduced')
         R22=0
-        W1 = torch.eye(R.shape[1])
-        NN = R.shape[0]
-        n = Dtot.shape[0]//Nb
-        k = Dtot.shape[1]
+        W1 = torch.eye(Ru.shape[1])
+        NN = Ru.shape[0]
 
     else:
+        tic = time.time()
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
-        
+        W1 = torch.zeros(size = (Nb*n,n-k))
+        Ru = torch.zeros(size = (NN,n))
+        R22 = torch.zeros(size = (Nb*k,k))
+        tinit = time.time()-tic
         tic = time.time()
-        W1 = block_qr(Vtot,n,k,Nb)
+        if n>k:
+            W1 = block_qr(Vtot[:,:k],n,k,Nb)
+        else:
+            W1 = torch.zeros(size=(n*Nb,0))
         tVc+=time.time()-tic
         tic = time.time()
-        Q,Ru,R22 = block_Q_and_R(W1,Vtot,Dtot,Nb)
+        Q,R = block_Q_and_R(W1,Vtot[:,:k],Dtot,Nb)
         tQ += time.time()-tic
-    print("tVc//tQ = ",tVc,"//",tQ)
-    return Q,W1,Ru,R22,NN,n,k
+        tic = time.time()
+        for box_ind in range(Nb):
+            Ru[box_ind*(n-k):(box_ind+1)*(n-k),:] = R[box_ind*n:(box_ind+1)*n,:][:n-k,:]
+            R22[box_ind*k:(box_ind+1)*k,:]          = R[box_ind*n:(box_ind+1)*n,n-k:][n-k:,:]
+        tmv += time.time()-tic
+    print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
+    return Q,W1,Ru,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
     '''
@@ -199,7 +207,6 @@ def block_solve(A,B,Nb,mode='N'):
         raise ValueError("Mode not recognized")
     return C
 
-#Q1,Q2,W1,W2,R11,R12,R22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
 
 
 def compute_ULV(Umats,Dmats,Vmats,Nbvec):
@@ -222,63 +229,68 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     '''
     
     NNvec = [0]
-    #NNvec = torch.cat((NNvec,torch.tensor(0)))
-    #Q1list = []
-    Qlist = []
     W1list = []
     Uulist  = []
     Rlist = []
-    
+    R_off_list = []
+    Rulist = []
+    Qlist = []
     for i in range(len(Dmats)):
         print("lvl = ",i)
         print("Nbvec = ",Nbvec)
         
         if i==0:
             Rprime = Dmats[0]
-            Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            n = Vmats[0].shape[0]//Nbvec[0]
+            k = Vmats[0].shape[1]
         else:
             Rhat = sparse_block_mult(Uhat,Dmats[i],Nbvec[i-1],Nbvec[i])
             Rhat = block_diag_add(Rhat,R_22,Nbvec[i],Nbvec[i-1])
             if i<len(Vmats):
-                Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                n = Vmats[i].shape[0]//Nbvec[i]
+                k = Vmats[i].shape[1]
             else:
-                Q,W1,Ru,R_22,NN,n,k = compute_QRW_sparse(Rhat,None,Nbvec[i])
+                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i])
         NNvec += [NNvec[-1]+NN]
 
 
 
         if i<len(Umats):
             if i == 0:
-                Uu = sparse_block_mult(Q[:,:n-k],Umats[0],Nbvec[0],Nbvec[0],mode='T')
-                Ud = sparse_block_mult(Q[:,n-k:],Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Uu = sparse_block_mult(Q[:,:(n-k)],Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Ud = sparse_block_mult(Q[:,(n-k):],Umats[0],Nbvec[0],Nbvec[0],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
                 
             else:
                 Uhat = sparse_block_mult(Uhat,Umats[i],Nbvec[i-1],Nbvec[i])
-                Uu = sparse_block_mult(Q[:,:n-k],Uhat,Nbvec[i],Nbvec[i],mode='T')
-                Ud = sparse_block_mult(Q[:,n-k:],Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Uu = sparse_block_mult(Q[:,:(n-k)],Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Ud = sparse_block_mult(Q[:,(n-k):],Uhat,Nbvec[i],Nbvec[i],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
-                
+        Rlist+=[Ru]
         Qlist+=[Q]
         W1list+=[W1]
-        Rlist+=[Ru]
         
     return Qlist,W1list,Uulist,Rlist,NNvec
 
-def solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,rhs):
+def solve(Umats,Dmats,Qlist,W1list,W2list,Uulist,Rlist,NNvec,Nbvec,rhs):
     L = len(Dmats)
     if rhs.ndim == 1:
         rhshat = rhs[:,None].detach().clone()
     else:
         rhshat = rhs.detach().clone()
-    for i in range(len(Q1list)):
+    for i in range(len(Qlist)):
         rtmp = rhshat[NNvec[i]:,:].detach().clone()
-        
-        rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Q1list[i],rtmp,Nbvec[i],mode='T')
-        if i<len(Q1list)-1:
-            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Q2list[i],rtmp,Nbvec[i],mode='T')
+        if i<len(Qlist)-1:
+            n = Umats[i].shape[0]//Nbvec[i]
+            k = Umats[i].shape[1]
+            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
+            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
+        else:
+            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],rtmp,Nbvec[i],mode='T')
     
     y = torch.zeros(size=rhshat.shape)
 
@@ -286,10 +298,12 @@ def solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,
     v = apply_sparse_block(Dmats[L-1],y[NNvec[L-1]:,:],Nbvec[L-1])
 
     for i in range(L-2,-1,-1):
+        n = Umats[i].shape[0]//Nbvec[i]
+        k = Umats[i].shape[1]
         rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
                     -apply_sparse_block(Uulist[i],v,Nbvec[i])\
-                    -apply_sparse_block(R_off_list[i],y[NNvec[i+1]:,:],Nbvec[i])
-        y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i],rhs0,Nbvec[i]).detach().clone()
+                    -apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+        y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i][:,:n-k],rhs0,Nbvec[i]).detach().clone()
         y[NNvec[i]:,:]              = apply_sparse_block(W1list[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
                                     +apply_sparse_block(W2list[i],y[NNvec[i+1]:,:],Nbvec[i])
         v       = apply_sparse_block(Umats[i],v,Nbvec[i]).detach().clone()\
