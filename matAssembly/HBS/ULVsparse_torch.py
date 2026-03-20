@@ -2,7 +2,7 @@
 import time
 import torch
 import torch.linalg as tla
-
+import matplotlib.pyplot as plt
 
 '''
 Factorize Q^* S W = R
@@ -58,12 +58,15 @@ def block_Q_and_R(W1,W2,Dtot,Nb):
 def block_Q_and_R_tens(W1,W2,Dtot):
     n = Dtot.shape[1]
     Nb = Dtot.shape[0]
+    k = W2.shape[2]
     Q = torch.zeros(size = (Nb,n,n))
     R = torch.zeros(size = (Nb,n,n))
     
     for i in range(Nb):
-        D = Dtot[i,:,:]@torch.cat((W1[i,:,:],W2[i,:,:]),axis = 1)
-        [Q[i,:,:],R[i,:,:]]   = tla.qr(D,mode = 'reduced')
+        D = Dtot[i,:,:]@W1[i,:,:]
+        a,tau   = torch.geqrf(D)
+        R[i,:,:] = torch.ormqr(a, tau, torch.cat((Dtot[i,:,:]@W1[i,:,:],Dtot[i,:,:]@W2[i,:,:]),axis=1),left=True, transpose=True)
+        Q[i,:,:] = torch.ormqr(a, tau, torch.eye(n))
     return Q,R
 
 
