@@ -86,9 +86,20 @@ for indN in range(len(Nvec)):
         Dmats_torch = [torch.from_numpy(D) for D in Dmats]
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
+
+        Dtens = [ULVsparse_torch.convert_to_torch_tens(D,Nb) for D,Nb in zip(Dmats_torch,Nbvec)]
+        Utens = [ULVsparse_torch.convert_to_torch_tens(U,Nb) for U,Nb in zip(Umats_torch,Nbvec[:-1])]
+        Vtens = [ULVsparse_torch.convert_to_torch_tens(V,Nb) for V,Nb in zip(Vmats_torch,Nbvec[:-1])]
+        
         Nbvec_torch = torch.from_numpy(np.array(Nbvec,dtype=np.int64))
         ticULV = time.time()
-        Qlist,W1list,Uulist,Rlist,NNvec= ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch,device)
+        Qlist,W1list,Uulist,Rlist,NNvec= ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch,device,Utens,Dtens,Vtens)
+        
+        Qlist = [ULVsparse_torch.convert_to_blkdiag(Q) for Q in Qlist]
+        W1list = [ULVsparse_torch.convert_to_blkdiag(W) for W in W1list]
+        Uulist = [ULVsparse_torch.convert_to_blkdiag(U) for U in Uulist]
+        Rlist = [ULVsparse_torch.convert_to_blkdiag(R) for R in Rlist]
+        
         tocULV = time.time()
         SHBS = HBSnew.HBSMAT()
         SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
