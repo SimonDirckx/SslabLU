@@ -34,14 +34,15 @@ def block_qr(A,n,k,Nb):
         C[i*n:(i+1)*n,:] = Q[:,k:]
     return C
 def block_qr_tens(A):
-    n = A.shape[0]
-    k = A.shape[1]
-    Nb = A.shape[2]
-    C = torch.zeros(size = (n,n-k,Nb))
+    n = A.shape[1]
+    k = A.shape[2]
+    Nb = A.shape[0]
+    C = torch.zeros(size = (Nb,n,n-k))
     for i in range(Nb):
-        Q,_ = tla.qr(A[:,:,i],mode='complete')
-        C[:,:,i] = Q[:,k:]
+        Q,_ = tla.qr(A[i,:,:],mode='complete')
+        C[i,:,:] = Q[:,k:]
     return C
+
 def block_Q_and_R(W1,W2,Dtot,Nb):
     k = W2.shape[1]
     n = Dtot.shape[1]
@@ -54,12 +55,22 @@ def block_Q_and_R(W1,W2,Dtot,Nb):
         # = Q0
         # = R0
     return Q,R
+def block_Q_and_R_tens(W1,W2,Dtot):
+    n = Dtot.shape[1]
+    Nb = Dtot.shape[0]
+    Q = torch.zeros(size = (Nb,n,n))
+    R = torch.zeros(size = (Nb,n,n))
+    
+    for i in range(Nb):
+        D = Dtot[i,:,:]@torch.cat((W1[i,:,:],W2[i,:,:]),axis = 1)
+        [Q[i,:,:],R[i,:,:]]   = tla.qr(D,mode = 'reduced')
+    return Q,R
 
 
 
 
 
-def compute_QRW_sparse(Dtot,Vtot,Nb):
+def compute_QRW_sparse(Dtot,Vtot,Nb,device):
     
     '''
     
@@ -88,17 +99,20 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         Ru = torch.zeros(size = (NN,n))
         R22 = torch.zeros(size = (Nb*k,k))
         tinit = time.time()-tic
-        VV = convert_to_torch_tens(Vtot[:,:k],Nb)
+        VV = convert_to_torch_tens(Vtot[:,:k],Nb).to(device)
         tic = time.time()
         if n>k:
             Wprime = block_qr_tens(VV)
         else:
             Wprime = torch.zeros(size=(n*Nb,0))
         tVc+=time.time()-tic
-        W1 = convert_to_blkdiag(Wprime)
+        Dprime = convert_to_torch_tens(Dtot,Nb).to(device)
         tic = time.time()
-        Q,R = block_Q_and_R(W1,Vtot[:,:k],Dtot,Nb)
+        Q,R = block_Q_and_R_tens(Wprime,VV,Dprime)
         tQ += time.time()-tic
+        W1 = convert_to_blkdiag(Wprime)
+        Q = convert_to_blkdiag(Q)
+        R = convert_to_blkdiag(R)
         tic = time.time()
         for box_ind in range(Nb):
             Ru[box_ind*(n-k):(box_ind+1)*(n-k),:] = R[box_ind*n:(box_ind+1)*n,:][:n-k,:]
@@ -235,7 +249,7 @@ def block_solve(A,B,Nb,mode='N'):
 
 
 
-def compute_ULV(Umats,Dmats,Vmats,Nbvec):
+def compute_ULV(Umats,Dmats,Vmats,Nbvec,device):
     '''
     computes ULV decomp
 
@@ -267,18 +281,18 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
         
         if i==0:
             Rprime = Dmats[0]
-            Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0],device)
             n = Vmats[0].shape[0]//Nbvec[0]
             k = Vmats[0].shape[1]
         else:
             Rhat = sparse_block_mult(Uhat,Dmats[i],Nbvec[i-1],Nbvec[i])
             Rhat = block_diag_add(Rhat,R_22,Nbvec[i],Nbvec[i-1])
             if i<len(Vmats):
-                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i],device)
                 n = Vmats[i].shape[0]//Nbvec[i]
                 k = Vmats[i].shape[1]
             else:
-                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i])
+                Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i],device)
         NNvec += [NNvec[-1]+NN]
 
 

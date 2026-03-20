@@ -81,14 +81,14 @@ for indN in range(len(Nvec)):
         print("Ndofs = ", Dmats[0].shape[0])
     else:
         torch.set_default_dtype(torch.float64)
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("CUDA available? ",torch.cuda.is_available())
         Dmats_torch = [torch.from_numpy(D) for D in Dmats]
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
         Nbvec_torch = torch.from_numpy(np.array(Nbvec,dtype=np.int64))
         ticULV = time.time()
-        Qlist,W1list,Uulist,Rlist,NNvec= ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch)
+        Qlist,W1list,Uulist,Rlist,NNvec= ULVsparse_torch.compute_ULV(Umats_torch,Dmats_torch,Vmats_torch,Nbvec_torch,device)
         tocULV = time.time()
         SHBS = HBSnew.HBSMAT()
         SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
