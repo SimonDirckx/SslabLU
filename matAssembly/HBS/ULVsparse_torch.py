@@ -168,7 +168,7 @@ def sparse_block_mult(A,B,NbA,NbB,mode='N'):
 
 
     return C
-def sparse_block_mult_tens(A,B,mode='N'):
+def sparse_block_mult_tens(A,B,mode='N',device="cpu"):
     
     '''
     Multiply block diag matrices
@@ -192,15 +192,14 @@ def sparse_block_mult_tens(A,B,mode='N'):
         
         #startA=0
         for i in range(NbB):
-            Asub = torch.zeros(size = (fac*na,fac*ka)).to(A.get_device())
-            Bsub = B[i,:,:]
+            Asub = torch.zeros(size = (fac*na,fac*ka)).to(device)
             for j in range(fac):
                 Asub[j*na:(j+1)*na,:][:,j*ka:(j+1)*ka] = A[fac*i+j,:,:]#startA+j*na:startA+(j+1)*na,:]
             C[i,:,:] = Asub@B[i,:,:]
             #startA+=fac*na
     elif mode=='T':
         # this assumes NbB=NbA
-        C = torch.zeros(size = (NbA,ka,kb)).to(A.get_device())
+        C = torch.zeros(size = (NbA,ka,kb)).to(device)
         for i in range(NbA):
             C[i,:,:] = A[i,:,:].T@B[i,:,:]
 
@@ -309,7 +308,7 @@ def block_solve(A,B,Nb,mode='N'):
 
 
 
-def compute_ULV(Umats,Dmats,Vmats,Nbvec,device,Utens,Dtens,Vtens):
+def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
     '''
     computes ULV decomp
 
@@ -333,7 +332,7 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec,device,Utens,Dtens,Vtens):
     Uulist  = []
     Rlist = []
     Qlist = []
-    for i in range(len(Dmats)):
+    for i in range(len(Dtens)):
         
         if i==0:
             Rprime = Dtens[0]
@@ -359,7 +358,7 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec,device,Utens,Dtens,Vtens):
         NNvec += [NNvec[-1]+NN]
 
         tic = time.time()
-        if i<len(Umats):
+        if i<len(Utens):
             W1list+=[W1]
             if i == 0:
                 Uu = sparse_block_mult_tens(Q[:,:,:(n-k)].to(device),Utens[0].to(device),mode='T')
@@ -380,38 +379,58 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec,device,Utens,Dtens,Vtens):
         
     return Qlist,W1list,Uulist,Rlist,NNvec
 
-def solve(Umats,Dmats,Qlist,W1list,W2list,Uulist,Rlist,NNvec,Nbvec,rhs):
-    L = len(Dmats)
-    if rhs.ndim == 1:
-        rhshat = rhs[:,None].detach().clone()
-    else:
-        rhshat = rhs.detach().clone()
-    for i in range(len(Qlist)):
-        rtmp = rhshat[NNvec[i]:,:].detach().clone()
-        if i<len(Qlist)-1:
+def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
+    if mode=='N':
+        L = len(Dmats)
+        if rhs.ndim == 1:
+            rhshat = rhs[:,None].detach().clone()
+        else:
+            rhshat = rhs.detach().clone()
+        for i in range(len(Qlist)):
+            rtmp = rhshat[NNvec[i]:,:].detach().clone()
+            if i<len(Qlist)-1:
+                n = Umats[i].shape[0]//Nbvec[i]
+                k = Umats[i].shape[1]
+                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
+                rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
+            else:
+                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],rtmp,Nbvec[i],mode='T')
+        
+        y = torch.zeros(size=rhshat.shape)
+
+        y[NNvec[L-1]:,:] = block_solve(Rlist[L-1],rhshat[NNvec[L-1]:,:],Nbvec[L-1])
+        v = apply_sparse_block(Dmats[L-1],y[NNvec[L-1]:,:],Nbvec[L-1])
+
+        for i in range(L-2,-1,-1):
             n = Umats[i].shape[0]//Nbvec[i]
             k = Umats[i].shape[1]
-            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
-            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
+            rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
+                        -apply_sparse_block(Uulist[i],v,Nbvec[i])\
+                        -apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i][:,:n-k],rhs0,Nbvec[i]).detach().clone()
+            y[NNvec[i]:,:]              = apply_sparse_block(Wlist[i][:,:(n-k)],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
+                                        +apply_sparse_block(Wlist[i][:,(n-k):],y[NNvec[i+1]:,:],Nbvec[i])
+            v       = apply_sparse_block(Umats[i],v,Nbvec[i]).detach().clone()\
+                    +apply_sparse_block(Dmats[i],y[NNvec[i]:,:],Nbvec[i])
+        if rhs.ndim==1:
+            y = torch.flatten(y)
+    elif mode == 'T':
+        L = len(Dmats)
+        if rhs.ndim == 1:
+            rhshat = rhs[:,None].detach().clone()
         else:
-            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],rtmp,Nbvec[i],mode='T')
-    
-    y = torch.zeros(size=rhshat.shape)
+            rhshat = rhs.detach().clone()
+        for i in range(len(Wlist)):
+            rtmp = rhshat[NNvec[i]:,:].detach().clone()
+            n = Umats[i].shape[0]//Nbvec[i]
+            k = Umats[i].shape[1]
+            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Wlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
+            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Wlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
+        y = torch.zeros(size=rhshat.shape)
 
-    y[NNvec[L-1]:,:] = block_solve(Rlist[L-1],rhshat[NNvec[L-1]:,:],Nbvec[L-1])
-    v = apply_sparse_block(Dmats[L-1],y[NNvec[L-1]:,:],Nbvec[L-1])
+        if rhs.ndim==1:
+            y = torch.flatten(y)
+        else:
+            raise NotImplementedError("mode not recognized")
 
-    for i in range(L-2,-1,-1):
-        n = Umats[i].shape[0]//Nbvec[i]
-        k = Umats[i].shape[1]
-        rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
-                    -apply_sparse_block(Uulist[i],v,Nbvec[i])\
-                    -apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
-        y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i][:,:n-k],rhs0,Nbvec[i]).detach().clone()
-        y[NNvec[i]:,:]              = apply_sparse_block(W1list[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
-                                    +apply_sparse_block(W2list[i],y[NNvec[i+1]:,:],Nbvec[i])
-        v       = apply_sparse_block(Umats[i],v,Nbvec[i]).detach().clone()\
-                +apply_sparse_block(Dmats[i],y[NNvec[i]:,:],Nbvec[i])
-    if rhs.ndim==1:
-        y = torch.flatten(y)
     return y

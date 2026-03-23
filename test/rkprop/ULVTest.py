@@ -16,8 +16,8 @@ import scipy.linalg as sclinalg
 
 import ULVdense
 
-nl = 4*4
-L = 5
+nl = 2*2
+L = 6
 N = (4**(L-1))*nl
 
 Nleaves = N//nl
@@ -65,18 +65,13 @@ for ind in range(1,L):
 
 
 SHBS = Dmats[-1]
-
-for i in range(len(Vmats)-1,-1,-1):
-    SHBS= Umats[i]@SHBS@Vmats[i].T+Dmats[i]
-
-
+for i in range(L-2,-1,-1):
+    SHBS = Umats[i]@SHBS@Vmats[i].T+Dmats[i]
 Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec = ULVdense.compute_ULV(Umats,Dmats,Vmats,Nbvec)
 
-x = np.random.standard_normal(size=(SHBS.shape[0],5))
-rhs = SHBS@x
-y = ULVdense.solve_ULV(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,R_off_list,NNvec,rhs)
-print("solve err = ",np.linalg.norm(x-y)/np.linalg.norm(x))
 
-plt.figure(1)
-plt.plot(x-y)
-plt.show()
+x = np.random.standard_normal(size = (SHBS.shape[0],1))
+rhs = SHBS.T@x
+xhat = ULVdense.solve_ULV(Umats, Dmats, Qlist, Wlist, Uulist, Rlist, R_off_list, NNvec, rhs,mode='T')
+
+print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
