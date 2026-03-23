@@ -338,7 +338,6 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
             Rprime = Dtens[0]
             tic = time.time()
             Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rprime.to(device),Vtens[0].to(device),Nbvec[0],device)
-            print("TIME = ",time.time()-tic)
             n = Vtens[0].shape[1]
             k = Vtens[0].shape[2]
         else:
@@ -348,13 +347,11 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
             if i<len(Vtens):
                 tic = time.time()
                 Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vtens[i].to(device),Nbvec[i],device)
-                print("TIME = ",time.time()-tic)
                 n = Vtens[i].shape[1]
                 k = Vtens[i].shape[2]
             else:
                 tic = time.time()
                 Q,W1,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i],device)
-                print("TIME = ",time.time()-tic)
         NNvec += [NNvec[-1]+NN]
 
         tic = time.time()
@@ -372,7 +369,6 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
                 Ud = sparse_block_mult_tens(Q[:,:,(n-k):].to(device),Uhat.to(device),mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud.to(device)
-        print("TIME UU = ",time.time()-tic)
         Rlist+=[Ru]
         Qlist+=[Q]
         
@@ -420,17 +416,29 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
             rhshat = rhs[:,None].detach().clone()
         else:
             rhshat = rhs.detach().clone()
-        for i in range(len(Wlist)):
-            rtmp = rhshat[NNvec[i]:,:].detach().clone()
+        y = rhshat.detach().clone()
+        v = torch.zeros(size=(Umats[0].shape[0],rhshat.shape[1]))
+        for i in range(L-1):
             n = Umats[i].shape[0]//Nbvec[i]
             k = Umats[i].shape[1]
-            rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Wlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
-            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Wlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
-        y = torch.zeros(size=rhshat.shape)
+            rhscopy = rhshat.detach().clone()
+            rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block(Wlist[i][:,:(n-k)],rhscopy,Nbvec[i],mode='T')
+            rhshat[NNvec[i+1]-NNvec[i]:,:] = apply_sparse_block(Wlist[i][:,(n-k):],rhscopy,Nbvec[i],mode='T')
+            y[NNvec[i]:NNvec[i+1],:] = block_solve(Rlist[i][:,:n-k],rhshat[:NNvec[i+1]-NNvec[i],:],Nbvec[i],mode='T')
+            v=apply_sparse_block(Uulist[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i],mode='T')+apply_sparse_block(Umats[i],v,Nbvec[i],mode='T')
+            rhshat = rhshat[NNvec[i+1]-NNvec[i]:,:]-apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i]:NNvec[i+1],:],Nbvec[i],mode='T')-apply_sparse_block(Dmats[i+1],v,Nbvec[i+1],mode='T')
+        y[NNvec[-2]:,:] = block_solve(Rlist[-1],rhshat,Nbvec[-1],mode='T')
+        for i in range(len(Qlist)-1,-1,-1):
+            if i<len(Qlist)-1:
+                n = Umats[i].shape[0]//Nbvec[i]
+                k = Umats[i].shape[1]
+                y[NNvec[i]:,:] = apply_sparse_block(Qlist[i][:,:n-k],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
+                    +apply_sparse_block(Qlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            else:
+                y[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])
 
-        if rhs.ndim==1:
-            y = torch.flatten(y)
-        else:
-            raise NotImplementedError("mode not recognized")
+            
+    else:
+        raise NotImplementedError("mode not recognized")
 
     return y
