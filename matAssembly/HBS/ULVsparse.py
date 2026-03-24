@@ -40,29 +40,21 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
     tinit = 0
     if Nb==1:
         D = Dtot
-        [Q,R] = np.linalg.qr(D)
-        Q1 = Q
-        Q2 = 0
-        
-        R11 = R
-        
-        R12=0
+        [Q,Ru] = np.linalg.qr(D)
         R22=0
-        W1 = np.identity(R.shape[1])
-        W2 = 0
-        NN = R.shape[0]
+        W1 = np.identity(Ru.shape[1])
+        W2 = np.zeros(shape = (Ru.shape[0],0))
+        NN = Ru.shape[0]
 
     else:
         tic = time.time()
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
-        Q1 = np.zeros(shape = (Nb*n,n-k))
-        Q2 = np.zeros(shape = (Nb*n,k))
+        Q = np.zeros(shape = (Nb*n,n))
         W1 = np.zeros(shape = (Nb*n,n-k))
         W2 = Vtot[:,:k]
-        R11 = np.zeros(shape = (NN,n-k))
-        R12 = np.zeros(shape = (NN,k))
+        Ru = np.zeros(shape = (NN,n))
         R22 = np.zeros(shape = (Nb*k,k))
         tinit = time.time()-tic
         tic = time.time()
@@ -79,19 +71,18 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
                 D = Dtot[box_ind*n:(box_ind+1)*n,:]@np.append(W1[box_ind*n:(box_ind+1)*n,:],W2[box_ind*n:(box_ind+1)*n,:],axis = 1)
             else:
                 D = Dtot[box_ind*n:(box_ind+1)*n,:]@W2[box_ind*n:(box_ind+1)*n,:]
-            [Q,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
-            Q = (Q.detach().cpu().numpy())
+            [Qloc,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
+            Qloc = (Qloc.detach().cpu().numpy())
             R = (R.detach().cpu().numpy())
             tQ+=time.time()-tic
             tic = time.time()
-            Q1[box_ind*n:(box_ind+1)*n,:]           = Q[:,:n-k]
-            Q2[box_ind*n:(box_ind+1)*n,:]           = Q[:,n-k:]
-            R11[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,:n-k][:n-k,:]
-            R12[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:,n-k:][:n-k,:]
+            Q[box_ind*n:(box_ind+1)*n,:]           = Qloc
+            Ru[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:n-k,:]
             R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
             tmv += time.time()-tic
     print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
-    return Q1,Q2,W1,W2,R11,R12,R22,NN
+    W = np.append(W1,W2,axis=1)
+    return Q,W,Ru,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
     '''
@@ -176,56 +167,6 @@ def block_diag_add(A,B,NbA,NbB):
         raise(ValueError("put smol frist"))
     return C
 
-def update_U(Q1,Q2,U,Umat,NNvec,Nb,fac=4):
-
-    '''
-    Update U matrix
-    U <- blkdiag(I,Q1,Q2)@U@Umat
-
-
-    INPUT  
-        Q1,Q2   :   Block diagonal matrices (reduced form)
-        U       :   cbd matrix
-        Umat    :   Block diagonal matrix   (reduced form)
-    OUTPUT
-        U       :   blkdiag(I,Q1,Q2)@U@Umat
-    '''
-    
-    U_tmp = np.zeros(shape=(U.shape[0],Umat.shape[1]))
-    for i in range(len(NNvec)-1):
-        U_tmp[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],Umat,fac*Nb,Nb)
-    U_tmp[NNvec[-1]:,:] = sparse_block_mult(U[NNvec[-1]:,:],Umat,fac*Nb,Nb)
-    U = U_tmp.copy()
-    NNtot = NNvec[-1]
-    NNu = Q1.shape[1]*Nb
-    U[NNtot:NNtot+NNu,:] = sparse_block_mult(Q1,U_tmp[NNtot:,:],Nb,Nb,mode='T')
-    U[NNtot+NNu:,:] = sparse_block_mult(Q2,U_tmp[NNtot:,:],Nb,Nb,mode='T')
-    return U
-def compute_Rr(Rprime,R12,R22,W2,NNvec,Nb):
-    Rr = np.zeros(shape = (Rprime.shape[0],R12.shape[1]))
-    for i in range(len(NNvec)-2):
-        Rr[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(Rprime[NNvec[i]:NNvec[i+1],:],W2,Nb,Nb)
-    Rr[NNvec[-2]:NNvec[-1],:] = R12
-    Rr[NNvec[-1]:,:] = R22
-    return Rr
-def compute_Rl(Rprime,W1,R11,NNvec,Nb):
-    Rl = np.zeros(shape = (Rprime.shape[0],R11.shape[1]))
-    for i in range(len(NNvec)-1):
-        Rl[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(Rprime[NNvec[i]:NNvec[i+1],:],W1,Nb,Nb)
-    Rl[NNvec[-2]:NNvec[-1],:] = R11
-    return Rl
-
-def compute_Rprime(U,D,Rr,NNvec,Nb,fac=4):
-    Rprime                           = np.zeros(shape = (U.shape[0],D.shape[1]))
-    for i in range(len(NNvec)-1):
-        Rprime[NNvec[i]:NNvec[i+1],:] = sparse_block_mult(U[NNvec[i]:NNvec[i+1],:],D,fac*Nb,Nb)
-        Rprime[NNvec[i]:NNvec[i+1],:] = block_diag_add(Rprime[NNvec[i]:NNvec[i+1],:],Rr[NNvec[i]:NNvec[i+1],:],Nb,fac*Nb)
-    
-    Rprime[NNvec[-1]:,:]            = sparse_block_mult(U[NNvec[-1]:,:],D,fac*Nb,Nb)
-    Rprime[NNvec[-1]:,:]            = block_diag_add(Rprime[NNvec[-1]:,:],Rr[NNvec[-1]:,:],Nb,fac*Nb)
-
-    return Rprime
-
 def apply_sparse_block(A,B,Nb,mode='N'):
     
     #A is block matrix
@@ -293,81 +234,112 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     
     NNvec = np.zeros(shape=(0,),dtype=np.int64)
     NNvec = np.append(NNvec,0)
-    Q1list = []
-    Q2list = []
-    W1list = []
-    W2list = []
+    Qlist = []
+    Wlist = []
     Uulist  = []
     Rlist = []
-    R_off_list = []
+    torch.set_default_dtype(torch.float64)
     for i in range(len(Dmats)):
         print("lvl = ",i)
         print("Nbvec = ",Nbvec)
         
         if i==0:
             Rprime = Dmats[0]
-            Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
+            Q,W,Ru,R_22,NN = compute_QRW_sparse(Rprime,Vmats[0],Nbvec[0])
         else:
             Rhat = sparse_block_mult(Uhat,Dmats[i],Nbvec[i-1],Nbvec[i])
             Rhat = block_diag_add(Rhat,R_22,Nbvec[i],Nbvec[i-1])
             if i<len(Vmats):
-                Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
+                Q,W,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vmats[i],Nbvec[i])
             else:
-                Q1,Q2,W1,W2,R_11,R_12,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i])
+                Q,W,Ru,R_22,NN = compute_QRW_sparse(Rhat,None,Nbvec[i])
         NNvec = np.append(NNvec,NNvec[-1]+NN)
 
 
 
         if i<len(Umats):
+            n = Umats[i].shape[0]//Nbvec[i]
+            k = Umats[i].shape[1]
             if i == 0:
-                Uu = sparse_block_mult(Q1,Umats[0],Nbvec[0],Nbvec[0],mode='T')
-                Ud = sparse_block_mult(Q2,Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Uu = sparse_block_mult(Q[:,:n-k],Umats[0],Nbvec[0],Nbvec[0],mode='T')
+                Ud = sparse_block_mult(Q[:,n-k:],Umats[0],Nbvec[0],Nbvec[0],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
                 
             else:
                 Uhat = sparse_block_mult(Uhat,Umats[i],Nbvec[i-1],Nbvec[i])
-                Uu = sparse_block_mult(Q1,Uhat,Nbvec[i],Nbvec[i],mode='T')
-                Ud = sparse_block_mult(Q2,Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Uu = sparse_block_mult(Q[:,:n-k],Uhat,Nbvec[i],Nbvec[i],mode='T')
+                Ud = sparse_block_mult(Q[:,n-k:],Uhat,Nbvec[i],Nbvec[i],mode='T')
                 Uulist+=[Uu]
                 Uhat=Ud
                 
-        Q1list+=[Q1]
-        Q2list+=[Q2]
-        W1list+=[W1]
-        W2list+=[W2]
-        Rlist+=[R_11]
-        R_off_list+=[R_12]
+        Qlist+=[Q]
+        Wlist+=[W]
+        Rlist+=[Ru]
         
-    return Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec
+    return Qlist,Wlist,Uulist,Rlist,NNvec
 
-def solve(Umats,Dmats,Q1list,Q2list,W1list,W2list,Uulist,Rlist,R_off_list,NNvec,Nbvec,rhs):
-    L = len(Dmats)
-    if rhs.ndim == 1:
-        rhshat = rhs[:,np.newaxis].copy()
+def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
+    if mode=='N':
+        L = len(Dmats)
+        if rhs.ndim == 1:
+            rhshat = rhs[:,np.newaxis].copy()
+        else:
+            rhshat = rhs.copy()
+        for i in range(len(Qlist)):
+            rtmp = rhshat[NNvec[i]:,:].copy()
+            if i<len(Qlist)-1:
+                n = Umats[i].shape[0]//Nbvec[i]
+                k = Umats[i].shape[1]
+                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:n-k],rtmp,Nbvec[i],mode='T')
+                rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,n-k:],rtmp,Nbvec[i],mode='T')
+            else:
+                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],rtmp,Nbvec[i],mode='T')
+        
+        y = np.zeros(shape=rhshat.shape)
+
+        y[NNvec[L-1]:,:] = block_solve(Rlist[L-1],rhshat[NNvec[L-1]:,:],Nbvec[L-1])
+        v = apply_sparse_block(Dmats[L-1],y[NNvec[L-1]:,:],Nbvec[L-1])
+
+        for i in range(L-2,-1,-1):
+            n = Umats[i].shape[0]//Nbvec[i]
+            k = Umats[i].shape[1]
+            rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
+                        -apply_sparse_block(Uulist[i],v,Nbvec[i])\
+                        -apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i][:,:n-k],rhs0,Nbvec[i]).copy()
+            y[NNvec[i]:,:]              = apply_sparse_block(Wlist[i][:,:n-k],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
+                                        +apply_sparse_block(Wlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            v       = apply_sparse_block(Umats[i],v,Nbvec[i]).copy()\
+                    +apply_sparse_block(Dmats[i],y[NNvec[i]:,:],Nbvec[i])
+    elif mode=='T':
+        L = len(Dmats)
+        if rhs.ndim == 1:
+            rhshat = rhs[:,None].copy()
+        else:
+            rhshat = rhs.copy()
+        y = rhshat.copy()
+        v = np.zeros(shape=(Umats[0].shape[0],rhshat.shape[1]))
+        for i in range(L-1):
+            n = Umats[i].shape[0]//Nbvec[i]
+            k = Umats[i].shape[1]
+            rhscopy = rhshat.copy()
+            rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block(Wlist[i][:,:(n-k)],rhscopy,Nbvec[i],mode='T')
+            rhshat[NNvec[i+1]-NNvec[i]:,:] = apply_sparse_block(Wlist[i][:,(n-k):],rhscopy,Nbvec[i],mode='T')
+            y[NNvec[i]:NNvec[i+1],:] = block_solve(Rlist[i][:,:n-k],rhshat[:NNvec[i+1]-NNvec[i],:],Nbvec[i],mode='T')
+            v=apply_sparse_block(Uulist[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i],mode='T')+apply_sparse_block(Umats[i],v,Nbvec[i],mode='T')
+            rhshat = rhshat[NNvec[i+1]-NNvec[i]:,:]-apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i]:NNvec[i+1],:],Nbvec[i],mode='T')-apply_sparse_block(Dmats[i+1],v,Nbvec[i+1],mode='T')
+        y[NNvec[-2]:,:] = block_solve(Rlist[-1],rhshat,Nbvec[-1],mode='T')
+        for i in range(len(Qlist)-1,-1,-1):
+            if i<len(Qlist)-1:
+                n = Umats[i].shape[0]//Nbvec[i]
+                k = Umats[i].shape[1]
+                y[NNvec[i]:,:] = apply_sparse_block(Qlist[i][:,:n-k],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
+                    +apply_sparse_block(Qlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            else:
+                y[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])
     else:
-        rhshat = rhs.copy()
-    for i in range(len(Q1list)):
-        rtmp = rhshat[NNvec[i]:,:].copy()
-        
-        rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Q1list[i],rtmp,Nbvec[i],mode='T')
-        if i<len(Q1list)-1:
-            rhshat[NNvec[i+1]:,:] = apply_sparse_block(Q2list[i],rtmp,Nbvec[i],mode='T')
-    
-    y = np.zeros(shape=rhshat.shape)
-
-    y[NNvec[L-1]:,:] = block_solve(Rlist[L-1],rhshat[NNvec[L-1]:,:],Nbvec[L-1])
-    v = apply_sparse_block(Dmats[L-1],y[NNvec[L-1]:,:],Nbvec[L-1])
-
-    for i in range(L-2,-1,-1):
-        rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
-                    -apply_sparse_block(Uulist[i],v,Nbvec[i])\
-                    -apply_sparse_block(R_off_list[i],y[NNvec[i+1]:,:],Nbvec[i])
-        y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i],rhs0,Nbvec[i]).copy()
-        y[NNvec[i]:,:]              = apply_sparse_block(W1list[i],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
-                                    +apply_sparse_block(W2list[i],y[NNvec[i+1]:,:],Nbvec[i])
-        v       = apply_sparse_block(Umats[i],v,Nbvec[i]).copy()\
-                +apply_sparse_block(Dmats[i],y[NNvec[i]:,:],Nbvec[i])
+        raise NotImplementedError("mode not recognized")
     if rhs.ndim==1:
-        y = y.flatten()
+            y = y.flatten()
     return y
