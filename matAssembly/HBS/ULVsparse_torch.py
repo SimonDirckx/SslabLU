@@ -145,7 +145,7 @@ def sparse_block_mult_tens(A,B,device,mode='N'):
     return C
 
 
-def block_diag_add_tens(A,B):
+def block_diag_add_tens(A,B,device):
     '''
     Add block diag matrices
     INPUT  
@@ -278,11 +278,11 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N'):
     if mode=='N':
         L = len(Dmats)
         if rhs.ndim == 1:
-            rhshat = rhs[:,None].detach().clone()
+            rhshat = rhs[:,None].detach().clone().to(device)
         else:
-            rhshat = rhs.detach().clone()
+            rhshat = rhs.detach().clone().to(device)
         for i in range(len(Qlist)):
-            rtmp = rhshat[NNvec[i]:,:].detach()
+            rtmp = rhshat[NNvec[i]:,:].detach().clone().to(device)
             if i<len(Qlist)-1:
                 n = Umats[i].shape[1]
                 k = Umats[i].shape[2]
@@ -291,7 +291,7 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N'):
             else:
                 rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block_tens(Qlist[i],rtmp,device,mode='T')
         
-        y = torch.zeros(size=rhshat.shape)
+        y = torch.zeros(size=rhshat.shape,device=device)
 
         y[NNvec[L-1]:,:] = block_solve_tens(Rlist[L-1],rhshat[NNvec[L-1]:,:],device)
         v = apply_sparse_block_tens(Dmats[L-1],y[NNvec[L-1]:,:],device)
@@ -302,25 +302,25 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N'):
             rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
                         -apply_sparse_block_tens(Uulist[i],v,device)\
                         -apply_sparse_block_tens(Rlist[i][:,:,n-k:],y[NNvec[i+1]:,:],device)
-            y[NNvec[i]:NNvec[i+1],:]    = block_solve_tens(Rlist[i][:,:,:n-k],rhs0,device).detach().clone()
+            y[NNvec[i]:NNvec[i+1],:]    = block_solve_tens(Rlist[i][:,:,:n-k],rhs0,device).detach().clone().to(device)
             y[NNvec[i]:,:]              = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],y[NNvec[i]:NNvec[i+1],:],device)\
                                         +apply_sparse_block_tens(Wlist[i][:,:,(n-k):],y[NNvec[i+1]:,:],device)
-            v       = apply_sparse_block_tens(Umats[i],v,device).detach().clone()\
+            v       = apply_sparse_block_tens(Umats[i],v,device).detach().clone().to(device)\
                     +apply_sparse_block_tens(Dmats[i],y[NNvec[i]:,:],device)
         if rhs.ndim==1:
             y = torch.flatten(y)
     elif mode == 'T':
         L = len(Dmats)
         if rhs.ndim == 1:
-            rhshat = rhs[:,None].detach().clone()
+            rhshat = rhs[:,None].detach().clone().to(device)
         else:
-            rhshat = rhs.detach().clone()
-        y = rhshat.detach().clone()
-        v = torch.zeros(size=(Umats[0].shape[0]*Umats[0].shape[1],rhshat.shape[1]))
+            rhshat = rhs.detach().clone().to(device)
+        y = rhshat.detach().clone().to(device)
+        v = torch.zeros(size=(Umats[0].shape[0]*Umats[0].shape[1],rhshat.shape[1]),device=device)
         for i in range(L-1):
             n = Umats[i].shape[1]
             k = Umats[i].shape[2]
-            rhscopy = rhshat.detach().clone()
+            rhscopy = rhshat.detach().clone().to(device)
             rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],device,rhscopy,mode='T')
             rhshat[NNvec[i+1]-NNvec[i]:,:] = apply_sparse_block_tens(Wlist[i][:,:,(n-k):],rhscopy,device,mode='T')
             y[NNvec[i]:NNvec[i+1],:] = block_solve_tens(Rlist[i][:,:,:n-k],rhshat[:NNvec[i+1]-NNvec[i],:],device,mode='T')
