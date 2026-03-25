@@ -57,7 +57,27 @@ def block_Q_and_R_tens(W12,Dtot,device):
     for i in range(Nb):
         [Q[i,:,:],R[i,:,:]]   = tla.qr(Dtot[i,:,:]@W12[i,:,:])
     return Q,R
+def compute_QR_sparse(Dtot,Wtot,k,device):
+    Nb = Dtot.shape[0]
+    if Nb==1:
+        D = Dtot
+        [Q,Ru] = tla.qr(D)
+        R22=0
+        NN = Ru.shape[0]
 
+    else:
+        n = Dtot.shape[1]
+        NN = (n-k)*Nb
+        Q = torch.zeros(size = (Nb,n,n),device=device)
+        Ru = torch.zeros(size = (Nb,(n-k),n),device=device)
+        R22 = torch.zeros(size = (Nb,k,k),device=device)
+        for i in range(Nb):
+            D = Dtot[i,:,:]@Wtot[i,:,:]
+            [Qloc,R]   = tla.qr(D,mode = 'reduced')
+            Q[i,:,:]           = Qloc
+            Ru[i,:,:]  = R[:n-k,:]
+            R22[i,:,:]          = R[:,n-k:][n-k:,:]
+    return Q,Ru,R22,NN
 
 def compute_QRW_sparse(Dtot,Vtot,Nb,device):
     
