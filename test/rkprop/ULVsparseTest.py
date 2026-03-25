@@ -8,10 +8,11 @@ import scipy.linalg as sclinalg
 
 import matAssembly.HBS.ULVsparse as ULVsparse
 import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
-
-torchbool = False
-nl = 8*8
-Nvec = np.array([2**14,2**16,2**18],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torchbool= True
+nl = 16*16
+Nvec = np.array([2**14,2**16,2**18,2**20,2**22],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
@@ -87,9 +88,9 @@ for indN in range(len(Nvec)):
         Umats_torch = [torch.from_numpy(U) for U in Umats]
         Vmats_torch = [torch.from_numpy(V) for V in Vmats]
 
-        Dtens = [ULVsparse_torch.convert_to_torch_tens(D,Nb) for D,Nb in zip(Dmats_torch,Nbvec)]
-        Utens = [ULVsparse_torch.convert_to_torch_tens(U,Nb) for U,Nb in zip(Umats_torch,Nbvec[:-1])]
-        Vtens = [ULVsparse_torch.convert_to_torch_tens(V,Nb) for V,Nb in zip(Vmats_torch,Nbvec[:-1])]
+        Dtens = [ULVsparse_torch.convert_to_torch_tens(D,Nb).to(device) for D,Nb in zip(Dmats_torch,Nbvec)]
+        Utens = [ULVsparse_torch.convert_to_torch_tens(U,Nb).to(device) for U,Nb in zip(Umats_torch,Nbvec[:-1])]
+        Vtens = [ULVsparse_torch.convert_to_torch_tens(V,Nb).to(device) for V,Nb in zip(Vmats_torch,Nbvec[:-1])]
         
         Nbvec_torch = torch.from_numpy(np.array(Nbvec,dtype=np.int64))
         ticULV = time.time()
@@ -102,7 +103,7 @@ for indN in range(len(Nvec)):
         print(NNvec)
         NNvec = [int(N) for N in NNvec]
         ticSolveULV = time.time()
-        xhat = ULVsparse_torch.solve(Utens,Dtens,Qlist,Wlist,Uulist,Rlist,NNvec,torch.from_numpy(b))
+        xhat = ULVsparse_torch.solve(Utens,Dtens,Qlist,Wlist,Uulist,Rlist,NNvec,torch.from_numpy(b),device)
         tocSolveULV = time.time()
         xhat = xhat.detach().cpu().numpy()
         
