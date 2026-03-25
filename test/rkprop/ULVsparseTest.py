@@ -11,7 +11,7 @@ import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 
 torchbool = False
 nl = 8*8
-Nvec = np.array([2**16,2**18],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+Nvec = np.array([2**16,2**18,2**20],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
@@ -70,8 +70,11 @@ for indN in range(len(Nvec)):
         
         SHBS0 = HBSnew.HBSMAT(SHBS)
         SHBS0.set_Nbvec(Nbvec)
-        SHBS0.constructHBS(k+1)
-        
+        tic = time.time()
+        SHBS0.construct(k+1,True)
+        print("==========================")
+        print("HBS time = ",time.time()-tic)
+        print("==========================")
         x= np.random.standard_normal(size=(SHBS.shape[1],2))
         b = SHBS.matvec(x,mode='T')
         btest = SHBS0.matvec(x,mode='T')

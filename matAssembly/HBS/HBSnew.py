@@ -2,24 +2,25 @@ import numpy as np
 import scipy.linalg as splinalg
 import time
 import matAssembly.HBS.ULVsparse as ULVsparse
-
+import torch.linalg as tla
+import torch
 #sparse block matrix operations
 
 def block_col(A,rk,Nb):
     B = np.zeros(shape = (A.shape[0],rk))
     n = A.shape[0]//Nb
     for i in range(Nb):
-        [U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        #U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
-        B[i*n:(i+1)*n,:] = U[:,:rk]
+        #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
+        U,_ = tla.qr(torch.from_numpy(A[i*n:(i+1)*n,:]),mode='reduced')
+        B[i*n:(i+1)*n,:] = U[:,:rk].detach().clone().cpu()
     return B
 def block_col_full(A,rk,Nb):
-    B = np.zeros(shape = (A.shape[0],rk))
     n = A.shape[0]//Nb
+    B = np.zeros(shape = (A.shape[0],n))
     for i in range(Nb):
-        [U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        #U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
-        B[i*n:(i+1)*n,:] = U
+        #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
+        U,_ = tla.qr(torch.from_numpy(A[i*n:(i+1)*n,:]),mode='complete')
+        B[i*n:(i+1)*n,:] = U.detach().clone().cpu().numpy()
     return B
 
 def block_null(A,rk,Nb):
@@ -27,12 +28,13 @@ def block_null(A,rk,Nb):
     kA = A.shape[1]
     B = np.zeros(shape = (kA*Nb,rk))
     for i in range(Nb):
-        Q,_ = np.linalg.qr(A[i*nA:(i+1)*nA,:].T,mode='reduced')
+        Q,_ = tla.qr(torch.from_numpy(A[i*nA:(i+1)*nA,:].T),mode='reduced')
+        Q = Q.detach().clone().cpu().numpy()
         Om = np.random.standard_normal(size = (Q.shape[0],rk))
         Om-=Q@(Q.T@Om)
-        V,_ = np.linalg.qr(Om,mode='reduced')
+        V,_ = tla.qr(torch.from_numpy(Om),mode='reduced')
         nV = V.shape[1]
-        B[i*kA:(i+1)*kA,:] = V[:,nV-rk:]
+        B[i*kA:(i+1)*kA,:] = V[:,nV-rk:].detach().clone().cpu().numpy()
     return B
 
 def block_solve_r(A,B,Nb):
@@ -42,9 +44,12 @@ def block_solve_r(A,B,Nb):
     n = A.shape[0]//Nb
     C = np.zeros(shape = (A.shape[0],nb))
     for i in range(Nb):
-        [U,s,Vh] = np.linalg.svd(B[i*nb:(i+1)*nb,:],full_matrices=False)
+        [U,s,Vh] = tla.svd(torch.from_numpy(B[i*nb:(i+1)*nb,:]),full_matrices=False)
+        U = U.detach().clone().numpy()
+        s = s.detach().clone().numpy()
+        Vh = Vh.detach().clone().numpy()
         k = sum(s>s[0]*1e-14)
-        Vh = Vh[:k,:].T
+        Vh = (Vh[:k,:].T)
         C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vh)/s[:k])@U[:,:k].T
     return C
 
@@ -165,7 +170,6 @@ class HBSMAT:
         self.Vmats = Vmats
         self.perm = np.arange(Dmats[0].shape[0])
         self.fac = fac
-        self.Nbvec = Nbvec
         self.Nb = Nbvec[0]
         self.shape = np.array([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = np.int64)
         self.dtype = Dmats[0][0].dtype
@@ -250,8 +254,8 @@ class HBSMAT:
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
         Psiprime[self.perm,:] = Psi
-        Y = self.A@Omprime
-        Z = self.A.T@Psiprime
+        Y = self.A.matvec(Omprime)
+        Z = self.A.matvec(Psiprime,mode='T')
         Y = Y[self.perm,:]
         Z = Z[self.perm,:]
         Nb = self.Nb
@@ -292,7 +296,7 @@ class HBSMAT:
                 ZQ = block_mult(Z_ell,Q_ell,Nb)
                 
                 U_ell = block_col(YP,rkm,Nb)
-                W_ell = ULVsparse.block_coll_full(ZQ,rkm,Nb)
+                W_ell = block_col_full(ZQ,rkm,Nb)
                 V_ell = W_ell[:,:rkm]
 
 
@@ -307,7 +311,6 @@ class HBSMAT:
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
                 self.Vmats+=[V_ell]
-                self.Qlist+=[Q]
                 self.Wlist+=[W_ell]
 
             else:

@@ -28,7 +28,7 @@ def compute_QR_sparse(Dtot,Wtot,Nb,k):
         D = Dtot
         [Q,Ru] = np.linalg.qr(D)
         R22=0
-        N = Ru.shape[0]
+        NN = Ru.shape[0]
 
     else:
         n = Dtot.shape[0]//Nb
@@ -37,7 +37,7 @@ def compute_QR_sparse(Dtot,Wtot,Nb,k):
         Ru = np.zeros(shape = (Nb*(n-k),n))
         R22 = np.zeros(shape = (Nb*k,k))
         for box_ind in range(Nb):
-            D = Dtot[box_ind*n:(box_ind+1)*n,:]@W[box_ind*n:(box_ind+1)*n,:]
+            D = Dtot[box_ind*n:(box_ind+1)*n,:]@Wtot[box_ind*n:(box_ind+1)*n,:]
             [Qloc,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
             Qloc = (Qloc.detach().cpu().numpy())
             R = (R.detach().cpu().numpy())
