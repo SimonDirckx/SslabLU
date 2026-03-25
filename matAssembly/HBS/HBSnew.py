@@ -13,6 +13,14 @@ def block_col(A,rk,Nb):
         #U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
         B[i*n:(i+1)*n,:] = U[:,:rk]
     return B
+def block_col_full(A,rk,Nb):
+    B = np.zeros(shape = (A.shape[0],rk))
+    n = A.shape[0]//Nb
+    for i in range(Nb):
+        [U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
+        #U,_ = np.linalg.qr(A[i*n:(i+1)*n,:],mode='reduced')
+        B[i*n:(i+1)*n,:] = U
+    return B
 
 def block_null(A,rk,Nb):
     nA = A.shape[0]//Nb
@@ -112,12 +120,19 @@ class HBSMAT:
     """
 
     def __init__(self,A=None,tree=None,quad=True):
+        print("CONSTRUCT CALLED")
         self.Umats  =   []
         self.Vmats  =   []
         self.Dmats  =   []
+        self.Qlist  =   []
+        self.Rlist  =   []
+        self.Wlist  =   []
+        self.Uulist  =  []
+
         self.nbytes =   0
         if A is not None:
             self.A      =   A
+            print("A is set, with shape ",self.A.shape)
             self.shape  =   self.A.shape
             self.shape = A.shape
             self.dtype = A.dtype
@@ -127,6 +142,7 @@ class HBSMAT:
             self.Nb = tree.nleaves
             self.nl = self.A.shape[0]//self.Nb
             self.L = tree.nlevels
+            
         self.blockSolveTime = 0
         self.nullTime = 0
         self.setupTime = 0
@@ -137,7 +153,12 @@ class HBSMAT:
             self.fac = 4
         else:
             self.fac = 2
-        
+    def set_Nbvec(self,Nbvec):
+        self.Nbvec = Nbvec    
+        self.Nb = Nbvec[0]
+        self.nl = self.A.shape[0]//self.Nb
+        self.L = len(Nbvec)
+        self.perm   =   np.arange(self.A.shape[0],dtype=np.int64)
     def set_mats(self,Umats,Dmats,Vmats,Nbvec,fac=4):
         self.Umats = Umats
         self.Dmats = Dmats
@@ -147,18 +168,25 @@ class HBSMAT:
         self.Nbvec = Nbvec
         self.Nb = Nbvec[0]
         self.shape = np.array([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = np.int64)
-    def construct(self,rk):
+        self.dtype = Dmats[0][0].dtype
+    def construct(self,rk,compute_ULV=False):
+        if compute_ULV:
+            self.constructHBS_ULV(rk)
+        else: 
+            self.constructHBS(rk)
+
+    def constructHBS(self,rk):
         # we compute an HBS compression of permuted op
         
         tic = time.time()
-        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+10))
-        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+10))
+        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+20))
+        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+20))
         Omprime = np.zeros(shape = Om.shape)
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
         Psiprime[self.perm,:] = Psi
-        Y = self.A@Omprime
-        Z = self.A.T@Psiprime
+        Y = self.A.matvec(Omprime)
+        Z = self.A.matvec(Psiprime,mode='T')
         Y = Y[self.perm,:]
         Z = Z[self.perm,:]
         Nb = self.Nb
@@ -213,6 +241,108 @@ class HBSMAT:
                 self.blockSolveTime+=time.time()-tic
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
+    def constructHBS_ULV(self,rk):
+        # we compute an HBS compression of permuted op
+        tic = time.time()
+        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+10))
+        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+10))
+        Omprime = np.zeros(shape = Om.shape)
+        Omprime[self.perm,:] = Om
+        Psiprime = np.zeros(shape = Psi.shape)
+        Psiprime[self.perm,:] = Psi
+        Y = self.A@Omprime
+        Z = self.A.T@Psiprime
+        Y = Y[self.perm,:]
+        Z = Z[self.perm,:]
+        Nb = self.Nb
+        nl = self.nl
+        self.setupTime+=time.time()-tic
+        self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
+        self.NNvec = np.append(self.NNvec,0)
+        for lvl in range(self.L-1,-1,-1):
+            
+            if lvl == self.L-1:
+                Om_ell      = Om
+                Psi_ell     = Psi
+                Y_ell       = Y
+                Z_ell       = Z
+                rkm = min(rk,nl)
+            else:
+                
+                Y_ell       -=block_mult(D_ell,Om_ell,Nb)
+                Y_ell       = block_mult(U_ell,Y_ell,Nb,mode='T')
+
+                Z_ell       -= block_mult(D_ell,Psi_ell,Nb,mode='T')
+                Z_ell       = block_mult(V_ell,Z_ell,Nb,mode='T')
+                
+                Om_ell      = block_mult(V_ell,Om_ell,Nb,mode='T')
+                Psi_ell     = block_mult(U_ell,Psi_ell,Nb,mode='T')
+
+                
+                Nb = Nb//self.fac
+                rkm = rk
+            print("lvl//Nb = ",lvl,"//",Nb)
+            
+            if lvl>0:
+                tic = time.time()
+                P_ell = block_null(Om_ell,rkm,Nb)
+                Q_ell = block_null(Psi_ell,rkm,Nb)
+                self.nullTime+=time.time()-tic
+                YP = block_mult(Y_ell,P_ell,Nb)
+                ZQ = block_mult(Z_ell,Q_ell,Nb)
+                
+                U_ell = block_col(YP,rkm,Nb)
+                W_ell = ULVsparse.block_coll_full(ZQ,rkm,Nb)
+                V_ell = W_ell[:,:rkm]
+
+
+
+                tic = time.time()
+                YO = block_solve_r(Y_ell,Om_ell,Nb)
+                ZP = block_solve_r(Z_ell,Psi_ell,Nb)
+                self.blockSolveTime+=time.time()-tic
+                tic = time.time()
+                D_ell = construct_D(U_ell,V_ell,YO,ZP,Nb)
+                self.DTime+= time.time()-tic
+                self.Dmats+=[D_ell]
+                self.Umats+=[U_ell]
+                self.Vmats+=[V_ell]
+                self.Qlist+=[Q]
+                self.Wlist+=[W_ell]
+
+            else:
+                tic = time.time()
+                D_ell = block_solve_r(Y_ell,Om_ell,Nb)
+                self.blockSolveTime+=time.time()-tic
+                self.Dmats+=[D_ell]
+            self.Nbvec+=[Nb]
+            
+            if lvl==self.L-1:
+                Rprime = D_ell
+                Q,Ru,R22,NN = ULVsparse.compute_QR_sparse(Rprime,W_ell,Nb,rkm)
+                n = U_ell.shape[0]//Nb
+                k = U_ell.shape[1]
+                Uu = ULVsparse.sparse_block_mult(Q[:,:n-k],U_ell,self.Nbvec[-1],self.Nbvec[-1],mode='T')
+                Ud = ULVsparse.sparse_block_mult(Q[:,n-k:],U_ell,self.Nbvec[-1],self.Nbvec[-1],mode='T')
+                self.Uulist+=[Uu]
+                Uhat=Ud
+            else:
+                Rhat = ULVsparse.sparse_block_mult(Uhat,D_ell,self.Nbvec[-2],self.Nbvec[-1])
+                Rhat = ULVsparse.block_diag_add(Rhat,R22,Nb,self.Nbvec[-2])
+                Q,Ru,R22,NN = ULVsparse.compute_QR_sparse(Rhat,W_ell,Nb,rkm)
+                if lvl>0:
+                    n = U_ell.shape[0]//Nb
+                    k = U_ell.shape[1]
+                    Uhat = ULVsparse.sparse_block_mult(Uhat,U_ell,self.Nbvec[-2],self.Nbvec[-1])
+                    Uu = ULVsparse.sparse_block_mult(Q[:,:n-k],Uhat,self.Nbvec[-1],self.Nbvec[-1],mode='T')
+                    Ud = ULVsparse.sparse_block_mult(Q[:,n-k:],Uhat,self.Nbvec[-1],self.Nbvec[-1],mode='T')
+                    self.Uulist+=[Uu]
+                    Uhat=Ud           
+            self.Qlist+=[Q]
+            self.Rlist+=[Ru]
+            self.NNvec = np.append(self.NNvec,self.NNvec[-1]+NN)
+
+                
 
     def matvec(self,v,mode='N'):
         if v.ndim==1:
@@ -253,7 +383,7 @@ class HBSMAT:
         return u
     
     def compute_ULV(self):
-        self.Q1list,self.Q2list,self.W1list,self.W2list,self.Uulist,self.Rlist,self.R_off_list,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
+        self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
     def solve(self,b,mode='N'):
         if b.ndim==1:

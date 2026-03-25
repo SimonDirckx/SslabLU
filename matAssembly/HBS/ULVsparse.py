@@ -23,6 +23,28 @@ def block_qr(A,n,k,Nb):
     return C
 
 
+def compute_QR_sparse(Dtot,Wtot,Nb,k):
+    if Nb==1:
+        D = Dtot
+        [Q,Ru] = np.linalg.qr(D)
+        R22=0
+        N = Ru.shape[0]
+
+    else:
+        n = Dtot.shape[0]//Nb
+        NN = (n-k)*Nb
+        Q = np.zeros(shape = (Nb*n,n))
+        Ru = np.zeros(shape = (Nb*(n-k),n))
+        R22 = np.zeros(shape = (Nb*k,k))
+        for box_ind in range(Nb):
+            D = Dtot[box_ind*n:(box_ind+1)*n,:]@W[box_ind*n:(box_ind+1)*n,:]
+            [Qloc,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
+            Qloc = (Qloc.detach().cpu().numpy())
+            R = (R.detach().cpu().numpy())
+            Q[box_ind*n:(box_ind+1)*n,:]           = Qloc
+            Ru[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:n-k,:]
+            R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
+    return Q,Ru,R22,NN
 
 
 def compute_QRW_sparse(Dtot,Vtot,Nb):
