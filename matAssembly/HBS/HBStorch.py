@@ -200,13 +200,13 @@ class HBSMAT:
             else:
                 
                 Y_ell       -=block_mult(D_ell,Om_ell,self.device)
-                Y_ell       = block_mult(U_ell,Y_ell,self.device,mode='T')
+                Y_ell       = block_mult_and_reduce(U_ell,Y_ell,self.fac,self.device,mode='T')
 
                 Z_ell       -= block_mult(D_ell,Psi_ell,self.device,mode='T')
-                Z_ell       = block_mult(V_ell,Z_ell,self.device,mode='T')
+                Z_ell       = block_mult_and_reduce(V_ell,Z_ell,self.fac,self.device,mode='T')
                 
-                Om_ell      = block_mult(V_ell,Om_ell,self.device,mode='T')
-                Psi_ell     = block_mult(U_ell,Psi_ell,self.device,mode='T')
+                Om_ell      = block_mult_and_reduce(V_ell,Om_ell,self.fac,self.device,mode='T')
+                Psi_ell     = block_mult_and_reduce(U_ell,Psi_ell,self.fac,self.device,mode='T')
                 
                 Nb = Nb//self.fac
                 rkm = rk
@@ -238,9 +238,6 @@ class HBSMAT:
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
-        print("SETUP START")
-        tic = time.time()
-        # we compute an HBS compression of permuted op
         tic = time.time()
         Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+10))
         Psi0 = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+10))
@@ -260,17 +257,13 @@ class HBSMAT:
         Om = ULVsparse.convert_to_torch_tens(Om,self.Nb).to(self.device)
         Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb).to(self.device)
 
+        
         Nb = self.Nb
         nl = self.nl
         self.setupTime+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
-        print("SETUP DONE IN ",time.time()-tic,"s")
-        t_null = 0.
-        t_full_col = 0.
-        t_col = 0.
-        t_pinv=0.
-        t_construct_D=0.
+        t_init = time.time()-tic
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -280,6 +273,7 @@ class HBSMAT:
                 Z_ell       = Z
                 rkm = min(rk,nl)
             else:
+                
                 Y_ell       -=block_mult(D_ell,Om_ell,self.device)
                 Y_ell       = block_mult_and_reduce(U_ell,Y_ell,self.fac,self.device,mode='T')
 
@@ -288,80 +282,68 @@ class HBSMAT:
                 
                 Om_ell      = block_mult_and_reduce(V_ell,Om_ell,self.fac,self.device,mode='T')
                 Psi_ell     = block_mult_and_reduce(U_ell,Psi_ell,self.fac,self.device,mode='T')
+
                 
                 Nb = Nb//self.fac
                 rkm = rk
             print("lvl//Nb = ",lvl,"//",Nb)
-            
+            self.Nbvec+=[Nb]
             if lvl>0:
                 tic = time.time()
                 P_ell = block_null(Om_ell,rkm,self.device)
                 Q_ell = block_null(Psi_ell,rkm,self.device)
-                t_null+=time.time()-tic
                 self.nullTime+=time.time()-tic
                 YP = block_mult(Y_ell,P_ell,self.device)
                 ZQ = block_mult(Z_ell,Q_ell,self.device)
-                tic = time.time()
                 U_ell = block_col(YP,rkm,self.device)
-                t_col+=time.time()-tic
-                tic = time.time()
-                W_ell = block_col_full(ZQ,self.device)
-                t_full_col+=time.time()-tic
-                V_ell = W_ell[:,:,:rkm]
-
-
-
+                V_ell = block_col(ZQ,rkm,self.device)
                 tic = time.time()
                 YO = block_solve_r(Y_ell,Om_ell,self.device)
                 ZP = block_solve_r(Z_ell,Psi_ell,self.device)
-                t_pinv+=time.time()-tic
                 self.blockSolveTime+=time.time()-tic
                 tic = time.time()
                 D_ell = construct_D(U_ell,V_ell,YO,ZP,self.device)
-                t_construct_D+= time.time()-tic
+                self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
                 self.Vmats+=[V_ell]
-                self.Wlist+=[W_ell]
-
             else:
                 tic = time.time()
                 D_ell = block_solve_r(Y_ell,Om_ell,self.device)
-                t_pinv+=time.time()-tic
+                self.blockSolveTime+=time.time()-tic
                 self.Dmats+=[D_ell]
-            self.Nbvec+=[Nb]
-
+                U_ell = torch.eye(D_ell.shape[1])
+                U_ell = U_ell[None,:,:]
             
             if lvl==self.L-1:
-                Rprime = D_ell
-                Q,Ru,R22,NN = ULVsparse.compute_QR_sparse(Rprime,W_ell,rkm,self.device)
-                n = U_ell.shape[1]
-                k = U_ell.shape[2]
-                Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:n-k],U_ell,self.device,mode='T')
-                Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,n-k:],U_ell,self.device,mode='T')
-                self.Uulist+=[Uu]
-                Uhat=Ud
+                    Rhat = D_ell
             else:
-                Rhat = ULVsparse.sparse_block_mult_tens(Uhat,D_ell,self.device)
-                Rhat = ULVsparse.block_diag_add_tens(Rhat,R22,self.device)
-                Q,Ru,R22,NN = ULVsparse.compute_QR_sparse(Rhat,W_ell,rkm,self.device)
-                if lvl>0:
-                    n = U_ell.shape[1]
-                    k = U_ell.shape[2]
-                    Uhat = ULVsparse.sparse_block_mult_tens(Uhat,U_ell,self.device)
-                    Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:n-k],Uhat,self.device,mode='T')
-                    Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,n-k:],Uhat,self.device,mode='T')
-                    self.Uulist+=[Uu]
-                    Uhat=Ud           
+                Rhat = ULVsparse.sparse_block_mult_tens(Uhat,D_ell,device=self.device)
+                Rhat = ULVsparse.block_diag_add_tens(Rhat,R_22,device=self.device)
+            
+            Q,W,Ru,R_22,NN = ULVsparse.compute_QRW_sparse(Rhat,V_ell,self.Nbvec[-1],device=self.device)
             self.Qlist+=[Q]
+            self.Wlist+=[W]
             self.Rlist+=[Ru]
-            self.NNvec = np.append(self.NNvec,self.NNvec[-1]+NN)
+            self.NNvec=np.append(self.NNvec,self.NNvec[-1]+NN)
+
+
+            if lvl == self.L-1:
+                Uhat = U_ell
+            else:
+                Uhat = ULVsparse.sparse_block_mult_tens(Uhat,U_ell,device=self.device)
+            
+            Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:-rk],Uhat,device=self.device,mode='T')
+            Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rk:],Uhat,device=self.device,mode='T')
+            self.Uulist+=[Uu]
+            Uhat=Ud
         print("=====TIMINGS HBS=====")
-        print("t_null       = ",t_null)
-        print("t_pinv       = ",t_pinv)
-        print("t_col        = ",t_col)
-        print("t_full_col   = ",t_full_col)
-        print("t_D          = ",t_construct_D)
+        print("t",t_init)
+        #print("t_null       = ",t_null)
+        #print("t_pinv       = ",t_pinv)
+        #print("t_col        = ",t_col)
+        #print("t_full_col   = ",t_full_col)
+        #print("t_D          = ",t_construct_D)
         print("=====================")
 
                 
@@ -411,14 +393,27 @@ class HBSMAT:
     def compute_ULV(self):
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
-    def solve(self,b,mode='N'):
-        if b.ndim==1:
-            bperm = b[self.perm,np.newaxis]    
+    def solve(self,b,device,mode='N'):
+        if mode =='N':
+            if b.ndim==1:
+                bperm = b[self.perm,None]    
+            else:
+                bperm= b[self.perm,:]
+            rhs = bperm.detach().clone()
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,device=device)
+            u = torch.zeros(size = uhat.shape)
+            u[self.perm,:] = uhat
+        elif mode=='T':
+            rhs = np.zeros(shape = b.shape)
+            if b.ndim==1:
+                rhs = rhs[:,None]
+                rhs[self.perm,:] = b[:,None].copy()
+            else:
+                rhs[self.perm,:] = b.copy()
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,mode='T')
+            u = uhat[self.perm,:]
         else:
-            bperm= b[self.perm,:]
-        rhs = bperm.copy()
-        uhat = ULVsparse.solve(Utens,Dtens,Qlist,Wlist,Uulist,Rlist,NNvec,torch.from_numpy(b),device)
-        u[self.perm,:] = uperm
+            raise NotImplementedError("mode not recognized")
         if b.ndim==1:
             u = u.flatten()
         return u

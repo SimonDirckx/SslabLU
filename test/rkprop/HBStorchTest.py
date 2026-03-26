@@ -71,22 +71,18 @@ for indN in range(len(Nvec)):
     SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    test_torch = False
-    if test_torch:
-        SHBS0 = HBStorch.HBSMAT(SHBS,device)
-    else:
-        SHBS0 = HBSnew.HBSMAT(SHBS)
+    SHBS0 = HBStorch.HBSMAT(SHBS,device)
     SHBS0.set_Nbvec(Nbvec)
     tic = time.time()
-    SHBS0.construct(k,True)
+    SHBS0.construct(k+1,True)
     print("==========================")
     print("HBS time = ",time.time()-tic)
     print("==========================")
     x= np.random.standard_normal(size=(SHBS.shape[1],))
-    b = SHBS0.matvec(x,mode='T')
-    xhat = SHBS0.solve(b,mode='T')
+    b = SHBS0.matvec(x)
+    xhat = SHBS0.solve(torch.from_numpy(b),device)
     print("==========================")
-    print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
+    print("solve err = ",np.linalg.norm(x-xhat.detach().clone().cpu().numpy())/np.linalg.norm(x))
     print("==========================")
     '''
     ticSolveULV = time.time()
