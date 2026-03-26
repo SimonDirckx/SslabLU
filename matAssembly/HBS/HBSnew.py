@@ -53,30 +53,8 @@ def block_solve_r(A,B,Nb):
         C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vh)/s[:k])@U[:,:k].T
     return C
 
-def block_orth_proj(A,B,Nb,compl=True):
-    # assumes blocks of A orth
-    C = np.zeros(shape = (A.shape[0],B.shape[1]))
-    n = A.shape[0]//Nb
-    for i in range(Nb):
-        U = A[i*n:(i+1)*n,:]
-        
-        if compl:
-            C[i*n:(i+1)*n,:] = B[i*n:(i+1)*n,:]-U@(U.T@B[i*n:(i+1)*n,:])
-        else:
-            C[i*n:(i+1)*n,:] = U@(U.T@B[i*n:(i+1)*n,:])
-    return C
 
 
-
-def block_transpose(A,Nb):
-    
-    #note: this is one of ONLY TWO places where uniformity of B ito blocks is assumed!
-    kA = A.shape[1]
-    nA = A.shape[0]//Nb
-    AT = np.zeros(shape = (Nb*kA,nA))
-    for i in range(Nb):
-        AT[i*kA:(i+1)*kA,:] = A[i*nA:(i+1)*nA,:].T
-    return AT
 def block_mult(A,B,Nb,mode='N'):
     if mode=='N':
         C = np.zeros(shape=(A.shape[0],B.shape[1]))
@@ -272,6 +250,7 @@ class HBSMAT:
                 Z_ell       = Z
                 rkm = min(rk,nl)
             else:
+                print("Y shape in = ",Y_ell.shape)
                 
                 Y_ell       -=block_mult(D_ell,Om_ell,Nb)
                 Y_ell       = block_mult(U_ell,Y_ell,Nb,mode='T')
@@ -281,7 +260,7 @@ class HBSMAT:
                 
                 Om_ell      = block_mult(V_ell,Om_ell,Nb,mode='T')
                 Psi_ell     = block_mult(U_ell,Psi_ell,Nb,mode='T')
-
+                print("Y shape out = ",Y_ell.shape)
                 
                 Nb = Nb//self.fac
                 rkm = rk
@@ -292,9 +271,11 @@ class HBSMAT:
                 P_ell = block_null(Om_ell,rkm,Nb)
                 Q_ell = block_null(Psi_ell,rkm,Nb)
                 self.nullTime+=time.time()-tic
+                print("Y shape = ",Y_ell.shape)
+                print("P shape = ",P_ell.shape)
                 YP = block_mult(Y_ell,P_ell,Nb)
                 ZQ = block_mult(Z_ell,Q_ell,Nb)
-                
+                print("YP shape = ",YP.shape)
                 U_ell = block_col(YP,rkm,Nb)
                 W_ell = block_col_full(ZQ,rkm,Nb)
                 V_ell = W_ell[:,:rkm]
@@ -319,7 +300,9 @@ class HBSMAT:
                 self.blockSolveTime+=time.time()-tic
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
-            
+            print("U shape = ",U_ell.shape)
+            print("V shape = ",V_ell.shape)
+            print("D shape = ",D_ell.shape)
             if lvl==self.L-1:
                 Rprime = D_ell
                 Q,Ru,R22,NN = ULVsparse.compute_QR_sparse(Rprime,W_ell,Nb,rkm)
