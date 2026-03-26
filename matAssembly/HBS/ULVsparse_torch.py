@@ -11,10 +11,10 @@ with R upper triangular
 Q,R,W given in reduced format
 
 '''
-def convert_to_torch_tens(A,Nb):
+def convert_to_torch_tens(A,Nb,device):
     n = A.shape[0]//Nb
     k = A.shape[1]
-    B = torch.zeros(size = (Nb,n,k))
+    B = torch.zeros(size = (Nb,n,k),device=device)
     for i in range(Nb):
         B[i,:,:] = A[i*n:(i+1)*n,:]
     return B

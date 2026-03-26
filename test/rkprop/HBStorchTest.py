@@ -13,15 +13,14 @@ import torch.linalg as tla
 
 torchbool = False
 nl = 8*8
-Nvec = np.array([2**16],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+Nvec = np.array([2**16],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 for indN in range(len(Nvec)):
     N = Nvec[indN]
     Nleaves = N//nl
     L = (int)(np.log2(Nleaves))//2 + 1
-    kvec = np.array([32,64,128],dtype=np.int64)
-
     k = 32
     k0 = min(nl,k)
 
@@ -62,15 +61,9 @@ for indN in range(len(Nvec)):
         Dmats += [Dtot_sparse]
 
 
-    ticULV = time.time()
-    Qlist,Wlist,Uulist,Rlist,NNvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,Nbvec)
-    tocULV = time.time()
-
-    #tic = time.time()
     SHBS = HBSnew.HBSMAT()
     SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHBS0 = HBStorch.HBSMAT(SHBS,device)
     SHBS0.set_Nbvec(Nbvec)
     tic = time.time()
@@ -84,25 +77,4 @@ for indN in range(len(Nvec)):
     print("==========================")
     print("solve err = ",np.linalg.norm(x-xhat.detach().clone().cpu().numpy())/np.linalg.norm(x))
     print("==========================")
-    '''
-    ticSolveULV = time.time()
-    xhat = ULVsparse.solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,b,mode='T')
-    tocSolveULV = time.time()
-    t_ULV_vec[indN] = tocULV-ticULV
-    t_solve_vec[indN] = tocSolveULV-ticSolveULV
-    print("solve err = ",np.linalg.norm(xhat-x)/np.linalg.norm(x))
-    print("solve ULV time = ", t_solve_vec[indN])
-    print("ULV fact. time = ", t_ULV_vec[indN])
-    print("Ndofs = ", Dmats[0].shape[0])
-    plt.figure(1)
-plt.loglog(Nvec,t_ULV_vec)
-plt.loglog(Nvec,Nvec*1.1*(t_ULV_vec[0]/Nvec[0]),linestyle='dashed')
-plt.legend(['tULV','O(N)'])
-
-plt.figure(2)
-plt.loglog(Nvec,t_solve_vec)
-plt.loglog(Nvec,Nvec*1.1*(t_solve_vec[0]/Nvec[0]),linestyle='dashed')
-plt.legend(['tsol','O(N)'])
-
-plt.show()
-'''
+    

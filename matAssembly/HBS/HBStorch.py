@@ -247,23 +247,29 @@ class HBSMAT:
         Psiprime[self.perm,:] = Psi0
         Y = self.A.matvec(Omprime)
         Z = self.A.matvec(Psiprime,mode='T')
-        Y = torch.from_numpy(Y[self.perm,:])
-        Z = torch.from_numpy(Z[self.perm,:])
-        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb).to(self.device)
-        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb).to(self.device)
+        t_sample = time.time()-tic
+        tic = time.time()
+        Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
+        Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
+        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,self.device)
+        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb,self.device)
 
-        Om = torch.from_numpy(Om0)
-        Psi = torch.from_numpy(Psi0)
-        Om = ULVsparse.convert_to_torch_tens(Om,self.Nb).to(self.device)
-        Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb).to(self.device)
+        Om = torch.from_numpy(Om0).to(self.device)
+        Psi = torch.from_numpy(Psi0).to(self.device)
+        Om = ULVsparse.convert_to_torch_tens(Om,self.Nb,self.device)
+        Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb,self.device)
 
+        t_trans = time.time()-tic
         
         Nb = self.Nb
         nl = self.nl
         self.setupTime+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
-        t_init = time.time()-tic
+        print("=====INIT TIME HBS=====")
+        print("sample time          : ",t_sample)
+        print("data transfer time   : ",t_trans)
+        print("=====================")
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -337,14 +343,7 @@ class HBSMAT:
             Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rk:],Uhat,device=self.device,mode='T')
             self.Uulist+=[Uu]
             Uhat=Ud
-        print("=====TIMINGS HBS=====")
-        print("t",t_init)
-        #print("t_null       = ",t_null)
-        #print("t_pinv       = ",t_pinv)
-        #print("t_col        = ",t_col)
-        #print("t_full_col   = ",t_full_col)
-        #print("t_D          = ",t_construct_D)
-        print("=====================")
+        
 
                 
 
