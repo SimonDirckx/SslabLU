@@ -9,10 +9,11 @@ import scipy.linalg as sclinalg
 
 import matAssembly.HBS.ULVsparse as ULVsparse
 import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
+import torch.linalg as tla
 
 torchbool = False
 nl = 8*8
-Nvec = np.array([2**18],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+Nvec = np.array([2**16],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
@@ -70,19 +71,24 @@ for indN in range(len(Nvec)):
     SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SHBS0 = HBStorch.HBSMAT(SHBS,device)
+    test_torch = False
+    if test_torch:
+        SHBS0 = HBStorch.HBSMAT(SHBS,device)
+    else:
+        SHBS0 = HBSnew.HBSMAT(SHBS)
     SHBS0.set_Nbvec(Nbvec)
     tic = time.time()
     SHBS0.construct(k,True)
     print("==========================")
     print("HBS time = ",time.time()-tic)
     print("==========================")
+    x= np.random.standard_normal(size=(SHBS.shape[1],))
+    b = SHBS0.matvec(x,mode='T')
+    xhat = SHBS0.solve(b,mode='T')
+    print("==========================")
+    print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))
+    print("==========================")
     '''
-    x= np.random.standard_normal(size=(SHBS.shape[1],2))
-    b = SHBS.matvec(x,mode='T')
-    btest = SHBS0.matvec(x,mode='T')
-    print("b0 err = ",np.linalg.norm(b-btest)/np.linalg.norm(b))
-
     ticSolveULV = time.time()
     xhat = ULVsparse.solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,b,mode='T')
     tocSolveULV = time.time()
