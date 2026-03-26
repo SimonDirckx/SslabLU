@@ -12,7 +12,7 @@ import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 
 torchbool = False
 nl = 8*8
-Nvec = np.array([2**16],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
+Nvec = np.array([2**18],dtype=np.int64)#np.array([2**14,2**16,2**18,2**20],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 for indN in range(len(Nvec)):
@@ -65,12 +65,12 @@ for indN in range(len(Nvec)):
     Qlist,Wlist,Uulist,Rlist,NNvec = ULVsparse.compute_ULV(Umats,Dmats,Vmats,Nbvec)
     tocULV = time.time()
 
-
+    #tic = time.time()
     SHBS = HBSnew.HBSMAT()
     SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SHBS0 = HBStorch.HBSMAT(SHBS)
+    SHBS0 = HBStorch.HBSMAT(SHBS,device)
     SHBS0.set_Nbvec(Nbvec)
     tic = time.time()
     SHBS0.construct(k,True)

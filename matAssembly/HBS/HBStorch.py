@@ -241,6 +241,8 @@ class HBSMAT:
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
+        print("SETUP START")
+        tic = time.time()
         # we compute an HBS compression of permuted op
         tic = time.time()
         Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+10))
@@ -251,10 +253,10 @@ class HBSMAT:
         Psiprime[self.perm,:] = Psi0
         Y = self.A.matvec(Omprime)
         Z = self.A.matvec(Psiprime,mode='T')
-        Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
-        Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
-        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb)
-        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb)
+        Y = torch.from_numpy(Y[self.perm,:])
+        Z = torch.from_numpy(Z[self.perm,:])
+        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb).to(self.device)
+        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb).to(self.device)
 
         Om = torch.from_numpy(Om0)
         Psi = torch.from_numpy(Psi0)
@@ -266,6 +268,7 @@ class HBSMAT:
         self.setupTime+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
+        print("SETUP DONE IN ",time.time()-tic,"s")
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
