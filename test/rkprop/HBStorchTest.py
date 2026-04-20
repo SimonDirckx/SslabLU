@@ -12,17 +12,17 @@ import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 import torch.linalg as tla
 
 torchbool = False
-nl = 16
+nl = 32
 Nvec = np.array([2**12*nl],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-quad = True
+quad = False
 for indN in range(len(Nvec)):
     N = Nvec[indN]
     Nleaves = N//nl
     
-    k = nl
+    k = 16
     k0 = min(nl,k)
     if quad:
         fac = 4
@@ -41,7 +41,6 @@ for indN in range(len(Nvec)):
         U = np.linalg.qr(np.random.standard_normal(size = (nl,k0)),mode='reduced')[0]
         V = np.linalg.qr(np.random.standard_normal(size = (nl,k0)),mode='reduced')[0]
         D = np.random.standard_normal(size = (nl,nl))
-        
         Dtot1_sparse[i*nl:(i+1)*nl,:] = D-U@(U.T@D@V)@V.T
         Utot1_sparse[i*nl:(i+1)*nl,:] = U
         Vtot1_sparse[i*nl:(i+1)*nl,:] = V
@@ -90,7 +89,7 @@ for indN in range(len(Nvec)):
     print("==========================")
     print("HBS time = ",time.time()-tic)
     print("==========================")
-    x= np.random.standard_normal(size=(SHBS.shape[1],))
+    x= np.random.standard_normal(size=(SHBS.shape[1],5))
     b = SHBS.matvec(x.copy())
     btest = SHBS0.matvec(x.copy())
     xhat = SHBS0.solve(torch.from_numpy(btest),device)

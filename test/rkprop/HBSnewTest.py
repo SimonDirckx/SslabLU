@@ -92,10 +92,10 @@ for indN in range(len(Nvec)):
     print("==========================")
     
 
-    x= np.random.standard_normal(size=(SHBS.shape[1],))
+    x= np.random.standard_normal(size=(SHBS.shape[1],10))
     b = SHBS.matvec(x)
     bhat = SHBS0.matvec(x)
-    xhat = SHBS0.solve(bhat)
+    xhat = SHBS0.solve(b)
     print("==========================")
     print("matvec err = ",np.linalg.norm(b-bhat)/np.linalg.norm(b))
     print("solve err = ",np.linalg.norm(x-xhat)/np.linalg.norm(x))

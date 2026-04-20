@@ -262,6 +262,7 @@ class HBSMAT:
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
+        torch.set_default_dtype(torch.float64)
         tic = time.time()
         print("self.fac = ",self.fac)
         Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+4)*rk+5))
@@ -272,8 +273,6 @@ class HBSMAT:
         Psiprime[self.perm,:] = Psi0
         Y = self.A.matvec(Omprime)
         Z = self.A.matvec(Psiprime,mode='T')
-        t_sample = time.time()-tic
-        tic = time.time()
         Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
         Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
         Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,self.device)
@@ -283,8 +282,6 @@ class HBSMAT:
         Psi = torch.from_numpy(Psi0).to(self.device)
         Om = ULVsparse.convert_to_torch_tens(Om,self.Nb,self.device)
         Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb,self.device)
-
-        t_trans = time.time()-tic
         
         Nb = self.Nb
         nl = self.nl

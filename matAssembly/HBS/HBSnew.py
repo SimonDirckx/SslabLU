@@ -4,7 +4,6 @@ import time
 import matAssembly.HBS.ULVsparse as ULVsparse
 import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 import torch.linalg as tla
-import torch
 import scipy.linalg as sclinalg
 #sparse block matrix operations
 
@@ -195,8 +194,8 @@ class HBSMAT:
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
         tic = time.time()
-        Om = np.random.standard_normal(size = (self.shape[1],(4*self.fac+2)*rk+20))
-        Psi = np.random.standard_normal(size = (self.shape[0],(4*self.fac+2)*rk+20))
+        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+20))
+        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+20))
         Omprime = np.zeros(shape = Om.shape)
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
@@ -318,24 +317,22 @@ class HBSMAT:
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
     def solve(self,b,mode='N'):
-        torch.set_default_dtype(torch.float64)
         if mode =='N':
             if b.ndim==1:
-                bperm = b[self.perm,None]    
+                bperm = b[:,np.newaxis]    
             else:
                 bperm= b[self.perm,:]
             rhs = bperm.copy()
-            Umats_torch = [ULVsparse_torch.convert_to_torch_tens(U,Nb,'cpu') for U,Nb in zip(self.Umats,self.Nbvec)]
-            Vmats_torch = [ULVsparse_torch.convert_to_torch_tens(V,Nb,'cpu') for V,Nb in zip(self.Vmats,self.Nbvec)]
-            Dmats_torch = [ULVsparse_torch.convert_to_torch_tens(D,Nb,'cpu') for D,Nb in zip(self.Dmats,self.Nbvec)]
-            Qlist_torch = [ULVsparse_torch.convert_to_torch_tens(Q,Nb,'cpu') for Q,Nb in zip(self.Qlist,self.Nbvec)]
-            Wlist_torch = [ULVsparse_torch.convert_to_torch_tens(W,Nb,'cpu') for W,Nb in zip(self.Wlist,self.Nbvec)]
-            Uulist_torch = [ULVsparse_torch.convert_to_torch_tens(Uu,Nb,'cpu') for Uu,Nb in zip(self.Uulist,self.Nbvec)]
-            Rlist_torch = [ULVsparse_torch.convert_to_torch_tens(R,Nb,'cpu') for R,Nb in zip(self.Rlist,self.Nbvec)]
-            uhat = ULVsparse_torch.solve(Umats_torch,Dmats_torch,Qlist_torch,\
-                                         Wlist_torch,Uulist_torch,Rlist_torch,self.NNvec,torch.from_numpy(rhs),'cpu')
+            #Umats_torch = [ULVsparse_torch.convert_to_torch_tens(U,Nb,'cpu') for U,Nb in zip(self.Umats,self.Nbvec)]
+            #Vmats_torch = [ULVsparse_torch.convert_to_torch_tens(V,Nb,'cpu') for V,Nb in zip(self.Vmats,self.Nbvec)]
+            #Dmats_torch = [ULVsparse_torch.convert_to_torch_tens(D,Nb,'cpu') for D,Nb in zip(self.Dmats,self.Nbvec)]
+            #Qlist_torch = [ULVsparse_torch.convert_to_torch_tens(Q,Nb,'cpu') for Q,Nb in zip(self.Qlist,self.Nbvec)]
+            #Wlist_torch = [ULVsparse_torch.convert_to_torch_tens(W,Nb,'cpu') for W,Nb in zip(self.Wlist,self.Nbvec)]
+            #Uulist_torch = [ULVsparse_torch.convert_to_torch_tens(Uu,Nb,'cpu') for Uu,Nb in zip(self.Uulist,self.Nbvec)]
+            #Rlist_torch = [ULVsparse_torch.convert_to_torch_tens(R,Nb,'cpu') for R,Nb in zip(self.Rlist,self.Nbvec)]
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs)
             u = np.zeros(shape = uhat.shape)
-            u[self.perm,:] = uhat.detach().clone().cpu().numpy()
+            u[self.perm,:] = uhat
         elif mode=='T':
             rhs = np.zeros(shape = b.shape)
             if b.ndim==1:

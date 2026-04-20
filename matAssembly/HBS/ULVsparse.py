@@ -15,10 +15,12 @@ Q,R,W given in reduced format
 
 '''
 
-def block_qr(A,n,k,Nb):
-    C = torch.zeros(size = (n*Nb,n-k))
+def block_qr(A,Nb):
+    k = A.shape[1]
+    n = A.shape[0]//Nb
+    C = np.zeros(shape = (n*Nb,n-k))
     for i in range(Nb):
-        Q,_ = tla.qr(A[i*n:(i+1)*n,:],mode='complete')
+        Q = np.linalg.qr(A[i*n:(i+1)*n,:],mode='complete')[0]
         C[i*n:(i+1)*n,:] = Q[:,k:]
     return C
 
@@ -46,6 +48,18 @@ def compute_QR_sparse(Dtot,Wtot,Nb,k):
             R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
     return Q,Ru,R22,NN
 
+def block_Q_and_R(W12,Dtot,k,Nb):
+    n = Dtot.shape[0]//Nb
+    nw=W12.shape[0]//Nb
+    Q = np.zeros(shape = (Nb*n,n))
+    Ru = np.zeros(shape = (Nb*(n-k),n))
+    R22 = np.zeros(shape = (Nb*k,k))
+    for i in range(Nb):
+        [Q[i*n:(i+1)*n,:],R]   = np.linalg.qr(Dtot[i*n:(i+1)*n,:]@W12[i*nw:(i+1)*nw,:])
+        Ru[i*(n-k):(i+1)*(n-k),:] = R[:n-k,:]
+        R22[i*k:(i+1)*k,:] = R[n-k:,n-k:]
+    return Q,Ru,R22
+
 
 def compute_QRW_sparse(Dtot,Vtot,Nb):
     
@@ -62,49 +76,29 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
     tinit = 0
     if Nb==1:
         D = Dtot
-        [Q,Ru] = np.linalg.qr(D)
+        [Q,Ru] = np.linalg.qr(D,mode='reduced')
         R22=0
-        W1 = np.identity(Ru.shape[1])
-        W2 = np.zeros(shape = (Ru.shape[0],0))
-        NN = Ru.shape[0]
+        W12 = None
+        NN = Ru.shape[1]
 
     else:
         tic = time.time()
         k = Vtot.shape[1]
         n = Vtot.shape[0]//Nb
         NN = (n-k)*Nb
-        Q = np.zeros(shape = (Nb*n,n))
-        W1 = np.zeros(shape = (Nb*n,n-k))
-        W2 = Vtot[:,:k]
-        Ru = np.zeros(shape = (NN,n))
-        R22 = np.zeros(shape = (Nb*k,k))
         tinit = time.time()-tic
         tic = time.time()
-        print("n = ",n)
-        print("k = ",k)
         if n>k:
-            W1 = (block_qr(torch.from_numpy(W2),n,k,Nb)).detach().cpu().numpy()
+            W1 = block_qr(Vtot,Nb)
         else:
-            W1 = np.zeros(shape=(n*Nb,0))
+            W1 = np.zeros(shape=(Nb*n,0))
         tVc+=time.time()-tic
-        for box_ind in range(Nb):
-            tic = time.time()
-            if n>k:
-                D = Dtot[box_ind*n:(box_ind+1)*n,:]@np.append(W1[box_ind*n:(box_ind+1)*n,:],W2[box_ind*n:(box_ind+1)*n,:],axis = 1)
-            else:
-                D = Dtot[box_ind*n:(box_ind+1)*n,:]@W2[box_ind*n:(box_ind+1)*n,:]
-            [Qloc,R]   = tla.qr(torch.from_numpy(D),mode = 'reduced')
-            Qloc = (Qloc.detach().cpu().numpy())
-            R = (R.detach().cpu().numpy())
-            tQ+=time.time()-tic
-            tic = time.time()
-            Q[box_ind*n:(box_ind+1)*n,:]           = Qloc
-            Ru[box_ind*(n-k):(box_ind+1)*(n-k),:]  = R[:n-k,:]
-            R22[box_ind*k:(box_ind+1)*k,:]          = R[:,n-k:][n-k:,:]
-            tmv += time.time()-tic
+        tic = time.time()
+        W12 = np.append(W1,Vtot,axis=1)
+        Q,Ru,R22 = block_Q_and_R(W12,Dtot,k,Nb)
+        tQ += time.time()-tic
     print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
-    W = np.append(W1,W2,axis=1)
-    return Q,W,Ru,R22,NN
+    return Q,W12,Ru,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
     '''
