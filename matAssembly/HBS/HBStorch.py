@@ -11,7 +11,7 @@ def block_col(A,rk,device):
     B = torch.zeros(size = (A.shape[0],A.shape[1],rk),device=device)
     Nb = A.shape[0]
     for i in range(Nb):
-        U,_ = tla.qr(A[i,:,:],mode='reduced')
+        U = tla.svd(A[i,:,:])[0]
         B[i,:,:] = U[:,:rk]
     return B
 def block_col_full(A,device):
@@ -19,7 +19,7 @@ def block_col_full(A,device):
     n = A.shape[1]
     B = torch.zeros(size = (Nb,A.shape[1],n),device=device)
     for i in range(Nb):
-        B[i,:,:],_ = tla.qr(A[i,:,:],mode='complete')
+        B[i,:,:] =   tla.qr(A[i,:,:],mode='complete')[0]
     return B
 
 def block_null(A,rk,device):
@@ -28,7 +28,7 @@ def block_null(A,rk,device):
     kA = A.shape[2]
     B = torch.zeros(size = (Nb,kA,rk),device=device)
     for i in range(Nb):
-        B[i,:,:] = tla.qr(A[i,:,:].T,mode='complete')[0][:,-rk:]
+        B[i,:,:] = (tla.svd(A[i,:,:])[2].T)[:,-rk:]
     return B
 
 def block_solve_r(A,B,device):
@@ -40,7 +40,10 @@ def block_solve_r(A,B,device):
         #[U,s,Vh] = tla.svd(B[i,:,:],full_matrices=False)
         #k = sum(s>s[0]*1e-14)
         #Vh = (Vh[:k,:].T)
-        C[i,:,:] = tla.lstsq(B[i,:,:].T,A[i,:,:].T)[0].T#((A[i,:,:]@Vh)/s[:k])@U[:,:k].T
+        #U=U[:,:k]
+        #s=s[:k]
+        C[i,:,:] = A[i,:,:]@tla.pinv(B[i,:,:]);# (A[i,:,:]@Vh)@(U/s).T
+        #C[i,:,:] = tla.lstsq(B[i,:,:].T,A[i,:,:].T)[0].T
     return C
 
 
@@ -92,6 +95,27 @@ def construct_D(U_ell,V_ell,YO,ZP,device):
         C[i,:,:] = YOsub-Usub@Usub.T@YOsub\
                             +Usub@(Usub.T@((ZPsub-Vsub@(Vsub.T@ZPsub)).T))
     return C
+def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell):
+    Nb = Om_ell.shape[0]
+    C = torch.zeros(size = (Nb,U_ell.shape[1],Om_ell.shape[1]))
+    for i in range(Nb):
+        Usub = U_ell[i,:,:]
+        Vsub = V_ell[i,:,:]
+        Ysub = Y_ell[i,:,:]
+        Zsub = Z_ell[i,:,:]
+        Omsub = Om_ell[i,:,:]
+        Psisub = Psi_ell[i,:,:]
+        C[i,:,:] = (Ysub-Usub@(Usub.T@Ysub))@tla.pinv(Omsub)\
+                            +Usub@(Usub.T@(((Zsub-Vsub@(Vsub.T@Zsub))@tla.pinv(Psisub)).T))
+    return C
+def compute_UV(Om,Y,rk):
+    Nb = Om.shape[0]
+    n = Om.shape[1]
+    U = torch.zeros(size = (Nb,Y.shape[1],rk))
+    for i in range(Nb):
+        Q = tla.qr(Om[i,:,:].T,mode='complete')[0]
+        U[i,:,:] = (tla.svd(Y[i,:,:]@Q[:,-n:])[0])[:,:rk]
+    return U
 
 
 class HBSMAT:
@@ -239,8 +263,9 @@ class HBSMAT:
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
         tic = time.time()
-        Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+10))
-        Psi0 = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+10))
+        print("self.fac = ",self.fac)
+        Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+4)*rk+5))
+        Psi0 = np.random.standard_normal(size = (self.shape[0],(self.fac+4)*rk+5))
         Omprime = np.zeros(shape = Om0.shape)
         Omprime[self.perm,:] = Om0
         Psiprime = np.zeros(shape = Psi0.shape)
@@ -266,10 +291,6 @@ class HBSMAT:
         self.setupTime+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
-        print("=====INIT TIME HBS=====")
-        print("sample time          : ",t_sample)
-        print("data transfer time   : ",t_trans)
-        print("=====================")
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -295,20 +316,10 @@ class HBSMAT:
             print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
+                U_ell = compute_UV(Om_ell,Y_ell,rkm)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm)
                 tic = time.time()
-                P_ell = block_null(Om_ell,rkm,self.device)
-                Q_ell = block_null(Psi_ell,rkm,self.device)
-                self.nullTime+=time.time()-tic
-                YP = block_mult(Y_ell,P_ell,self.device)
-                ZQ = block_mult(Z_ell,Q_ell,self.device)
-                U_ell = block_col(YP,rkm,self.device)
-                V_ell = block_col(ZQ,rkm,self.device)
-                tic = time.time()
-                YO = block_solve_r(Y_ell,Om_ell,self.device)
-                ZP = block_solve_r(Z_ell,Psi_ell,self.device)
-                self.blockSolveTime+=time.time()-tic
-                tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,YO,ZP,self.device)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -344,8 +355,6 @@ class HBSMAT:
             self.Uulist+=[Uu]
             Uhat=Ud
         
-
-                
 
     def matvec(self,v,mode='N'):
         if v.ndim==1:

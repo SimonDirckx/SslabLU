@@ -305,7 +305,7 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
     if mode=='N':
         L = len(Dmats)
         if rhs.ndim == 1:
-            rhshat = rhs[:,np.newaxis].copy()
+            rhshat = rhs[:,None].copy()
         else:
             rhshat = rhs.copy()
         for i in range(len(Qlist)):
@@ -313,8 +313,8 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
             if i<len(Qlist)-1:
                 n = Umats[i].shape[0]//Nbvec[i]
                 k = Umats[i].shape[1]
-                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:n-k],rtmp,Nbvec[i],mode='T')
-                rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,n-k:],rtmp,Nbvec[i],mode='T')
+                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i][:,:(n-k)],rtmp,Nbvec[i],mode='T')
+                rhshat[NNvec[i+1]:,:] = apply_sparse_block(Qlist[i][:,(n-k):],rtmp,Nbvec[i],mode='T')
             else:
                 rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block(Qlist[i],rtmp,Nbvec[i],mode='T')
         
@@ -330,8 +330,8 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,Nbvec,rhs,mode='N'):
                         -apply_sparse_block(Uulist[i],v,Nbvec[i])\
                         -apply_sparse_block(Rlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
             y[NNvec[i]:NNvec[i+1],:]    = block_solve(Rlist[i][:,:n-k],rhs0,Nbvec[i]).copy()
-            y[NNvec[i]:,:]              = apply_sparse_block(Wlist[i][:,:n-k],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
-                                        +apply_sparse_block(Wlist[i][:,n-k:],y[NNvec[i+1]:,:],Nbvec[i])
+            y[NNvec[i]:,:]              = apply_sparse_block(Wlist[i][:,:(n-k)],y[NNvec[i]:NNvec[i+1],:],Nbvec[i])\
+                                        +apply_sparse_block(Wlist[i][:,(n-k):],y[NNvec[i+1]:,:],Nbvec[i])
             v       = apply_sparse_block(Umats[i],v,Nbvec[i]).copy()\
                     +apply_sparse_block(Dmats[i],y[NNvec[i]:,:],Nbvec[i])
     elif mode=='T':

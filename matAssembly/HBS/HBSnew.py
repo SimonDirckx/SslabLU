@@ -2,40 +2,12 @@ import numpy as np
 import scipy.linalg as splinalg
 import time
 import matAssembly.HBS.ULVsparse as ULVsparse
+import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 import torch.linalg as tla
 import torch
+import scipy.linalg as sclinalg
 #sparse block matrix operations
 
-def block_col(A,rk,Nb):
-    B = np.zeros(shape = (A.shape[0],rk))
-    n = A.shape[0]//Nb
-    for i in range(Nb):
-        #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        U,_ = tla.qr(torch.from_numpy(A[i*n:(i+1)*n,:]),mode='reduced')
-        B[i*n:(i+1)*n,:] = U[:,:rk].detach().clone().cpu()
-    return B
-def block_col_full(A,rk,Nb):
-    n = A.shape[0]//Nb
-    B = np.zeros(shape = (A.shape[0],n))
-    for i in range(Nb):
-        #[U,_,_] = np.linalg.svd(A[i*n:(i+1)*n,:])
-        U,_ = tla.qr(torch.from_numpy(A[i*n:(i+1)*n,:]),mode='complete')
-        B[i*n:(i+1)*n,:] = U.detach().clone().cpu().numpy()
-    return B
-
-def block_null(A,rk,Nb):
-    nA = A.shape[0]//Nb
-    kA = A.shape[1]
-    B = np.zeros(shape = (kA*Nb,rk))
-    for i in range(Nb):
-        Q,_ = tla.qr(torch.from_numpy(A[i*nA:(i+1)*nA,:].T),mode='reduced')
-        Q = Q.detach().clone().cpu().numpy()
-        Om = np.random.standard_normal(size = (Q.shape[0],rk))
-        Om-=Q@(Q.T@Om)
-        V,_ = tla.qr(torch.from_numpy(Om),mode='reduced')
-        nV = V.shape[1]
-        B[i*kA:(i+1)*kA,:] = V[:,nV-rk:].detach().clone().cpu().numpy()
-    return B
 
 def block_solve_r(A,B,Nb):
     #compute A_tau/B_tau per block
@@ -44,14 +16,17 @@ def block_solve_r(A,B,Nb):
     n = A.shape[0]//Nb
     C = np.zeros(shape = (A.shape[0],nb))
     for i in range(Nb):
-        [U,s,Vh] = tla.svd(torch.from_numpy(B[i*nb:(i+1)*nb,:]),full_matrices=False)
-        U = U.detach().clone().numpy()
-        s = s.detach().clone().numpy()
-        Vh = Vh.detach().clone().numpy()
-        k = sum(s>s[0]*1e-14)
-        Vh = (Vh[:k,:].T)
-        C[i*n:(i+1)*n,:] = ((A[i*n:(i+1)*n,:]@Vh)/s[:k])@U[:,:k].T
+        C[i*n:(i+1)*n,:] = A[i*n:(i+1)*n,:]@np.linalg.pinv(B[i*nb:(i+1)*nb,:],rcond=1e-15)
     return C
+def compute_UV(Om,Y,rk,Nb):
+    nloc = Om.shape[0]//Nb
+    U = np.zeros(shape = (Y.shape[0],rk))
+    n = Om.shape[0]//Nb
+    nU = U.shape[0]//Nb
+    for i in range(Nb):
+        Q = np.linalg.qr(Om[i*n:(i+1)*n,:].T,mode='complete')[0]
+        U[i*nU:(i+1)*nU,:] = (np.linalg.svd(Y[i*nU:(i+1)*nU,:]@Q[:,-nloc:])[0])[:,:rk]
+    return U
 
 
 
@@ -71,17 +46,20 @@ def block_mult(A,B,Nb,mode='N'):
     else:
         raise ValueError("mode not recognized")
     return C
-def construct_D(U_ell,V_ell,YO,ZP,Nb):
-    C = np.zeros(shape = (U_ell.shape[0],YO.shape[1]))
+def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,Nb):
+    C = np.zeros(shape = (U_ell.shape[0],Om_ell.shape[0]//Nb))
     n = U_ell.shape[0]//Nb
     for i in range(Nb):
         Usub = U_ell[i*n:(i+1)*n,:]
         Vsub = V_ell[i*n:(i+1)*n,:]
-        YOsub = YO[i*n:(i+1)*n,:]
-        ZPsub = ZP[i*n:(i+1)*n,:]
-
-        C[i*n:(i+1)*n,:] = YOsub-Usub@Usub.T@YOsub\
-                            +Usub@(Usub.T@((ZPsub-Vsub@(Vsub.T@ZPsub)).T))
+        Ysub = Y_ell[i*n:(i+1)*n,:]
+        Zsub = Z_ell[i*n:(i+1)*n,:]
+        Omsub = Om_ell[i*n:(i+1)*n,:]
+        Psisub = Psi_ell[i*n:(i+1)*n,:]
+        #YO = (Ysub@np.linalg.pinv(Omsub))
+        #ZP = (Zsub@np.linalg.pinv(Psisub))
+        C[i*n:(i+1)*n,:] = (Ysub-Usub@(Usub.T@Ysub))@np.linalg.pinv(Omsub)\
+                            +Usub@(Usub.T@(((Zsub-Vsub@(Vsub.T@Zsub))@np.linalg.pinv(Psisub)).T))
     return C
 
 
@@ -159,10 +137,10 @@ class HBSMAT:
 
     def constructHBS(self,rk):
         # we compute an HBS compression of permuted op
-        
+        rng = np.random.default_rng()
         tic = time.time()
-        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+20))
-        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+20))
+        Om = rng.standard_normal(size = (self.shape[1],4*rk+10))
+        Psi = rng.standard_normal(size = (self.shape[0],4*rk+10))
         Omprime = np.zeros(shape = Om.shape)
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
@@ -200,19 +178,11 @@ class HBSMAT:
             
             if lvl>0:
                 tic = time.time()
-                P_ell = block_null(Om_ell,rkm,Nb)
-                Q_ell = block_null(Psi_ell,rkm,Nb)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,Nb)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,Nb)
                 self.nullTime+=time.time()-tic
-                YP = block_mult(Y_ell,P_ell,Nb)
-                ZQ = block_mult(Z_ell,Q_ell,Nb)
-                U_ell = block_col(YP,rkm,Nb)
-                V_ell = block_col(ZQ,rkm,Nb)
                 tic = time.time()
-                YO = block_solve_r(Y_ell,Om_ell,Nb)
-                ZP = block_solve_r(Z_ell,Psi_ell,Nb)
-                self.blockSolveTime+=time.time()-tic
-                tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,YO,ZP,Nb)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,Nb)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -225,8 +195,8 @@ class HBSMAT:
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
         tic = time.time()
-        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+20))
-        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+20))
+        Om = np.random.standard_normal(size = (self.shape[1],(4*self.fac+2)*rk+20))
+        Psi = np.random.standard_normal(size = (self.shape[0],(4*self.fac+2)*rk+20))
         Omprime = np.zeros(shape = Om.shape)
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
@@ -266,19 +236,9 @@ class HBSMAT:
             self.Nbvec+=[Nb]
             if lvl>0:
                 tic = time.time()
-                P_ell = block_null(Om_ell,rkm,Nb)
-                Q_ell = block_null(Psi_ell,rkm,Nb)
-                self.nullTime+=time.time()-tic
-                YP = block_mult(Y_ell,P_ell,Nb)
-                ZQ = block_mult(Z_ell,Q_ell,Nb)
-                U_ell = block_col(YP,rkm,Nb)
-                V_ell = block_col(ZQ,rkm,Nb)
-                tic = time.time()
-                YO = block_solve_r(Y_ell,Om_ell,Nb)
-                ZP = block_solve_r(Z_ell,Psi_ell,Nb)
-                self.blockSolveTime+=time.time()-tic
-                tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,YO,ZP,Nb)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,Nb)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,Nb)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,Nb)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -358,15 +318,24 @@ class HBSMAT:
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
     def solve(self,b,mode='N'):
+        torch.set_default_dtype(torch.float64)
         if mode =='N':
             if b.ndim==1:
-                bperm = b[self.perm,np.newaxis]    
+                bperm = b[self.perm,None]    
             else:
                 bperm= b[self.perm,:]
             rhs = bperm.copy()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs)
+            Umats_torch = [ULVsparse_torch.convert_to_torch_tens(U,Nb,'cpu') for U,Nb in zip(self.Umats,self.Nbvec)]
+            Vmats_torch = [ULVsparse_torch.convert_to_torch_tens(V,Nb,'cpu') for V,Nb in zip(self.Vmats,self.Nbvec)]
+            Dmats_torch = [ULVsparse_torch.convert_to_torch_tens(D,Nb,'cpu') for D,Nb in zip(self.Dmats,self.Nbvec)]
+            Qlist_torch = [ULVsparse_torch.convert_to_torch_tens(Q,Nb,'cpu') for Q,Nb in zip(self.Qlist,self.Nbvec)]
+            Wlist_torch = [ULVsparse_torch.convert_to_torch_tens(W,Nb,'cpu') for W,Nb in zip(self.Wlist,self.Nbvec)]
+            Uulist_torch = [ULVsparse_torch.convert_to_torch_tens(Uu,Nb,'cpu') for Uu,Nb in zip(self.Uulist,self.Nbvec)]
+            Rlist_torch = [ULVsparse_torch.convert_to_torch_tens(R,Nb,'cpu') for R,Nb in zip(self.Rlist,self.Nbvec)]
+            uhat = ULVsparse_torch.solve(Umats_torch,Dmats_torch,Qlist_torch,\
+                                         Wlist_torch,Uulist_torch,Rlist_torch,self.NNvec,torch.from_numpy(rhs),'cpu')
             u = np.zeros(shape = uhat.shape)
-            u[self.perm,:] = uhat
+            u[self.perm,:] = uhat.detach().clone().cpu().numpy()
         elif mode=='T':
             rhs = np.zeros(shape = b.shape)
             if b.ndim==1:
@@ -374,7 +343,7 @@ class HBSMAT:
                 rhs[self.perm,:] = b[:,None].copy()
             else:
                 rhs[self.perm,:] = b.copy()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs,mode='T')
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,mode='T')
             u = uhat[self.perm,:]
         else:
             raise NotImplementedError("mode not recognized")

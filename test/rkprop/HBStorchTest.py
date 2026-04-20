@@ -12,49 +12,68 @@ import matAssembly.HBS.ULVsparse_torch as ULVsparse_torch
 import torch.linalg as tla
 
 torchbool = False
-nl = 8*8
-Nvec = np.array([2**16],dtype=np.int64)
+nl = 16
+Nvec = np.array([2**12*nl],dtype=np.int64)
 t_ULV_vec = np.zeros(shape = Nvec.shape)
 t_solve_vec = np.zeros(shape = Nvec.shape)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+quad = True
 for indN in range(len(Nvec)):
     N = Nvec[indN]
     Nleaves = N//nl
-    L = (int)(np.log2(Nleaves))//2 + 1
-    k = 32
+    
+    k = nl
     k0 = min(nl,k)
-
-
+    if quad:
+        fac = 4
+    else:
+        fac = 2
+    
+    L = (int)(np.log2(Nleaves)//np.log2(fac)) + 1
     Nb = Nleaves
     Nbvec = [Nb]
     Utot1_sparse = np.zeros(shape = (Nb*nl,k0))
     Vtot1_sparse = np.zeros(shape = (Nb*nl,k0))
     Dtot1_sparse = np.zeros(shape = (Nb*nl,nl))
 
+
     for i in range(Nb):
-        Dtot1_sparse[i*nl:(i+1)*nl,:] = np.random.standard_normal(size = (nl,nl))#Dtot1[i*nl:(i+1)*nl,:][:,i*nl:(i+1)*nl].copy()
-        Utot1_sparse[i*nl:(i+1)*nl,:] = sclinalg.orth(np.random.standard_normal(size = (nl,k0)))#Utot1[i*nl:(i+1)*nl,:][:,i*k0:(i+1)*k0].copy()
-        Vtot1_sparse[i*nl:(i+1)*nl,:] = sclinalg.orth(np.random.standard_normal(size = (nl,k0)))#Vtot1[i*nl:(i+1)*nl,:][:,i*k0:(i+1)*k0].copy()
+        U = np.linalg.qr(np.random.standard_normal(size = (nl,k0)),mode='reduced')[0]
+        V = np.linalg.qr(np.random.standard_normal(size = (nl,k0)),mode='reduced')[0]
+        D = np.random.standard_normal(size = (nl,nl))
+        
+        Dtot1_sparse[i*nl:(i+1)*nl,:] = D-U@(U.T@D@V)@V.T
+        Utot1_sparse[i*nl:(i+1)*nl,:] = U
+        Vtot1_sparse[i*nl:(i+1)*nl,:] = V
+
+
     Umats = [Utot1_sparse]
     Vmats = [Vtot1_sparse]
     Dmats = [Dtot1_sparse]
 
 
+
     for ind in range(1,L):
-        Nb      = Nb//4
+        Nb      = Nb//fac
         Nbvec+=[Nb]
         if ind==1:
-            n = 4*k0
+            n = fac*k0
         else:
-            n = 4*k
+            n = fac*k
         Utot_sparse = np.zeros(shape = (Nb*n,k))
         Vtot_sparse = np.zeros(shape = (Nb*n,k))
         Dtot_sparse = np.zeros(shape = (Nb*n,n))
 
         for i in range(Nb):
-            Dtot_sparse[i*n:(i+1)*n,:] = np.random.standard_normal(size = (n,n))#Dtot2[i*n:(i+1)*n,:][:,i*n:(i+1)*n].copy()
-            Utot_sparse[i*n:(i+1)*n,:] = sclinalg.orth(np.random.standard_normal(size = (n,k)))#Utot2[i*n:(i+1)*n,:][:,i*k:(i+1)*k].copy()
-            Vtot_sparse[i*n:(i+1)*n,:] = sclinalg.orth(np.random.standard_normal(size = (n,k)))#Vtot2[i*n:(i+1)*n,:][:,i*k:(i+1)*k].copy()
+            U = np.linalg.qr(np.random.standard_normal(size = (n,k)),mode='reduced')[0]
+            V = np.linalg.qr(np.random.standard_normal(size = (n,k)),mode='reduced')[0]
+            D = np.random.standard_normal(size = (n,n))
+            if ind<L-1:
+                D = D-U@(U.T@D@V)@V.T
+            Dtot_sparse[i*n:(i+1)*n,:] = D
+            Utot_sparse[i*n:(i+1)*n,:] = U
+            Vtot_sparse[i*n:(i+1)*n,:] = V
+
         if ind<L-1:
             Umats += [Utot_sparse]
             Vmats += [Vtot_sparse]
@@ -62,19 +81,21 @@ for indN in range(len(Nvec)):
 
 
     SHBS = HBSnew.HBSMAT()
-    SHBS.set_mats(Umats,Dmats,Vmats,Nbvec)
+    SHBS.set_mats(Umats,Dmats,Vmats,Nbvec,fac=fac)
     
-    SHBS0 = HBStorch.HBSMAT(SHBS,device)
+    SHBS0 = HBStorch.HBSMAT(SHBS,device,tree=None,quad=quad)
     SHBS0.set_Nbvec(Nbvec)
     tic = time.time()
-    SHBS0.construct(k+1,True)
+    SHBS0.construct(k,True)
     print("==========================")
     print("HBS time = ",time.time()-tic)
     print("==========================")
     x= np.random.standard_normal(size=(SHBS.shape[1],))
-    b = SHBS0.matvec(x)
-    xhat = SHBS0.solve(torch.from_numpy(b),device)
+    b = SHBS.matvec(x.copy())
+    btest = SHBS0.matvec(x.copy())
+    xhat = SHBS0.solve(torch.from_numpy(btest),device)
     print("==========================")
+    print("matvec err = ",np.linalg.norm(b-btest)/np.linalg.norm(b))
     print("solve err = ",np.linalg.norm(x-xhat.detach().clone().cpu().numpy())/np.linalg.norm(x))
     print("==========================")
     
