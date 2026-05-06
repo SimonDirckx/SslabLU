@@ -168,8 +168,11 @@ class oms:
             discrTime += tDisc
             if dbg>1:
                 print("SLAB %2.0d discretization time = %5.2f s" % (slabInd,tDisc))
+                
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
             nc = len(Ic)
+            if dbg>1:
+                print("SLAB %2.0d size = %2.0d" % (slabInd,nc))
             self.nc = nc
             Ntot += nc
             glob_target_dofs+=[range(startCentral,startCentral+nc)]

@@ -18,6 +18,8 @@ import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
+import multislab.omsdirectsolveHBS as omsdirectHBS
+
 
 import geometry.geom_3D.cube as cube
 class gmres_info(object):
@@ -36,7 +38,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 5.
+kh = 2.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -79,7 +81,7 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([4,6,8,10],dtype = np.int64)
+pvec = np.array([6],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -95,8 +97,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/32,1/32])
-    assembler = mA.rkHMatAssembler((p-1)*(p-1),75)
+    a = np.array([H/6,1/32,1/32])
+    assembler = mA.rkHMatAssembler(p*p,125)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
@@ -118,8 +120,8 @@ for indp in range(len(pvec)):
         rhstot = np.zeros(shape = (Ntot,))
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
-        T = omsdirect.build_block_tridiagonal_solver(S_rk_list)
-        uhat  = omsdirect.block_tridiagonal_solve(OMS, T, rhstot)
+        T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,True,assembler.matOpts.maxRank+50)
+        uhat  = omsdirectHBS.block_tridiagonal_solve(OMS, T, rhstot)
     
     res = Stot@uhat-rhstot
 
