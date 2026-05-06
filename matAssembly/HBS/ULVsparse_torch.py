@@ -341,7 +341,7 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N'):
             n = Umats[i].shape[1]
             k = Umats[i].shape[2]
             rhscopy = rhshat.detach().clone().to(device)
-            rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],device,rhscopy,mode='T')
+            rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],rhscopy,device,mode='T')
             rhshat[NNvec[i+1]-NNvec[i]:,:] = apply_sparse_block_tens(Wlist[i][:,:,(n-k):],rhscopy,device,mode='T')
             y[NNvec[i]:NNvec[i+1],:] = block_solve_tens(Rlist[i][:,:,:n-k],rhshat[:NNvec[i+1]-NNvec[i],:],device,mode='T')
             v=apply_sparse_block_tens(Uulist[i],y[NNvec[i]:NNvec[i+1],:],device,mode='T')+apply_sparse_block_tens(Umats[i],v,device,mode='T')

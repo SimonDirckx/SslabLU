@@ -13,7 +13,7 @@ import torch.linalg as tla
 
 
 def gen_random_HBS(k,nl,L,quad = True):
-    Nbvec = []
+    Nbvec = [];
     if quad:
         fac = 4
     else:
@@ -78,7 +78,7 @@ def gen_random_HBS(k,nl,L,quad = True):
 quad=   True
 k   =   16
 nl  =   16
-L   =   8
+L   =   10
 SHBS,Nbvec = gen_random_HBS(k,nl,L,quad)
     
 SHBS0 = HBSnew.HBSMAT(SHBS,tree=None,quad=quad)

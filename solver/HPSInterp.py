@@ -17,16 +17,19 @@ def interp(solver,p,f,typestr):
         raise ValueError("ndim must be 2 or 3")
     
 
-def interp_2d(solver,pts,f):
+def interp_2d(solver,pts,f,typestr):
     g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_2d(npan_dim,solver.geom)
-    ord=[solver.p,solver.p]
+    if typestr=='hps':
+        ord=[solver.p,solver.p]
+    else:
+        ord=solver.p
     for box in boxes:
         I = idxs_2d(pts,box)
         J = idxs_2d(solver._XXfull,box)
         XX = solver._XXfull[J,:]
-        g[I] = local_interp_2d(pts[I,:],f[J],XX,box,ord)
+        g[I] = local_interp_2d(pts[I,:],f[J],XX,box,ord,typestr)
     return g
 
 def interp_3d(solver,pts,f,typestr):
@@ -177,12 +180,11 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
             for k2 in range(core.shape[2]):
                 F_approx+=core[k0,k1,k2]*cx[:,k0]*cy[:,k1]*cz[:,k2]
     return F_approx
-def local_interp_2d(pts,f,XX,box,ord0):
+def local_interp_2d(pts,f,XX,box,ord0,typestr):
     ord = [ord0[0],ord0[1]]
     _,I0  = np.unique(XX,axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,shape=(ord[0],ord[1]))
-    
     [U,s,Vh]=np.linalg.svd(F)
     F_approx = np.zeros(shape =(pts.shape[0],))
     

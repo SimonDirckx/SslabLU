@@ -26,9 +26,9 @@ def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
                 v_tmp = v
 
             if (not transpose):
-                result = v_tmp-Sl@(Sr@v_tmp)
+                result = v_tmp-Sl.matmat(Sr.matmat(v_tmp))
             else:
-                result = v_tmp-Sr.T@(Sl.T@v_tmp)
+                result = v_tmp-Sr.rmatmat(Sl.rmatmat(v_tmp))
             if (v.ndim == 1):
                 result = result.flatten()
             return result
@@ -41,9 +41,9 @@ def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
                 v_tmp = v
 
             if (not transpose):
-                result = v_tmp-Sl@Sprime_prev.solve(Sr@v_tmp)
+                result = v_tmp-Sl.matmat(Sprime_prev.solve(Sr.matmat(v_tmp)))
             else:
-                result = v_tmp-Sr.T@Sprime_prev.solve(Sl.T@v_tmp,mode='T')
+                result = v_tmp-Sr.rmatmat(Sprime_prev.solve(Sl.rmatmat(v_tmp)))
             if (v.ndim == 1):
                 result = result.flatten()
             return result
@@ -83,52 +83,59 @@ def build_block_tridiagonal_solver(S_rk_list,tree,quad,rk):
     """
 
     m = S_rk_list[0][0].shape[0]
-    n = len(S_rk_list) - 1 # Accounts for E and F in periodic case
-    I = np.eye(m, dtype=S_rk_list.dtype)
+    n = len(S_rk_list) - 1
+    I = np.eye(m, dtype=S_rk_list[0][0].dtype)
 
     # Thus we need three lists of block matrices: A, B, and C:
-    Sl = [S_rk_list[_][0] for _ in range(n)]
+    Sl = [S_rk_list[_][0] for _ in range(1,n+1)]
     Sprime = [I] # Set initial Sprime
     Sr = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
     for i in range(1, n+1):
         if i==1:
-            Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True))
-            Sprime_i.construct(rk)
+            Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True),tree,quad)
+            Sprime_i.construct(rk,compute_ULV=True)
+            
         else:
-            Sprime[i-1].compute_ULV()
             Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),tree,quad)
-            Sprime_i.construct(rk)
+            Sprime_i.construct(rk,compute_ULV=True)
         Sprime.append(Sprime_i)
     return Sl, Sprime, Sr
 
 def block_tridiagonal_solve(OMS, T, rhs):
+
     """
     Given precomputed factors for T and a RHS d, this solves Tx = d
     Note that d can be a matrix (i.e. this can handle multiple RHS)
     """
-    Sl, Sprime, Sr = T
+    Sl, Sprime_rk, Sr = T
+
     n       = len(Sl)
     indices = OMS.glob_target_dofs
 
     d = rhs.copy()
-
+    if rhs.ndim==1:
+        d = d[:,np.newaxis]
     #
     # For i = 1 to n, we have d_i = d_i - A_i d_i-1
     #
     for i in range(1, n+1):
-        d[indices[i]] = d[indices[i]] - Sl[i-1]@Sprime[i-1].solve(d[indices[i-1]])
+        if i==1:
+            d[indices[i],:] = d[indices[i],:] - Sl[i-1]@d[indices[i-1],:]
+        else:
+            d[indices[i],:] = d[indices[i],:] - Sl[i-1]@(Sprime_rk[i-1].solve(d[indices[i-1],:]))
 
     #
     # Then for i = n-1 to 0, we have x_n = B_n \ d_n,   x_i = B_i \ (d_i - C_i x_i+1)
     #
     x             = np.zeros(d.shape)
-    x[indices[n]] = Sprime[n].solve( d[indices[n]] )
-
+    x[indices[n],:] = Sprime_rk[n].solve(d[indices[n],:] )
     for i in range(n-1, 0, -1):
-        x[indices[i]] = Sprime[i].solve( d[indices[i]] - Sr[i] @ x[indices[i+1]] )
+        x[indices[i],:] = Sprime_rk[i].solve(d[indices[i],:] - Sr[i] @ x[indices[i+1],:] )
 
     # Since B[0] is the identity matrix, we can avoid a solve there:
-    x[indices[0]] = d[indices[0]] - Sr[0] @ x[indices[1]]
+    x[indices[0],:] = d[indices[0],:] - Sr[0] @ x[indices[1],:]
+    if rhs.ndim==1:
+        x = x.flatten()
     return x
 
 

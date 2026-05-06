@@ -4,6 +4,7 @@
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 from matAssembly.HBS import HBSTree as HBS
+from matAssembly.HBS import HBSnew
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
@@ -96,21 +97,36 @@ class matAssembler:
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
             start = time.time()
+            if not self.matOpts.tree:
+                c0,L0 = compute_c0_L0(stMap.XXI)
+                self.matOpts.tree =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
+
+            
+            HBSmat = HBSnew.HBSMAT(linOp,self.matOpts.tree,quad=False)
+            HBSmat.construct(self.matOpts.maxRank,True)
+            self.stats.timeSample=0
+            s = HBSmat.nSamples
+            self.stats.timeSample=HBSmat.tSample
+            self.stats.nbytes = HBSmat.nbytes
+            self.stats.timeCompress=HBSmat.tCompress
+            
+            if dbg>0:
+                print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))
+                print("\t Toc HBS construction %.2e s"%self.stats.timeCompress)
+                mem = self.stats.nbytes/1e6
+                print("\t HBS mem = %5.2f MB"%mem)
+            
+            #Linop = LinearOperator(shape=linOp.shape,\
+            #    matvec = lambda v : HBSmat.matmat(v), rmatvec = lambda v : HBSmat.rmatmat(v),\
+            #    matmat = lambda v : HBSmat.matmat(v), rmatmat = lambda v : HBSmat.rmatmat(v))
+            return HBSmat
+        if self.matOpts.method == 'rkHBSold':
+            start = time.time()
             if self.matOpts.tree:
                 tree0 = self.matOpts.tree
             else:
                 c0,L0 = compute_c0_L0(stMap.XXI)
                 tree0 =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
-                # in case tree clusters to be plotted
-                #print("tree info:")
-                #L = tree0.nlevels
-                #plt.figure(1)
-                #for l in range(L):
-                #    boxes = tree0.get_boxes_level(l)
-                #    for box in boxes:
-                #        inds = tree0.get_box_inds(box)
-                #        plt.scatter(stMap.XXI[inds,1],stMap.XXI[inds,2])
-                #    plt.show()
                 
             toc_tree  = time.time() - start
 
@@ -121,7 +137,6 @@ class matAssembler:
                 s=5*(self.matOpts.maxRank+10)
             if self.matOpts.ndim==2:
                 s=3*(self.matOpts.maxRank+10)
-            #s=max(s,self.matOpts.maxRank+10+self.matOpts.leaf_size)
             Om  = np.random.standard_normal(size=(n,s))
             Psi = np.random.standard_normal(size=(m,s))
             Y = linOp@Om
@@ -148,10 +163,10 @@ class matAssembler:
                 else:
                     return hbsMat.matvec(v.astype('float64'))
             
-            LinopTest = LinearOperator(shape=(m,n),\
+            Linop = LinearOperator(shape=(m,n),\
                 matvec = matmat, rmatvec = lambda v: matmat(v,transpose=True),\
                 matmat = matmat, rmatmat = lambda v: matmat(v,transpose=True))
-            return LinopTest
+            return Linop
 
 '''
 DEFAULT ASSEMBLERS

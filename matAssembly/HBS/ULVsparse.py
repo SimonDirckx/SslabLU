@@ -97,7 +97,6 @@ def compute_QRW_sparse(Dtot,Vtot,Nb):
         W12 = np.append(W1,Vtot,axis=1)
         Q,Ru,R22 = block_Q_and_R(W12,Dtot,k,Nb)
         tQ += time.time()-tic
-    print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
     return Q,W12,Ru,R22,NN
 def sparse_block_mult(A,B,NbA,NbB,mode='N'):
     
@@ -256,8 +255,6 @@ def compute_ULV(Umats,Dmats,Vmats,Nbvec):
     Rlist = []
     torch.set_default_dtype(torch.float64)
     for i in range(len(Dmats)):
-        print("lvl = ",i)
-        print("Nbvec = ",Nbvec)
         
         if i==0:
             Rprime = Dmats[0]

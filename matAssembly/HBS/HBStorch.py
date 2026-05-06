@@ -61,6 +61,25 @@ def block_mult(A,B,device,mode='N'):
     else:
         raise ValueError("mode not recognized")
     return C
+
+
+def block_matvec(A,B,device,mode='N'):
+    Nb = A.shape[0]
+    n = A.shape[1]
+    nB = B.shape[0]//Nb
+    if mode=='N':
+        C = torch.zeros(size=(Nb*A.shape[1],B.shape[1]),device=device)
+        for i in range(Nb):
+            C[i*n:(i+1)*n,:]=A[i,:,:]@B[i*nB:(i+1)*nB,:]
+    elif mode=='T':
+        kA = A.shape[2]
+        C = torch.zeros(size=(Nb*kA,B.shape[1]),device=device)        
+        for i in range(Nb):
+            C[i*kA:(i+1)*kA,:]=A[i,:,:].T@B[i*nB:(i+1)*nB,:]
+    else:
+        raise ValueError("mode not recognized")
+    return C
+
     
 def block_mult_and_reduce(A,B,fac,device,mode='N'):
     Nb = A.shape[0]
@@ -192,10 +211,14 @@ class HBSMAT:
 
     def constructHBS(self,rk):
         # we compute an HBS compression of permuted op
+        if self.fac == 4:
+            s = 6*rk+4*self.nl+5
+        else:
+            s = 4*rk+2*self.nl+5
         
         tic = time.time()
-        Om = np.random.standard_normal(size = (self.shape[1],(self.fac+2)*rk+5))
-        Psi = np.random.standard_normal(size = (self.shape[0],(self.fac+2)*rk+5))
+        Om = np.random.standard_normal(size = (self.shape[1],s))
+        Psi = np.random.standard_normal(size = (self.shape[0],s))
         Omprime = np.zeros(shape = Om.shape)
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
@@ -263,10 +286,14 @@ class HBSMAT:
             self.Nbvec+=[Nb]
     def constructHBS_ULV(self,rk):
         torch.set_default_dtype(torch.float64)
+        if self.fac == 4:
+            s = 6*rk+4*self.nl+5
+        else:
+            s = 4*rk+2*self.nl+5
         tic = time.time()
         print("self.fac = ",self.fac)
-        Om0 = np.random.standard_normal(size = (self.shape[1],(self.fac+4)*rk+5))
-        Psi0 = np.random.standard_normal(size = (self.shape[0],(self.fac+4)*rk+5))
+        Om0 = np.random.standard_normal(size = (self.shape[1],s))
+        Psi0 = np.random.standard_normal(size = (self.shape[0],s))
         Omprime = np.zeros(shape = Om0.shape)
         Omprime[self.perm,:] = Om0
         Psiprime = np.zeros(shape = Psi0.shape)
@@ -353,7 +380,7 @@ class HBSMAT:
             Uhat=Ud
         
 
-    def matvec(self,v,mode='N'):
+    def matvec(self,v,device='cpu',mode='N'):
         if v.ndim==1:
             vperm = v[:,None]    
         else:
@@ -363,30 +390,23 @@ class HBSMAT:
         if mode=='N':
             VV+=[vperm]
             for lvl in range(len(self.Vmats)):
-                Vloc = ULVsparse.convert_to_blkdiag(self.Vmats[lvl]).detach().clone().cpu().numpy()
-                v_lvl = HBSnew.block_mult(Vloc,VV[lvl],Nb,mode='T')
+                v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],device,mode='T')
                 VV+=[v_lvl]
                 Nb=Nb//self.fac
-            Dloc = ULVsparse.convert_to_blkdiag(self.Dmats[-1]).detach().clone().cpu().numpy()
-            uperm = HBSnew.block_mult(Dloc,VV[-1],Nb)
+            uperm = block_matvec(self.Dmats[-1],VV[-1],device)
             for lvl in range(len(self.Umats)-1,-1,-1):
-                Uloc = ULVsparse.convert_to_blkdiag(self.Umats[lvl]).detach().clone().cpu().numpy()
-                Dloc = ULVsparse.convert_to_blkdiag(self.Dmats[lvl]).detach().clone().cpu().numpy()
-                uperm = HBSnew.block_mult(Uloc,uperm,self.fac*Nb)+ HBSnew.block_mult(Dloc,VV[lvl],self.fac*Nb)
-                Nb=Nb*self.fac
+                uperm = block_matvec(self.Umats[lvl],uperm,device)+ block_matvec(self.Dmats[lvl],VV[lvl],device)
             u = np.zeros(shape = uperm.shape)
             u[self.perm,:] = uperm
 
         elif mode=='T':
             VV+=[vperm]
             for lvl in range(len(self.Umats)):
-                v_lvl = block_mult(self.Umats[lvl],VV[lvl],Nb,mode='T')
+                v_lvl = block_matvec(self.Umats[lvl],VV[lvl],device,mode='T')
                 VV+=[v_lvl]
-                Nb=Nb//self.fac
-            uperm = block_mult(self.Dmats[-1],VV[-1],Nb,mode='T')
+            uperm = block_matvec(self.Dmats[-1],VV[-1],device,mode='T')
             for lvl in range(len(self.Vmats)-1,-1,-1):
-                uperm = block_mult(self.Vmats[lvl],uperm,self.fac*Nb)+ block_mult(self.Dmats[lvl],VV[lvl],self.fac*Nb,mode='T')
-                Nb=Nb*self.fac    
+                uperm = block_matvec(self.Vmats[lvl],uperm,device)+ block_matvec(self.Dmats[lvl],VV[lvl],device,mode='T')
             u = np.zeros(shape = uperm.shape)
             u[self.perm,:] = uperm
         else:
@@ -409,13 +429,13 @@ class HBSMAT:
             u = torch.zeros(size = uhat.shape)
             u[self.perm,:] = uhat
         elif mode=='T':
-            rhs = np.zeros(shape = b.shape)
+            rhs = torch.zeros(size = b.shape)
             if b.ndim==1:
                 rhs = rhs[:,None]
-                rhs[self.perm,:] = b[:,None].copy()
+                rhs[self.perm,:] = b[:,None].detach().clone()
             else:
-                rhs[self.perm,:] = b.copy()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,mode='T')
+                rhs[self.perm,:] = b.detach().clone()
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,device=device,mode='T')
             u = uhat[self.perm,:]
         else:
             raise NotImplementedError("mode not recognized")
