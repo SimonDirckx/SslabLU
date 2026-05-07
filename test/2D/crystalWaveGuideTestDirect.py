@@ -1,6 +1,7 @@
 # basic packages
 import numpy as np
 import jax.numpy as jnp
+import scipy.linalg
 import torch
 import scipy
 from packaging.version import Version
@@ -230,7 +231,9 @@ for indp in range(len(pvec)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
         rhstot_copy = rhstot.copy()
         T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,False,assembler.matOpts.maxRank)
-        Sinv_HBS  = omsdirectHBS.block_tridiagonal_solve(OMS, T, np.identity(Stot.shape[0]))
+        def matvec(v):
+            return omsdirectHBS.block_tridiagonal_solve(OMS, T, v)
+        Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
         gInfo = gmres_info()
         pgInfo = gmres_info()
         stol = 1e-11*H*H

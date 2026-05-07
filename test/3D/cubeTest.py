@@ -38,7 +38,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 2.
+kh = 10.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -97,7 +97,7 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/6,1/32,1/32])
+    a = np.array([H/2,1/32,1/32])
     assembler = mA.rkHMatAssembler(p*p,125)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -120,19 +120,36 @@ for indp in range(len(pvec)):
         rhstot = np.zeros(shape = (Ntot,))
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
-        T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,True,assembler.matOpts.maxRank+50)
-        uhat  = omsdirectHBS.block_tridiagonal_solve(OMS, T, rhstot)
-    
+        rhstot_copy = rhstot.copy()
+        T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,True,assembler.matOpts.maxRank+10)
+        def matvec(v):
+            return omsdirectHBS.block_tridiagonal_solve(OMS, T, v)
+        Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
+        gInfo = gmres_info()
+        pgInfo = gmres_info()
+        stol = 1e-11*H*H
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+        else:
+            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
+        else:
+            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
+        niter = gInfo.niter
     res = Stot@uhat-rhstot
 
     
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
+    print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
+    print("nc                       = ",OMS.nc)
     print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-    print("GMRES iters              = ", niter)
+    print("GMRES iters              = ", gInfo.niter)
+    print("pGMRES iters              = ", pgInfo.niter)
     print("==================================")
-
     nc = OMS.nc
     err_tot = 0
     for slabInd in range(len(dSlabs)):

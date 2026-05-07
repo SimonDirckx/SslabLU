@@ -100,11 +100,11 @@ class matAssembler:
             if not self.matOpts.tree:
                 c0,L0 = compute_c0_L0(stMap.XXI)
                 self.matOpts.tree =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
-            quad = True
-            if self.matOpts.ndim==3:
+            quad = False
+            if stMap.XXI.shape[1]==2:
                 quad = True
             HBSmat = HBSnew.HBSMAT(linOp,self.matOpts.tree,quad)
-            HBSmat.construct(self.matOpts.maxRank,True)
+            HBSmat.construct(self.matOpts.maxRank,quad)
             self.stats.timeSample=0
             s = HBSmat.nSamples
             self.stats.timeSample=HBSmat.tSample
