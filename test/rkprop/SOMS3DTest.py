@@ -2,10 +2,12 @@ import numpy as np
 import jax.numpy as jnp
 import torch
 import scipy.special as special
+import scipy.sparse.linalg as splinalg
 import time
 import SOMS3D as SOMS
+import SOMS3D_csr as SOMS_csr
 import matplotlib.pyplot as plt
-
+from scipy.linalg   import lu_factor, lu_solve
 from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
 import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 from solver.hpsmultidomain.hpsmultidomain import pdo as pdoalt
@@ -38,6 +40,30 @@ def my_condest(A):
     
     nrmAi = np.abs(v.T@(np.linalg.solve(A,w)))
     return nrmA*nrmAi
+def my_condest_sparse(A):
+    #estim norm A:
+    lu =  splinalg.splu(A)
+    v = np.random.standard_normal(size=(A.shape[1],))
+    v = v/np.linalg.norm(v)
+    Niter = 50#(int)(np.sqrt(A.shape[0]))
+    for i in range(Niter):
+        w = A.T@v
+        w = w/np.linalg.norm(w)
+        v = A@w
+        v = v/np.linalg.norm(v)
+    nrmA = np.abs(v.T@(A@w))
+    #estim norm for Ai
+    v = np.random.standard_normal(size=(A.shape[1],))
+    v = v/np.linalg.norm(v)
+    Niter = 50#(int)(np.sqrt(A.shape[0]))
+    for i in range(Niter):
+        w = lu.solve(v,'T')
+        w = w/np.linalg.norm(w)
+        v = lu.solve(w)
+        v = v/np.linalg.norm(v)
+    
+    nrmAi = np.abs(v.T@(lu.solve(w)))
+    return nrmA*nrmAi
 
 def bc_laplace(p):
     r = np.sqrt(((p[:,0]+.1)**2)+((p[:,1]+.1)**2)+((p[:,2]+.1)**2))
@@ -45,12 +71,11 @@ def bc_laplace(p):
     return 1./(4*np.pi*r)
 
 def bc_helmholtz(p,kh):
-    r = np.sqrt(((p[:,0]+.1)**2)+((p[:,1]+.1)**2))
     
-    return np.sin(kh*r)/(4*np.pi*r)
+    return np.sin(kh*(p[:,0]+p[:,1])/np.sqrt(2))
 
 
-pvec = np.array([4,6,8],dtype=np.int64)
+pvec = np.array([14],dtype=np.int64)
 condvecS_L = np.zeros(shape=(len(pvec),))
 condvecT_L = np.zeros(shape=(len(pvec),))
 condvecS_H = np.zeros(shape=(len(pvec),))
@@ -68,38 +93,38 @@ for indp in range(len(pvec)):
     py = pvec[indp]
     pz = pvec[indp]
     nbx = 4
-    nby = 1
-    nbz = 1
-    kh = 0.
+    nby = 4
+    nbz = 4
+    kh = 25.
+    Lx = 1.
+    Ly = 1.
+    Lz = 1.
 
     ####################################################
     # compare laplace problem: accuracy and conditioning
 
-    print("########### LAPLACE PROBLEM #############")
+    print("########### HELMHOLZ PROBLEM, kh = %5.2f #############"%kh)
 
     print("#DOFS = ",px*py*pz*nbx*nby*nbz)
     Nvec[indp] = px*py*pz*nbx*nby*nbz
 
 
     tic = time.time()
-    Sii,Sib,XX,Ii,Ib = SOMS.SOMS_solver(px,py,pz,nbx,nby,nbz,1.,1.,1.,0.)
+    Sii,Sib,XX,Ii,Ib = SOMS_csr.SOMS_solver_sparse(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,kh)
     toc = time.time()-tic
-    print("elapsed time S = ",toc)
-    print("Sii shape = ",Sii.shape)
-    tic = time.time()
-    condS = np.linalg.cond(Sii)
-    toc_cond = time.time()-tic
-    tic = time.time()
-    condestS = my_condest(Sii)
-    toc_cond_est = time.time()-tic
-    condvecS_L[indp] = condS
-    print("condS,condestS = ",condS,',',condestS)
-    print("t,t_est = ",toc_cond,',',toc_cond_est)
-    u = bc_laplace(XX)
-    uhat = -np.linalg.solve(Sii,Sib@u[Ib])
+    u = bc_helmholtz(XX,kh)
+    uhat = splinalg.spsolve(Sii,-Sib@u[Ib])#-np.linalg.solve(Sii,Sib@u[Ib])
     err = np.linalg.norm(u[Ii]-uhat)/np.linalg.norm(u[Ii])
     print("S sol err. = ",err)
     errvecS_L[indp] = err
+    print("elapsed time S = ",toc)
+    print("Sii shape = ",Sii.shape)
+    tic = time.time()
+    condestS = my_condest_sparse(Sii)
+    toc_cond_est = time.time()-tic
+    condvecS_L[indp] = condestS
+    print("condestS = ",condestS)
+    
 
     bnds = np.array([[0,0,0],[1,1,1]])
     geom = hpsaltGeom.BoxGeometry(bnds)
@@ -112,31 +137,33 @@ for indp in range(len(pvec)):
         return torch.ones_like(p[:,0])
     def c33(p):
         return torch.ones_like(p[:,0])
+    def c(p):
+        return -kh*kh*torch.ones_like(p[:,0])
+    
+    diff_op = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
-    diff_op = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
-
-    ax = .5/nbx
-    ay = .5/nby
-    az = .5/nbz
+    ax = .5*Lx/nbx
+    ay = .5*Ly/nby
+    az = .5*Lz/nbz
     tic = time.time()
-    solver = hpsalt.Domain_Driver(geom, diff_op, 0, np.array([ax,ay,az]), [px+1,px+1,px+1], 3)
+    solver = hpsalt.Domain_Driver(geom, diff_op, kh, np.array([ax,ay,az]), [px+1,px+1,px+1], 3)
     solver.build("reduced_cpu", "MUMPS",verbose=False)
     toc = time.time()-tic
-    Aii = np.array(solver.Aii.todense())
-    Aib = np.array(solver.Aix.todense())
-    print("elapsed time T = ",toc)
-    print("Tii shape = ",Sii.shape)
-    condT = np.linalg.cond(Aii)
-    condestT = my_condest(Aii)
-    condvecT_L[indp] = condT
-    print("condT,condestT = ",condT,',',condestT)
+    Aii = solver.Aii
+    Aib = solver.Aix
     XX = solver.XX
     Ii = solver._Ji
     Ib = solver._Jx
-    u = bc_laplace(XX).numpy()
-    uhat = -np.linalg.solve(Aii,Aib@u[Ib])
+    u = bc_helmholtz(XX,kh).numpy()
+    uhat = -splinalg.spsolve(Aii,Aib@u[Ib])
     err = np.linalg.norm(u[Ii]-uhat)/np.linalg.norm(u[Ii])
     print("T sol err. = ",err)
+    print("elapsed time T = ",toc)
+    print("Tii shape = ",Aii.shape)
+    condestT = my_condest_sparse(Aii)
+    condvecT_L[indp] = condestT
+    print("condestT = ",condestT)
+    
     errvecT_L[indp] = err
 
     '''

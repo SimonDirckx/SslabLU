@@ -5,12 +5,48 @@ import matplotlib.pyplot as plt
 import scipy.linalg as sclinalg
 import time
 
-def bc(p):
-    r = np.sqrt(((p[:,0]+.1)**2)+((p[:,1]+.1)**2)+((p[:,2]+.1)**2))
-    
-    return 1./(4*np.pi*r)
 
-def L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
+def _cheb_1d(p, scl):
+    """
+    Return the scaled Chebyshev differentiation matrix and interior-mapped points
+    for a single direction with polynomial order p and length scale scl.
+
+    Points are mapped from [-1,1] -> [0, scl].
+    """
+    D, pts = spectral.cheb(p)
+    D = -2 * D / scl
+    pts = ((pts[::-1] + 1) / 2) * scl
+    return D, pts
+
+
+def _joined_cheb_1d(p, scl):
+    """
+    Return the scaled Chebyshev differentiation matrix and interior-mapped points
+    for the *joined* (double-wide) direction.
+
+    Polynomial order is rounded up to the nearest even number of (3*p)//2.
+    Points are mapped from [-1,1] -> [0, 2*scl].
+    """
+    p_joined = (3 * p) // 2
+    p_joined -= p_joined % 2          # round down to even
+    D, pts = spectral.cheb(p_joined)
+    pts = (1 + pts[::-1]) * scl       # maps to [0, 2*scl]
+    D = -D / scl
+    return D, pts, p_joined
+
+
+def _svd_interp(E_src, E_tgt):
+    """
+    Build the interpolation matrix that maps from the column-space of E_src to E_tgt
+    via a truncated SVD pseudo-inverse:  cc = E_tgt @ pinv(E_src).
+    """
+    U, s, V = np.linalg.svd(E_src, full_matrices=False)
+    k = np.sum(s > 1e-15 * s[0])
+    Uk, Vk, sk = U[:, :k], V[:k, :].T, s[:k]
+    return (E_tgt @ Vk) @ np.diag(sk ** -1) @ Uk.T
+
+
+def L_op(dir, px, py, pz, scl_x, scl_y, scl_z, kh):
     """
     Construct differential operator for 2x1 joined block set-up for the Helmholtz equation at kappa = kh
 
@@ -25,142 +61,91 @@ def L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
             - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
             - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
             - kh                    :    wave number
-    
+
     OUTPUT: - L_joined_dir                  : diff op for the joined block
             - Ijl,Ijf,Ijd,Iju,Ijb,Ijr       : joined DOFS corresponding to left, front, down, up, back and right face (as subsets of boundary dofs)
             - Ic_dir                        : joined interior DOFs corresponding to the interior central interface
             - Ibox_joined_dir               : union of Ijl,Ijf,Ijd,Iju,Ijb,Ijr, in that order
-            - Ii_dir,Ib_dir                 : interior and boundary dofs for the joined block  
+            - Ii_dir,Ib_dir                 : interior and boundary dofs for the joined block
             - XY_joined_dir                 : spatial locations of the total DOFs
-    
     """
+    Dx, xpts = _cheb_1d(px, scl_x)
+    Dy, ypts = _cheb_1d(py, scl_y)
+    Dz, zpts = _cheb_1d(pz, scl_z)
 
+    Dx2, xpts2, _ = _joined_cheb_1d(px, scl_x)
+    Dy2, ypts2, _ = _joined_cheb_1d(py, scl_y)
+    Dz2, zpts2, _ = _joined_cheb_1d(pz, scl_z)
 
-
-    Dx,xpts = spectral.cheb(px)
-    Dy,ypts = spectral.cheb(py)
-    Dz,zpts = spectral.cheb(pz)
-
-    Dx = - 2*Dx/scl_x
-    Dy = - 2*Dy/scl_y
-    Dz = - 2*Dz/scl_z
-
-    xpts = ((xpts[::-1]+1)/2)*scl_x
-    ypts = ((ypts[::-1]+1)/2)*scl_y
-    zpts = ((zpts[::-1]+1)/2)*scl_z
-
-
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
-
-
-    px_joined = (3*px)//2
-    py_joined = (3*py)//2
-    pz_joined = (3*pz)//2
-
-    px_joined = px_joined-px_joined%2
-    py_joined = py_joined-py_joined%2
-    pz_joined = pz_joined-pz_joined%2
-
-
-    Dx2,xpts2 = spectral.cheb(px_joined)
-    Dy2,ypts2 = spectral.cheb(py_joined)
-    Dz2,zpts2 = spectral.cheb(pz_joined)
-    xpts2 = (1+xpts2[::-1])*scl_x
-    ypts2 = (1+ypts2[::-1])*scl_y
-    zpts2 = (1+zpts2[::-1])*scl_z
-
-
-    Dx2 = - Dx2/scl_x
-    Dy2 = - Dy2/scl_y
-    Dz2 = - Dz2/scl_z
-
+    # Replace differentiation matrix and point set in the joined direction
     if dir == 0:
-        xjoined = xpts2
-        yjoined = ypts
-        zjoined = zpts
         Dx = Dx2
-        xlim = 2*scl_x
-        xc = scl_x
-        ylim = scl_y
-        zlim = scl_z
+        xjoined, yjoined, zjoined = xpts2, ypts, zpts
+        xlim, ylim, zlim, xc = 2 * scl_x, scl_y, scl_z, scl_x
     elif dir == 1:
-        xjoined = xpts
-        yjoined = ypts2
-        zjoined = zpts
         Dy = Dy2
-        xlim = scl_x
-        ylim = 2*scl_y
-        xc = scl_y
-        zlim = scl_z
-    elif dir == 2:
-        xjoined = xpts
-        yjoined = ypts
-        zjoined = zpts2
+        xjoined, yjoined, zjoined = xpts, ypts2, zpts
+        xlim, ylim, zlim, xc = scl_x, 2 * scl_y, scl_z, scl_y
+    else:  # dir == 2
         Dz = Dz2
-        xlim = scl_x
-        ylim = scl_y
-        zlim = 2*scl_z
-        xc = scl_z
-    njx = len(xjoined)
-    njy = len(yjoined)
-    njz = len(zjoined)
+        xjoined, yjoined, zjoined = xpts, ypts, zpts2
+        xlim, ylim, zlim, xc = scl_x, scl_y, 2 * scl_z, scl_z
 
-    XY_joined_dir = np.zeros(shape=(njx*njy*njz,3))
-    XY_joined_dir[:,0] = np.kron(np.kron(xjoined,np.ones_like(yjoined)),np.ones_like(zjoined))
-    XY_joined_dir[:,1] = np.kron(np.kron(np.ones_like(xjoined),yjoined),np.ones_like(zjoined))
-    XY_joined_dir[:,2] = np.kron(np.kron(np.ones_like(xjoined),np.ones_like(yjoined)),zjoined)
+    njx, njy, njz = len(xjoined), len(yjoined), len(zjoined)
 
-    Ii_dir = np.where((XY_joined_dir[:,0]>0) & (XY_joined_dir[:,0]<xlim) & (XY_joined_dir[:,1]>0) & (XY_joined_dir[:,1]<ylim) & (XY_joined_dir[:,2]>0) & (XY_joined_dir[:,2]<zlim) )[0]
-    Ib_dir = np.where((np.abs(XY_joined_dir[:,0])<1e-10) | (np.abs(XY_joined_dir[:,0]-xlim)<1e-10) | (np.abs(XY_joined_dir[:,1])<1e-10) | (np.abs(XY_joined_dir[:,1]-ylim)<1e-10) | (np.abs(XY_joined_dir[:,2])<1e-10) | (np.abs(XY_joined_dir[:,2]-zlim)<1e-10) )[0]
+    # Build spatial coordinate array via Kronecker products
+    ones_x = np.ones(njx)
+    ones_y = np.ones(njy)
+    ones_z = np.ones(njz)
+    XY_joined_dir = np.column_stack([
+        np.kron(np.kron(xjoined, ones_y), ones_z),
+        np.kron(np.kron(ones_x, yjoined), ones_z),
+        np.kron(np.kron(ones_x, ones_y), zjoined),
+    ])
 
-    XY_joined_dir_i = XY_joined_dir[Ii_dir,:]
-    XY_joined_dir_b = XY_joined_dir[Ib_dir,:]
+    x, y, z = XY_joined_dir[:, 0], XY_joined_dir[:, 1], XY_joined_dir[:, 2]
 
-    Il_dir = np.where( (np.abs(XY_joined_dir_b[:,0])<1e-10) & (XY_joined_dir_b[:,1]>0) & (XY_joined_dir_b[:,1]<ylim) & (XY_joined_dir_b[:,2]>0) & (XY_joined_dir_b[:,2]<zlim) )[0]
-    Ir_dir = np.where( (np.abs(XY_joined_dir_b[:,0]-xlim)<1e-10) & (XY_joined_dir_b[:,1]>0) & (XY_joined_dir_b[:,1]<ylim) & (XY_joined_dir_b[:,2]>0) & (XY_joined_dir_b[:,2]<zlim) )[0]
+    # Interior and boundary index sets
+    Ii_dir = np.where((x > 0) & (x < xlim) & (y > 0) & (y < ylim) & (z > 0) & (z < zlim))[0]
+    Ib_dir = np.where(
+        (np.abs(x) < 1e-10) | (np.abs(x - xlim) < 1e-10) |
+        (np.abs(y) < 1e-10) | (np.abs(y - ylim) < 1e-10) |
+        (np.abs(z) < 1e-10) | (np.abs(z - zlim) < 1e-10)
+    )[0]
 
-    If_dir = np.where( (np.abs(XY_joined_dir_b[:,1])<1e-10) & (XY_joined_dir_b[:,0]>0) & (XY_joined_dir_b[:,0]<xlim) & (XY_joined_dir_b[:,2]>0) & (XY_joined_dir_b[:,2]<zlim) )[0]
-    Ibk_dir = np.where( (np.abs(XY_joined_dir_b[:,1]-ylim)<1e-10) & (XY_joined_dir_b[:,0]>0) & (XY_joined_dir_b[:,0]<xlim) & (XY_joined_dir_b[:,2]>0) & (XY_joined_dir_b[:,2]<zlim) )[0]
+    xb, yb, zb = XY_joined_dir[Ib_dir, 0], XY_joined_dir[Ib_dir, 1], XY_joined_dir[Ib_dir, 2]
 
-    Id_dir = np.where( (np.abs(XY_joined_dir_b[:,2])<1e-10) & (XY_joined_dir_b[:,0]>0) & (XY_joined_dir_b[:,0]<xlim) & (XY_joined_dir_b[:,1]>0) & (XY_joined_dir_b[:,1]<ylim) )[0]
-    Iu_dir = np.where( (np.abs(XY_joined_dir_b[:,2]-zlim)<1e-10) & (XY_joined_dir_b[:,0]>0) & (XY_joined_dir_b[:,0]<xlim) & (XY_joined_dir_b[:,1]>0) & (XY_joined_dir_b[:,1]<ylim) )[0]
+    # Face index sets within boundary DOFs
+    Il_dir  = np.where((np.abs(xb) < 1e-10)        & (yb > 0) & (yb < ylim) & (zb > 0) & (zb < zlim))[0]
+    Ir_dir  = np.where((np.abs(xb - xlim) < 1e-10) & (yb > 0) & (yb < ylim) & (zb > 0) & (zb < zlim))[0]
+    If_dir  = np.where((np.abs(yb) < 1e-10)        & (xb > 0) & (xb < xlim) & (zb > 0) & (zb < zlim))[0]
+    Ibk_dir = np.where((np.abs(yb - ylim) < 1e-10) & (xb > 0) & (xb < xlim) & (zb > 0) & (zb < zlim))[0]
+    Id_dir  = np.where((np.abs(zb) < 1e-10)        & (xb > 0) & (xb < xlim) & (yb > 0) & (yb < ylim))[0]
+    Iu_dir  = np.where((np.abs(zb - zlim) < 1e-10) & (xb > 0) & (xb < xlim) & (yb > 0) & (yb < ylim))[0]
 
-    Ic_dir = np.where( (np.abs(XY_joined_dir_i[:,dir]-xc)<1e-10))[0]
+    Ic_dir = np.where(np.abs(XY_joined_dir[Ii_dir, dir] - xc) < 1e-10)[0]
 
-    Ibox_joined_dir = np.append(Il_dir,If_dir)
-    Ibox_joined_dir = np.append(Ibox_joined_dir,Id_dir)
-    Ibox_joined_dir = np.append(Ibox_joined_dir,Iu_dir)
-    Ibox_joined_dir = np.append(Ibox_joined_dir,Ibk_dir)
-    Ibox_joined_dir = np.append(Ibox_joined_dir,Ir_dir)
+    Ibox_joined_dir = np.concatenate([Il_dir, If_dir, Id_dir, Iu_dir, Ibk_dir, Ir_dir])
 
-    ctr = 0
-    Ijl = np.arange(ctr,ctr+len(Il_dir))
-    ctr+= len(Il_dir)
-    Ijf = np.arange(ctr,ctr+len(If_dir))
-    ctr+= len(If_dir)
-    Ijd = np.arange(ctr,ctr+len(Id_dir))
-    ctr+= len(Id_dir)
-    Iju = np.arange(ctr,ctr+len(Iu_dir))
-    ctr+= len(Iu_dir)
-    Ijb = np.arange(ctr,ctr+len(Ibk_dir))
-    ctr+= len(Ibk_dir)
-    Ijr = np.arange(ctr,ctr+len(Ir_dir))
+    # Build contiguous index ranges for each face within Ibox
+    face_lengths = [len(Il_dir), len(If_dir), len(Id_dir), len(Iu_dir), len(Ibk_dir), len(Ir_dir)]
+    cumlen = np.concatenate([[0], np.cumsum(face_lengths)])
+    Ijl, Ijf, Ijd, Iju, Ijb, Ijr = [np.arange(cumlen[i], cumlen[i + 1]) for i in range(6)]
 
+    # Helmholtz operator: -(Dxx ⊗ I ⊗ I + I ⊗ Dyy ⊗ I + I ⊗ I ⊗ Dzz) - kh^2 * I
+    Ix, Iy, Iz = np.eye(njx), np.eye(njy), np.eye(njz)
+    Dxx, Dyy, Dzz = Dx @ Dx, Dy @ Dy, Dz @ Dz
+    L_joined_dir = (
+        -np.kron(np.kron(Dxx, Iy), Iz)
+        - np.kron(np.kron(Ix, Dyy), Iz)
+        - np.kron(np.kron(Ix, Iy), Dzz)
+        - kh * kh * np.kron(np.kron(Ix, Iy), Iz)
+    )
 
-    Dxx = Dx@Dx
-    Dyy = Dy@Dy
-    Dzz = Dz@Dz
-
-    L_joined_dir = -np.kron(np.kron(Dxx,np.identity(njy)),np.identity(njz))-np.kron(np.kron(np.identity(njx),Dyy),np.identity(njz))-np.kron(np.kron(np.identity(njx),np.identity(njy)),Dzz)-kh*kh*np.kron(np.kron(np.identity(njx),np.identity(njy)),np.identity(njz))
-    return L_joined_dir,Ijl,Ijf,Ijd,Iju,Ijb,Ijr,Ic_dir,Ibox_joined_dir,Ii_dir,Ib_dir,XY_joined_dir
-
+    return L_joined_dir, Ijl, Ijf, Ijd, Iju, Ijb, Ijr, Ic_dir, Ibox_joined_dir, Ii_dir, Ib_dir, XY_joined_dir
 
 
-def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
-
-
+def interp_ops(px, py, pz, scl_x, scl_y, scl_z):
     """
     Construct interpolation operators from joined dofs to unjoined dofs
 
@@ -173,140 +158,66 @@ def interp_ops(px,py,pz,scl_x,scl_y,scl_z):
 
     INPUT:  - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
             - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
-    
+
     OUTPUT: - Interp_x,Interp_y,Interp_z    : Interpolation operators associated to (px,scl_x) etc
 
 
     DESCRIPTION:
-                        
-                                              Interp                         
+
+                                          Interp
     |* *  *   *   *  * *|* *  *   *   *  * *| <-------------------------------- |* *  *   *    *    *    *    *   *  * *|
             (scl,p)             (scl,p)                                                         (2*scl,3*p/2)
-    
 
-    Interp is the map that takes ~3*p/2 cheb grid sample on the interval [0,2*scl] 
-    and interpolates underlying poly to the two pieces of p cheb pts, on [0,scl] and [scl,2*scl] respectively 
 
+    Interp is the map that takes ~3*p/2 cheb grid sample on the interval [0,2*scl]
+    and interpolates underlying poly to the two pieces of p cheb pts, on [0,scl] and [scl,2*scl] respectively
     """
+    # Build single-block interior points (stripped of boundary)
+    _, xpts = _cheb_1d(px, scl_x)
+    _, ypts = _cheb_1d(py, scl_y)
+    _, zpts = _cheb_1d(pz, scl_z)
+
+    nx, ny, nz = len(xpts), len(ypts), len(zpts)
+
+    xpts_int = xpts[1:nx - 1]
+    ypts_int = ypts[1:ny - 1]
+    zpts_int = zpts[1:nz - 1]
+
+    # Two-tile interior points (concatenate both sub-blocks)
+    x2 = np.append(xpts_int, scl_x + xpts_int)
+    y2 = np.append(ypts_int, scl_y + ypts_int)
+    z2 = np.append(zpts_int, scl_z + zpts_int)
+
+    # Build joined interior points (strip boundary from double-wide grid)
+    _, xpts2, _ = _joined_cheb_1d(px, scl_x)
+    _, ypts2, _ = _joined_cheb_1d(py, scl_y)
+    _, zpts2, _ = _joined_cheb_1d(pz, scl_z)
+
+    xpts2 = xpts2[1:-1]
+    ypts2 = ypts2[1:-1]
+    zpts2 = zpts2[1:-1]
+
+    # Build Chebyshev Vandermonde matrices and compute interpolation via SVD pseudo-inverse
+    # All points are normalised to [-1,1] around the centre of the double-wide interval.
+    nxpts2, nypts2, nzpts2 = len(xpts2), len(ypts2), len(zpts2)
+
+    ccx = _svd_interp(
+        chebpoly.chebvander((x2    - scl_x) / scl_x, nxpts2 - 1),
+        chebpoly.chebvander((xpts2 - scl_x) / scl_x, nxpts2 - 1),
+    )
+    ccy = _svd_interp(
+        chebpoly.chebvander((y2    - scl_y) / scl_y, nypts2 - 1),
+        chebpoly.chebvander((ypts2 - scl_y) / scl_y, nypts2 - 1),
+    )
+    ccz = _svd_interp(
+        chebpoly.chebvander((z2    - scl_z) / scl_z, nzpts2 - 1),
+        chebpoly.chebvander((zpts2 - scl_z) / scl_z, nzpts2 - 1),
+    )
+
+    return ccx, ccy, ccz
 
 
-
-    # sorry for this notation, it sucks
-    # x2 = 2 sets of p-1 cheb pts stuck next to each other
-    # xpts2 = 1 set op pjoined-1 cheb pts on the double-wide interval
-
-    Dx,xpts = spectral.cheb(px)
-    Dy,ypts = spectral.cheb(py)
-    Dz,zpts = spectral.cheb(pz)
-
-    Dx = - 2*Dx/scl_x
-    Dy = - 2*Dy/scl_y
-    Dz = - 2*Dz/scl_z
-
-    xpts = ((xpts[::-1]+1)/2)*scl_x
-    ypts = ((ypts[::-1]+1)/2)*scl_y
-    zpts = ((zpts[::-1]+1)/2)*scl_z
-
-
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
-
-
-    x2 = np.append(xpts[1:nx-1],scl_x+xpts[1:nx-1])
-    y2 = np.append(ypts[1:ny-1],scl_y+ypts[1:ny-1])
-    z2 = np.append(zpts[1:nz-1],scl_z+zpts[1:nz-1])
-
-    nx2 = len(x2)
-    ny2 = len(y2)
-    nz2 = len(z2)
-
-
-    px_joined = (3*px)//2
-    py_joined = (3*py)//2
-    pz_joined = (3*pz)//2
-
-    px_joined = px_joined-px_joined%2
-    py_joined = py_joined-py_joined%2
-    pz_joined = pz_joined-pz_joined%2
-
-
-    Dx2,xpts2 = spectral.cheb(px_joined)
-    Dy2,ypts2 = spectral.cheb(py_joined)
-    Dz2,zpts2 = spectral.cheb(pz_joined)
-    xpts2 = (1+xpts2[::-1])*scl_x
-    ypts2 = (1+ypts2[::-1])*scl_y
-    zpts2 = (1+zpts2[::-1])*scl_z
-
-
-    Dx2 = - Dx2/scl_x
-    Dy2 = - Dy2/scl_y
-    Dz2 = - Dz2/scl_z
-
-    nxpts2 = len(xpts2)
-    nypts2 = len(ypts2)
-    nzpts2 = len(zpts2)
-
-
-    xpts2 = xpts2[1:nxpts2-1]
-    ypts2 = ypts2[1:nypts2-1]
-    zpts2 = zpts2[1:nzpts2-1]
-
-    nxpts2 = len(xpts2)
-    nypts2 = len(ypts2)
-    nzpts2 = len(zpts2)
-
-
-    # E is evaluation from cheb coeffs to points
-    # Interpolation map is now E_x2*E_xpts2^-1
-    # you can check that this is correct by chasing diagrams:
-    #       E_x2        E_xpts2
-    # x2 <----- coeffs ---------> xpts2
-    #   <-------------------------|
-    #           Interp_x
-
-    
-    E_x2 = chebpoly.chebvander((x2-scl_x)/scl_x,nxpts2-1)
-    E_xpts2 = chebpoly.chebvander((xpts2-scl_x)/scl_x,nxpts2-1)
-
-    [U,s,V] = np.linalg.svd(E_x2,full_matrices=False)
-    k = sum(s>1e-15*s[0])
-    Uk = U[:,:k]
-    Vk = V[:k,:].T
-    sk = s[:k]
-    Sk = np.diag(sk**(-1))
-    ccx = ((E_xpts2@Vk)@Sk)@Uk.T
-
-
-    E_y2 = chebpoly.chebvander((y2-scl_y)/scl_y,nypts2-1)
-    E_ypts2 = chebpoly.chebvander((ypts2-scl_y)/scl_y,nypts2-1)
-
-    [U,s,V] = np.linalg.svd(E_y2,full_matrices=False)
-    k = sum(s>1e-15*s[0])
-    Uk = U[:,:k]
-    Vk = V[:k,:].T
-    sk = s[:k]
-    Sk = np.diag(sk**(-1))
-    ccy = ((E_ypts2@Vk)@Sk)@Uk.T
-
-    E_z2 = chebpoly.chebvander((z2-scl_z)/scl_z,nzpts2-1)
-    E_zpts2 = chebpoly.chebvander((zpts2-scl_z)/scl_z,nzpts2-1)
-
-    [U,s,V] = np.linalg.svd(E_z2,full_matrices=False)
-    k = sum(s>1e-15*s[0])
-    Uk = U[:,:k]
-    Vk = V[:k,:].T
-    sk = s[:k]
-    Sk = np.diag(sk**(-1))
-    ccz = ((E_zpts2@Vk)@Sk)@Uk.T
-
-
-
-    return ccx,ccy,ccz
-
-def XYU(dir,px,py,pz,scl_x,scl_y,scl_z):
-
-
+def XYU(dir, px, py, pz, scl_x, scl_y, scl_z):
     """
     Construct unjoined DOFs
 
@@ -318,112 +229,77 @@ def XYU(dir,px,py,pz,scl_x,scl_y,scl_z):
     INPUT:  - dir (in [0,1,2])      :    whether two blocks are stacked together in x-dir (0), y-dir (1), z-dir (2)
             - (px,py,pz)            :    polynomial orders for each 1x1 block in the 2x1 set-up
             - (scl_x,scl_y,scl_z)   :    length scales of the 1x1 blocks
-    
+
     OUTPUT: - XYu                       :   spatial coordinates of the unjoined DOFs
             - Iul,Iuf,Iud,Iuu,Iub,Iur   :   faces (left, front, down, up, back, right) as subsets of the boundary
 
-
     NOTE: edges of the faces are removed
-
     """
+    _, xpts = _cheb_1d(px, scl_x)
+    _, ypts = _cheb_1d(py, scl_y)
+    _, zpts = _cheb_1d(pz, scl_z)
 
+    nx, ny, nz = len(xpts), len(ypts), len(zpts)
 
-    Dx,xpts = spectral.cheb(px)
-    Dy,ypts = spectral.cheb(py)
-    Dz,zpts = spectral.cheb(pz)
+    # Strip boundary nodes
+    xpts = xpts[1:nx - 1]
+    ypts = ypts[1:ny - 1]
+    zpts = zpts[1:nz - 1]
 
-    Dx = - 2*Dx/scl_x
-    Dy = - 2*Dy/scl_y
-    Dz = - 2*Dz/scl_z
-
-    xpts = ((xpts[::-1]+1)/2)*scl_x
-    ypts = ((ypts[::-1]+1)/2)*scl_y
-    zpts = ((zpts[::-1]+1)/2)*scl_z
-
-
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
-
-    xpts = xpts[1:nx-1]
-    ypts = ypts[1:ny-1]
-    zpts = zpts[1:nz-1]
-
-    
-
+    # Extend points in the joined direction to cover both sub-blocks
     if dir == 0:
-        xpts = np.append(xpts,scl_x+xpts)
-    if dir == 1:
-        ypts = np.append(ypts,scl_y+ypts)
-    if dir == 2:
-        zpts = np.append(zpts,scl_z+zpts)
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
+        xpts = np.append(xpts, scl_x + xpts)
+    elif dir == 1:
+        ypts = np.append(ypts, scl_y + ypts)
+    else:  # dir == 2
+        zpts = np.append(zpts, scl_z + zpts)
 
-    #left
-    XYul = np.zeros(shape = (ny*nz,3))
-    XYul[:,1] = np.kron(ypts,np.ones_like(zpts))
-    XYul[:,2] = np.kron(np.ones_like(ypts),zpts)
-    
+    nx, ny, nz = len(xpts), len(ypts), len(zpts)
+    ones_x, ones_y, ones_z = np.ones(nx), np.ones(ny), np.ones(nz)
+
+    # Left face  (x=0): varies in y,z
+    XYul = np.zeros((ny * nz, 3))
+    XYul[:, 1] = np.kron(ypts, ones_z)
+    XYul[:, 2] = np.kron(ones_y, zpts)
+
+    # Front face (y=0): varies in x,z
+    XYuf = np.zeros((nx * nz, 3))
+    XYuf[:, 0] = np.kron(xpts, ones_z)
+    XYuf[:, 2] = np.kron(ones_x, zpts)
+
+    # Down face  (z=0): varies in x,y
+    XYud = np.zeros((nx * ny, 3))
+    XYud[:, 0] = np.kron(xpts, ones_y)
+    XYud[:, 1] = np.kron(ones_x, ypts)
+
+    # Up, back, right faces are offsets of their counterparts
+    up_offset   = scl_z * np.array([0, 0, 1]) * (2 if dir == 2 else 1)
+    back_offset = scl_y * np.array([0, 1, 0]) * (2 if dir == 1 else 1)
+    right_offset = scl_x * np.array([1, 0, 0]) * (2 if dir == 0 else 1)
+
+    XYuu = XYud + up_offset
+    XYub = XYuf + back_offset
+    XYur = XYul + right_offset
+
+    XYu = np.concatenate([XYul, XYuf, XYud, XYuu, XYub, XYur], axis=0)
+
+    # Build contiguous index ranges for each face
+    face_sizes = [XYul.shape[0], XYuf.shape[0], XYud.shape[0],
+                  XYuu.shape[0], XYub.shape[0], XYur.shape[0]]
+    cumlen = np.concatenate([[0], np.cumsum(face_sizes)])
+    Iul, Iuf, Iud, Iuu, Iub, Iur = [np.arange(cumlen[i], cumlen[i + 1]) for i in range(6)]
+
+    return XYu, Iul, Iuf, Iud, Iuu, Iub, Iur
 
 
-    #front
-    XYuf = np.zeros(shape = (nx*nz,3))
-    XYuf[:,0] = np.kron(xpts,np.ones_like(zpts))
-    XYuf[:,2] = np.kron(np.ones_like(xpts),zpts)
-
-    # down
-
-    XYud = np.zeros(shape = (nx*ny,3))
-    XYud[:,0] = np.kron(xpts,np.ones_like(ypts))
-    XYud[:,1] = np.kron(np.ones_like(xpts),ypts)
-
-    # up
-    XYuu = XYud+scl_z*np.array([0,0,1])
-    if dir == 2:
-        XYuu = XYuu+scl_z*np.array([0,0,1])
-
-
-    # back
-    XYub = XYuf+scl_y*np.array([0,1,0])
-    if dir == 1:
-        XYub = XYub+scl_y*np.array([0,1,0])
-
-    # right
-    XYur = XYul+scl_x*np.array([1,0,0])
-    if dir == 0:
-        XYur = XYur+scl_x*np.array([1,0,0])
-
-    XYu=np.zeros(shape=(0,3))
-    XYu = np.append(XYul,XYuf,axis=0)
-    XYu = np.append(XYu,XYud,axis=0)
-    XYu = np.append(XYu,XYuu,axis=0)
-    XYu = np.append(XYu,XYub,axis=0)
-    XYu = np.append(XYu,XYur,axis=0)
-    ctr = 0
-    Iul = np.arange(ctr,ctr+XYul.shape[0])
-    ctr+= XYul.shape[0]
-    Iuf = np.arange(ctr,ctr+XYuf.shape[0])
-    ctr+= XYuf.shape[0]
-    Iud = np.arange(ctr,ctr+XYud.shape[0])
-    ctr+= XYud.shape[0]
-    Iuu = np.arange(ctr,ctr+XYuu.shape[0])
-    ctr+= XYuu.shape[0]
-    Iub = np.arange(ctr,ctr+XYub.shape[0])
-    ctr+= XYub.shape[0]
-    Iur = np.arange(ctr,ctr+XYur.shape[0])
-    return XYu,Iul,Iuf,Iud,Iuu,Iub,Iur
-
-def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
+def global_dofs(tiling, px, py, pz, Lx, Ly, Lz):
     """
     Construct global reduced DOFs
-
 
     INPUT:  - tiling (1x3 int array)    :   the tiling defining the underlying non-overlapping domain decomp
             - (px,py,pz)                :    polynomial orders for each 1x1 block
             - (Lx,Ly,Lz)                :    length scales of the global domain
-    
+
     OUTPUT: - XYtot                     :   spatial coordinates of the global DOFs
             - md_vec                    :   int vec with length the number of cuboid faces
                                             'missing direction vector', equals 2 for an xy face, 1 for an xz face, 0 for a yz face
@@ -433,96 +309,86 @@ def global_dofs(tiling,px,py,pz,Lx,Ly,Lz):
                                             for example, the bottom and top face have nxy points etc.
             -indx_vec,indy_vec,indz_vec :   int vecs with length the number of cuboid faces
                                             correspond to the loop indexes at which face is added
-
-
-
     """
-    Lx0 = tiling[0]
-    Ly0 = tiling[1]
-    Lz0 = tiling[2]
+    Lx0, Ly0, Lz0 = tiling
+    scl_x, scl_y, scl_z = Lx / Lx0, Ly / Ly0, Lz / Lz0
 
-    scl_z = Lz/Lz0
-    scl_y = Ly/Ly0
-    scl_x = Lx/Lx0
-    _,xpts = spectral.cheb(px)
-    _,ypts = spectral.cheb(py)
-    _,zpts = spectral.cheb(pz)
-    xpts = ((xpts[::-1]+1)/2)*scl_x
-    ypts = ((ypts[::-1]+1)/2)*scl_y
-    zpts = ((zpts[::-1]+1)/2)*scl_z
+    _, xpts = _cheb_1d(px, scl_x)
+    _, ypts = _cheb_1d(py, scl_y)
+    _, zpts = _cheb_1d(pz, scl_z)
 
+    nx, ny, nz = len(xpts), len(ypts), len(zpts)
 
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
+    # Strip boundary nodes
+    xpts = xpts[1:nx - 1]
+    ypts = ypts[1:ny - 1]
+    zpts = zpts[1:nz - 1]
 
-    xpts = xpts[1:nx-1]
-    ypts = ypts[1:ny-1]
-    zpts = zpts[1:nz-1]
+    ones_x, ones_y, ones_z = np.ones_like(xpts), np.ones_like(ypts), np.ones_like(zpts)
 
-    xy = np.zeros(shape = ((nx-2)*(ny-2),3))
-    yz = np.zeros(shape = ((ny-2)*(nz-2),3))
-    xz = np.zeros(shape = ((nx-2)*(nz-2),3))
-    
-    xy[:,0] = np.kron(xpts,np.ones_like(ypts))
-    xy[:,1] = np.kron(np.ones_like(xpts),ypts)
+    # Template face grids at the origin
+    xy = np.zeros(((nx - 2) * (ny - 2), 3))
+    xy[:, 0] = np.kron(xpts, ones_y)
+    xy[:, 1] = np.kron(ones_x, ypts)
 
-    yz[:,1] = np.kron(ypts,np.ones_like(zpts))
-    yz[:,2] = np.kron(np.ones_like(ypts),zpts)
+    yz = np.zeros(((ny - 2) * (nz - 2), 3))
+    yz[:, 1] = np.kron(ypts, ones_z)
+    yz[:, 2] = np.kron(ones_y, zpts)
 
-    xz[:,0] = np.kron(xpts,np.ones_like(zpts))
-    xz[:,2] = np.kron(np.ones_like(xpts),zpts)
-    
-    nxy = xy.shape[0]
-    nyz = yz.shape[0]
-    nxz = xz.shape[0]
-    md_vec=np.zeros(shape=(0,),dtype = np.int8)
-    b_vec=np.zeros(shape=(0,),dtype = np.bool)
-    indx_vec=np.zeros(shape=(0,),dtype = np.int64)
-    indy_vec=np.zeros(shape=(0,),dtype = np.int64)
-    indz_vec=np.zeros(shape=(0,),dtype = np.int64)
-    
-    XYtot = np.zeros(shape=(0,3))
-    for indx in range(tiling[0]+1):
+    xz = np.zeros(((nx - 2) * (nz - 2), 3))
+    xz[:, 0] = np.kron(xpts, ones_z)
+    xz[:, 2] = np.kron(ones_x, zpts)
+
+    nxy, nyz, nxz = xy.shape[0], yz.shape[0], xz.shape[0]
+
+    # Pre-allocate lists; convert to arrays at the end (avoids repeated np.append)
+    XYtot_list = []
+    md_list, b_list, indx_list, indy_list, indz_list = [], [], [], [], []
+
+    for indx in range(tiling[0] + 1):
+        x_off = indx * scl_x
         for indy in range(tiling[1]):
             for indz in range(tiling[2]):
-            
-                XYtot = np.append(XYtot,yz+np.array([indx*scl_x,indy*scl_y,indz*scl_z]),axis=0)
-                md_vec=np.append(md_vec,0)
-                b_bool = (indx == 0) | (indx == tiling[0])
-                b_vec = np.append(b_vec,b_bool)
-                indx_vec=np.append(indx_vec,indx)
-                indy_vec=np.append(indy_vec,indy)
-                indz_vec=np.append(indz_vec,indz)
-                
-        for indy in range(tiling[1]+1):
-            for indz in range(tiling[2]):
-                if indx<tiling[0]:
-                    XYtot = np.append(XYtot,xz+np.array([indx*scl_x,indy*scl_y,indz*scl_z]),axis=0)
-                    md_vec=np.append(md_vec,1)
-                    b_bool = (indy == 0) | (indy == tiling[1])
-                    b_vec = np.append(b_vec,b_bool)
-                    indx_vec=np.append(indx_vec,indx)
-                    indy_vec=np.append(indy_vec,indy)
-                    indz_vec=np.append(indz_vec,indz)
-                    
-            for indz in range(tiling[2]+1):
-                if indy<tiling[1] and indx<tiling[0]:
-                    XYtot = np.append(XYtot,xy+np.array([indx*scl_x,indy*scl_y,indz*scl_z]),axis=0)
-                    md_vec=np.append(md_vec,2)
-                    b_bool = (indz == 0) | (indz == tiling[2])
-                    b_vec = np.append(b_vec,b_bool)
-                    indx_vec=np.append(indx_vec,indx)
-                    indy_vec=np.append(indy_vec,indy)
-                    indz_vec=np.append(indz_vec,indz)
-                    
-    return XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec
+                XYtot_list.append(yz + np.array([x_off, indy * scl_y, indz * scl_z]))
+                md_list.append(0)
+                b_list.append(indx == 0 or indx == tiling[0])
+                indx_list.append(indx)
+                indy_list.append(indy)
+                indz_list.append(indz)
 
-def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,Sx,Sy,Sz):
+        if indx < tiling[0]:
+            for indy in range(tiling[1] + 1):
+                for indz in range(tiling[2]):
+                    XYtot_list.append(xz + np.array([x_off, indy * scl_y, indz * scl_z]))
+                    md_list.append(1)
+                    b_list.append(indy == 0 or indy == tiling[1])
+                    indx_list.append(indx)
+                    indy_list.append(indy)
+                    indz_list.append(indz)
+
+                if indy < tiling[1]:
+                    for indz in range(tiling[2] + 1):
+                        XYtot_list.append(xy + np.array([x_off, indy * scl_y, indz * scl_z]))
+                        md_list.append(2)
+                        b_list.append(indz == 0 or indz == tiling[2])
+                        indx_list.append(indx)
+                        indy_list.append(indy)
+                        indz_list.append(indz)
+
+    XYtot     = np.concatenate(XYtot_list, axis=0)
+    md_vec    = np.array(md_list,   dtype=np.int8)
+    b_vec     = np.array(b_list,    dtype=bool)
+    indx_vec  = np.array(indx_list, dtype=np.int64)
+    indy_vec  = np.array(indy_list, dtype=np.int64)
+    indz_vec  = np.array(indz_list, dtype=np.int64)
+
+    return XYtot, md_vec, b_vec, nxy, nyz, nxz, indx_vec, indy_vec, indz_vec
+
+
+def construct_SOMS(nxy, nyz, nxz, md_vec, b_vec, XYtot, tiling, indx_vec, indy_vec, indz_vec, Sx, Sy, Sz):
     """
     Construct global SOMS system
 
-    
     INPUT:  - nxy,nyz,nxz               :   number of points for the xy-faces (down and up) etc.
             - md_vec                    :   vec indication direction of each face (xy=2,xz=1,yz=0)
             - b_vec                     :   vec indicating if corresponding face is on global boundary
@@ -531,216 +397,216 @@ def construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_
             - indx_vec,indy_vec,indz_vec:   hard to explain, sorry
             - uXY                       :   solution on XYtot, for testing purposes
             - Sx,Sy,Sz                  :   Local solve-and-restrict maps, one for each direction
-    
+
     OUTPUT: - Stot                      :   total S system
-
-
-
     """
     ctr = 0
-    nFYZ = tiling[1]*tiling[2]*nyz
-    nFXZ = tiling[2]*nxz
-    nFXY = (tiling[2]+1)*nxy
+    nFYZ = tiling[1] * tiling[2] * nyz
+    nFXZ = tiling[2] * nxz
+    nFXY = (tiling[2] + 1) * nxy
 
     Stot = np.identity(XYtot.shape[0])
+
     for indxyz in range(len(md_vec)):
-        source = np.zeros(shape=(0,),dtype = np.int64)
+        source = np.zeros(shape=(0,), dtype=np.int64)
         match md_vec[indxyz]:
             case 2:
-                target = np.arange(ctr,ctr+nxy)
-                source = np.zeros(shape = (0,),dtype=np.int64)
-        
-                step_up     = nxy
-                step_down   = nxy
-                step_bk  = (tiling[2]+1-indz_vec[indxyz])*nxy+(indz_vec[indxyz]-1)*nxz
-                step_front  = (indz_vec[indxyz])*nxy+(tiling[2]+1-indz_vec[indxyz])*nxz
+                target = np.arange(ctr, ctr + nxy)
 
-                step_right =  (tiling[1]-indy_vec[indxyz])*tiling[2]*nxz+(tiling[2]+1)*(tiling[1]-indy_vec[indxyz]-1)*nxy+ nxy*(tiling[2]+1-indz_vec[indxyz])+(indz_vec[indxyz]-1)*nyz + (indy_vec[indxyz])*tiling[2]*nyz
-                start_left =  ctr+step_right - tiling[2]*tiling[1]*nyz - (tiling[2]+1)*tiling[1]*nxy - (tiling[1]+1)*tiling[2]*nxz
+                step_up    = nxy
+                step_down  = nxy
+                step_bk    = (tiling[2] + 1 - indz_vec[indxyz]) * nxy + (indz_vec[indxyz] - 1) * nxz
+                step_front = indz_vec[indxyz] * nxy + (tiling[2] + 1 - indz_vec[indxyz]) * nxz
+                step_right = (
+                    (tiling[1] - indy_vec[indxyz]) * tiling[2] * nxz
+                    + (tiling[2] + 1) * (tiling[1] - indy_vec[indxyz] - 1) * nxy
+                    + nxy * (tiling[2] + 1 - indz_vec[indxyz])
+                    + (indz_vec[indxyz] - 1) * nyz
+                    + indy_vec[indxyz] * tiling[2] * nyz
+                )
+                start_left = ctr + step_right - tiling[2] * tiling[1] * nyz - (tiling[2] + 1) * tiling[1] * nxy - (tiling[1] + 1) * tiling[2] * nxz
 
-                source = np.append(source,np.arange(start_left,start_left+2*nyz))
-                source = np.append(source,np.arange(ctr-step_front,ctr-step_front+2*nxz))
-                source = np.append(source,np.arange(ctr-step_down,ctr-step_down+nxy))
-                source = np.append(source,np.arange(ctr+step_up,ctr+step_up+nxy))
-                source = np.append(source,np.arange(ctr+step_bk,ctr+step_bk+2*nxz))
-                source = np.append(source,np.arange(ctr+step_right,ctr+step_right+2*nyz))
+                source = np.concatenate([
+                    np.arange(start_left,          start_left + 2 * nyz),
+                    np.arange(ctr - step_front,    ctr - step_front + 2 * nxz),
+                    np.arange(ctr - step_down,     ctr - step_down + nxy),
+                    np.arange(ctr + step_up,       ctr + step_up + nxy),
+                    np.arange(ctr + step_bk,       ctr + step_bk + 2 * nxz),
+                    np.arange(ctr + step_right,    ctr + step_right + 2 * nyz),
+                ])
                 ctr += nxy
 
-                
-                
                 if not b_vec[indxyz]:
-                    Stot[np.ix_(target,source)]=-Sz
-                
-                
+                    Stot[np.ix_(target, source)] = -Sz
 
             case 1:
-                target = np.arange(ctr,ctr+nxz)
+                target = np.arange(ctr, ctr + nxz)
                 # woops, mixed up front and back
-                step_front = nxz*tiling[2] + nxy*(tiling[2]+1)
-                step_back = step_front
-                start_left1 = indx_vec[indxyz]*(nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)+tiling[2]*nyz*(indy_vec[indxyz]-1)+nyz*indz_vec[indxyz]
-                start_left2 = indx_vec[indxyz]*(nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)+tiling[2]*nyz*indy_vec[indxyz]+nyz*indz_vec[indxyz]
-                
-                start_right1 = start_left1+ (nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)
-                start_right2 = start_left2+ (nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)
+                step_front = nxz * tiling[2] + nxy * (tiling[2] + 1)
+                step_back  = step_front
 
-                start_down1 = indx_vec[indxyz]*(nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)+nFYZ+indy_vec[indxyz]*nFXZ+ (indy_vec[indxyz]-1)*nFXY +indz_vec[indxyz]*nxy
-                start_down2 = start_down1 + nFXY+nFXZ
+                block_stride = nFYZ + (tiling[1] + 1) * nFXZ + tiling[1] * nFXY
+                start_left1 = indx_vec[indxyz] * block_stride + tiling[2] * nyz * (indy_vec[indxyz] - 1) + nyz * indz_vec[indxyz]
+                start_left2 = indx_vec[indxyz] * block_stride + tiling[2] * nyz *  indy_vec[indxyz]      + nyz * indz_vec[indxyz]
 
-                start_up1 = start_down1+nxy
-                start_up2 = start_up1 + nFXY+nFXZ
+                start_right1 = start_left1 + block_stride
+                start_right2 = start_left2 + block_stride
 
+                start_down1 = indx_vec[indxyz] * block_stride + nFYZ + indy_vec[indxyz] * nFXZ + (indy_vec[indxyz] - 1) * nFXY + indz_vec[indxyz] * nxy
+                start_down2 = start_down1 + nFXY + nFXZ
+                start_up1   = start_down1 + nxy
+                start_up2   = start_up1   + nFXY + nFXZ
 
-
-                source = np.append(source,np.arange(start_left1,start_left1+nyz))
-                source = np.append(source,np.arange(start_left2,start_left2+nyz))
-                source = np.append(source,np.arange(ctr-step_back,ctr-step_back+nxz))
-                
-                source = np.append(source,np.arange(start_down1,start_down1+nxy))
-                source = np.append(source,np.arange(start_down2,start_down2+nxy))
-                source = np.append(source,np.arange(start_up1,start_up1+nxy))
-                source = np.append(source,np.arange(start_up2,start_up2+nxy))
-                source = np.append(source,np.arange(ctr+step_front,ctr+step_front+nxz))
-                source = np.append(source,np.arange(start_right1,start_right1+nyz))
-                source = np.append(source,np.arange(start_right2,start_right2+nyz))
-                
+                source = np.concatenate([
+                    np.arange(start_left1,      start_left1  + nyz),
+                    np.arange(start_left2,      start_left2  + nyz),
+                    np.arange(ctr - step_back,  ctr - step_back + nxz),
+                    np.arange(start_down1,      start_down1  + nxy),
+                    np.arange(start_down2,      start_down2  + nxy),
+                    np.arange(start_up1,        start_up1    + nxy),
+                    np.arange(start_up2,        start_up2    + nxy),
+                    np.arange(ctr + step_front, ctr + step_front + nxz),
+                    np.arange(start_right1,     start_right1 + nyz),
+                    np.arange(start_right2,     start_right2 + nyz),
+                ])
                 ctr += nxz
-                
-            
+
                 if not b_vec[indxyz]:
-                    Stot[np.ix_(target,source)]=-Sy
-                    
+                    Stot[np.ix_(target, source)] = -Sy
 
             case 0:
-                target = np.arange(ctr,ctr+nyz)
-                step_right = nyz*tiling[2]*tiling[1] + nxy*(tiling[2]+1)*tiling[1] + nxz*(tiling[1]+1)*tiling[2]
+                target = np.arange(ctr, ctr + nyz)
+                step_right = (
+                    nyz * tiling[2] * tiling[1]
+                    + nxy * (tiling[2] + 1) * tiling[1]
+                    + nxz * (tiling[1] + 1) * tiling[2]
+                )
                 step_left = step_right
-                
-                
-                start_front1 = (indx_vec[indxyz]-1)*(nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)+nFYZ+indy_vec[indxyz]*nFXZ+ (indy_vec[indxyz])*nFXY +indz_vec[indxyz]*nxz
-                start_front2 = start_front1+nFYZ+tiling[1]*nFXY + (tiling[1]+1)*nFXZ
-                
-                start_back1 = start_front1 + nFXY + nFXZ
-                start_back2 = start_front2 + nFXY + nFXZ
-                
-                start_down1 = (indx_vec[indxyz]-1)*(nFYZ+(tiling[1]+1)*nFXZ+tiling[1]*nFXY)+nFYZ+(indy_vec[indxyz]+1)*nFXZ+ (indy_vec[indxyz])*nFXY +indz_vec[indxyz]*nxy
-                start_down2 = start_down1+(tiling[1])*nFXY + (tiling[1]+1)*nFXZ + nFYZ
-                start_up1 = start_down1+nxy
-                start_up2 = start_down2+nxy
-                source = np.append(source,np.arange(ctr-step_left,ctr-step_left+nyz))
-                source = np.append(source,np.arange(start_front1,start_front1+nxz))
-                source = np.append(source,np.arange(start_front2,start_front2+nxz))
-                source = np.append(source,np.arange(start_down1,start_down1+nxy))
-                source = np.append(source,np.arange(start_down2,start_down2+nxy))
-                source = np.append(source,np.arange(start_up1,start_up1+nxy))
-                source = np.append(source,np.arange(start_up2,start_up2+nxy))
-                source = np.append(source,np.arange(start_back1,start_back1+nxz))
-                source = np.append(source,np.arange(start_back2,start_back2+nxz))
-                source = np.append(source,np.arange(ctr+step_right,ctr+step_right+nyz))
-                
-                
 
-                #print(source)
+                block_stride = nFYZ + (tiling[1] + 1) * nFXZ + tiling[1] * nFXY
+                prev_block   = (indx_vec[indxyz] - 1) * block_stride
+
+                start_front1 = prev_block + nFYZ + indy_vec[indxyz] * nFXZ + indy_vec[indxyz] * nFXY + indz_vec[indxyz] * nxz
+                start_front2 = start_front1 + nFYZ + tiling[1] * nFXY + (tiling[1] + 1) * nFXZ
+                start_back1  = start_front1 + nFXY + nFXZ
+                start_back2  = start_front2 + nFXY + nFXZ
+
+                start_down1  = prev_block + nFYZ + (indy_vec[indxyz] + 1) * nFXZ + indy_vec[indxyz] * nFXY + indz_vec[indxyz] * nxy
+                start_down2  = start_down1 + tiling[1] * nFXY + (tiling[1] + 1) * nFXZ + nFYZ
+                start_up1    = start_down1 + nxy
+                start_up2    = start_down2 + nxy
+
+                source = np.concatenate([
+                    np.arange(ctr - step_left,  ctr - step_left + nyz),
+                    np.arange(start_front1,     start_front1 + nxz),
+                    np.arange(start_front2,     start_front2 + nxz),
+                    np.arange(start_down1,      start_down1  + nxy),
+                    np.arange(start_down2,      start_down2  + nxy),
+                    np.arange(start_up1,        start_up1    + nxy),
+                    np.arange(start_up2,        start_up2    + nxy),
+                    np.arange(start_back1,      start_back1  + nxz),
+                    np.arange(start_back2,      start_back2  + nxz),
+                    np.arange(ctr + step_right, ctr + step_right + nyz),
+                ])
                 ctr += nyz
-                
+
                 if not b_vec[indxyz]:
-                    Stot[np.ix_(target,source)]=-Sx
+                    Stot[np.ix_(target, source)] = -Sx
+
     return Stot
 
-def local_S(dir,px,py,pz,scl_x,scl_y,scl_z,kh):
+
+def local_S(dir, px, py, pz, scl_x, scl_y, scl_z, kh):
     """
     Construct local SOMS system
 
-    
     INPUT:  - dir                       :   direction in {0,1,2} in which blocks are stacked/joined
             - (px,py,pz)                :   polynomial orders for each 1x1 block
             - (scl_x,scl_y,scl_z)       :   length scales of 1x1 blocks
-    
+
     OUTPUT: - S_dir                     :   local S-block in direction dir
-
-
-
     """
-    Dx,xpts = spectral.cheb(px)
-    Dy,ypts = spectral.cheb(py)
-    Dz,zpts = spectral.cheb(pz)
-    nx = len(xpts)
-    ny = len(ypts)
-    nz = len(zpts)
-    L_joined_dir,Ijl,Ijf,Ijd,Iju,Ijb,Ijr,Ic_dir,Ibox_joined_dir,Ii_dir,Ib_dir,XY_joined_dir = L_op(dir,px,py,pz,scl_x,scl_y,scl_z,kh)
-    XY_joined_dir_i = XY_joined_dir[Ii_dir,:]
-    XY_joined_dir_b = XY_joined_dir[Ib_dir,:]
+    _, xpts = _cheb_1d(px, scl_x)
+    _, ypts = _cheb_1d(py, scl_y)
+    _, zpts = _cheb_1d(pz, scl_z)
+    nx, ny, nz = len(xpts), len(ypts), len(zpts)
 
-    Lii_joined_dir = L_joined_dir[Ii_dir,:][:,Ii_dir]
-    Lib_joined_dir = L_joined_dir[Ii_dir,:][:,Ib_dir]
-    Lib_joined_dir_box = Lib_joined_dir[:,Ibox_joined_dir]
+    L_joined_dir, Ijl, Ijf, Ijd, Iju, Ijb, Ijr, Ic_dir, Ibox_joined_dir, Ii_dir, Ib_dir, XY_joined_dir = \
+        L_op(dir, px, py, pz, scl_x, scl_y, scl_z, kh)
 
+    Lii = L_joined_dir[np.ix_(Ii_dir, Ii_dir)]
+    Lib_box = L_joined_dir[np.ix_(Ii_dir, Ib_dir)][:, Ibox_joined_dir]
 
     # fiddle with interp since kronecker is not respected by global disc
     # inv_inter_xy is interpolation for the two xy-faces etc.
+    Interp_x, Interp_y, Interp_z = interp_ops(px, py, pz, scl_x, scl_y, scl_z)
 
-    Interp_x,Interp_y,Interp_z=interp_ops(px,py,pz,scl_x,scl_y,scl_z)
+    Iy_int = np.eye(ny - 2)
+    Ix_int = np.eye(nx - 2)
+    Iz_int = np.eye(nz - 2)
+
     if dir == 0:
-        inv_inter_xy = np.kron(Interp_x,np.identity(ny-2))
-        inv_inter_yz = np.identity((ny-2)*(nz-2))
-        inv_inter_xz = np.kron(Interp_x,np.identity(nz-2))
-    if dir == 1:
-        inv_inter_xy_1 = np.kron(np.identity(nx-2),Interp_y[:,:(ny-2)])
-        inv_inter_xy_2 = np.kron(np.identity(nx-2),Interp_y[:,(ny-2):])
-        inv_inter_xy = np.append(inv_inter_xy_1,inv_inter_xy_2,axis=1)
-        inv_inter_yz = np.kron(Interp_y,np.identity(nz-2))
-        inv_inter_xz = np.identity((nx-2)*(nz-2))
+        inv_inter_yz = np.eye((ny - 2) * (nz - 2))
+        inv_inter_xz = np.kron(Interp_x, Iz_int)
+        inv_inter_xy = np.kron(Interp_x, Iy_int)
+    elif dir == 1:
+        inv_inter_xy = np.concatenate([
+            np.kron(Ix_int, Interp_y[:, :(ny - 2)]),
+            np.kron(Ix_int, Interp_y[:, (ny - 2):]),
+        ], axis=1)
+        inv_inter_yz = np.kron(Interp_y, Iz_int)
+        inv_inter_xz = np.eye((nx - 2) * (nz - 2))
+    else:  # dir == 2
+        inv_inter_xy = np.eye((nx - 2) * (ny - 2))
+        inv_inter_yz = np.concatenate([
+            np.kron(Iy_int, Interp_z[:, :(nz - 2)]),
+            np.kron(Iy_int, Interp_z[:, (nz - 2):]),
+        ], axis=1)
+        inv_inter_xz = np.concatenate([
+            np.kron(Ix_int, Interp_z[:, :(nz - 2)]),
+            np.kron(Ix_int, Interp_z[:, (nz - 2):]),
+        ], axis=1)
 
+    XYu, Iul, Iuf, Iud, Iuu, Iub, Iur = XYU(dir, px, py, pz, scl_x, scl_y, scl_z)
 
-    if dir == 2:
-        inv_inter_xy = np.identity((nx-2)*(ny-2))
-        inv_inter_yz1 = np.kron(np.identity(ny-2),Interp_z[:,:(nz-2)])
-        inv_inter_yz2 = np.kron(np.identity(ny-2),Interp_z[:,(nz-2):])
-        inv_inter_yz = np.append(inv_inter_yz1,inv_inter_yz2,axis=1)
-        inv_inter_xz1 = np.kron(np.identity(nx-2),Interp_z[:,:(nz-2)])
-        inv_inter_xz2 = np.kron(np.identity(nx-2),Interp_z[:,(nz-2):])
-        inv_inter_xz = np.append(inv_inter_xz1,inv_inter_xz2,axis=1)
-    XYu,Iul,Iuf,Iud,Iuu,Iub,Iur = XYU(dir,px,py,pz,scl_x,scl_y,scl_z)
-    
-    # C_dir is total inverse interpolation matrix, i.e. over the 6 faces
+    # C_dir is total inverse interpolation matrix over the 6 faces
+    C_dir = np.zeros((len(Ibox_joined_dir), XYu.shape[0]))
+    C_dir[np.ix_(Ijl, Iul)] = inv_inter_yz
+    C_dir[np.ix_(Ijf, Iuf)] = inv_inter_xz
+    C_dir[np.ix_(Ijd, Iud)] = inv_inter_xy
+    C_dir[np.ix_(Iju, Iuu)] = inv_inter_xy
+    C_dir[np.ix_(Ijb, Iub)] = inv_inter_xz
+    C_dir[np.ix_(Ijr, Iur)] = inv_inter_yz
 
-
-    C_dir = np.zeros( shape = ( len(Ibox_joined_dir) , XYu.shape[0] ) )
-
-    C_dir[np.ix_(Ijl,Iul)] = inv_inter_yz
-    C_dir[np.ix_(Ijf,Iuf)] = inv_inter_xz
-    C_dir[np.ix_(Ijd,Iud)] = inv_inter_xy
-    C_dir[np.ix_(Iju,Iuu)] = inv_inter_xy
-    C_dir[np.ix_(Ijb,Iub)] = inv_inter_xz
-    C_dir[np.ix_(Ijr,Iur)] = inv_inter_yz
-
-    S_dir = -(np.linalg.solve(Lii_joined_dir,Lib_joined_dir[:,Ibox_joined_dir]@C_dir))[Ic_dir,:]
+    S_dir = -(np.linalg.solve(Lii, Lib_box @ C_dir))[Ic_dir, :]
     return S_dir
-def SOMS_solver(px,py,pz,nbx,nby,nbz,Lx=1.,Ly=1.,Lz=1.,kh=0,dbg = 0):
-    tiling = [nbx,nby,nbz]
-    Lx0 = tiling[0]
-    Ly0 = tiling[1]
-    Lz0 = tiling[2]
 
-    scl_x = Lx/Lx0
-    scl_y = Ly/Ly0
-    scl_z = Lz/Lz0
 
-    Sx = local_S(0,px,py,pz,scl_x,scl_y,scl_z,kh)
-    Sy = local_S(1,px,py,pz,scl_x,scl_y,scl_z,kh)
-    Sz = local_S(2,px,py,pz,scl_x,scl_y,scl_z,kh)
-    XYtot,md_vec,b_vec,nxy,nyz,nxz,indx_vec,indy_vec,indz_vec = global_dofs(tiling,px,py,pz,Lx,Ly,Lz)
-    Stot = construct_SOMS(nxy,nyz,nxz,md_vec,b_vec,XYtot,tiling,indx_vec,indy_vec,indz_vec,Sx,Sy,Sz)
-    
-    Ib = np.where((np.abs(XYtot[:,0])<1e-10)|(np.abs(XYtot[:,0]-Lx)<1e-10)|(np.abs(XYtot[:,1])<1e-10)|(np.abs(XYtot[:,1]-Ly)<1e-10)|(np.abs(XYtot[:,2])<1e-10)|(np.abs(XYtot[:,2]-Lz)<1e-10))[0]
-    Ii = [i for i in range(XYtot.shape[0]) if not i in Ib]
-    fig = plt.figure(1)
-    
-    if dbg>0:
+def SOMS_solver(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1., kh=0, dbg=0):
+    tiling = [nbx, nby, nbz]
+    scl_x = Lx / nbx
+    scl_y = Ly / nby
+    scl_z = Lz / nbz
+
+    Sx = local_S(0, px, py, pz, scl_x, scl_y, scl_z, kh)
+    Sy = local_S(1, px, py, pz, scl_x, scl_y, scl_z, kh)
+    Sz = local_S(2, px, py, pz, scl_x, scl_y, scl_z, kh)
+
+    XYtot, md_vec, b_vec, nxy, nyz, nxz, indx_vec, indy_vec, indz_vec = \
+        global_dofs(tiling, px, py, pz, Lx, Ly, Lz)
+    Stot = construct_SOMS(nxy, nyz, nxz, md_vec, b_vec, XYtot, tiling, indx_vec, indy_vec, indz_vec, Sx, Sy, Sz)
+
+    x, y, z = XYtot[:, 0], XYtot[:, 1], XYtot[:, 2]
+    Ib = np.where(
+        (np.abs(x) < 1e-10) | (np.abs(x - Lx) < 1e-10) |
+        (np.abs(y) < 1e-10) | (np.abs(y - Ly) < 1e-10) |
+        (np.abs(z) < 1e-10) | (np.abs(z - Lz) < 1e-10)
+    )[0]
+    Ii = np.setdiff1d(np.arange(XYtot.shape[0]), Ib)
+
+    if dbg > 0:
         print("S made, subselecting")
-    Sii = Stot[Ii,:][:,Ii]
-    Sib = Stot[Ii,:][:,Ib]
-    return Sii,Sib,XYtot,Ii,Ib
 
-
-
+    Sii = Stot[np.ix_(Ii, Ii)]
+    Sib = Stot[np.ix_(Ii, Ib)]
+    return Sii, Sib, XYtot, Ii, Ib
