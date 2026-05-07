@@ -9,6 +9,7 @@ import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
 from matAssembly.HBS.simpleoctree import simpletree as tree
+import matAssembly.HBS.slabTree as slabTree
 import torch
 
 
@@ -43,15 +44,16 @@ class matAssemblerOptions:
 
 
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,reduced=False):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,quad = False,reduced=False):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
         self.maxRank    = maxRank
         self.tree       = tree
         self.leaf_size  = leaf_size
-        self.ndim = 3
+        self.ndim       = ndim
         self.reduced    = reduced
+        self.quad       = quad
 class matAssemblerStats:
     """
     Stats of matrix constuction (only for dbg putposes)
@@ -100,9 +102,8 @@ class matAssembler:
             if not self.matOpts.tree:
                 c0,L0 = compute_c0_L0(stMap.XXI)
                 self.matOpts.tree =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
-            quad = False
-            if stMap.XXI.shape[1]==2:
-                quad = True
+            quad = self.matOpts.quad
+            self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
             HBSmat = HBSnew.HBSMAT(linOp,self.matOpts.tree,quad)
             HBSmat.construct(self.matOpts.maxRank,quad)
             self.stats.timeSample=0
@@ -178,8 +179,8 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,leaf_size,rk,tree=None,ndim=3):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim))
+    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad))
 
 class tolHMatAssembler(matAssembler):
     def __init__(self,tol,leaf_size,rk,ndim=3):

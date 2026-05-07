@@ -23,6 +23,7 @@ import multislab.omsdirectsolveHBS as omsdirectHBS
 
 import geometry.geom_3D.cube as cube
 from matAssembly.HBS.simpleoctree import simpletree as tree
+import matAssembly.HBS.slabTree as slabTree
 
 
 def compute_c0_L0(XX):
@@ -117,9 +118,10 @@ XXr = XXb[Ir,:]
 XXl = XXb[Il,:]
 assembler = mA.rkHMatAssembler(p*p,200)
 c0,L0 = compute_c0_L0(XXc)
-tree0 =  tree.BalancedTree(XXc,p*p,c0,L0)
-L = tree0.nlevels
-leaves = tree0.get_boxes_level(L-5)
+tree0 =  slabTree.slabTree(XXc,False,p*p)
+L = tree0.nlevels-3
+leaves = tree0.get_boxes_level(L-1)
+print("number of leaves = ",len(leaves))
 plt.figure(1)
 for leaf in leaves:
     I = tree0.get_box_inds(leaf)

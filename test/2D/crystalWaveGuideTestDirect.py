@@ -192,7 +192,7 @@ hpsalt=True
 N = 8
 dSlabs,connectivity,H = square.dSlabs(N)
 print(connectivity)
-pvec = np.array([30],dtype = np.int64)
+pvec = np.array([20],dtype = np.int64)
 #pvec = np.array([8,10,12,14,16,18,20],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -204,7 +204,7 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/32])
+    a = np.array([H/16,1/64])
     if compression == 'dense':
         assembler = mA.denseMatAssembler()
     else:
@@ -230,7 +230,9 @@ for indp in range(len(pvec)):
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
         rhstot_copy = rhstot.copy()
+        tic = time.time()
         T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,False,assembler.matOpts.maxRank)
+        print("time to construct direct solver = ",time.time()-tic)
         def matvec(v):
             return omsdirectHBS.block_tridiagonal_solve(OMS, T, v)
         Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
