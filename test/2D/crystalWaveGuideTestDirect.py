@@ -192,7 +192,7 @@ hpsalt=True
 N = 8
 dSlabs,connectivity,H = square.dSlabs(N)
 print(connectivity)
-pvec = np.array([20],dtype = np.int64)
+pvec = np.array([14],dtype = np.int64)
 #pvec = np.array([8,10,12,14,16,18,20],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -250,10 +250,10 @@ for indp in range(len(pvec)):
             uhat,_   = gmres(Stot,rhstot,tol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
         niter = gInfo.niter
 
-        
+    Stot_dense = Stot@np.identity(Stot.shape[0])
     #print("inv err = ",np.linalg.norm(Sinv_HBS-Sinv_dense,ord=2)/np.linalg.norm(Sinv_dense,ord=2))
-    #SS = Sinv_HBS@Stot_dense
-    #[e,_]=np.linalg.eig(SS)
+    SS = Sinv_HBS@Stot_dense
+    [e,_]=np.linalg.eig(SS)
     res = Stot@uhat-rhstot
 
     
@@ -267,6 +267,8 @@ for indp in range(len(pvec)):
     print("pGMRES iters              = ", pgInfo.niter)
     print("==================================")
     plt.figure(1)
+    plt.scatter(np.real(e),np.imag(e))
+    plt.figure(2)
     plt.semilogy(gInfo.resList)
     plt.semilogy(pgInfo.resList)
     plt.show()

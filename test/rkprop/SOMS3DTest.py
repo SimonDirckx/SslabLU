@@ -75,7 +75,7 @@ def bc_helmholtz(p,kh):
     return np.sin(kh*(p[:,0]+p[:,1])/np.sqrt(2))
 
 
-pvec = np.array([14],dtype=np.int64)
+pvec = np.array([8,10,12,14],dtype=np.int64)
 condvecS_L = np.zeros(shape=(len(pvec),))
 condvecT_L = np.zeros(shape=(len(pvec),))
 condvecS_H = np.zeros(shape=(len(pvec),))
@@ -95,7 +95,7 @@ for indp in range(len(pvec)):
     nbx = 4
     nby = 4
     nbz = 4
-    kh = 25.
+    kh = 75.
     Lx = 1.
     Ly = 1.
     Lz = 1.

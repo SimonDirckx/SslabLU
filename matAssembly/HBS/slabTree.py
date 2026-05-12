@@ -1,48 +1,9 @@
 """
 slabTree — a unified binary / quad spatial tree.
-
-Splitting rules
----------------
-Line input (intrinsic dimension 1):
-  - Always binary (quad=True raises ValueError).
-  - Each box is an interval [lo, hi] along the line's axis.
-  - Split at the midpoint: left child gets [lo, mid], right child [mid, hi].
-
-Rectangle input (intrinsic dimension 2), binary:
-  - Each box is an axis-aligned rectangle [x_lo, x_hi] x [y_lo, y_hi].
-  - Levels alternate splitting axis: even levels split x, odd levels split y.
-  - Left/bottom child gets the lower half, right/top child the upper half.
-
-Rectangle input (intrinsic dimension 2), quad:
-  - Each box is an axis-aligned rectangle.
-  - Every split divides both x and y at their midpoints simultaneously,
-    producing 4 children: SW, SE, NW, NE.
-
-Box index conventions
----------------------
-  Binary  : children of box b -> 2b+1 (left/bottom), 2b+2 (right/top).
-  Quad    : children of box b -> 4b+1 (SW), 4b+2 (SE), 4b+3 (NW), 4b+4 (NE).
-
-All 2 (binary) or 4 (quad) children are always created at each split, even
-if empty, so that the index formula is always valid. Empty boxes are leaves
-that contain no points.
-
-Geometry detection
-------------------
-XX shape (N,) or (N,1)     -> line in 1-D.
-XX shape (N,d) with d >= 2 -> SVD test: if the second singular value is
-                               negligible relative to the first (ratio <
-                               line_tol), the cloud is a line; otherwise a
-                               rectangle. The two splitting axes for the
-                               rectangle case are always the raw coordinate
-                               axes 0 and 1 of XX (the rectangle is assumed
-                               axis-aligned).
 """
 
-from __future__ import annotations
-
 import numpy as np
-from typing import List
+import matplotlib.pyplot as plt
 
 
 # ---------------------------------------------------------------------------
@@ -60,11 +21,7 @@ def _is_line(XX: np.ndarray, tol: float = 1e-8) -> bool:
     return float(sv[1] / sv[0]) < tol
 
 
-# ---------------------------------------------------------------------------
-# Internal node
-# ---------------------------------------------------------------------------
-
-class _Box:
+class _Node:
     """
     A single node in slabTree.
 
@@ -76,10 +33,17 @@ class _Box:
                    line   : (lo, hi)
                    rect   : (x_lo, x_hi, y_lo, y_hi)
     point_inds : indices into XX of the points owned by this box
-    children   : list of child _Box objects (empty list -> leaf)
+    children   : list of child _Node objects (empty list -> leaf)
+    bDOFs      : dict with keys 'left','down','up','right', each a numpy array
+                 of indices into XX giving the boundary DOFs, in order
+                 Set during tree construction for rect binary trees.
+    iDOFs      : np.ndarray of indices into XX for the interface DOFs
+                 (interior points on the split line, in order).
+                 None for leaves.
     """
 
-    __slots__ = ("index", "level", "bounds", "point_inds", "children")
+    __slots__ = ("index", "level", "bounds", "point_inds", "children",
+                 "bDOFs", "iDOFs")
 
     def __init__(self, index: int, level: int, bounds: tuple,
                  point_inds: np.ndarray):
@@ -87,23 +51,20 @@ class _Box:
         self.level      = level
         self.bounds     = bounds
         self.point_inds = point_inds
-        self.children: List[_Box] = []
+        self.children: list[_Node] = []
+        self.bDOFs      = None   # populated by _build_binary_rect
+        self.iDOFs      = None   # populated by _build_binary_rect (None for leaves)
 
     @property
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
 
-# ---------------------------------------------------------------------------
-# slabTree
-# ---------------------------------------------------------------------------
-
 class slabTree:
     """
-    Spatial slab tree -- binary or quad, for lines and axis-aligned rectangles.
+    Spatial slab tree -- binary or quad, for lines and axis-aligned rectangles/lines.
 
-    Splitting continues recursively until every leaf holds at most
-    *min_leaf_size* points.
+    Top-down; splitting continues recursively until min_leaf size or max_level reached
 
     Parameters
     ----------
@@ -111,47 +72,23 @@ class slabTree:
         Points, shape (N,), (N,1), (N,2), or (N,3).
         For rectangle input the rectangle is assumed axis-aligned; the two
         axes with the largest variance are used as the x- and y-splitting axes.
+        Lex ordering is maintained
 
     quad : bool
         False -> binary tree.
         True  -> quad tree (rectangle input only; raises ValueError for lines).
 
     min_leaf_size : int
-        Splitting stops when a box holds <= this many points.  Default 1
-        (split all the way down to individual points).
+        minimum leaf size (default = 1)
 
     line_tol : float
         SVD singular-value ratio below which the cloud is declared a line.
         Default 1e-8.
 
-    Examples
-    --------
-    >>> import numpy as np
-
-    Binary tree on a 1-D line, leaves of size 1:
-    >>> XX = np.linspace(0, 1, 32)
-    >>> t = slabTree(XX, quad=False, min_leaf_size=1)
-    >>> len(t.get_leaves())    # 32
-
-    Binary tree on a 1-D line, leaves of size 4:
-    >>> t = slabTree(XX, quad=False, min_leaf_size=4)
-    >>> len(t.get_leaves())    # 8
-
-    Binary tree on an axis-aligned rectangle in 2-D:
-    >>> rng = np.random.default_rng(0)
-    >>> XX = rng.random((64, 2))
-    >>> t = slabTree(XX, quad=False, min_leaf_size=4)
-
-    Quad tree on a rectangle:
-    >>> t = slabTree(XX, quad=True, min_leaf_size=4)
-    >>> t.get_boxes_level(1)   # [1, 2, 3, 4]  (SW, SE, NW, NE)
-
-    quad=True on a line raises ValueError:
-    >>> slabTree(np.linspace(0,1,20), quad=True)
     """
 
     def __init__(self, XX: np.ndarray, quad: bool = False,
-                 min_leaf_size: int = 1, line_tol: float = 1e-8):
+                 min_leaf_size: int = 1,max_level=np.inf, line_tol: float = 1e-8):
 
         # -- normalise input --------------------------------------------------
         XX = np.asarray(XX, dtype=float)
@@ -171,55 +108,53 @@ class slabTree:
         self._XX            = XX
         self._quad          = quad
         self._min_leaf_size = min_leaf_size
-        self._boxes: dict[int, _Box] = {}
-
-        # -- find the two (or one) columns that actually vary -----------------
-        # For an axis-aligned rectangle embedded in 2-D or 3-D, exactly two
-        # columns have non-trivial spread; for a line, exactly one does.
-        # We pick columns by descending variance so col_x has the larger
-        # spread and col_y has the second-largest (rectangle only).
-        col_vars  = XX.var(axis=0)
-        sorted_cols = np.argsort(col_vars)[::-1]   # descending variance
-        self._col_x = int(sorted_cols[0])           # primary axis
+        self._max_level = max_level
+        self._boxes: dict[int, _Node] = {}
+        vars = []
+        for d in range(XX.ndim):
+            if XX[:,d].var()>line_tol:#delete constant vars for rect in 3D
+                vars+=[d]
+        sorted_cols = vars
+        self._col_x = int(sorted_cols[0])
         self._col_y = int(sorted_cols[1]) if XX.shape[1] > 1 else None
-
-        # -- root bounding box ------------------------------------------------
         if self._line:
             vals = XX[:, self._col_x]
             lo, hi = float(vals.min()), float(vals.max())
-            eps = (hi - lo) * 1e-10 if hi > lo else 1e-10
-            root_bounds = (lo - eps, hi + eps)
+            root_bounds = (lo, hi)
         else:
             x, y = XX[:, self._col_x], XX[:, self._col_y]
-            ex = (x.max() - x.min()) * 1e-10 if x.max() > x.min() else 1e-10
-            ey = (y.max() - y.min()) * 1e-10 if y.max() > y.min() else 1e-10
-            root_bounds = (float(x.min()) - ex, float(x.max()) + ex,
-                           float(y.min()) - ey, float(y.max()) + ey)
+            root_bounds = (float(x.min()), float(x.max()),
+                           float(y.min()), float(y.max()))
 
-        root = _Box(index=0, level=0, bounds=root_bounds,
+        root = _Node(index=0, level=0, bounds=root_bounds,
                     point_inds=np.arange(len(XX)))
         self._boxes[0] = root
 
         # -- build ------------------------------------------------------------
         self.perm_leaf  = np.empty(len(XX), dtype=int)
         self._perm_pos  = 0          # write cursor into perm_leaf
-
+        # adjacent_pairs: list of (left_or_bot_idx, right_or_top_idx, orientation)
+        # orientation is 'horizontal' (shared vertical boundary) or
+        # 'vertical' (shared horizontal boundary).
+        
+        
         if self._line:
             self._build_binary_line(root)
         elif quad:
             self._build_quad(root)
         else:
             self._build_binary_rect(root)
-
+        
+        self._build_adjacency()
     # -- Line binary build ----------------------------------------------------
 
-    def _write_leaf(self, box: _Box):
+    def _write_leaf(self, box: _Node):
         """Write box.point_inds into perm_leaf at the current cursor."""
         n = len(box.point_inds)
-        self.perm_leaf[self._perm_pos : self._perm_pos + n] = box.point_inds
-        self._perm_pos += n
+        #self.perm_leaf[self._perm_pos : self._perm_pos + n] = box.point_inds
+        #self._perm_pos += n
 
-    def _build_binary_line(self, box: _Box):
+    def _build_binary_line(self, box: _Node):
         """Split interval [lo, hi] at its midpoint."""
         if len(box.point_inds) <= self._min_leaf_size:
             self._write_leaf(box)
@@ -229,14 +164,14 @@ class slabTree:
         mid    = 0.5 * (lo + hi)
         vals   = self._XX[box.point_inds, self._col_x]
 
-        left_mask  = vals <= mid
-        right_mask = ~left_mask
+        left_mask  = vals <= mid+1e-10
+        right_mask = vals>=mid-1e-10
 
         li = 2 * box.index + 1
         ri = 2 * box.index + 2
 
-        left  = _Box(li, box.level + 1, (lo,  mid), box.point_inds[left_mask])
-        right = _Box(ri, box.level + 1, (mid, hi),  box.point_inds[right_mask])
+        left  = _Node(li, box.level + 1, (lo,  mid), box.point_inds[left_mask])
+        right = _Node(ri, box.level + 1, (mid, hi),  box.point_inds[right_mask])
 
         box.children    = [left, right]
         self._boxes[li] = left
@@ -247,18 +182,48 @@ class slabTree:
 
     # -- Rectangle binary build -----------------------------------------------
 
-    def _build_binary_rect(self, box: _Box):
+    def _build_binary_rect(self, box: _Node):
         """
         Split rectangle alternating axes:
-          even level -> split along x  (left  = lower x half, right = upper x half)
-          odd  level -> split along y  (left  = lower y half, right = upper y half)
-        """
-        if len(box.point_inds) <= self._min_leaf_size:
-            self._write_leaf(box)
-            return
+          odd  level -> split along x  (left child = lower x, right = upper x)
+          even level -> split along y  (left child = lower y, right = upper y)
 
+        Assigns bDOFs and iDOFs to every node.
+
+        bDOFs : dict with keys 'left','down','up','right' — corner-excluded
+                boundary DOF indices into XX, ordered along each side.
+        iDOFs : interface DOF indices (interior points on the split line,
+                ordered along the line). None for leaves.
+
+        """
+        tol = 1e-10
         x_lo, x_hi, y_lo, y_hi = box.bounds
-        split_x = (box.level % 2 == 0)
+
+        # ----- LEAF -----
+        if box.level == self._max_level or len(box.point_inds) <= self._min_leaf_size:
+            self._write_leaf(box)
+            pts = box.point_inds
+            XX  = self._XX
+            # Corner-excluded boundary DOFs ordered along each side
+            left  = pts[np.where((abs(XX[pts,self._col_x]-x_lo)<tol) &
+                                 (XX[pts,self._col_y]>y_lo+tol) &
+                                 (XX[pts,self._col_y]<y_hi-tol))[0]]
+            right = pts[np.where((abs(XX[pts,self._col_x]-x_hi)<tol) &
+                                 (XX[pts,self._col_y]>y_lo+tol) &
+                                 (XX[pts,self._col_y]<y_hi-tol))[0]]
+            down  = pts[np.where((abs(XX[pts,self._col_y]-y_lo)<tol) &
+                                 (XX[pts,self._col_x]>x_lo+tol) &
+                                 (XX[pts,self._col_x]<x_hi-tol))[0]]
+            up    = pts[np.where((abs(XX[pts,self._col_y]-y_hi)<tol) &
+                                 (XX[pts,self._col_x]>x_lo+tol) &
+                                 (XX[pts,self._col_x]<x_hi-tol))[0]]
+            box.bDOFs = {'left': left, 'down': down, 'up': up, 'right': right}
+            box.iDOFs = None
+            return {'left': [box.index], 'right': [box.index],
+                    'down': [box.index], 'up': [box.index]}
+
+        # ----- INTERNAL NODE -----
+        split_x = (box.level % 2 == 1)
 
         if split_x:
             mid  = 0.5 * (x_lo + x_hi)
@@ -271,25 +236,85 @@ class slabTree:
             left_bounds  = (x_lo, x_hi, y_lo, mid)
             right_bounds = (x_lo, x_hi, mid,  y_hi)
 
-        left_mask  = vals <= mid
-        right_mask = ~left_mask
+        left_mask  = vals <= mid+tol
+        right_mask = vals>=mid-tol
 
         li = 2 * box.index + 1
         ri = 2 * box.index + 2
 
-        left  = _Box(li, box.level + 1, left_bounds,  box.point_inds[left_mask])
-        right = _Box(ri, box.level + 1, right_bounds, box.point_inds[right_mask])
+        left  = _Node(li, box.level + 1, left_bounds,  box.point_inds[left_mask])
+        right = _Node(ri, box.level + 1, right_bounds, box.point_inds[right_mask])
 
         box.children    = [left, right]
         self._boxes[li] = left
         self._boxes[ri] = right
 
-        self._build_binary_rect(left)
-        self._build_binary_rect(right)
+        left_sides  = self._build_binary_rect(left)
+        right_sides = self._build_binary_rect(right)
+        #XX  = self._XX
+        pts = box.point_inds
+
+        if split_x:
+            # x-split: left child LEFT, right child RIGHT
+            box.iDOFs = left.bDOFs['right']
+            box.bDOFs = {
+                'left':  left.bDOFs['left'],
+                'right': right.bDOFs['right'],
+                'down':  np.concatenate([left.bDOFs['down'],  right.bDOFs['down']]),
+                'up':    np.concatenate([left.bDOFs['up'],    right.bDOFs['up']]),
+            }
+            
+            return {
+                'left':   left_sides['left'],
+                'right':  right_sides['right'],
+                'down': left_sides['down'] + right_sides['down'],
+                'up':    left_sides['up']    + right_sides['up'],
+            }
+        else:
+            box.iDOFs = left.bDOFs['up']
+            box.bDOFs = {
+                'left':  np.concatenate([left.bDOFs['left'],  right.bDOFs['left']]),
+                'right': np.concatenate([left.bDOFs['right'], right.bDOFs['right']]),
+                'down':  left.bDOFs['down'],
+                'up':    right.bDOFs['up'],
+            }
+            
+            return {
+                'left':   left_sides['left']   + right_sides['left'],
+                'right':  left_sides['right']  + right_sides['right'],
+                'down': left_sides['down'],
+                'up':    right_sides['up'],
+            }
+    def _build_adjacency(self):
+        adjacency = []
+        for lvl in range(self.nlevels):
+            split_x = (lvl % 2 == 1)
+            if split_x:
+                split_dir = 'vertical'
+                opp_dir = 'horizontal'
+            else:
+                split_dir = 'horizontal'
+                opp_dir = 'vertical'
+            adj_lvl = []
+            if lvl == 0:
+                adjacency+=[adj_lvl]
+            else:
+                for node in self.get_nodes_level(lvl-1):
+                    adj_lvl+=[(node.children[0].index,node.children[1].index,split_dir)]
+                for gr in adjacency[lvl-1]:
+                    if gr[2]==split_dir:
+                        adj_lvl+=[(self.get_node(gr[0]).children[1].index,self.get_node(gr[1]).children[0].index,split_dir)]
+                    else:
+                        adj_lvl+=[(self.get_node(gr[0]).children[0].index,self.get_node(gr[1]).children[0].index,opp_dir)]
+                        adj_lvl+=[(self.get_node(gr[0]).children[1].index,self.get_node(gr[1]).children[1].index,opp_dir)]
+                adjacency+=[adj_lvl]
+        self.adjacency = adjacency
+
+
 
     # -- Quad build -----------------------------------------------------------
 
-    def _build_quad(self, box: _Box):
+    def _build_quad(self, box: _Node):
         """
         Split rectangle into 4 quadrants by halving both x and y:
           4b+1 = SW, 4b+2 = SE, 4b+3 = NW, 4b+4 = NE.
@@ -322,7 +347,7 @@ class slabTree:
         children = []
         for k, (mask, cb) in enumerate(zip(masks, child_bounds)):
             ci    = 4 * box.index + 1 + k
-            child = _Box(ci, box.level + 1, cb, box.point_inds[mask])
+            child = _Node(ci, box.level + 1, cb, box.point_inds[mask])
             self._boxes[ci] = child
             children.append(child)
 
@@ -330,16 +355,21 @@ class slabTree:
         for child in children:
             self._build_quad(child)
 
-    # -- Public API -----------------------------------------------------------
-
-    def get_leaves(self) -> List[int]:
+    def get_leaves(self) -> list[int]:
         """Return sorted list of box indices that are leaves."""
         return sorted(b.index for b in self._boxes.values() if b.is_leaf)
 
-    def get_boxes_level(self, lvl: int) -> List[int]:
+    def get_boxes_level(self, lvl: int) -> list[int]:
         """Return sorted list of box indices at depth *lvl*."""
         return sorted(b.index for b in self._boxes.values()
                       if b.level == lvl)
+    def get_nodes_level(self, lvl: int) -> list[int]:
+        """Return sorted list of box indices at depth *lvl*."""
+        return [b for b in self._boxes.values() if b.level == lvl]
+    
+    def get_node(self, idx: int):
+        
+        return self._boxes[idx]
 
     def get_box_inds(self, box: int) -> np.ndarray:
         """
