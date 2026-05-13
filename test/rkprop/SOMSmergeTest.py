@@ -4,6 +4,7 @@ import SOMSmerge
 import matplotlib.pyplot as plt
 import scipy.special as special
 import numpy.polynomial.chebyshev as chebpoly
+import scipy.sparse as sp
 def bc(p):
     r = np.sqrt(((p[:, 0] -.25)**2) + ((p[:, 1] + 1.)**2))
     return np.log(r) / (2 * np.pi)
@@ -57,6 +58,13 @@ def helmholtz_stencil(nx, ny,hx,hy,kh):
     Dxx = (-2*np.identity(nx)+np.diag(ex,-1)+np.diag(ex,1))/(hx*hx)
     Dyy = (-2*np.identity(ny)+np.diag(ey,-1)+np.diag(ey,1))/(hy*hy)
     L = np.kron(Dxx,np.identity(ny))+np.kron(np.identity(nx),Dyy)+kh*kh*np.kron(np.identity(nx),np.identity(ny))
+    return L
+def sparse_helmholtz_stencil(nx, ny,hx,hy,kh):
+    ex = np.ones(shape = (nx-1,))
+    ey = np.ones(shape = (ny-1,))
+    Dxx = (-2*np.identity(nx)+np.diag(ex,-1)+np.diag(ex,1))/(hx*hx)
+    Dyy = (-2*np.identity(ny)+np.diag(ey,-1)+np.diag(ey,1))/(hy*hy)
+    L = sp.kron(Dxx,np.identity(ny))+sp.kron(np.identity(nx),Dyy)+kh*kh*sp.kron(np.identity(nx),np.identity(ny))
     return L
 
 

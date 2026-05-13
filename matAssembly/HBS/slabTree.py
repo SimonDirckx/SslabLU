@@ -5,6 +5,17 @@ slabTree — a unified binary / quad spatial tree.
 import numpy as np
 import matplotlib.pyplot as plt
 
+def ldur(nx,ny):
+    xpts = np.linspace(0,nx,nx)
+    ypts = np.linspace(0,ny,ny)
+    xy = np.zeros((nx*ny,2))
+    xy[:,0] = np.kron(xpts,np.ones_like(ypts))
+    xy[:,1] = np.kron(np.ones_like(xpts),ypts)
+    l = np.where((xy[:,0]==0) & (xy[:,1]>0) & (xy[:,1]<ny))[0]
+    d = np.where((xy[:,1]==0) & (xy[:,0]>0) & (xy[:,0]<nx-1))[0]
+    u = np.where((xy[:,1]==ny-1) & (xy[:,0]>0) & (xy[:,0]<nx-1))[0]
+    r = np.where((xy[:,0]==nx-1) & (xy[:,1]>0) & (xy[:,1]<ny))[0]
+    return l,d,u,r
 
 # ---------------------------------------------------------------------------
 # Geometry detection
@@ -43,7 +54,7 @@ class _Node:
     """
 
     __slots__ = ("index", "level", "bounds", "point_inds", "children",
-                 "bDOFs", "iDOFs")
+                 "bDOFs", "iDOFs","u")
 
     def __init__(self, index: int, level: int, bounds: tuple,
                  point_inds: np.ndarray):
@@ -54,10 +65,37 @@ class _Node:
         self.children: list[_Node] = []
         self.bDOFs      = None   # populated by _build_binary_rect
         self.iDOFs      = None   # populated by _build_binary_rect (None for leaves)
+        self.u          = None
 
     @property
     def is_leaf(self) -> bool:
         return len(self.children) == 0
+    
+def _outer_of_pair(p_node, q_node, direction):
+    """
+    Outer boundary indices and 4-segment sizes for an adjacent pair (p, q).
+    direction: 'horizontal' (p LEFT of q) or 'vertical' (p BELOW q).
+    Returns (outer_idxs, n_l, n_d, n_u, n_r).
+    """
+    if direction == 'horizontal':
+        outer = np.concatenate([p_node.bDOFs['left'],
+                                p_node.bDOFs['down'], q_node.bDOFs['down'],
+                                p_node.bDOFs['up'],   q_node.bDOFs['up'],
+                                q_node.bDOFs['right']])
+        n_l = len(p_node.bDOFs['left'])
+        n_d = len(p_node.bDOFs['down']) + len(q_node.bDOFs['down'])
+        n_u = len(p_node.bDOFs['up'])   + len(q_node.bDOFs['up'])
+        n_r = len(q_node.bDOFs['right'])
+    else:
+        outer = np.concatenate([p_node.bDOFs['left'],  q_node.bDOFs['left'],
+                                p_node.bDOFs['down'],
+                                q_node.bDOFs['up'],
+                                p_node.bDOFs['right'], q_node.bDOFs['right']])
+        n_l = len(p_node.bDOFs['left'])  + len(q_node.bDOFs['left'])
+        n_d = len(p_node.bDOFs['down'])
+        n_u = len(q_node.bDOFs['up'])
+        n_r = len(p_node.bDOFs['right']) + len(q_node.bDOFs['right'])
+    return outer, n_l, n_d, n_u, n_r
 
 
 class slabTree:
@@ -137,7 +175,6 @@ class slabTree:
         # orientation is 'horizontal' (shared vertical boundary) or
         # 'vertical' (shared horizontal boundary).
         
-        
         if self._line:
             self._build_binary_line(root)
         elif quad:
@@ -147,12 +184,6 @@ class slabTree:
         
         self._build_adjacency()
     # -- Line binary build ----------------------------------------------------
-
-    def _write_leaf(self, box: _Node):
-        """Write box.point_inds into perm_leaf at the current cursor."""
-        n = len(box.point_inds)
-        #self.perm_leaf[self._perm_pos : self._perm_pos + n] = box.point_inds
-        #self._perm_pos += n
 
     def _build_binary_line(self, box: _Node):
         """Split interval [lo, hi] at its midpoint."""
@@ -201,22 +232,21 @@ class slabTree:
 
         # ----- LEAF -----
         if box.level == self._max_level or len(box.point_inds) <= self._min_leaf_size:
-            self._write_leaf(box)
             pts = box.point_inds
-            XX  = self._XX
-            # Corner-excluded boundary DOFs ordered along each side
-            left  = pts[np.where((abs(XX[pts,self._col_x]-x_lo)<tol) &
-                                 (XX[pts,self._col_y]>y_lo+tol) &
-                                 (XX[pts,self._col_y]<y_hi-tol))[0]]
-            right = pts[np.where((abs(XX[pts,self._col_x]-x_hi)<tol) &
-                                 (XX[pts,self._col_y]>y_lo+tol) &
-                                 (XX[pts,self._col_y]<y_hi-tol))[0]]
-            down  = pts[np.where((abs(XX[pts,self._col_y]-y_lo)<tol) &
-                                 (XX[pts,self._col_x]>x_lo+tol) &
-                                 (XX[pts,self._col_x]<x_hi-tol))[0]]
-            up    = pts[np.where((abs(XX[pts,self._col_y]-y_hi)<tol) &
-                                 (XX[pts,self._col_x]>x_lo+tol) &
-                                 (XX[pts,self._col_x]<x_hi-tol))[0]]
+            XX  = self._XX[pts,:]
+            
+            left  = pts[np.where((abs(XX[:,self._col_x]-x_lo)<tol) &
+                                 (XX[:,self._col_y]>y_lo+tol) &
+                                 (XX[:,self._col_y]<y_hi-tol))[0]]
+            right = pts[np.where((abs(XX[:,self._col_x]-x_hi)<tol) &
+                                 (XX[:,self._col_y]>y_lo+tol) &
+                                 (XX[:,self._col_y]<y_hi-tol))[0]]
+            down  = pts[np.where((abs(XX[:,self._col_y]-y_lo)<tol) &
+                                 (XX[:,self._col_x]>x_lo+tol) &
+                                 (XX[:,self._col_x]<x_hi-tol))[0]]
+            up    = pts[np.where((abs(XX[:,self._col_y]-y_hi)<tol) &
+                                 (XX[:,self._col_x]>x_lo+tol) &
+                                 (XX[:,self._col_x]<x_hi-tol))[0]]
             box.bDOFs = {'left': left, 'down': down, 'up': up, 'right': right}
             box.iDOFs = None
             return {'left': [box.index], 'right': [box.index],
@@ -370,6 +400,58 @@ class slabTree:
     def get_node(self, idx: int):
         
         return self._boxes[idx]
+    
+
+    def solve(self,node:_Node,interface_map,dir):
+        if node.is_leaf:
+            return
+        else:
+            tau = node.children[0]
+            sig = node.children[1]
+            #print("nodes are : ",tau.index,"//",sig.index)
+            imap = interface_map(tau.index,sig.index)
+            S = imap.S
+            b = node.u
+            uc = S@b
+            if dir=='vertical':
+                _,nl,nd,nu,nr = _outer_of_pair(tau,sig,'vertical')
+                ut = np.concatenate([   b[:nl//2],
+                                        b[nl:nl+nd],
+                                        uc,
+                                        b[nl+nd+nu:nl+nd+nu+nr//2]
+                                        ])
+                us = np.concatenate([   b[nl//2:nl],
+                                        uc,
+                                        b[nl+nd:nl+nd+nu],
+                                        b[nl+nd+nu+nr//2:]
+                                    ])
+                self.set_u(tau,ut)
+                self.set_u(sig,us)
+                self.solve(tau,interface_map,'horizontal')
+                self.solve(sig,interface_map,'horizontal')
+            else:
+                _,nl,nd,nu,nr = _outer_of_pair(tau,sig,'horizontal')
+                ut = np.concatenate([   b[:nl],
+                                        b[nl:nl+nd//2],
+                                        b[nl+nd:nl+nd+nu//2],
+                                        uc
+                                        ])
+                us = np.concatenate([   uc,
+                                        b[nl+nd//2:nl+nd],
+                                        b[nl+nd+nu//2:nl+nd+nu],
+                                        b[nl+nd+nu:]
+                                    ])
+                self.set_u(tau,ut)
+                self.set_u(sig,us)
+                self.solve(tau,interface_map,'vertical')
+                self.solve(sig,interface_map,'vertical')
+
+
+
+
+    def set_u(self,node :_Node,u):
+        node.u = u
+
 
     def get_box_inds(self, box: int) -> np.ndarray:
         """
