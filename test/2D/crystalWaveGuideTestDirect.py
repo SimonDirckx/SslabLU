@@ -45,8 +45,8 @@ def convert_to_dense(Srk_list):
 
 
 #nwaves = 24.623521102434587
-#nwaves = 24.673521102434584
-nwaves = 50.
+nwaves = 24.673521102434584
+#nwaves = 50.
 kh = (nwaves+0.03)*2*np.pi+1.8
 
 
@@ -192,7 +192,7 @@ hpsalt=True
 N = 8
 dSlabs,connectivity,H = square.dSlabs(N)
 print(connectivity)
-pvec = np.array([14],dtype = np.int64)
+pvec = np.array([25],dtype = np.int64)
 #pvec = np.array([8,10,12,14,16,18,20],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -206,6 +206,7 @@ for indp in range(len(pvec)):
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/16,1/64])
     if compression == 'dense':
+        print("DENSE ASSEMBLER USED")
         assembler = mA.denseMatAssembler()
     else:
         assembler = mA.rkHMatAssembler(p,40,ndim=2)
@@ -217,6 +218,7 @@ for indp in range(len(pvec)):
     print("done")
     Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=1)
     niter = 0
+    pniter = 0
     if solve_method == 'iterative':
         gInfo = gmres_info()
         stol = 1e-11*H*H
@@ -249,11 +251,12 @@ for indp in range(len(pvec)):
         else:
             uhat,_   = gmres(Stot,rhstot,tol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
         niter = gInfo.niter
+        pniter = pgInfo.niter
 
-    Stot_dense = Stot@np.identity(Stot.shape[0])
+    #Stot_dense = Stot@np.identity(Stot.shape[0])
     #print("inv err = ",np.linalg.norm(Sinv_HBS-Sinv_dense,ord=2)/np.linalg.norm(Sinv_dense,ord=2))
-    SS = Sinv_HBS@Stot_dense
-    [e,_]=np.linalg.eig(SS)
+    #SS = Sinv_HBS@Stot_dense
+    #[e,_]=np.linalg.eig(SS)
     res = Stot@uhat-rhstot
 
     
@@ -263,21 +266,20 @@ for indp in range(len(pvec)):
     print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
     print("nc                       = ",OMS.nc)
     print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-    print("GMRES iters              = ", gInfo.niter)
-    print("pGMRES iters              = ", pgInfo.niter)
+    print("GMRES iters              = ", niter)
+    print("pGMRES iters              = ", pniter)
     print("==================================")
-    plt.figure(1)
-    plt.scatter(np.real(e),np.imag(e))
-    plt.figure(2)
-    plt.semilogy(gInfo.resList)
-    plt.semilogy(pgInfo.resList)
-    plt.show()
+    #plt.figure(1)
+    #plt.scatter(np.real(e),np.imag(e))
+    #plt.figure(2)
+    #plt.semilogy(gInfo.resList)
+    #plt.semilogy(pgInfo.resList)
+    #plt.show()
     #np.save('ref_sol_waveguide.npy',uhat)
     #gref = np.load('ref_sol_waveguide.npy')
     #print("err wrt gref = ",np.linalg.norm(gref-uhat)/np.linalg.norm(gref))
-"""
-    nc = OMS.nc
 
+    nc = OMS.nc
 
     nx=200
     ny=200
@@ -315,22 +317,27 @@ for indp in range(len(pvec)):
         uu=uu.numpy().flatten()
         ghat = solver.interp(YY0,uu)
         gYY[I0] = ghat
-
+    plt.figure(1)
+    plt.imshow(np.reshape(gYY,[nx,ny]),cmap='jet')
+    plt.colorbar()
+    plt.show()
     #triang = tri.Triangulation(YY[:,0],YY[:,1])
     #tri0 = triang.triangles
-"""   
-    
-    
-"""
+    #np.save('ref_sol_waveguide_full.npy',gYY)
+    gref = np.load('ref_sol_waveguide_full.npy')
+    plt.figure(1)
+    plt.imshow(np.log10(np.abs(np.reshape(gYY,[nx,ny])-np.reshape(gref,[nx,ny]))),cmap='jet')
+    plt.colorbar()
+    plt.show()
     print("===================REF SUP ERR===================")
     print("err ref = ",np.linalg.norm(gref-gYY,ord = 2)/np.linalg.norm(gref,ord = 2))
     print("=================================================")
-    err[indp] = np.linalg.norm(gref-gYY,ord=2)/np.linalg.norm(gref,ord = 2)
-    sampl_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
+    #err[indp] = np.linalg.norm(gref-gYY,ord=2)/np.linalg.norm(gref,ord = 2)
+    #sampl_time[indp] = OMS.stats.sampl_timing
+    #compr_time[indp] = OMS.stats.compr_timing
+    #discr_time[indp] = OMS.stats.discr_timing
 
-
+"""
 fileName = 'crystal_waveguide.csv'
 errMat = np.zeros(shape=(len(pvec),5))
 errMat[:,0] = pvec

@@ -4,6 +4,7 @@ slabTree — a unified binary / quad spatial tree.
 
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 
 def ldur(nx,ny):
     xpts = np.linspace(0,nx,nx)
@@ -149,12 +150,15 @@ class slabTree:
         self._max_level = max_level
         self._boxes: dict[int, _Node] = {}
         vars = []
-        for d in range(XX.ndim):
+        print("XX shape = ",XX.shape)
+        for d in range(XX.shape[1]):
             if XX[:,d].var()>line_tol:#delete constant vars for rect in 3D
                 vars+=[d]
+        
         sorted_cols = vars
+        print("sorted_cols = ",sorted_cols)
         self._col_x = int(sorted_cols[0])
-        self._col_y = int(sorted_cols[1]) if XX.shape[1] > 1 else None
+        self._col_y = int(sorted_cols[1]) if len(sorted_cols) > 1 else None
         if self._line:
             vals = XX[:, self._col_x]
             lo, hi = float(vals.min()), float(vals.max())
@@ -169,7 +173,7 @@ class slabTree:
         self._boxes[0] = root
 
         # -- build ------------------------------------------------------------
-        self.perm_leaf  = np.empty(len(XX), dtype=int)
+        self.perm_leaf  = np.zeros(shape=(0,), dtype=int)
         self._perm_pos  = 0          # write cursor into perm_leaf
         # adjacent_pairs: list of (left_or_bot_idx, right_or_top_idx, orientation)
         # orientation is 'horizontal' (shared vertical boundary) or
@@ -183,12 +187,15 @@ class slabTree:
             self._build_binary_rect(root)
         
         self._build_adjacency()
+        self.build_perm()
     # -- Line binary build ----------------------------------------------------
-
+    def build_perm(self):
+        leaves = self.get_leaves()
+        for leaf in leaves:
+            self.perm_leaf = np.append(self.perm_leaf,self.get_box_inds(leaf))
     def _build_binary_line(self, box: _Node):
         """Split interval [lo, hi] at its midpoint."""
         if len(box.point_inds) <= self._min_leaf_size:
-            self._write_leaf(box)
             return
 
         lo, hi = box.bounds

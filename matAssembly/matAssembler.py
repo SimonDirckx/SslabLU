@@ -99,10 +99,7 @@ class matAssembler:
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
             start = time.time()
-            if not self.matOpts.tree:
-                c0,L0 = compute_c0_L0(stMap.XXI)
-                self.matOpts.tree =  tree.BalancedTree(stMap.XXI,self.matOpts.leaf_size,c0,L0)
-            quad = self.matOpts.quad
+            quad = False
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
             HBSmat = HBSnew.HBSMAT(linOp,self.matOpts.tree,quad)
             HBSmat.construct(self.matOpts.maxRank,quad)

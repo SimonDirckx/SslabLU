@@ -5,14 +5,14 @@ import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
 import matplotlib.pyplot as plt
 
-def interp(solver,p,f,typestr):
+def interp(solver,pts,f,typestr):
 
     if solver.ndim==2:
         
-        return interp_2d(solver,p,f,typestr)
+        return interp_2d(solver,pts,f,typestr)
     elif solver.ndim==3:
         
-        return interp_3d(solver,p,f,typestr)
+        return interp_3d(solver,pts,f,typestr)
     else:
         raise ValueError("ndim must be 2 or 3")
     
