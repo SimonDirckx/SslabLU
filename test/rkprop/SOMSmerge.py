@@ -115,7 +115,7 @@ def merge_S(tau_idx, sig_idx, direction, tree):
         if abs(bq[1] - bp[0]) < tol: return 'horizontal'
         return 'vertical'
 
-    adj_pairs = []   # (p, q, imap, iface_idxs, pair_direction)
+    adj_pairs = []   # (p, q, imap, iface_idxs, pair_direction, pq_outer)
     seen = set()
     for i in range(len(children)):
         for j in range(i+1, len(children)):
@@ -135,7 +135,8 @@ def merge_S(tau_idx, sig_idx, direction, tree):
                 iface_idxs = p_node.bDOFs['right']   # = q_node.bDOFs['left']
             else:
                 iface_idxs = p_node.bDOFs['up']      # = q_node.bDOFs['down']
-            adj_pairs.append((p, q, imap, iface_idxs, pd))
+            pq_outer, *_ = _outer_of_pair(p_node, q_node, pd)
+            adj_pairs.append((p, q, imap, iface_idxs, pd, pq_outer))
 
     # ------------------------------------------------------------------
     # Assemble A_ext (n_all x n_ext) and A_int (n_all x n_all).
@@ -145,34 +146,35 @@ def merge_S(tau_idx, sig_idx, direction, tree):
     # where f_pq_bnd is evaluated at the outer boundary of p∪q,
     # and each DOF in that boundary is either in outer_pos (-> A_ext col)
     # or in all_pos (-> A_int col).
+    # Vectorised: precompute column-routing arrays, then scatter via
+    # matrix slices rather than a Python loop over individual columns.
     # ------------------------------------------------------------------
     A_ext = np.zeros((n_all, n_ext))
     A_int = np.zeros((n_all, n_all))
 
-    for (p, q, imap, iface_idxs, pd) in adj_pairs:
-        p_node = tree.get_node(p); q_node = tree.get_node(q)
-        pq_outer, *_ = _outer_of_pair(p_node, q_node, pd)
-
+    for (p, q, imap, iface_idxs, pd, pq_outer) in adj_pairs:
         S = imap.S   # (n_iface, n_bnd_pq)
 
         # Row positions in [u_int; u_tgt] for this pair's iface DOFs
-        rows = []
-        row_mask = []
-        for v in iface_idxs:
-            pos = all_pos.get(int(v))
-            rows.append(pos)
-            row_mask.append(pos is not None)
-        rows = [r for r in rows if r is not None]
-        S_rows = S[row_mask, :]
+        row_pos  = np.array([all_pos.get(int(v), -1) for v in iface_idxs])
+        row_mask = row_pos >= 0
+        rows     = row_pos[row_mask]
+        S_rows   = S[row_mask, :]   # (n_rows, n_bnd_pq)
 
-        # Decompose each boundary column
-        for col, v in enumerate(pq_outer):
-            v = int(v)
-            col_vec = S_rows[:, col]
-            if v in outer_pos:
-                A_ext[rows, outer_pos[v]] += col_vec
-            elif v in all_pos:
-                A_int[rows, all_pos[v]]   += col_vec
+        # Classify each boundary column as external or internal
+        pq_int   = np.array([int(v) for v in pq_outer])
+        ext_mask = np.array([v in outer_pos for v in pq_int])
+        int_mask = ~ext_mask & np.array([v in all_pos for v in pq_int])
+
+        ext_bnd_cols = np.where(ext_mask)[0]
+        int_bnd_cols = np.where(int_mask)[0]
+        ext_tgt_cols = np.array([outer_pos[pq_int[c]] for c in ext_bnd_cols])
+        int_tgt_cols = np.array([all_pos [pq_int[c]] for c in int_bnd_cols])
+
+        if ext_bnd_cols.size:
+            A_ext[np.ix_(rows, ext_tgt_cols)] += S_rows[:, ext_bnd_cols]
+        if int_bnd_cols.size:
+            A_int[np.ix_(rows, int_tgt_cols)] += S_rows[:, int_bnd_cols]
 
     # ------------------------------------------------------------------
     # Schur complement solve:

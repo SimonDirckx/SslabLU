@@ -8,6 +8,7 @@ import time
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
 import scipy.sparse.linalg as splinalg
+
 # ---------------------------------------------------------------------------
 # Grid and tree
 # ---------------------------------------------------------------------------
@@ -26,13 +27,13 @@ else:
 timeTree = False
 
 
-for k in range(5,11):
+for k in range(9,12):
     
     N = 2**k + 1
     Nvec = np.append(Nvec,N**2)
     print("NDOFS = ",N*N)
     Nx = N; Ny = N
-    p = 3
+    p = 4
     leaf_size = 2**p
     n_levels = 2*(k-p)
 
@@ -176,7 +177,8 @@ for k in range(5,11):
     Lib = L[Ii,:][:,Ib]
     ub = bc_loc(XY[Ib,:])
     ui = bc_loc(XY[Ii,:])
-    uhat = -splinalg.spsolve(Lii,Lib@ub)
+    lu = splinalg.splu(Lii)
+    uhat = -lu.solve(Lib@ub)
     print("err of full stencil sol = ",np.linalg.norm(ui-uhat,np.inf))
     err_vec_full_stencil = np.append(err_vec_full_stencil,np.linalg.norm(ui-uhat,np.inf))
     time_vec_full_stencil = np.append(time_vec_full_stencil,time.time()-tic)
@@ -186,10 +188,12 @@ fac2 = time_vec[0]/(Nvec[0]**(1))
 fac3 = time_vec[0]/(Nvec[0]*np.log(Nvec[0]))
 plt.figure(1)
 plt.loglog(Nvec,time_vec,label = 'time')
-plt.loglog(Nvec,time_vec_full_stencil,label = 'time stencil')
+#plt.loglog(Nvec,time_vec_full_stencil,label = 'time stencil')
 plt.loglog(Nvec,fac*Nvec**(1.5),label='O(N^{1.5})',linestyle='--')
 plt.loglog(Nvec,fac3*Nvec*np.log(Nvec),label='O(NlogN)',linestyle='--')
 plt.legend()
+plt.savefig('timeplot')
+plt.show()
 
 fach = 1.1*err_vec[-1]/(hvec[-1]**2)
 plt.figure(2)
@@ -197,6 +201,7 @@ plt.loglog(Nvec,err_vec,label = 'err_domino')
 plt.loglog(Nvec,err_vec,label = 'err_stencil')
 plt.loglog(Nvec,fach*(hvec**2),label='O(h^2)',linestyle='--')
 plt.legend()
+plt.savefig('errplot')
 
 
 if timeTree:
@@ -211,4 +216,17 @@ if timeTree:
     plt.loglog(Nvec,fac3*Nvec*np.log(Nvec),label='O(NlogN)')
     plt.legend()
 
-plt.show()
+#plt.show()
+
+'''
+starts at k=6
+time_vec = np.array([   0.12151765823364258,
+                        0.5961408615112305,
+                        4.538544654846191,
+                        26.474758625030518,
+                        146.1588625907898,
+                        635.6061873435974,
+                        1775.2131607532501,
+                        6299.312522888184
+                     ])
+'''
