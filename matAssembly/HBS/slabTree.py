@@ -173,7 +173,7 @@ class slabTree:
         self._boxes[0] = root
 
         # -- build ------------------------------------------------------------
-        self.perm_leaf  = np.zeros(shape=(0,), dtype=int)
+        self.perm_leaf  = np.zeros(shape=(XX.shape[0],), dtype=int)
         self._perm_pos  = 0          # write cursor into perm_leaf
         # adjacent_pairs: list of (left_or_bot_idx, right_or_top_idx, orientation)
         # orientation is 'horizontal' (shared vertical boundary) or
@@ -187,12 +187,16 @@ class slabTree:
             self._build_binary_rect(root)
         
         self._build_adjacency()
-        self.build_perm()
+        #self.build_perm()
     # -- Line binary build ----------------------------------------------------
     def build_perm(self):
         leaves = self.get_leaves()
+        start = 0
+        print("NLEAVES = ",len(leaves))
         for leaf in leaves:
-            self.perm_leaf = np.append(self.perm_leaf,self.get_box_inds(leaf))
+            print(start,",",leaf,",",len(self.get_box_inds(leaf)),"//",len(self.perm_leaf))
+            self.perm_leaf[start:start+len(self.get_box_inds(leaf))] = self.get_box_inds(leaf)
+            start+=len(self.get_box_inds(leaf))
     def _build_binary_line(self, box: _Node):
         """Split interval [lo, hi] at its midpoint."""
         if len(box.point_inds) <= self._min_leaf_size:
