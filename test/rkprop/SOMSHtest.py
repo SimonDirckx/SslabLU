@@ -62,20 +62,33 @@ for k in range(9,12):
     hvec = np.append(hvec,h)
     
     tic = time.time()
-    _reg = {}
-    SOMSmerge.interface_map = lambda a, b: _reg.get((a,b), None)
+    # _reg_levels[lvl] holds the imaps registered at tree level lvl.
+    # Sibling pairs (first entries in adjacency[lvl]) are needed by the solve.
+    # Cross pairs (remaining entries) are only needed during the build.
+    _reg_levels = [dict() for _ in range(tree.nlevels)]
+    n_sibling = [len(list(tree.get_nodes_level(lvl-1))) if lvl > 0 else 0
+                 for lvl in range(tree.nlevels)]
+
+    def interface_map_fn(a, b):
+        for d in _reg_levels:
+            v = d.get((a, b))
+            if v is not None: return v
+        return None
+
+    SOMSmerge.interface_map = interface_map_fn
     compute_errs = False
     errors = []
     S_hor = build_imap(nx, ny, dx, dy, 'horizontal',kh)
     S_ver = build_imap(nx, ny, dx, dy, 'vertical',kh)
+    leaf_level = tree.nlevels - 1
     for (a, b, ori) in tree.adjacency[-1]:
         ba = tree.get_node(a).bounds; bb = tree.get_node(b).bounds
         if ori == 'horizontal':
             left, right = (a,b) if ba[0] < bb[0] else (b,a)
-            _reg[(left, right)] = S_hor
+            _reg_levels[leaf_level][(left, right)] = S_hor
         else:
             bot, top = (a,b) if ba[2] < bb[2] else (b,a)
-            _reg[(bot, top)] = S_ver
+            _reg_levels[leaf_level][(bot, top)] = S_ver
         if compute_errs:
                 a_node = tree.get_node(a)
                 b_node = tree.get_node(b)
@@ -109,7 +122,7 @@ for k in range(9,12):
             sig_node = tree.get_node(sig_idx)
 
             imap = merge_S(tau_idx, sig_idx, dir, tree)
-            _reg[(tau_idx, sig_idx)] = imap
+            _reg_levels[level][(tau_idx, sig_idx)] = imap
 
             if compute_errs:
                 if dir == 'horizontal':
@@ -144,6 +157,13 @@ for k in range(9,12):
         if compute_errs:
             print(f"  --> Level {level}: max err over level ={max(errors):.2e}\n")
         print("level ",level," done.")
+
+        # Purge cross-pair imaps from level+1: these were the inputs to this
+        # merge step and are never needed again (solve only uses sibling pairs).
+        # Sibling pairs are the first n_sibling[level+1] entries of adjacency[level+1].
+        child_level = level + 1
+        for (tau_idx, sig_idx, _) in tree.adjacency[child_level][n_sibling[child_level]:]:
+            _reg_levels[child_level].pop((tau_idx, sig_idx), None)
     
 
     root = tree.get_node(0)
@@ -154,6 +174,10 @@ for k in range(9,12):
     b_root = bc_loc(XYb)
     tree.set_u(root,b_root)
     tree.solve(root,interface_map=lambda t,s:SOMSmerge.interface_map(t,s),dir='vertical')
+
+    # Solve complete — purge all remaining sibling-pair imaps
+    for d in _reg_levels:
+        d.clear()
     leaves = tree.get_leaves()
     err = 0.
     for node in tree.get_nodes_level(tree.nlevels-1):
@@ -168,20 +192,20 @@ for k in range(9,12):
     err_vec=np.append(err_vec,err)
     time_vec = np.append(time_vec,time.time()-tic)
     print("elapsed_time = ",time.time()-tic)
-    tic = time.time()
-    L = SOMSmergeTest.sparse_helmholtz_stencil(Nx,Ny,h,h,kh)
-    Ii = np.where((XY[:,0]>0)&(XY[:,0]<1)&(XY[:,1]>0)&(XY[:,1]<1))[0]
-    Ib = np.where((XY[:,0]==0)|(XY[:,0]==1)|(XY[:,1]==0)|(XY[:,1]==1))[0]
+    #tic = time.time()
+    #L = SOMSmergeTest.sparse_helmholtz_stencil(Nx,Ny,h,h,kh)
+    #Ii = np.where((XY[:,0]>0)&(XY[:,0]<1)&(XY[:,1]>0)&(XY[:,1]<1))[0]
+    #Ib = np.where((XY[:,0]==0)|(XY[:,0]==1)|(XY[:,1]==0)|(XY[:,1]==1))[0]
 
-    Lii = L[Ii,:][:,Ii]
-    Lib = L[Ii,:][:,Ib]
-    ub = bc_loc(XY[Ib,:])
-    ui = bc_loc(XY[Ii,:])
-    lu = splinalg.splu(Lii)
-    uhat = -lu.solve(Lib@ub)
-    print("err of full stencil sol = ",np.linalg.norm(ui-uhat,np.inf))
-    err_vec_full_stencil = np.append(err_vec_full_stencil,np.linalg.norm(ui-uhat,np.inf))
-    time_vec_full_stencil = np.append(time_vec_full_stencil,time.time()-tic)
+    #Lii = L[Ii,:][:,Ii]
+    #Lib = L[Ii,:][:,Ib]
+    #ub = bc_loc(XY[Ib,:])
+    #ui = bc_loc(XY[Ii,:])
+    #lu = splinalg.splu(Lii)
+    #uhat = -lu.solve(Lib@ub)
+    #print("err of full stencil sol = ",np.linalg.norm(ui-uhat,np.inf))
+    #err_vec_full_stencil = np.append(err_vec_full_stencil,np.linalg.norm(ui-uhat,np.inf))
+    #time_vec_full_stencil = np.append(time_vec_full_stencil,time.time()-tic)
 
 fac = time_vec[0]/(Nvec[0]**(1.5))
 fac2 = time_vec[0]/(Nvec[0]**(1))
