@@ -141,13 +141,17 @@ def merge_S(tau_idx, sig_idx, direction, tree):
     # ------------------------------------------------------------------
     # Assemble A_ext (n_all x n_ext) and A_int (n_all x n_all).
     #
-    # For each pair (p, q) with map S_pq (n_iface x n_bnd):
+    # For each pair (p, q) with map S_pq (n_iface x n_bnd_pq):
     #   u_pq = S_pq @ f_pq_bnd
-    # where f_pq_bnd is evaluated at the outer boundary of p∪q,
-    # and each DOF in that boundary is either in outer_pos (-> A_ext col)
-    # or in all_pos (-> A_int col).
-    # Vectorised: precompute column-routing arrays, then scatter via
-    # matrix slices rather than a Python loop over individual columns.
+    # Each column of S_pq corresponds to a boundary DOF that is either:
+    #   - in outer_pos  -> contributes to A_ext
+    #   - in all_pos    -> contributes to A_int
+    #   - neither       -> corner of merged domain, ignored
+    # Each row of S_pq corresponds to an iface DOF that may or may not
+    # land in u_all (rows); only those in all_pos are assembled.
+    #
+    # Vectorised: all column classification and scatter done as numpy
+    # integer-index slices rather than Python loops over columns.
     # ------------------------------------------------------------------
     A_ext = np.zeros((n_all, n_ext))
     A_int = np.zeros((n_all, n_all))
@@ -155,25 +159,33 @@ def merge_S(tau_idx, sig_idx, direction, tree):
     for (p, q, imap, iface_idxs, pd, pq_outer) in adj_pairs:
         S = imap.S   # (n_iface, n_bnd_pq)
 
-        # Row positions in [u_int; u_tgt] for this pair's iface DOFs
-        row_pos  = np.array([all_pos.get(int(v), -1) for v in iface_idxs])
+        # --- Row routing: which iface DOFs land in u_all, and where ---
+        row_pos  = np.fromiter((all_pos.get(int(v), -1) for v in iface_idxs),
+                               dtype=np.intp, count=len(iface_idxs))
         row_mask = row_pos >= 0
-        rows     = row_pos[row_mask]
-        S_rows   = S[row_mask, :]   # (n_rows, n_bnd_pq)
+        rows     = row_pos[row_mask]       # positions in [u_int; u_tgt]
+        S_rows   = S[row_mask, :]          # (n_rows, n_bnd_pq)
 
-        # Classify each boundary column as external or internal
-        pq_int   = np.array([int(v) for v in pq_outer])
-        ext_mask = np.array([v in outer_pos for v in pq_int])
-        int_mask = ~ext_mask & np.array([v in all_pos for v in pq_int])
+        # --- Column routing: classify every boundary DOF once ----------
+        pq_int = pq_outer.astype(int) if pq_outer.dtype != int \
+                 else pq_outer          # ensure plain int for dict lookup
 
-        ext_bnd_cols = np.where(ext_mask)[0]
-        int_bnd_cols = np.where(int_mask)[0]
-        ext_tgt_cols = np.array([outer_pos[pq_int[c]] for c in ext_bnd_cols])
-        int_tgt_cols = np.array([all_pos [pq_int[c]] for c in int_bnd_cols])
+        # Build routing arrays in one pass over pq_outer
+        ext_bnd_cols = []; ext_tgt_cols = []
+        int_bnd_cols = []; int_tgt_cols = []
+        for col, v in enumerate(pq_int):
+            oe = outer_pos.get(v)
+            if oe is not None:
+                ext_bnd_cols.append(col); ext_tgt_cols.append(oe)
+            else:
+                ai = all_pos.get(v)
+                if ai is not None:
+                    int_bnd_cols.append(col); int_tgt_cols.append(ai)
 
-        if ext_bnd_cols.size:
+        # --- Scatter via single matrix-block updates -------------------
+        if ext_bnd_cols:
             A_ext[np.ix_(rows, ext_tgt_cols)] += S_rows[:, ext_bnd_cols]
-        if int_bnd_cols.size:
+        if int_bnd_cols:
             A_int[np.ix_(rows, int_tgt_cols)] += S_rows[:, int_bnd_cols]
 
     # ------------------------------------------------------------------
