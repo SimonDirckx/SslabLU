@@ -24,10 +24,10 @@ if kh>0.:
     bc_loc = lambda p : bc_helmholtz(p,kh)
 else:
     bc_loc = lambda p : bc(p)
-timeTree = False
+timeTree = True
 
 
-for k in range(9,12):
+for k in range(7,13):
     
     N = 2**k + 1
     Nvec = np.append(Nvec,N**2)
@@ -76,7 +76,7 @@ for k in range(9,12):
         return None
 
     SOMSmerge.interface_map = interface_map_fn
-    compute_errs = False
+    compute_errs = True
     errors = []
     S_hor = build_imap(nx, ny, dx, dy, 'horizontal',kh)
     S_ver = build_imap(nx, ny, dx, dy, 'vertical',kh)
@@ -113,7 +113,7 @@ for k in range(9,12):
     
 
     
-    compute_errs = False
+    compute_errs = True
     print("level ",tree.nlevels-1," done.")
     for level in range(tree.nlevels-2, 0, -1):
         errors = []
@@ -219,13 +219,13 @@ plt.legend()
 plt.savefig('timeplot')
 plt.show()
 
-fach = 1.1*err_vec[-1]/(hvec[-1]**2)
-plt.figure(2)
-plt.loglog(Nvec,err_vec,label = 'err_domino')
-plt.loglog(Nvec,err_vec,label = 'err_stencil')
-plt.loglog(Nvec,fach*(hvec**2),label='O(h^2)',linestyle='--')
-plt.legend()
-plt.savefig('errplot')
+#fach = 1.1*err_vec[-1]/(hvec[-1]**2)
+#plt.figure(2)
+#plt.loglog(Nvec,err_vec,label = 'err_domino')
+#plt.loglog(Nvec,err_vec,label = 'err_stencil')
+#plt.loglog(Nvec,fach*(hvec**2),label='O(h^2)',linestyle='--')
+#plt.legend()
+#plt.savefig('errplot')
 
 
 if timeTree:
@@ -239,8 +239,7 @@ if timeTree:
     plt.loglog(Nvec,fac2*Nvec**(1),label='O(N)')
     plt.loglog(Nvec,fac3*Nvec*np.log(Nvec),label='O(NlogN)')
     plt.legend()
-
-#plt.show()
+    plt.show()
 
 '''
 starts at k=6

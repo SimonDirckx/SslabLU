@@ -18,10 +18,10 @@ import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
-import multislab.omsdirectsolveHBS as omsdirectHBS
-
-
+#import multislab.omsdirectsolveHBS as omsdirectHBS
+import direct_solve.omsdirectsolveHBS as omsdirectHBS
 import geometry.geom_3D.cube as cube
+
 class gmres_info(object):
     def __init__(self, disp=False):
         self._disp = disp
@@ -81,7 +81,7 @@ def bc(p):
 
 N = 8
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([8],dtype = np.int64)
+pvec = np.array([6],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -97,7 +97,7 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/6,1/16,1/16])
+    a = np.array([H/4,1/8,1/8])
     assembler = mA.rkHMatAssembler(p*p,125,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
@@ -121,9 +121,11 @@ for indp in range(len(pvec)):
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
         rhstot_copy = rhstot.copy()
-        T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,True,assembler.matOpts.maxRank+10)
+        direct_solver = omsdirectHBS.ThomasSolverHBS(nc,125,False)
+        direct_solver.factorize(S_rk_list)
         def matvec(v):
-            return omsdirectHBS.block_tridiagonal_solve(OMS, T, v)
+            return direct_solver.solve(v)
+        print("Ntot = ",Ntot)
         Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
         gInfo = gmres_info()
         pgInfo = gmres_info()

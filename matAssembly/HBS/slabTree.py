@@ -173,7 +173,7 @@ class slabTree:
         self._boxes[0] = root
 
         # -- build ------------------------------------------------------------
-        self.perm_leaf  = np.zeros(shape=(XX.shape[0],), dtype=int)
+        self.perm_leaf  = np.zeros(shape=(2*XX.shape[0],), dtype=int)
         self._perm_pos  = 0          # write cursor into perm_leaf
         # adjacent_pairs: list of (left_or_bot_idx, right_or_top_idx, orientation)
         # orientation is 'horizontal' (shared vertical boundary) or
@@ -187,16 +187,16 @@ class slabTree:
             self._build_binary_rect(root)
         
         self._build_adjacency()
-        #self.build_perm()
+        self.build_perm()
     # -- Line binary build ----------------------------------------------------
     def build_perm(self):
         leaves = self.get_leaves()
         start = 0
-        print("NLEAVES = ",len(leaves))
         for leaf in leaves:
-            print(start,",",leaf,",",len(self.get_box_inds(leaf)),"//",len(self.perm_leaf))
             self.perm_leaf[start:start+len(self.get_box_inds(leaf))] = self.get_box_inds(leaf)
             start+=len(self.get_box_inds(leaf))
+        self.perm_leaf = self.perm_leaf[:start]
+        print("PERM BUILT")
     def _build_binary_line(self, box: _Node):
         """Split interval [lo, hi] at its midpoint."""
         if len(box.point_inds) <= self._min_leaf_size:
@@ -327,6 +327,12 @@ class slabTree:
                 'up':    right_sides['up'],
             }
     def _build_adjacency(self):
+        if self._quad:
+            self._build_adjacency_quad()
+        else:
+            self._build_adjacency_binary()
+
+    def _build_adjacency_binary(self):
         adjacency = []
         for lvl in range(self.nlevels):
             split_x = (lvl % 2 == 1)
@@ -351,6 +357,55 @@ class slabTree:
                 adjacency+=[adj_lvl]
         self.adjacency = adjacency
 
+    def _build_adjacency_quad(self):
+        """
+        Build adjacency for a quad tree.
+        At each level, each quad node contributes 4 sibling pairs:
+          SW↔SE (horizontal), NW↔NE (horizontal),
+          SW↔NW (vertical),   SE↔NE (vertical).
+        Cross pairs from parent adjacency are expanded: for each parent
+        adjacent pair (A, B, dir), the touching children of A and B are
+        adjacent in the same direction dir.
+        """
+        adjacency = []
+        for lvl in range(self.nlevels):
+            adj_lvl = []
+            if lvl == 0:
+                adjacency += [adj_lvl]
+            else:
+                # Sibling pairs from all internal nodes at level lvl-1
+                for node in self.get_nodes_level(lvl-1):
+                    if node.is_leaf:
+                        continue
+                    sw, se, nw, ne = node.children  # order: SW, SE, NW, NE
+                    adj_lvl += [
+                        (sw.index, se.index, 'horizontal'),
+                        (nw.index, ne.index, 'horizontal'),
+                        (sw.index, nw.index, 'vertical'),
+                        (se.index, ne.index, 'vertical'),
+                    ]
+                # Cross pairs from parent level adjacency
+                for (ai, bi, dir) in adjacency[lvl-1]:
+                    a = self.get_node(ai); b = self.get_node(bi)
+                    if a.is_leaf or b.is_leaf:
+                        continue
+                    a_sw, a_se, a_nw, a_ne = a.children
+                    b_sw, b_se, b_nw, b_ne = b.children
+                    if dir == 'horizontal':
+                        # A is LEFT of B: A's right children touch B's left children
+                        adj_lvl += [
+                            (a_se.index, b_sw.index, 'horizontal'),
+                            (a_ne.index, b_nw.index, 'horizontal'),
+                        ]
+                    else:  # vertical: A is BELOW B
+                        # A's top children touch B's bottom children
+                        adj_lvl += [
+                            (a_nw.index, b_sw.index, 'vertical'),
+                            (a_ne.index, b_se.index, 'vertical'),
+                        ]
+                adjacency += [adj_lvl]
+        self.adjacency = adjacency
+
 
 
     # -- Quad build -----------------------------------------------------------
@@ -359,25 +414,57 @@ class slabTree:
         """
         Split rectangle into 4 quadrants by halving both x and y:
           4b+1 = SW, 4b+2 = SE, 4b+3 = NW, 4b+4 = NE.
-        All four children are always created (possibly empty).
+        Sets bDOFs (corner-excluded) and iDOFs on every node.
         """
-        if len(box.point_inds) <= self._min_leaf_size:
-            self._write_leaf(box)
+        tol = 1e-10
+        x_lo, x_hi, y_lo, y_hi = box.bounds
+        pts = box.point_inds
+        XX  = self._XX
+
+        # ----- LEAF -----
+        if box.level == self._max_level or len(pts) <= self._min_leaf_size:
+            # bDOFs must include ALL global grid points on each boundary side,
+            # not just the points owned by this leaf (points on shared edges
+            # may be owned by adjacent siblings). Search the full XX array.
+            all_pts = np.arange(len(XX))
+            left  = all_pts[np.where((abs(XX[:, self._col_x]-x_lo)<tol) &
+                                     (XX[:, self._col_y]>y_lo+tol) &
+                                     (XX[:, self._col_y]<y_hi-tol))[0]]
+            right = all_pts[np.where((abs(XX[:, self._col_x]-x_hi)<tol) &
+                                     (XX[:, self._col_y]>y_lo+tol) &
+                                     (XX[:, self._col_y]<y_hi-tol))[0]]
+            down  = all_pts[np.where((abs(XX[:, self._col_y]-y_lo)<tol) &
+                                     (XX[:, self._col_x]>x_lo+tol) &
+                                     (XX[:, self._col_x]<x_hi-tol))[0]]
+            up    = all_pts[np.where((abs(XX[:, self._col_y]-y_hi)<tol) &
+                                     (XX[:, self._col_x]>x_lo+tol) &
+                                     (XX[:, self._col_x]<x_hi-tol))[0]]
+            box.bDOFs = {
+                'left':  left [np.argsort(XX[left,  self._col_y])],
+                'right': right[np.argsort(XX[right, self._col_y])],
+                'down':  down [np.argsort(XX[down,  self._col_x])],
+                'up':    up   [np.argsort(XX[up,    self._col_x])],
+            }
+            box.iDOFs = None
             return
 
-        x_lo, x_hi, y_lo, y_hi = box.bounds
+        # ----- INTERNAL NODE -----
         x_mid = 0.5 * (x_lo + x_hi)
         y_mid = 0.5 * (y_lo + y_hi)
 
-        px = self._XX[box.point_inds, self._col_x]
-        py = self._XX[box.point_inds, self._col_y]
+        px = XX[pts, self._col_x]
+        py = XX[pts, self._col_y]
 
         masks = [
-            (px <= x_mid) & (py <= y_mid),   # SW -> 4b+1
-            (px >  x_mid) & (py <= y_mid),   # SE -> 4b+2
-            (px <= x_mid) & (py >  y_mid),   # NW -> 4b+3
-            (px >  x_mid) & (py >  y_mid),   # NE -> 4b+4
+            (px <= x_mid) & (py <= y_mid),   # SW: x<=mid, y<=mid
+            (px >  x_mid) & (py <= y_mid),   # SE: x>mid,  y<=mid
+            (px <= x_mid) & (py >  y_mid),   # NW: x<=mid, y>mid
+            (px >  x_mid) & (py >  y_mid),   # NE: x>mid,  y>mid
         ]
+        # Points exactly on the vertical split (x==x_mid) go to SW/NW (left half).
+        # Points exactly on the horizontal split (y==y_mid) go to SW/SE (bottom half).
+        # This is already handled by <= above: x==x_mid goes to SW/NW,
+        # y==y_mid goes to SW/SE. Points at the cross (x_mid, y_mid) go to SW only.
         child_bounds = [
             (x_lo,  x_mid, y_lo,  y_mid),    # SW
             (x_mid, x_hi,  y_lo,  y_mid),    # SE
@@ -388,13 +475,39 @@ class slabTree:
         children = []
         for k, (mask, cb) in enumerate(zip(masks, child_bounds)):
             ci    = 4 * box.index + 1 + k
-            child = _Node(ci, box.level + 1, cb, box.point_inds[mask])
+            child = _Node(ci, box.level + 1, cb, pts[mask])
             self._boxes[ci] = child
             children.append(child)
 
         box.children = children
         for child in children:
             self._build_quad(child)
+
+        # SW, SE, NW, NE
+        sw, se, nw, ne = children
+
+        # iDOFs: all interior points on both split lines (cross shape)
+        # horizontal split line y=y_mid (interior to x range)
+        h_iface = pts[np.where(
+            (abs(XX[pts, self._col_y] - y_mid) < tol) &
+            (XX[pts, self._col_x] > x_lo + tol) &
+            (XX[pts, self._col_x] < x_hi - tol))[0]]
+        h_iface = h_iface[np.argsort(XX[h_iface, self._col_x])]
+        # vertical split line x=x_mid (interior to y range)
+        v_iface = pts[np.where(
+            (abs(XX[pts, self._col_x] - x_mid) < tol) &
+            (XX[pts, self._col_y] > y_lo + tol) &
+            (XX[pts, self._col_y] < y_hi - tol))[0]]
+        v_iface = v_iface[np.argsort(XX[v_iface, self._col_y])]
+        box.iDOFs = np.concatenate([h_iface, v_iface])
+
+        # bDOFs: corner-excluded outer boundary, assembled from children
+        box.bDOFs = {
+            'left':  np.concatenate([sw.bDOFs['left'],  nw.bDOFs['left']]),
+            'right': np.concatenate([se.bDOFs['right'], ne.bDOFs['right']]),
+            'down':  np.concatenate([sw.bDOFs['down'],  se.bDOFs['down']]),
+            'up':    np.concatenate([nw.bDOFs['up'],    ne.bDOFs['up']]),
+        }
 
     def get_leaves(self) -> list[int]:
         """Return sorted list of box indices that are leaves."""

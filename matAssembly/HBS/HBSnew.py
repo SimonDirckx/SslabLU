@@ -92,6 +92,7 @@ class HBSMAT:
         self.mode   =   'N'
         if A is not None:
             self.A      =   A
+            print("A shape = ",A.shape)
             self.shape  =   self.A.shape
             self.shape = A.shape
             self.dtype = A.dtype
@@ -101,7 +102,9 @@ class HBSMAT:
             self.Nb = tree.nleaves
             self.nl = self.A.shape[0]//self.Nb
             self.L = tree.nlevels
-            
+            self.tree = tree
+        
+        self.quad = quad
         self.blockSolveTime = 0
         self.nullTime = 0
         self.setupTime = 0
