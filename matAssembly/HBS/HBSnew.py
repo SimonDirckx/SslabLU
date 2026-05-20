@@ -386,7 +386,7 @@ class HBSMAT:
     def solve(self,b,mode='N'):
         if mode =='N':
             if b.ndim==1:
-                bperm = b[:,np.newaxis]    
+                bperm = b[self.perm,np.newaxis]    
             else:
                 bperm= b[self.perm,:]
             rhs = bperm.copy()

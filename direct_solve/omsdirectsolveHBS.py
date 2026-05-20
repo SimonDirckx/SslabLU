@@ -5,16 +5,105 @@ import matAssembly.HBS.HBSnew as HBSnew
 from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 
-def id_op(n):
-    return LinearOperator(
-        shape=(n, n), 
-        matvec=lambda v: v,
-        matmat=lambda v: v,      
-        rmatvec=lambda v: v,
-        rmatmat=lambda v: v,
-        dtype=np.float64
-        )
+# ---------------------------------------------------------------------------
+# Linear operator helpers
+# ---------------------------------------------------------------------------
 
+class id_op(LinearOperator):
+    """Identity operator."""
+    def __init__(self, n,dtype=np.float64):
+        super().__init__(shape=(n, n), dtype=dtype)
+    def _matvec(self, v):         return v.copy()
+    def _matmat(self, v):         return v.copy()
+    def _rmatvec(self, v):        return v.copy()
+    def _rmatmat(self, v):        return v.copy()
+    def solve(self, v, mode='N'): return v.copy()
+
+def dense_to_linop(A):
+    A = np.array(A)
+    n = A.shape[0]
+    lo = LinearOperator(
+        shape=(n, n), dtype=A.dtype,
+        matvec  = lambda v: A @ v,
+        rmatvec = lambda v: A.T @ v,
+        matmat  = lambda V: A @ V,
+        rmatmat = lambda V: A.T @ V,
+    )
+    lo.solve = lambda v, mode='N': (
+        np.linalg.solve(A, v) if mode == 'N' else np.linalg.solve(A.T, v)
+    )
+    lo.tree = lo.quad = None
+    return lo
+
+def _linop_from_mat(A):
+    """Wrap a dense numpy matrix as a LinearOperator with .solve and .tree/.quad."""
+    n  = A.shape[0]
+    lo = LinearOperator(
+        shape   = (n, n),
+        dtype   = A.dtype,
+        matvec  = lambda v: A @ v,
+        rmatvec = lambda v: A.T @ v,
+        matmat  = lambda V: A @ V,
+        rmatmat = lambda V: A.T @ V,
+    )
+    lo.solve = lambda v, mode='N': (
+        np.linalg.solve(A, v) if mode == 'N' else np.linalg.solve(A.T, v)
+    )
+    lo.tree = None
+    lo.quad = None
+    return lo
+
+
+def STS_linop(Sl, T, Sr):
+    """Returns the LinearOperator  -Sl @ T^{-1} @ Sr."""
+    def sts_matmat(v, transpose=False):
+        v_tmp = v[:, np.newaxis] if v.ndim == 1 else v
+        if not transpose:
+            result = -Sl.matmat(T.solve(Sr.matmat(v_tmp)))
+        else:
+            result = -Sr.rmatmat(T.solve(Sl.rmatmat(v_tmp), mode='T'))
+        return result.flatten() if v.ndim == 1 else result
+
+    return LinearOperator(
+        shape   = (T.shape[0], T.shape[1]),
+        dtype   = np.float64,
+        matvec  = lambda v: sts_matmat(v),
+        rmatvec = lambda v: sts_matmat(v, transpose=True),
+        matmat  = lambda v: sts_matmat(v),
+        rmatmat = lambda v: sts_matmat(v, transpose=True),
+    )
+
+
+def RB_linop(Ti, tm, tp, SiPi, SiMi, smp, spm):
+    """
+    Returns the LinearOperator for the Schur complement diagonal:
+        Ti - SiPi @ tp^{-1} @ smp - SiMi @ tm^{-1} @ spm
+    tm, tp, smp, spm may be None (boundary).
+    """
+    def smatmat(v, transpose=False):
+        v_tmp = v[:, np.newaxis] if v.ndim == 1 else v
+        if not transpose:
+            result = Ti.matmat(v_tmp)
+            if tp is not None:
+                result -= SiPi.matmat(tp.solve(smp.matmat(v_tmp)))
+            if tm is not None:
+                result -= SiMi.matmat(tm.solve(spm.matmat(v_tmp)))
+        else:
+            result = Ti.rmatmat(v_tmp)
+            if tp is not None:
+                result -= smp.rmatmat(tp.solve(SiPi.rmatmat(v_tmp), mode='T'))
+            if tm is not None:
+                result -= spm.rmatmat(tm.solve(SiMi.rmatmat(v_tmp), mode='T'))
+        return result.flatten() if v.ndim == 1 else result
+
+    return LinearOperator(
+        shape   = (Ti.shape[0], Ti.shape[1]),
+        dtype   = np.float64,
+        matvec  = lambda v: smatmat(v),
+        rmatvec = lambda v: smatmat(v, transpose=True),
+        matmat  = lambda v: smatmat(v),
+        rmatmat = lambda v: smatmat(v, transpose=True),
+    )
 
 def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
     if id:
@@ -69,7 +158,25 @@ def Dprime_Linop(D,A,B,Dprev):
         matvec = lambda v:dmatmat(v), rmatvec = lambda v:dmatmat(v,transpose=True),\
         matmat = lambda v:dmatmat(v), rmatmat = lambda v:dmatmat(v,transpose=True))
     return Dprime
+# returns -Sl@T\Sr
+def STS_linop(Sl,T,Sr):
+    def sts_matmat(v,transpose=False):        
+        if (v.ndim == 1):
+            v_tmp = v[:,np.newaxis]
+        else:
+            v_tmp = v
 
+        if (not transpose):
+            result = -Sl.matmat(T.solve(Sr.matmat(v_tmp)))
+        else:
+            result = -Sr.rmatmat(T.solve(Sl.rmatmat(v_tmp),mode='T'))
+        if (v.ndim == 1):
+            result = result.flatten()
+        return result
+    STS = LinearOperator(shape=(T.shape[0],T.shape[1]),\
+        matvec = lambda v:sts_matmat(v), rmatvec = lambda v:sts_matmat(v,transpose=True),\
+        matmat = lambda v:sts_matmat(v), rmatmat = lambda v:sts_matmat(v,transpose=True))
+    return STS
 
 
 '''
@@ -243,255 +350,209 @@ class ThomasSolverHBS(DirectSolver):
 
         return x
 
+
+
+# ---------------------------------------------------------------------------
+# HBS Red-Black solver
+# ---------------------------------------------------------------------------
+
 class RedBlackSolverHBS(DirectSolver):
+    """
+    Block-tridiagonal solver using cyclic reduction (red-black),
+    replacing dense LU factorizations with HBS-compressed operators.
 
-    # Construct a solver for the red-black scheme. This one is not periodic (aka not cyclical)
-    def factorize(self, S_rk_list, T):
-        """
-        
-        [  I   ] [ S_12 ] [  0   ] [  E?  ]
-        [ S_21 ] [  I   ] [ S_23 ] [  0   ]
-        [  0   ] [ S_32 ] [  I   ] [ S_34 ]
-        [  F?  ] [  0   ] [ S_43 ] [  I   ]
+    RB level structure mirrors the dense RedBlackSolver exactly:
+      RB[l] = (SiM, T, T_hbs, SiP)  -- all four lists of length nSlabs_at_level
+      SiM[i]   : left  off-diagonal at node i
+      T[i]     : diagonal LinearOperator at node i
+      T_hbs[i] : HBS factorization of T[i]  (replaces lu_factor)
+      SiP[i]   : right off-diagonal at node i
 
-        Using linear operators corresponding to the slabs of a slab solver, we will construct a block tridiagonal direct solver
+    lu_solve(T_inv[k], v)  -->  T_hbs[k].solve(v)
+    lu_factor(T[i])        -->  HBSnew.HBSMAT(...).construct(rk, compute_ULV=True)
+    """
 
-        This is based off of the red-black algorithm. ASSUME POWER OF 2 FOR SLABCOUNT ONLY
+    def __init__(self, m, rk, tree, quad, cyclic=False):
+        super().__init__(m, cyclic)
+        self.rk   = rk
+        self.tree = tree
+        self.quad = quad
 
-        We need to store 4 objects:
-        1. Original S_rk_list, all entries are needed for either even solves or RHS of odd solves
-        2. For i odd, the factorized systems B_i' = (I - S_{i,i-1} S_{i-1,i} - S_{i,i+1} S_{i+1,i})^-1 that makes up the "main diagonal"
-        3. For i odd, the factorized system  A_i' = (B_i') \\ S_{i,i-1} S_{i-1,i-2}
-        4. For i odd, the factorized system  C_i' = (B_i') \\ S_{i,i+1} S_{i+1,i+2}
-        """
+    # ------------------------------------------------------------------
+
+    def _hbs(self, linop,rk = None):
+        if rk is None:
+            rkloc = self.rk
+        else:
+            rkloc = rk
+        """Compress a LinearOperator into an HBS matrix and factorize it."""
+        h = HBSnew.HBSMAT(linop, self.tree, self.quad)
+        h.construct(rkloc, compute_ULV=True)
+        return h
+
+    # ------------------------------------------------------------------
+    # factorize  -- mirrors RedBlackSolver.factorize
+    # ------------------------------------------------------------------
+
+    def factorize(self, S_rk_list, T=None):
         m      = S_rk_list[0][0].shape[0]
         nSlabs = len(S_rk_list)
 
-        if not ((nSlabs & (nSlabs-1) == 0) and nSlabs != 0):
-            ValueError("ERROR! Number of slabs is not a power of 2.")
+        if not ((nSlabs & (nSlabs - 1) == 0) and nSlabs != 0):
+            raise ValueError("Number of slabs must be a power of 2.")
 
         SiM = [_[0]  for _ in S_rk_list]
         SiP = [_[-1] for _ in S_rk_list]
 
+        # Boundary zeros -- kept as zero LinearOperators (like np.zeros in dense version)
+        # so that indexing is uniform throughout.
         if not self.cyclic:
-            SiM[0] = np.zeros((m,m))
-            SiP[-1] = np.zeros((m,m))
+            SiM[0]  = _linop_from_mat(np.zeros((m, m)))
+            SiP[-1] = _linop_from_mat(np.zeros((m, m)))
 
-        RB = [(SiM, T, [lu_factor(_) for _ in T], SiP)]
+        if T is None:
+            #T = [dense_to_linop(np.eye(m)) for _ in range(nSlabs)]
+            T = [id_op(m,S_rk_list[0][0].dtype) for _ in range(nSlabs)]
+        # At level 0, T operators are used directly without HBS compression.
+        # Deeper levels produce HBS objects via _build_level.
+        T_hbs = T
+
+        RB = [(SiM, T, T_hbs, SiP)]
 
         l = nSlabs
+        rk = self.rk
         while l > 1:
-            RB.append(self.build_block_RB_solver_level(m, l, RB[-1], cyclic=self.cyclic))
-            l = int(l / 2)
+            RB.append(self._build_level(m, l, RB[-1],rk))
+            rk = rk #+ 20
+            l //= 2
 
         self.nSlabs = nSlabs
-        self.RB = RB
+        self.RB     = RB
+
+    # ------------------------------------------------------------------
+    # _build_level  -- mirrors build_block_RB_solver_level
+    # ------------------------------------------------------------------
+
+    def _build_level(self, m, nSlabs, RB_level,rk):
+        """
+        Eliminate all odd-indexed nodes and return a reduced level of length nSlabs//2.
+
+        Dense counterpart formulas:
+          B_i  = T[i] - SiM[i] @ T[i-1]^{-1} @ SiP[i-1]
+                       - SiP[i] @ T[i+1]^{-1} @ SiM[i+1]   (new diagonal, factorized)
+          A_i  = -SiM[i] @ T[i-1]^{-1} @ SiM[i-1]          (new left  off-diag)
+          C_i  = -SiP[i] @ T[i+1]^{-1} @ SiP[i+1]          (new right off-diag)
+        for even i = 0, 2, ..., nSlabs-2.
+
+        Returns (A_i, B_i, T_hbs_new, C_i) matching the dense (A_i, B_i, T_inv, C_i) layout.
+        """
+        SiM   = RB_level[0]
+        T     = RB_level[1]
+        T_hbs = RB_level[2]
+        SiP   = RB_level[3]
+
+        cyclic = self.cyclic
+
+        B_i      = []
+        T_hbs_new = []
+
+        for i in range(0, nSlabs, 2):
+            spm = SiP[(i - 1) % nSlabs] if ((i > 0) or cyclic) else None
+            smp = SiM[(i + 1) % nSlabs] if ((i < nSlabs - 1) or cyclic) else None
+            tm  = T_hbs[(i - 1) % nSlabs] if spm is not None else None
+            tp  = T_hbs[(i + 1) % nSlabs] if smp is not None else None
+
+            # B_i linop = T[i] - SiM[i]@T[i-1]^{-1}@SiP[i-1] - SiP[i]@T[i+1]^{-1}@SiM[i+1]
+            B_linop = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
+            B_hbs   = self._hbs(B_linop,rk)
+            B_i.append(B_linop)       # keep as LinearOperator (mirrors dense T list)
+            T_hbs_new.append(B_hbs)   # factorized (mirrors lu_factor)
+
+        # A_i = -SiM[i] @ T[i-1]^{-1} @ SiM[i-1]  for even i = 0,2,...
+        A_i = [
+            self._hbs(STS_linop(SiM[i], T_hbs[(i - 1) % nSlabs], SiM[(i - 1) % nSlabs]),rk)
+            for i in range(0, nSlabs, 2)
+        ]
+
+        # C_i = -SiP[i] @ T[i+1]^{-1} @ SiP[i+1]  for even i = 0,2,...
+        C_i = [
+            self._hbs(STS_linop(SiP[i], T_hbs[(i + 1) % nSlabs], SiP[(i + 1) % nSlabs]),rk)
+            for i in range(0, nSlabs, 2)
+        ]
+
+        return (A_i, B_i, T_hbs_new, C_i)
+
+    # ------------------------------------------------------------------
+    # solve  -- mirrors RedBlackSolver.solve
+    # ------------------------------------------------------------------
 
     def solve(self, rhs):
-        """
-        [  I   ] [ S_12 ] [  0   ] [  E?  ]
-        [ S_21 ] [  I   ] [ S_23 ] [  0   ]
-        [  0   ] [ S_32 ] [  I   ] [ S_34 ]
-        [  F?  ] [  0   ] [ S_43 ] [  I   ]
-
-        Solves using the Red-Black factorization. Assumes we have RB = (A_i, B_i, C_i) and v of size m * nSlabs
-        """
         m  = self.m
         RB = self.RB
 
-        m = RB[0][0][0].shape[0]
-        # Building the RHS:
+        # ---- forward reduction ----------------------------------------
+        # Mirrors dense forward loop exactly; lu_solve(T_inv[k], v) -> T_hbs[k].solve(v)
         vPrimes = [rhs.copy()]
 
-        # Now build the RHS:
         for l in range(len(RB) - 1):
-
-            (SiM, _, T_inv, SiP) = RB[l]
+            SiM, _, T_hbs, SiP = RB[l]
 
             nSlabs   = len(SiM)
-            nReduced = int(nSlabs / 2)
-            vPrime   = np.zeros(m*nReduced)
+            nReduced = nSlabs // 2
             vPrev    = vPrimes[-1]
+            vPrime   = np.zeros(m * nReduced)
 
             for j in range(nReduced):
-                i    = 2 * j
-                prev = (i - 1) % nSlabs
-                next = (i + 1) % nSlabs
-                vPrime[j*m:(j+1)*m] = vPrev[i*m:(i+1)*m] - SiM[i] @ lu_solve(T_inv[prev], vPrev[prev*m:(prev+1)*m]) - SiP[i] @ lu_solve(T_inv[next], vPrev[next*m:(next+1)*m])
+                i = 2 * j
+
+                prev = (i - 1) % nSlabs if (self.cyclic or i > 0)          else None
+                next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1) else None
+
+                contrib = vPrev[i*m:(i+1)*m].copy()
+                if prev is not None:
+                    contrib -= SiM[i].matmat(
+                        T_hbs[prev].solve(vPrev[prev*m:(prev+1)*m, np.newaxis])
+                    )[:, 0]
+                if next is not None:
+                    contrib -= SiP[i].matmat(
+                        T_hbs[next].solve(vPrev[next*m:(next+1)*m, np.newaxis])
+                    )[:, 0]
+
+                vPrime[j*m:(j+1)*m] = contrib
 
             vPrimes.append(vPrime)
 
-        # Now get u:
-        vPrimes[-1] = lu_solve(RB[-1][2][0], vPrimes[-1])
-        
+        # ---- coarsest solve -------------------------------------------
+        # Mirrors:  vPrimes[-1] = lu_solve(RB[-1][2][0], vPrimes[-1])
+        vPrimes[-1] = RB[-1][2][0].solve(vPrimes[-1])
+
+        # ---- back substitution ----------------------------------------
+        # Mirrors dense back-sub exactly; lu_solve(Tinv[i+1], v) -> T_hbs[i+1].solve(v)
         for l in range(len(RB) - 1, 0, -1):
-            (SiM, _, Tinv, SiP)   = RB[l-1]
-            nReduced = int(len(SiM) / 2)
+            SiM, _, T_hbs, SiP = RB[l - 1]
+
+            nSlabs   = len(SiM)
+            nReduced = nSlabs // 2
+
             for j in range(nReduced):
                 i = 2 * j
-                # We fill in the odd segments of u
+
+                # Copy even node solution down from coarser level
                 vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
-                
-                # Here we compute the even segments of u:
-                next = (j + 1) % nReduced
-                vPrimes[l-1][(i+1)*m:(i+2)*m] -= SiM[i+1] @ vPrimes[l][j*m:(j+1)*m] + SiP[i+1] @ vPrimes[l][next*m:(next+1)*m]
-                vPrimes[l-1][(i+1)*m:(i+2)*m] = lu_solve(Tinv[i+1], vPrimes[l-1][(i+1)*m:(i+2)*m])
+
+                # Recover odd node i+1
+                next_j = (j + 1) % nReduced
+                contrib = SiM[i+1].matmat(
+                    vPrimes[l][j*m:(j+1)*m, np.newaxis]
+                )[:, 0]
+                if self.cyclic or j + 1 < nReduced:
+                    contrib += SiP[i+1].matmat(
+                        vPrimes[l][next_j*m:(next_j+1)*m, np.newaxis]
+                    )[:, 0]
+
+                vPrimes[l-1][(i+1)*m:(i+2)*m] -= contrib
+                vPrimes[l-1][(i+1)*m:(i+2)*m] = T_hbs[i+1].solve(
+                    vPrimes[l-1][(i+1)*m:(i+2)*m]
+                )
 
         return vPrimes[0]
-
-
-    # Construct a solver for the red-black scheme. This one is not periodic (aka not cyclical)
-    def build_block_RB_solver_level(self, m, nSlabs, RB_level, cyclic=False):
-        """
-        
-        [  T_1 ] [ S_12 ] [  0   ] [  E?  ]
-        [ S_21 ] [  T_2 ] [ S_23 ] [  0   ]
-        [  0   ] [ S_32 ] [  T_3 ] [ S_34 ]
-        [  F?  ] [  0   ] [ S_43 ] [  T_4 ]
-
-        Using linear operators corresponding to the slabs of a slab solver, we will construct a block tridiagonal direct solver
-
-        This is based off of the red-black algorithm.
-
-        We need to store 4 objects:
-        1. Original S_rk_list, all entries are needed for either even solves or RHS of odd solves
-        2. For i odd, the factorized systems B_i' = (T_i - S_{i,i-1} (T_i-1)^-1 S_{i-1,i} - S_{i,i+1} (T_i+1)^-1 S_{i+1,i})^-1 that makes up the "main diagonal"
-        3. For i odd, the factorized system  A_i' = S_{i,i-1} (T_i-1)^-1 S_{i-1,i-2}
-        4. For i odd, the factorized system  C_i' = S_{i,i+1} (T_i+1)^-1 S_{i+1,i+2}
-
-        These become the new T_i, S_{i,i-1}, and S_{i,i+1} respectively.
-        """
-
-        SiM = RB_level[0]
-        SiP = RB_level[3]
-
-        T     = RB_level[1]
-        T_inv = RB_level[2]
-
-        # First let's build 2, B_i':
-        I = np.eye(m, dtype=SiM[1].dtype)
-        B_i = []
-        for i in range(0, nSlabs, 2):
-            B = reconstruct_from_lu_factor(T_inv[i])
-            if (i > 0) or cyclic:
-                B -= SiM[i] @ lu_solve(T_inv[i-1], (SiP[(i-1) % nSlabs] @ I))
-            if (i < nSlabs - 1) or cyclic:
-                B -= SiP[i] @ lu_solve(T_inv[i+1], (SiM[(i+1) % nSlabs] @ I))
-            B_i.append(B)
-
-        # Next let's build 3, A_i:
-        A_i = [-SiM[_] @ lu_solve(T_inv[_-1], (SiM[(_ - 1) % nSlabs] @ I)) for _ in range(0, nSlabs, 2)]
-        # And finally build 4, C_i:
-        C_i = [-SiP[_] @ lu_solve(T_inv[_+1], (SiP[(_ + 1) % nSlabs] @ I)) for _ in range(0, nSlabs, 2)]
-
-        # We need to account for cyclic effects if this is the topmost layer:
-        if len(B_i) == 1 and cyclic:
-            B_i[0] += A_i[0] + C_i[0]
-
-        # Now we factorize every B_i:
-        #B_i = [lu_factor(_, overwrite_a=True) for _ in B_i]
-
-        return (A_i, B_i, [lu_factor(_, overwrite_a=True) for _ in B_i], C_i)
-
-class NestedDissectionSolver:
-    """
-         [ L    B_l    0 ]    [ L     0    B_l] [u_left ]   [v_left]
-    from [C_l    M    C_r] to [ 0     R    B_r] [u_right] = [v_right]
-         [ 0    B_r    R ]    [C_l   C_r    M ] [u_sep  ]   [v_sep  ]
-    """
-
-    def __init__(self, L, R, C_l, C_r, B_l, B_r, M):
-        self.L   = L
-        self.R   = R
-        self.C_l = C_l
-        self.C_r = C_r
-        self.B_l = B_l
-        self.B_r = B_r
-        self.M   = M
-
-
-def build_nested_dissection(S_rk_list, T, cyclic=False):
-    """
-    Builds a factorized and sorted nested dissection solver.
-    """
-    m   = T[0].shape[0]
-    SiM = [_[0]  for _ in S_rk_list]
-    SiP = [_[-1] for _ in S_rk_list]
-
-    nSlabs = len(T)
-
-    if nSlabs > 2 and not cyclic:
-        SiM[0] = np.zeros((m,m))
-        SiP[-1] = np.zeros((m,m))
-
-    build_nested_dissection_level(SiM, SiP, T, cyclic=cyclic)
-
-    return 1
-
-def build_nested_dissection_level(SiM, SiP, T, cyclic=False):
-
-    m      = T[0].shape[0]
-    nSlabs = len(T)
-
-    # Special cases for nSlabs = 1 or 2
-    if nSlabs == 1:
-        return NestedDissectionSolver(None, None, None, None, None, None, lu_factor(T[0]))
-    elif nSlabs == 2:
-        return build_nested_dissection_2x2()
-    else:
-        # Denote the blocks that belong to left, right, and separator (merge)
-        sep = nSlabs // 2
-
-        T_l = T[:sep]
-        T_r = T[(sep+1):]
-        T_sep = T[sep]
-
-        # TODO: might need to fix these indices for cyclic case
-        if cyclic:
-            print("might need to fix sub-block indices for cyclic case")
-
-        SiM_l = SiM[:(len(T_l)-1)]
-        SiM_r = SiM[-(len(T_r)-1):]
-
-        SiP_l = SiP[:(len(T_l)-1)]
-        SiP_r = SiP[-(len(T_r)-1):]
-
-        # First set left and right blocks
-        L = build_nested_dissection_level(SiM_l, SiP_l, T_l)
-        R = build_nested_dissection_level(SiM_r, SiP_r, T_r)
-
-        # TODO: might need to fix these indices for cyclic case
-        # we also might need to pad these with zeros... or maybe not
-        C_l = SiM[sep-1]
-        C_r = SiP[sep]
-
-        B_l = SiP[sep-1]
-        B_r = SiM[sep]
-
-        M = 1 # Build this out properly
-
-        return NestedDissectionSolver(L, R, C_l, C_r, B_l, B_r, M)
-
-def build_nested_dissection_2x2(SiM, SiP, T):
-    """
-    Special case when there are only two blocks of the same size, so there isn't really a separator.
-    """
-
-    S_12 = SiM[0]
-    S_21 = SiP[0]
-
-    T_1 = T[0]
-    T_2 = T[1]
-
-    T_1inv = lu_factor(T_1)
-
-    # TODO: finish
-
-    L = T_1inv
-    C_l = S_21
-    B_l = S_12
-
-    M = lu_factor(T_2 - S_21 @ lu_solve(T_1inv, S_12))
-
-    return NestedDissectionSolver(L, None, C_l, None, B_l, None, M)
-    

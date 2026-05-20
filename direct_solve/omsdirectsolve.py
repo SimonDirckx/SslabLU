@@ -7,7 +7,7 @@ import pickle
 from abc import ABC, abstractmethod
 
 import os
-np.set_printoptions(linewidth=os.get_terminal_size().columns)
+np.set_printoptions(linewidth=200)
 np.set_printoptions(threshold=10000)
 
 class DirectSolver(ABC):
@@ -233,7 +233,7 @@ class RedBlackSolver(DirectSolver):
         m = RB[0][0][0].shape[0]
         # Building the RHS:
         vPrimes = [rhs.copy()]
-
+        print("rhs shape = ",rhs.shape)
         # Now build the RHS:
         for l in range(len(RB) - 1):
 
@@ -246,13 +246,18 @@ class RedBlackSolver(DirectSolver):
 
             for j in range(nReduced):
                 i    = 2 * j
-                prev = (i - 1) % nSlabs
-                next = (i + 1) % nSlabs
-                vPrime[j*m:(j+1)*m] = vPrev[i*m:(i+1)*m] - SiM[i] @ lu_solve(T_inv[prev], vPrev[prev*m:(prev+1)*m]) - SiP[i] @ lu_solve(T_inv[next], vPrev[next*m:(next+1)*m])
+                prev = (i - 1) % nSlabs if (self.cyclic or i > 0)            else None
+                next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1)   else None
+                contrib = vPrev[i*m:(i+1)*m].copy()
+                if prev is not None:
+                    contrib -= SiM[i] @ lu_solve(T_inv[prev], vPrev[prev*m:(prev+1)*m])
+                if next is not None:
+                    contrib -= SiP[i] @ lu_solve(T_inv[next], vPrev[next*m:(next+1)*m])
+                vPrime[j*m:(j+1)*m] = contrib
 
             vPrimes.append(vPrime)
 
-        # Now get u:
+        # Now get u: RB[-1] is the single-block coarsest level; vPrimes[-1] has size m (one block).
         vPrimes[-1] = lu_solve(RB[-1][2][0], vPrimes[-1])
         
         for l in range(len(RB) - 1, 0, -1):
@@ -265,7 +270,10 @@ class RedBlackSolver(DirectSolver):
                 
                 # Here we compute the even segments of u:
                 next = (j + 1) % nReduced
-                vPrimes[l-1][(i+1)*m:(i+2)*m] -= SiM[i+1] @ vPrimes[l][j*m:(j+1)*m] + SiP[i+1] @ vPrimes[l][next*m:(next+1)*m]
+                contrib = SiM[i+1] @ vPrimes[l][j*m:(j+1)*m]
+                if self.cyclic or j + 1 < nReduced:
+                    contrib += SiP[i+1] @ vPrimes[l][next*m:(next+1)*m]
+                vPrimes[l-1][(i+1)*m:(i+2)*m] -= contrib
                 vPrimes[l-1][(i+1)*m:(i+2)*m] = lu_solve(Tinv[i+1], vPrimes[l-1][(i+1)*m:(i+2)*m])
 
         return vPrimes[0]

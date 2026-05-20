@@ -137,5 +137,11 @@ def block_tridiagonal_solve(OMS, T, rhs):
     if rhs.ndim==1:
         x = x.flatten()
     return x
+    
+
+
+
+
+
 
 

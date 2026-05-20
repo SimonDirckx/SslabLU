@@ -20,7 +20,28 @@ import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
 #import multislab.omsdirectsolveHBS as omsdirectHBS
 import direct_solve.omsdirectsolveHBS as omsdirectHBS
+import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
+from scipy.sparse.linalg import LinearOperator
+
+
+
+
+def dense_to_linop(A):
+    A = np.array(A)
+    n = A.shape[0]
+    lo = LinearOperator(
+        shape=(n, n), dtype=A.dtype,
+        matvec  = lambda v: A @ v,
+        rmatvec = lambda v: A.T @ v,
+        matmat  = lambda V: A @ V,
+        rmatmat = lambda V: A.T @ V,
+    )
+    lo.solve = lambda v, mode='N': (
+        np.linalg.solve(A, v) if mode == 'N' else np.linalg.solve(A.T, v)
+    )
+    lo.tree = lo.quad = None
+    return lo
 
 class gmres_info(object):
     def __init__(self, disp=False):
@@ -38,7 +59,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 10.
+kh = 25.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -79,9 +100,9 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 8
+N = 9
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([6],dtype = np.int64)
+pvec = np.array([8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -97,8 +118,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/8,1/8])
-    assembler = mA.rkHMatAssembler(p*p,125,ndim=3)
+    a = np.array([H/8,1/8,1/8])
+    assembler = mA.rkHMatAssembler(p*p,200,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
@@ -121,12 +142,26 @@ for indp in range(len(pvec)):
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
         rhstot_copy = rhstot.copy()
-        direct_solver = omsdirectHBS.ThomasSolverHBS(nc,125,False)
+        E = np.identity(nc)
+        S_dense_list = []
+        T = []
+        print("len(S_rk_list) = ",len(S_rk_list),"//",len(dSlabs))
+        for i in range(len(S_rk_list)):
+            Sloc = []
+            print(len(S_rk_list[i]))
+            for j in range(len(S_rk_list[i])):
+                Sloc+=[S_rk_list[i][j]@E]
+            S_dense_list+=[Sloc]
+            T+=[E]
+
+
+        direct_solver = omsdirectHBS.RedBlackSolverHBS(nc,100,S_rk_list[0][0].tree,S_rk_list[0][0].quad)
+        #T_lo = [dense_to_linop(np.eye(nc)) for _ in range(len(S_rk_list))]
         direct_solver.factorize(S_rk_list)
         def matvec(v):
             return direct_solver.solve(v)
         print("Ntot = ",Ntot)
-        Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
+        Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec,dtype=np.float64)
         gInfo = gmres_info()
         pgInfo = gmres_info()
         stol = 1e-11*H*H
@@ -141,6 +176,10 @@ for indp in range(len(pvec)):
             uhat,_   = gmres(Stot,rhstot,tol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
         niter = gInfo.niter
     res = Stot@uhat-rhstot
+    u0 = direct_solver.solve(rhstot)
+    res_direct = Stot@u0-rhstot
+    print("direct solve error = ",np.linalg.norm(u0-uhat)/np.linalg.norm(uhat))
+    print("direct solve res = ",np.linalg.norm(res_direct)/np.linalg.norm(rhstot))
 
     
     print("=============SUMMARY==============")
