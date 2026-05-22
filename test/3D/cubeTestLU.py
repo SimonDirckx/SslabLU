@@ -108,8 +108,7 @@ discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
 compr_time=np.zeros(shape = (len(pvec),))
 
-#solve_method = 'iterative'
-solve_method = 'direct'
+solve_method = 'iterative'
 formulation = "hps"
 tridiag = (solve_method=='direct')
 for indp in range(len(pvec)):
@@ -119,16 +118,15 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/8,1/8,1/8])
-    assembler = mA.rkHMatAssembler(p*p,200,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    OMS = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+    S_lu_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, dbg=2)
     print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg=2)
     niter = 0
     if solve_method == 'iterative':
-        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
         stol = 1e-10*H*H
 
@@ -137,70 +135,17 @@ for indp in range(len(pvec)):
         else:
             uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
         niter = gInfo.niter
-    elif solve_method == 'direct':
-        rhstot = np.zeros(shape = (Ntot,))
-        for i in range(len(rhs_list)):
-            rhstot[i*nc:(i+1)*nc] = rhs_list[i]
-        rhstot_copy = rhstot.copy()
-        E = np.identity(nc)
-        S_dense_list = []
-        T = []
-        print("len(S_rk_list) = ",len(S_rk_list),"//",len(dSlabs))
-        for i in range(len(S_rk_list)):
-            Sloc = []
-            print(len(S_rk_list[i]))
-            for j in range(len(S_rk_list[i])):
-                Sloc+=[S_rk_list[i][j]@E]
-            S_dense_list+=[Sloc]
-            T+=[E]
-
-
-        thomas_solver = omsdirectHBS.ThomasSolverHBS(nc,100,S_rk_list[0][0].tree,S_rk_list[0][0].quad)
-        rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,100,S_rk_list[0][0].tree,S_rk_list[0][0].quad)
-        #T_lo = [dense_to_linop(np.eye(nc)) for _ in range(len(S_rk_list))]
-        thomas_solver.factorize(S_rk_list)
-        rb_solver.factorize(S_rk_list)
-        def matvec_thomas(v):
-            return thomas_solver.solve(v)
-        def matvec_rb(v):
-            return rb_solver.solve(v)
-        print("Ntot = ",Ntot)
-        Sinv_HBS_thomas  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_thomas,dtype=np.float64)
-        Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
-        gInfo = gmres_info()
-        ptgInfo = gmres_info()
-        prbgInfo = gmres_info()
-        stol = 1e-11*H*H
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
-        else:
-            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
-        
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat_thomas,_   = gmres(Stot,rhstot,rtol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_thomas)
-        else:
-            uhat_thomas,_   = gmres(Stot,rhstot,tol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_thomas)
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_rb)
-        else:
-            uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_rb)
-        niter = gInfo.niter
-    res_thomas = Stot@uhat_thomas-rhstot
-    res_rb = Stot@uhat_rb-rhstot
+    res = Stot@uhat-rhstot
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
     print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
     print("nc                       = ",OMS.nc)
-    print("L2 rel. res thomas       = ", np.linalg.norm(res_thomas)/np.linalg.norm(rhstot))
-    print("L2 rel. res rb           = ", np.linalg.norm(res_rb)/np.linalg.norm(rhstot))
+    print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
     print("GMRES iters              = ", gInfo.niter)
-    print("pGMRES iters thomas      = ", ptgInfo.niter)
-    print("pGMRES iters rb          = ", prbgInfo.niter)
     print("==================================")
     nc = OMS.nc
     err_tot = 0
-    uhat = uhat_rb
     for slabInd in range(len(dSlabs)):
         geom    = np.array(dSlabs[slabInd])
         slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))

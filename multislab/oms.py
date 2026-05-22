@@ -319,3 +319,211 @@ class oms:
         TODO IMPLEMENT RHS
         '''
         return 0
+class oms_lu:
+    """
+    overlapping multislab class, no interface reduction
+    @param
+    slablist: list of double-wide slabs
+    pdo:    global partial differntial operator
+    solver_opts: solver options (h and p specs)
+    connectivity: encodes which double slabs are connected to which
+    
+    """
+    def __init__(self,slabList:list[slab],pdo,gb,solver_opts,connectivity):
+        self.slabList=slabList
+        self.pdo = pdo
+        self.connectivity = connectivity
+        self.opts = solver_opts
+        self.gb = gb
+        self.glob_target_dofs = []
+        self.glob_source_dofs = []
+        self.localSolver=None
+        self.nbytes = 0
+        self.densebytes = 0 
+        self.stats = omsStats()
+
+    def compute_global_dofs(self):
+        # bookkeeping: keep track of how local double slab dofs relate to the 'global' dofs of reduced S-system
+        if not self.glob_source_dofs:
+            glob_source_dofs=[]
+            if self.glob_target_dofs:
+                for slabInd in range(len(self.connectivity)):
+                    IFLeft  = self.connectivity[slabInd][0]
+                    IFRight = self.connectivity[slabInd][1]
+                    if IFLeft<0:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFRight]]]
+                    elif IFRight<0:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFLeft]]]
+                    else:
+                        glob_source_dofs+=[[self.glob_target_dofs[IFLeft],self.glob_target_dofs[IFRight]]]
+        self.glob_source_dofs=glob_source_dofs
+
+    def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
+        # compute the source-target maps, in linear operator form
+        A_solver = solver.solver_ii
+        def smatmat(v,I,J,transpose=False):
+            
+            if (v.ndim == 1):
+            
+                v_tmp = v[:,np.newaxis]
+            else:
+                v_tmp = v
+
+            if (not transpose):
+                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I,:]
+            else:
+                result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
+                result[I,:] = v_tmp
+                result      = solver.Aib[:,J].T @ (A_solver.T@(result))
+            if (v.ndim == 1):
+                result = result.flatten()
+            return result
+
+        Linop_r = LinearOperator(shape=(len(Ic),len(Ir)),\
+            matvec = lambda v:smatmat(v,Ic,Ir), rmatvec = lambda v:smatmat(v,Ic,Ir,transpose=True),\
+            matmat = lambda v:smatmat(v,Ic,Ir), rmatmat = lambda v:smatmat(v,Ic,Ir,transpose=True))
+        Linop_l = LinearOperator(shape=(len(Ic),len(Il)),\
+            matvec = lambda v:smatmat(v,Ic,Il), rmatvec = lambda v:smatmat(v,Ic,Il,transpose=True),\
+            matmat = lambda v:smatmat(v,Ic,Il), rmatmat = lambda v:smatmat(v,Ic,Il,transpose=True))
+        
+        st_r = stMap(Linop_r,XXb[Ir,:],XXi[Ic,:],solver.solver_ii.shape[0],solver.solver_ii.shape[1])
+        st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:],solver.solver_ii.shape[0],solver.solver_ii.shape[1])
+        return st_l,st_r
+
+    def construct_Stot_helper(self, bc, dbg=0):
+        """
+        construct S_rk_list and other helpers needed for S operator, whether iterative or direct
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
+            - no domain checks are done (garbage in, garbage out)
+            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
+            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
+        """
+        connectivity    = self.connectivity
+        slabs           = self.slabList
+        Ntot = 0
+        S_lu_list = []
+        
+        rhs_list = []
+
+        glob_target_dofs=[]
+        startCentral = 0
+        opts = self.opts
+        pdo = self.pdo
+        data = 0
+        discrTime = 0
+        compressTime=0
+        sampleTime=0
+        shapeMatch = True
+        relerrl=0
+        relerrr=0
+        for slabInd in range(len(slabs)):
+            geom = np.array(slabs[slabInd])
+            slab_i = slab(geom,self.gb)
+            start = time.time()
+            solver = solverWrap.solverWrapper(opts)
+            solver.construct(geom,pdo,verbose=dbg)
+            tDisc = time.time()-start
+            discrTime += tDisc
+            if dbg>1:
+                print("SLAB %2.0d discretization time = %5.2f s" % (slabInd,tDisc))
+                
+            Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+            nc = len(Ic)
+            if dbg>1:
+                print("SLAB %2.0d size = %2.0d" % (slabInd,nc))
+            self.nc = nc
+            Ntot += nc
+            glob_target_dofs+=[range(startCentral,startCentral+nc)]
+            startCentral += nc
+            
+            fgb = bc(XXb[Igb,:])
+            
+            st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
+
+            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
+            rhs = -rhs[Ic]
+            rhs_list+=[rhs]
+            bool_r = len(Ir)>0
+            bool_l = len(Il)>0
+            
+            if self.connectivity[slabInd][0]<0:
+                S_lu_list += [[st_r.A]]
+            elif self.connectivity[slabInd][1]<0:
+                S_lu_list += [[st_l.A]]
+            else:
+                S_lu_list += [[st_l.A,st_r.A]]
+            
+            if dbg>0: print("overlapping slab ",slabInd+1," of ",len(connectivity)," done")
+        if dbg>0:
+            print('============================OMS SUMMARY============================')
+            print('avg. discr. time             = ',discrTime/(len(connectivity)-1))
+            print('avg. sample time             = ',sampleTime/(len(connectivity)-1))
+            print('avg. compr. time             = ',compressTime/(len(connectivity)-1))
+            print('total dofs                   = ',sum([len(dof) for dof in glob_target_dofs]))
+            print('===================================================================')
+        self.stats.sampl_timing = sampleTime/(len(connectivity)-1)
+        self.stats.compr_timing = compressTime/(len(connectivity)-1)
+        self.stats.discr_timing = discrTime/(len(connectivity)-1)
+        self.glob_target_dofs = glob_target_dofs
+        self.compute_global_dofs()
+
+        return S_lu_list, rhs_list, Ntot, nc
+
+
+    def construct_Stot_and_rhstot_linearOperator(self,S_lu_list,rhs_list,Ntot,nc,dbg=0):
+        '''
+        construct S operator and total global rhs
+
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (ficticious domain extension used for periodic domains)
+            - no domain checks are done (garbage in, garbage out)
+            - ranges are used for global dofs, to improve efficiency (global dofs of interfaces are assumed contiguous)
+            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs 0...len(Ic)-1
+        '''
+        rhstot = np.zeros(shape = (Ntot,))        
+        for rhsInd in range(len(rhs_list)):
+            rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
+
+        def smatmat(v,transpose=False):
+            if (v.ndim == 1):
+                v_tmp = v[...,jnp.newaxis].astype('float64')
+            else:
+                v_tmp = v.astype('float64')
+            result  = v_tmp.copy()
+            if (not transpose):
+                for i in range(len(self.glob_target_dofs)):
+                    for j in range(len(self.glob_source_dofs[i])):
+                            result[self.glob_target_dofs[i]]+=S_lu_list[i][j]@v_tmp[self.glob_source_dofs[i][j]]
+            else:
+                for i in range(len(self.glob_target_dofs)):
+                    for j in range(len(self.glob_source_dofs[i])):
+                            result[self.glob_source_dofs[i][j]]+=S_lu_list[i][j].T@v_tmp[self.glob_target_dofs[i]]
+            if (v.ndim == 1):
+                result = result.flatten()
+            return result
+        
+        Linop = LinearOperator(shape=(Ntot,Ntot),\
+        matvec = smatmat, rmatvec = lambda v: smatmat(v,transpose=True),\
+        matmat = smatmat, rmatmat = lambda v: smatmat(v,transpose=True))
+        return Linop,rhstot
+
+    def construct_Stot_and_rhstot(self, bc, assembler, dbg=0):
+
+        S_lu_list, rhs_list, Ntot, nc = self.construct_Stot_helper(bc,dbg)
+
+        Linop,rhstot = self.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg)
+
+        return Linop,rhstot
+    
+
+    
+    def construct_rhstot(self,bc):
+        '''
+        TODO IMPLEMENT RHS
+        '''
+        return 0
