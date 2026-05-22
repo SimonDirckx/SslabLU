@@ -100,8 +100,11 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 9
+N = 3
 dSlabs,connectivity,H = cube.dSlabs(N)
+print("len dSlabs = ",len(dSlabs))
+print("H = ",H)
+print("connectivity = ",connectivity)
 pvec = np.array([8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -118,75 +121,33 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/8,1/8,1/8])
+    assembler = mA.rkHMatAssembler(p*p,200,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-    OMS = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
-    print("computing S blocks & rhs's...")
-    S_lu_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, dbg=2)
-    print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg=2)
-    niter = 0
-    if solve_method == 'iterative':
-        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg=2)
-        gInfo = gmres_info()
-        stol = 1e-10*H*H
+    OMS_lu = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    OMS_rk = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    tic = time.time()
+    S_lu_list, rhs_list, Ntot, nc = OMS_lu.construct_Stot_helper(bc)
+    t_constr_lu = time.time()-tic
+    tic = time.time()
+    S_rk_list, rhs_list, Ntot, nc = OMS_rk.construct_Stot_helper(bc,assembler)
+    t_constr_rk = time.time()-tic
+    Stot_lu,_  = OMS_lu.construct_Stot_and_rhstot_linearOperator(S_lu_list,rhs_list,Ntot,nc,dbg=2)
+    Stot_rk,_  = OMS_rk.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    v= np.random.standard_normal(size=(Stot_rk.shape[0],))
+    tic = time.time()
+    u = Stot_lu@v
+    t_lu = time.time()-tic
+    tic = time.time()
+    u = Stot_rk@v
+    t_rk = time.time()-tic
 
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
-        else:
-            uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
-        niter = gInfo.niter
-    res = Stot@uhat-rhstot
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
     print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
-    print("nc                       = ",OMS.nc)
-    print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
-    print("GMRES iters              = ", gInfo.niter)
+    print("nc                       = ",OMS_lu.nc)
+    print("time construct LU        = ", t_constr_lu)
+    print("time construct rk        = ", t_constr_rk)
+    print("time matvec LU           = ", t_lu)
+    print("time matvec LU           = ", t_rk)
     print("==================================")
-    nc = OMS.nc
-    err_tot = 0
-    for slabInd in range(len(dSlabs)):
-        geom    = np.array(dSlabs[slabInd])
-        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
-        solver  = oms.solverWrap.solverWrapper(opts)
-        solver.construct(geom,Helm,False,False)
-        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-        startL = slabInd-1
-        startR = slabInd+1
-        g = np.zeros(shape=(XXb.shape[0],))
-        g[Igb] = bc(XXb[Igb,:])
-        if startL>-1:
-            g[Il] = uhat[startL*nc:(startL+1)*nc]
-        if startR<len(dSlabs):
-            g[Ir] = uhat[startR*nc:(startR+1)*nc]
-        ghat = bc(XXb)
-        err_loc = np.linalg.norm(ghat-g)/np.linalg.norm(g)
-        err_tot = np.max([err_loc,err_tot])
-        print("===================LOCAL ERR===================")
-        print("err ghat = ",err_loc)
-        print("===============================================")
-    
-    print("===================GLOBAL ERR===================")
-    print("err_tot = ",err_tot)
-    print("===============================================")
-    err[indp] = err_tot
-    sample_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
-
-
-fileName = 'cube.csv'
-errMat = np.zeros(shape=(len(pvec),5))
-errMat[:,0] = pvec
-errMat[:,1] = err
-errMat[:,2] = sample_time
-errMat[:,3] = compr_time
-errMat[:,4] = discr_time
-with open(fileName,'w') as f:
-    f.write('p,err,sample,compr,discr\n')
-    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
-
-plt.figure(0)
-plt.semilogy(pvec,err)
-plt.show()

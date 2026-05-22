@@ -464,9 +464,6 @@ class oms_lu:
             print('avg. compr. time             = ',compressTime/(len(connectivity)-1))
             print('total dofs                   = ',sum([len(dof) for dof in glob_target_dofs]))
             print('===================================================================')
-        self.stats.sampl_timing = sampleTime/(len(connectivity)-1)
-        self.stats.compr_timing = compressTime/(len(connectivity)-1)
-        self.stats.discr_timing = discrTime/(len(connectivity)-1)
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
 
