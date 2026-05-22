@@ -131,7 +131,14 @@ class HBSMAT:
         self.Nb = Nbvec[0]
         self.shape = np.array([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = np.int64)
         self.dtype = Dmats[0][0].dtype
+    @property
+    def T(self):
+        view = object.__new__(self.__class__)
+        view.__dict__ = self.__dict__.copy()
+        view.mode = 'T'
+        return view
     def construct(self,rk,compute_ULV=False):
+        
         if compute_ULV:
             self.constructHBS_ULV(rk)
         else: 

@@ -5,6 +5,7 @@ from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 from matAssembly.HBS import HBSTree as HBS
 from matAssembly.HBS import HBSnew
+from matAssembly.HBS import HBStorch
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
@@ -101,7 +102,11 @@ class matAssembler:
             start = time.time()
             quad = False
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
-            HBSmat = HBSnew.HBSMAT(linOp,self.matOpts.tree,quad)
+            if  torch.cuda.is_available():
+                device = torch.cuda.get_device_name()
+            else:
+                device = 'cpu'
+            HBSmat = HBStorch.HBSMAT(linOp,device,self.matOpts.tree,quad)
             HBSmat.construct(self.matOpts.maxRank,quad)
             self.stats.timeSample=0
             s = HBSmat.nSamples

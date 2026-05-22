@@ -102,7 +102,7 @@ def bc(p):
 
 N = 9
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([8],dtype = np.int64)
+pvec = np.array([6],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -155,7 +155,7 @@ for indp in range(len(pvec)):
             T+=[E]
 
 
-        thomas_solver = omsdirectHBS.ThomasSolverHBS(nc,100,S_rk_list[0][0].tree,S_rk_list[0][0].quad)
+        thomas_solver = omsdirectHBS.ThomasSolverHBS(nc,100)
         rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,100,S_rk_list[0][0].tree,S_rk_list[0][0].quad)
         #T_lo = [dense_to_linop(np.eye(nc)) for _ in range(len(S_rk_list))]
         thomas_solver.factorize(S_rk_list)

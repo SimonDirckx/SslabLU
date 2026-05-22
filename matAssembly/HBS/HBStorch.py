@@ -89,7 +89,7 @@ def block_mult_and_reduce(A,B,fac,device,mode='N'):
             M = A[i*fac,:,:]@B[i*fac,:,:]
             for j in range(1,fac):
                 M=torch.cat((M,A[i*fac+j,:,:]@B[i*fac+j,:,:]),axis=0)
-        C[i,:,:] = M
+            C[i,:,:] = M
     elif mode=='T':
         kA = A.shape[2]
         C = torch.zeros(size=(Nb//fac,fac*kA,B.shape[2]),device=device)        
@@ -102,21 +102,9 @@ def block_mult_and_reduce(A,B,fac,device,mode='N'):
         raise ValueError("mode not recognized")
     return C
 
-def construct_D(U_ell,V_ell,YO,ZP,device):
-    Nb = U_ell.shape[0]
-    C = torch.zeros(size = (U_ell.shape[0],U_ell.shape[1],YO.shape[2]),device=device)
-    n = U_ell.shape[1]
-    for i in range(Nb):
-        Usub = U_ell[i,:,:]
-        Vsub = V_ell[i,:,:]
-        YOsub = YO[i,:,:]
-        ZPsub = ZP[i,:,:]
-        C[i,:,:] = YOsub-Usub@Usub.T@YOsub\
-                            +Usub@(Usub.T@((ZPsub-Vsub@(Vsub.T@ZPsub)).T))
-    return C
-def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell):
+def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,device):
     Nb = Om_ell.shape[0]
-    C = torch.zeros(size = (Nb,U_ell.shape[1],Om_ell.shape[1]))
+    C = torch.zeros(size = (Nb,U_ell.shape[1],Om_ell.shape[1]),device=device)
     for i in range(Nb):
         Usub = U_ell[i,:,:]
         Vsub = V_ell[i,:,:]
@@ -127,10 +115,10 @@ def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell):
         C[i,:,:] = (Ysub-Usub@(Usub.T@Ysub))@tla.pinv(Omsub)\
                             +Usub@(Usub.T@(((Zsub-Vsub@(Vsub.T@Zsub))@tla.pinv(Psisub)).T))
     return C
-def compute_UV(Om,Y,rk):
+def compute_UV(Om,Y,rk,device):
     Nb = Om.shape[0]
     n = Om.shape[1]
-    U = torch.zeros(size = (Nb,Y.shape[1],rk))
+    U = torch.zeros(size = (Nb,Y.shape[1],rk),device=device)
     for i in range(Nb):
         Q = tla.qr(Om[i,:,:].T,mode='complete')[0]
         U[i,:,:] = (tla.svd(Y[i,:,:]@Q[:,-n:])[0])[:,:rk]
@@ -163,7 +151,7 @@ class HBSMAT:
         self.Wlist  =   []
         self.Uulist =   []
 
-        self.nbytes =   0
+        self.mode   =   'N'
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
@@ -177,13 +165,16 @@ class HBSMAT:
             self.Nb = tree.nleaves
             self.nl = self.A.shape[0]//self.Nb
             self.L = tree.nlevels
+            self.tree = tree
             
         self.blockSolveTime = 0
         self.nullTime = 0
         self.setupTime = 0
         self.DTime = 0
-        
+        self.tSample = 0
+        self.tConstruct = 0
         self.Nbvec = []
+        self.quad = quad
         if quad:
             self.fac = 4
         else:
@@ -201,8 +192,15 @@ class HBSMAT:
         self.perm = torch.arange(Dmats[0].shape[0])
         self.fac = fac
         self.Nb = Nbvec[0]
-        self.shape = torch.array([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = torch.int64)
+        self.shape = torch.tensor([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = torch.int64)
         self.dtype = Dmats[0][0].dtype
+    @property
+    def nbytes(self):
+        ctr = 0
+        ctr+=sum([U.nbytes for U in self.Umats])
+        ctr+=sum([V.nbytes for V in self.Vmats])
+        ctr+=sum([D.nbytes for D in self.Dmats])
+        return ctr
     def construct(self,rk,compute_ULV=False):
         if compute_ULV:
             self.constructHBS_ULV(rk)
@@ -216,6 +214,7 @@ class HBSMAT:
         else:
             s = 4*rk+2*self.nl+5
         
+        self.nSamples = s
         tic = time.time()
         Om = np.random.standard_normal(size = (self.shape[1],s))
         Psi = np.random.standard_normal(size = (self.shape[0],s))
@@ -223,19 +222,22 @@ class HBSMAT:
         Omprime[self.perm,:] = Om
         Psiprime = np.zeros(shape = Psi.shape)
         Psiprime[self.perm,:] = Psi
-        Y = self.A.matvec(Omprime)
-        Z = self.A.matvec(Psiprime,mode='T')
+        print("A shape = ",self.A.shape)
+        print("Om shape = ",Omprime.shape)
+        Y = self.A@(Omprime)
+        Z = self.A.T@Psiprime
         Y = torch.from_numpy(Y[self.perm,:])
         Z = torch.from_numpy(Z[self.perm,:])
-        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb)
-        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb)
+        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,device=self.device)
+        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb,device=self.device)
         Om = torch.from_numpy(Om)
         Psi = torch.from_numpy(Psi)
-        Om = ULVsparse.convert_to_torch_tens(Om,self.Nb)
-        Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb)
+        Om = ULVsparse.convert_to_torch_tens(Om,self.Nb,device=self.device)
+        Psi = ULVsparse.convert_to_torch_tens(Psi,self.Nb,device=self.device)
         Nb = self.Nb
         nl = self.nl
         self.setupTime+=time.time()-tic
+        self.tSample+=time.time()-tic
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -256,24 +258,16 @@ class HBSMAT:
                 Psi_ell     = block_mult_and_reduce(U_ell,Psi_ell,self.fac,self.device,mode='T')
                 
                 Nb = Nb//self.fac
-                rkm = rk
+                rkm = min(rk,nl*((self.fac)**(self.L-1-lvl)))
             print("lvl//Nb = ",lvl,"//",Nb)
             
             if lvl>0:
                 tic = time.time()
-                P_ell = block_null(Om_ell,rkm,self.device)
-                Q_ell = block_null(Psi_ell,rkm,self.device)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
                 self.nullTime+=time.time()-tic
-                YP = block_mult(Y_ell,P_ell,self.device)
-                ZQ = block_mult(Z_ell,Q_ell,self.device)
-                U_ell = block_col(YP,rkm,self.device)
-                V_ell = block_col(ZQ,rkm,self.device)
                 tic = time.time()
-                YO = block_solve_r(Y_ell,Om_ell,self.device)
-                ZP = block_solve_r(Z_ell,Psi_ell,self.device)
-                self.blockSolveTime+=time.time()-tic
-                tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,YO,ZP,self.device)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -284,12 +278,14 @@ class HBSMAT:
                 self.blockSolveTime+=time.time()-tic
                 self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
+        self.tCompress = time.time()-tic
     def constructHBS_ULV(self,rk):
         torch.set_default_dtype(torch.float64)
         if self.fac == 4:
             s = 6*rk+4*self.nl+5
         else:
             s = 4*rk+2*self.nl+5
+        self.nSamples = s
         tic = time.time()
         print("self.fac = ",self.fac)
         Om0 = np.random.standard_normal(size = (self.shape[1],s))
@@ -313,6 +309,7 @@ class HBSMAT:
         Nb = self.Nb
         nl = self.nl
         self.setupTime+=time.time()-tic
+        self.tSample+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
         for lvl in range(self.L-1,-1,-1):
@@ -336,14 +333,14 @@ class HBSMAT:
 
                 
                 Nb = Nb//self.fac
-                rkm = rk
+                rkm = min(rk,nl*(self.fac**(self.L-1-lvl)))
             print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
-                U_ell = compute_UV(Om_ell,Y_ell,rkm)
-                V_ell = compute_UV(Psi_ell,Z_ell,rkm)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -378,41 +375,117 @@ class HBSMAT:
             Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rk:],Uhat,device=self.device,mode='T')
             self.Uulist+=[Uu]
             Uhat=Ud
-        
+        self.tCompress = time.time()-tic
 
-    def matvec(self,v,device='cpu',mode='N'):
+    @property
+    def T(self):
+        view = object.__new__(self.__class__)
+        view.__dict__ = self.__dict__.copy()
+        view.mode = 'T'
+        return view
+
+    def matvec(self,v):
+        return self.matmat(v)
+    def rmatvec(self,v):
+        return self.rmatmat(v)
+
+    def matmat(self,v):
+        numpy_input = isinstance(v, np.ndarray)
+        if numpy_input:
+            v = torch.from_numpy(v).to(self.device)
+        v = v.to(self.Dmats[0].dtype)
         if v.ndim==1:
-            vperm = v[:,None]    
+            vperm = v[self.perm,None]
         else:
             vperm= v[self.perm,:]
         VV = []
         Nb = self.Nb
-        if mode=='N':
+        VV+=[vperm]
+        for lvl in range(len(self.Vmats)):
+            v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],self.device,mode='T')
+            VV+=[v_lvl]
+            Nb=Nb//self.fac
+        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device)
+        for lvl in range(len(self.Umats)-1,-1,-1):
+            uperm = block_matvec(self.Umats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device)
+            Nb=Nb*self.fac
+        u = torch.zeros(size=uperm.shape,device=self.device)
+        u[self.perm,:] = uperm
+        if v.ndim==1:
+            u = u.flatten()
+        if numpy_input:
+            u = u.cpu().numpy()
+        return u
+
+    def rmatmat(self,v):
+        numpy_input = isinstance(v, np.ndarray)
+        if numpy_input:
+            v = torch.from_numpy(v).to(self.device)
+        v = v.to(self.Dmats[0].dtype)
+        if v.ndim==1:
+            vperm = v[self.perm,None]
+        else:
+            vperm= v[self.perm,:]
+        VV = []
+        Nb = self.Nb
+        VV+=[vperm]
+        for lvl in range(len(self.Umats)):
+            v_lvl = block_matvec(self.Umats[lvl],VV[lvl],self.device,mode='T')
+            VV+=[v_lvl]
+            Nb=Nb//self.fac
+        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device,mode='T')
+        for lvl in range(len(self.Vmats)-1,-1,-1):
+            uperm = block_matvec(self.Vmats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device,mode='T')
+            Nb=Nb*self.fac
+        u = torch.zeros(size=uperm.shape,device=self.device)
+        u[self.perm,:] = uperm
+        if v.ndim==1:
+            u = u.flatten()
+        if numpy_input:
+            u = u.cpu().numpy()
+        return u
+
+    def __matmul__(self,v):
+        numpy_input = isinstance(v, np.ndarray)
+        if numpy_input:
+            v = torch.from_numpy(v).to(self.device)
+        v = v.to(self.Dmats[0].dtype)
+        if v.ndim==1:
+            vperm = v[self.perm,None]
+        else:
+            vperm= v[self.perm,:]
+        VV = []
+        Nb = self.Nb
+        if self.mode=='N':
             VV+=[vperm]
             for lvl in range(len(self.Vmats)):
-                v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],device,mode='T')
+                v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],self.device,mode='T')
                 VV+=[v_lvl]
                 Nb=Nb//self.fac
-            uperm = block_matvec(self.Dmats[-1],VV[-1],device)
+            uperm = block_matvec(self.Dmats[-1],VV[-1],self.device)
             for lvl in range(len(self.Umats)-1,-1,-1):
-                uperm = block_matvec(self.Umats[lvl],uperm,device)+ block_matvec(self.Dmats[lvl],VV[lvl],device)
-            u = np.zeros(shape = uperm.shape)
+                uperm = block_matvec(self.Umats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device)
+                Nb=Nb*self.fac
+            u = torch.zeros(size=uperm.shape,device=self.device)
             u[self.perm,:] = uperm
-
-        elif mode=='T':
+        elif self.mode=='T':
             VV+=[vperm]
             for lvl in range(len(self.Umats)):
-                v_lvl = block_matvec(self.Umats[lvl],VV[lvl],device,mode='T')
+                v_lvl = block_matvec(self.Umats[lvl],VV[lvl],self.device,mode='T')
                 VV+=[v_lvl]
-            uperm = block_matvec(self.Dmats[-1],VV[-1],device,mode='T')
+                Nb=Nb//self.fac
+            uperm = block_matvec(self.Dmats[-1],VV[-1],self.device,mode='T')
             for lvl in range(len(self.Vmats)-1,-1,-1):
-                uperm = block_matvec(self.Vmats[lvl],uperm,device)+ block_matvec(self.Dmats[lvl],VV[lvl],device,mode='T')
-            u = np.zeros(shape = uperm.shape)
+                uperm = block_matvec(self.Vmats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device,mode='T')
+                Nb=Nb*self.fac
+            u = torch.zeros(size=uperm.shape,device=self.device)
             u[self.perm,:] = uperm
         else:
             raise ValueError("mode not recognized")
         if v.ndim==1:
             u = u.flatten()
+        if numpy_input:
+            u = u.cpu().numpy()
         return u
     
     def compute_ULV(self):
@@ -425,7 +498,7 @@ class HBSMAT:
             else:
                 bperm= b[self.perm,:]
             rhs = bperm.detach().clone()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,device=device)
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs,device=device)
             u = torch.zeros(size = uhat.shape)
             u[self.perm,:] = uhat
         elif mode=='T':
@@ -435,7 +508,7 @@ class HBSMAT:
                 rhs[self.perm,:] = b[:,None].detach().clone()
             else:
                 rhs[self.perm,:] = b.detach().clone()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,rhs,device=device,mode='T')
+            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs,device=device,mode='T')
             u = uhat[self.perm,:]
         else:
             raise NotImplementedError("mode not recognized")
