@@ -57,7 +57,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 25.
+kh = 10.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -98,12 +98,12 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 3
+N = 9
 dSlabs,connectivity,H = cube.dSlabs(N)
 print("len dSlabs = ",len(dSlabs))
 print("H = ",H)
 print("connectivity = ",connectivity)
-pvec = np.array([10],dtype = np.int64)
+pvec = np.array([8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -118,8 +118,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/32,1/32])
-    assembler = mA.rkHMatAssembler(p*p,100,ndim=3)
+    a = np.array([H/8,1/8,1/8])
+    assembler = mA.rkHMatAssembler_strong(p*p,50,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
     OMS_rk = oms.oms(dSlabs,Helm,lambda p:cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
     OMS_lu = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)

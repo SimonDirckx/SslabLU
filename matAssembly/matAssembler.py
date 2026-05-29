@@ -6,6 +6,8 @@ import numpy as np
 from matAssembly.HBS import HBSTree as HBS
 from matAssembly.HBS import HBSnew
 from matAssembly.HBS import HBStorch
+from matAssembly.HBS import HBStorch_strong
+from matAssembly.HBS import HBSnew_strong
 import solver.solver as solver
 import time
 import matplotlib.pyplot as plt
@@ -124,6 +126,33 @@ class matAssembler:
             #    matvec = lambda v : HBSmat.matmat(v), rmatvec = lambda v : HBSmat.rmatmat(v),\
             #    matmat = lambda v : HBSmat.matmat(v), rmatmat = lambda v : HBSmat.rmatmat(v))
             return HBSmat
+        if self.matOpts.method == 'rkHBS_strong':
+            start = time.time()
+            quad = False
+            self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
+            if  torch.cuda.is_available():
+                device = torch.cuda.get_device_name()
+            else:
+                device = 'cpu'
+            print("START COMPRESS")
+            HBSmat = HBSnew_strong.HBSMAT_STRONG(linOp,self.matOpts.tree)
+            HBSmat.construct(self.matOpts.maxRank)
+            self.stats.timeSample=0
+            s = HBSmat.nSamples
+            self.stats.timeSample=HBSmat.tSample
+            self.stats.nbytes = HBSmat.nbytes
+            self.stats.timeCompress=HBSmat.tCompress
+            
+            if dbg>0:
+                print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))
+                print("\t Toc HBS construction %.2e s"%self.stats.timeCompress)
+                mem = self.stats.nbytes/1e6
+                print("\t HBS mem = %5.2f MB"%mem)
+            
+            #Linop = LinearOperator(shape=linOp.shape,\
+            #    matvec = lambda v : HBSmat.matmat(v), rmatvec = lambda v : HBSmat.rmatmat(v),\
+            #    matmat = lambda v : HBSmat.matmat(v), rmatmat = lambda v : HBSmat.rmatmat(v))
+            return HBSmat
         if self.matOpts.method == 'rkHBSold':
             start = time.time()
             if self.matOpts.tree:
@@ -183,6 +212,9 @@ class denseMatAssembler(matAssembler):
 class rkHMatAssembler(matAssembler):
     def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
         super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad))
+class rkHMatAssembler_strong(matAssembler):
+    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
+        super(rkHMatAssembler_strong,self).__init__(matAssemblerOptions('rkHBS_strong',0,leaf_size,rk,tree,ndim,quad))
 
 class tolHMatAssembler(matAssembler):
     def __init__(self,tol,leaf_size,rk,ndim=3):

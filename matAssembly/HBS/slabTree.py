@@ -187,7 +187,17 @@ class slabTree:
             self._build_binary_rect(root)
         
         self._build_adjacency()
+        self._build_level_adjacency()
+        # raw adjacency (global-index pairs) only needed to build
+        # level_adj_list; drop it now to free memory
+        del self.adjacency
         self.build_perm()
+        # point_inds and bDOFs on internal nodes are only needed during
+        # construction; clear them to free O(N * depth) index storage
+        for node in self._boxes.values():
+            if not node.is_leaf:
+                node.point_inds = None
+                node.bDOFs      = None
     # -- Line binary build ----------------------------------------------------
     def build_perm(self):
         leaves = self.get_leaves()
@@ -407,6 +417,58 @@ class slabTree:
         self.adjacency = adjacency
 
 
+
+    def _build_level_adjacency(self):
+        """
+        Build ``level_adj_list``: a per-level adjacency list in *level-local* indices.
+
+        ``level_adj_list[l]`` is a list of ``n`` sets, where ``n`` is the number
+        of nodes at level ``l``.  The nodes at each level are ranked by sorting
+        their global indices in ascending order, which is consistent with
+        ``get_boxes_level(l)``.
+
+        ``level_adj_list[l][r]`` is the set of level-local ranks adjacent to the
+        node at rank ``r`` at level ``l``.
+
+        Example
+        -------
+        To iterate over all adjacency pairs at level l::
+
+            for r, neighbours in enumerate(tree.level_adj_list[l]):
+                global_idx = tree.get_boxes_level(l)[r]
+                for nb_r in neighbours:
+                    nb_global_idx = tree.get_boxes_level(l)[nb_r]
+
+        Notes
+        -----
+        *   The root (level 0) has no adjacency pairs, so ``level_adj_list[0]``
+            is a list with a single empty set.
+        *   Adjacency is symmetric: if ``r`` is in ``level_adj_list[l][s]``
+            then ``s`` is in ``level_adj_list[l][r]``.
+        *   The direction of each pair is *not* stored here; use
+            ``self.adjacency[l]`` when you need orientation information.
+        """
+        level_adj_list = []
+
+        for lvl in range(self.nlevels):
+            # Sorted global indices at this level → defines the rank ordering.
+            global_ids = self.get_boxes_level(lvl)          # sorted list
+            n          = len(global_ids)
+            rank_of    = {gid: r for r, gid in enumerate(global_ids)}
+
+            # Initialise one empty set per node at this level.
+            adj_level  = [set() for _ in range(n)]
+
+            # Each entry in self.adjacency[lvl] is (i, j, dir) with global indices.
+            for (gi, gj, _dir) in self.adjacency[lvl]:
+                ri = rank_of[gi]
+                rj = rank_of[gj]
+                adj_level[ri].add(rj)
+                adj_level[rj].add(ri)
+
+            level_adj_list.append(adj_level)
+
+        self.level_adj_list = level_adj_list
 
     # -- Quad build -----------------------------------------------------------
 
