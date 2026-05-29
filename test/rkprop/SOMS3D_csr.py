@@ -23,6 +23,7 @@ order is p-1, basis dim is p.
 
 import numpy as np
 import scipy.sparse as sp
+import scipy.linalg as sla
 import numpy.polynomial.chebyshev as chebpoly
 
 
@@ -558,9 +559,10 @@ def local_S_fast(dir, geom, diffops, ops_pkg, coeffs, origin, forcing):
 
     # Static-condensation pipeline using cached ops
     Lii = L[np.ix_(Ii_dir, Ii_dir)]
+    Lii_lu = sla.lu_factor(Lii)
     Lib_box = L[np.ix_(Ii_dir, Ib_dir)][:, Ibox]
 
-    u_int = -np.linalg.solve(Lii, Lib_box @ C_dir)
+    u_int = -sla.lu_solve(Lii_lu, Lib_box @ C_dir)
     centerline_int = u_int[Ic_dir, :]
     centerline_edge = C_dir[Ibox_inv[Ic_edge], :]
 
@@ -584,22 +586,58 @@ def local_S_fast(dir, geom, diffops, ops_pkg, coeffs, origin, forcing):
         else:
             if forcing == 0.0:
                 b_dir = np.zeros(S_dir.shape[0])
-                return S_dir, b_dir
+                return S_dir, b_dir, Lii_lu
             fi = np.full(len(Ii_dir), float(forcing))
         if np.all(fi == 0.0):
             b_dir = np.zeros(S_dir.shape[0])
         else:
-            u_part = np.linalg.solve(Lii, fi)
+            u_part = sla.lu_solve(Lii_lu, fi)
             cl_vec = np.zeros(n_center)
             cl_vec[int_mask] = u_part[Ic_dir[cl_source_pos[int_mask]]]
             b_dir = P_out @ cl_vec
 
-    return S_dir, b_dir
+    return S_dir, b_dir, Lii_lu
 
 
-# ---------------------------------------------------------------------------
-# Per-face Legendre DOF positioning on each surrounding face of the merged box
-# ---------------------------------------------------------------------------
+def compute_forcing_trace(dir, geom, ops_pkg, Lii_lu, origin, forcing):
+    """
+    Compute the per-face forcing trace b_dir for a constant-coefficient problem,
+    reusing the cached LU factorisation of Lii (translation-invariant).
+
+    Skips L assembly and the homogeneous solve entirely.
+    """
+    (XY, Ii_dir, Ib_dir, Ibox, Ibox_inv,
+     Ic_dir, Ic_edge,
+     cl_xy_idx, cl_source_flag, cl_source_pos,
+     *_) = geom
+    _, P_out, _ = ops_pkg
+
+    x0, y0, z0 = origin
+    n_out = P_out.shape[0]
+    n_center = len(cl_xy_idx)
+    int_mask = (cl_source_flag == 0)
+
+    if callable(forcing):
+        xg = XY[Ii_dir, 0] + x0
+        yg = XY[Ii_dir, 1] + y0
+        zg = XY[Ii_dir, 2] + z0
+        fi = np.asarray(forcing(xg, yg, zg), dtype=float)
+        if fi.ndim == 0:
+            fi = np.full(len(Ii_dir), float(fi))
+    else:
+        if forcing == 0.0:
+            return np.zeros(n_out)
+        fi = np.full(len(Ii_dir), float(forcing))
+
+    if np.all(fi == 0.0):
+        return np.zeros(n_out)
+
+    u_part = sla.lu_solve(Lii_lu, fi)
+    cl_vec = np.zeros(n_center)
+    cl_vec[int_mask] = u_part[Ic_dir[cl_source_pos[int_mask]]]
+    return P_out @ cl_vec
+
+
 
 def XYU(dir, px, py, pz, scl_x, scl_y, scl_z):
     """
@@ -1075,6 +1113,7 @@ def global_dofs(tiling, px, py, pz, Lx, Ly, Lz):
     Lx0, Ly0, Lz0 = tiling
     scl_x, scl_y, scl_z = Lx / Lx0, Ly / Ly0, Lz / Lz0
 
+
     xleg = _legendre_1d(px, scl_x)[0]
     yleg = _legendre_1d(py, scl_y)[0]
     zleg = _legendre_1d(pz, scl_z)[0]
@@ -1175,108 +1214,202 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                           bx=None, by=None, bz=None,
                           px=None, py=None, pz=None,
                           scl_x=None, scl_y=None, scl_z=None,
-                          geom=None, diffops=None, ops_pkg=None):
+                          geom=None, diffops=None, ops_pkg=None,
+                          Ii=None, Ib=None,
+                          Lii_lu_x=None, Lii_lu_y=None, Lii_lu_z=None):
     """
-    Build the global Stot matrix and global forcing vector ftild.
+    Build Sii and Sib directly in CSR format, and the global forcing vector
+    ftild.  Avoids forming the full n_dofs x n_dofs Stot matrix.
 
-    With forcing (any non-None argument), the system to solve becomes
+    ``Ii`` and ``Ib`` are the interior / boundary DOF index arrays produced by
+    ``global_dofs`` + the boundary-coordinate test in ``SOMS_solver_sparse``.
+    They must be provided; ``SOMS_solver_sparse`` always supplies them.
 
-        Stot_ii @ u_i  =  -Stot_ib @ u_b  +  ftild[Ii]
+    With forcing (any non-None argument), the system to solve is
 
-    Stot is unchanged by forcing; only ftild is new.
+        Sii @ u_i  =  -Sib @ u_b  +  ftild[Ii]
 
     If ct_pde is True and forcing is None, Sx/Sy/Sz are precomputed S-matrices
-    used at every interior centerline face.
-
-    Otherwise local_S_fast is called per face using the precomputed
-    per-direction contexts geom[dir], diffops[dir], ops_pkg[dir].
+    used at every interior centerline face.  Otherwise local_S_fast is called
+    per face using the precomputed per-direction contexts geom[dir], diffops[dir],
+    ops_pkg[dir].
     """
-    # --- Direct CSR construction: build data/indices/indptr directly ---
-    # No COO triplet intermediate. Rows are written in monotonically increasing
-    # order (since target = arange(ctr, ctr+nT) and ctr only grows), so we can
-    # populate the CSR arrays linearly.
-    interior_mask = ~b_vec
-    n_int_md0 = int(np.sum(interior_mask & (md_vec == 0)))
-    n_int_md1 = int(np.sum(interior_mask & (md_vec == 1)))
-    n_int_md2 = int(np.sum(interior_mask & (md_vec == 2)))
+    # ------------------------------------------------------------------
+    # Partition information
+    # ------------------------------------------------------------------
+    # global_to_ii[g]  = local row in Sii  (or -1 if g is in Ib)
+    # global_to_ib[g]  = local col in Sib  (or -1 if g is in Ii)
+    # Every global DOF belongs to exactly one of Ii, Ib.
+    n_ii = len(Ii)
+    n_ib = len(Ib)
 
-    # Per-face off-diagonal block size (target rows * source cols):
-    #   md=0 (yz centerline):  target=nyz, source = 2*nyz + 4*nxz + 4*nxy
-    #   md=1 (xz centerline):  target=nxz, source = 4*nyz + 2*nxz + 4*nxy
-    #   md=2 (xy centerline):  target=nxy, source = 4*nyz + 4*nxz + 2*nxy
-    block_md0 = nyz * (2 * nyz + 4 * nxz + 4 * nxy)
-    block_md1 = nxz * (4 * nyz + 2 * nxz + 4 * nxy)
-    block_md2 = nxy * (4 * nyz + 4 * nxz + 2 * nxy)
+    global_to_ii = np.full(n_dofs, -1, dtype=np.int32)
+    global_to_ib = np.full(n_dofs, -1, dtype=np.int32)
+    global_to_ii[Ii] = np.arange(n_ii, dtype=np.int32)
+    global_to_ib[Ib] = np.arange(n_ib, dtype=np.int32)
 
-    total_nnz_off = (
-        n_int_md0 * block_md0
-        + n_int_md1 * block_md1
-        + n_int_md2 * block_md2
-    )
-    # Total nnz including diagonal (+1 per row).
-    total_nnz = total_nnz_off + n_dofs
-
-    data = np.empty(total_nnz, dtype=np.float64)
-    indices = np.empty(total_nnz, dtype=np.int32)
-    indptr = np.empty(n_dofs + 1, dtype=np.int32)
-    indptr[0] = 0
-    nnz_written = 0   # running write offset into data / indices
-
-    ftild = np.zeros(n_dofs)
-    ctr = 0
+    # ------------------------------------------------------------------
+    # Exact NNZ pre-pass for Sii and Sib
+    # ------------------------------------------------------------------
+    # Every source block is exactly one face's DOF range; b_vec[that face]
+    # tells us whether all its DOFs are Ib (True) or Ii (False).
+    # We run the same loop as assembly but only do b_vec lookups, giving
+    # exact nnz counts before any allocation.
     nFYZ = tiling[1] * tiling[2] * nyz
     nFXZ = tiling[2] * nxz
     nFXY = (tiling[2] + 1) * nxy
 
+    # Map DOF-offset -> face index (only face-boundary offsets are keys).
+    _face_start = np.empty(len(md_vec), dtype=np.int64)
+    _off = 0
+    for _i in range(len(md_vec)):
+        _face_start[_i] = _off
+        _sz = nyz if md_vec[_i] == 0 else (nxz if md_vec[_i] == 1 else nxy)
+        _off += _sz
+    _start_to_face = {int(s): i for i, s in enumerate(_face_start)}
+
+    sii_nnz_max = 0
+    sib_nnz_max = 0
+    _ctr = 0
+    for _f in range(len(md_vec)):
+        _md = md_vec[_f]
+        _ix = indx_vec[_f]; _iy = indy_vec[_f]; _iz = indz_vec[_f]
+        if _md == 2:
+            _step_bk    = (tiling[2] + 1 - _iz) * nxy + (_iz - 1) * nxz
+            _step_front = _iz * nxy + (tiling[2] + 1 - _iz) * nxz
+            _step_right = ((tiling[1] - _iy) * tiling[2] * nxz
+                           + (tiling[2] + 1) * (tiling[1] - _iy - 1) * nxy
+                           + nxy * (tiling[2] + 1 - _iz)
+                           + (_iz - 1) * nyz + _iy * tiling[2] * nyz)
+            _start_left = (_ctr + _step_right
+                           - tiling[2] * tiling[1] * nyz
+                           - (tiling[2] + 1) * tiling[1] * nxy
+                           - (tiling[1] + 1) * tiling[2] * nxz)
+            _src_starts = [_start_left, _start_left + nyz,
+                           _ctr - _step_front, _ctr - _step_front + nxz,
+                           _ctr - nxy, _ctr + nxy,
+                           _ctr + _step_bk, _ctr + _step_bk + nxz,
+                           _ctr + _step_right, _ctr + _step_right + nyz]
+            _src_sizes  = [nyz, nyz, nxz, nxz, nxy, nxy, nxz, nxz, nyz, nyz]
+            _nT = nxy; _ctr += nxy
+        elif _md == 1:
+            _step_front  = nxz * tiling[2] + nxy * (tiling[2] + 1)
+            _block_stride = nFYZ + (tiling[1] + 1) * nFXZ + tiling[1] * nFXY
+            _sl1 = _ix * _block_stride + tiling[2] * nyz * (_iy - 1) + nyz * _iz
+            _sl2 = _ix * _block_stride + tiling[2] * nyz * _iy       + nyz * _iz
+            _sr1 = _sl1 + _block_stride; _sr2 = _sl2 + _block_stride
+            _sd1 = _ix * _block_stride + nFYZ + _iy * nFXZ + (_iy - 1) * nFXY + _iz * nxy
+            _sd2 = _sd1 + nFXY + nFXZ; _su1 = _sd1 + nxy; _su2 = _su1 + nFXY + nFXZ
+            _src_starts = [_sl1, _sl2, _ctr - _step_front,
+                           _sd1, _sd2, _su1, _su2,
+                           _ctr + _step_front, _sr1, _sr2]
+            _src_sizes  = [nyz, nyz, nxz, nxy, nxy, nxy, nxy, nxz, nyz, nyz]
+            _nT = nxz; _ctr += nxz
+        else:
+            _step_right  = (nyz * tiling[2] * tiling[1]
+                            + nxy * (tiling[2] + 1) * tiling[1]
+                            + nxz * (tiling[1] + 1) * tiling[2])
+            _block_stride = nFYZ + (tiling[1] + 1) * nFXZ + tiling[1] * nFXY
+            _prev         = (_ix - 1) * _block_stride
+            _sf1 = _prev + nFYZ + _iy * nFXZ + _iy * nFXY + _iz * nxz
+            _sf2 = _sf1 + nFYZ + tiling[1] * nFXY + (tiling[1] + 1) * nFXZ
+            _sb1 = _sf1 + nFXY + nFXZ; _sb2 = _sf2 + nFXY + nFXZ
+            _sd1 = _prev + nFYZ + (_iy + 1) * nFXZ + _iy * nFXY + _iz * nxy
+            _sd2 = _sd1 + tiling[1] * nFXY + (tiling[1] + 1) * nFXZ + nFYZ
+            _su1 = _sd1 + nxy; _su2 = _sd2 + nxy
+            _src_starts = [_ctr - _step_right,
+                           _sf1, _sf2, _sd1, _sd2, _su1, _su2,
+                           _sb1, _sb2, _ctr + _step_right]
+            _src_sizes  = [nyz, nxz, nxz, nxy, nxy, nxy, nxy, nxz, nxz, nyz]
+            _nT = nyz; _ctr += nyz
+        if not b_vec[_f]:
+            _n_ib = sum(_src_sizes[_k] for _k, _s in enumerate(_src_starts)
+                        if b_vec[_start_to_face[_s]])
+            _n_ii = sum(_src_sizes) - _n_ib
+            sii_nnz_max += _nT * (_n_ii + 1)   # +1 for diagonal
+            sib_nnz_max += _nT * _n_ib
+
+    sii_data    = np.empty(sii_nnz_max, dtype=np.float64)
+    sii_indices = np.empty(sii_nnz_max, dtype=np.int32)
+    sii_indptr  = np.zeros(n_ii + 1, dtype=np.int32)
+
+    sib_data    = np.empty(sib_nnz_max, dtype=np.float64)
+    sib_indices = np.empty(sib_nnz_max, dtype=np.int32)
+    sib_indptr  = np.zeros(n_ii + 1, dtype=np.int32)
+
+    sii_nnz = 0
+    sib_nnz = 0
+
+    ftild = np.zeros(n_dofs)
+    ctr = 0
+
     def _write_interior_face(target, source, S_local):
         """
-        Write nT rows for an interior centerline face directly into the CSR
-        arrays. Each row gets `source` columns plus the diagonal column merged
-        in sorted order. data values: -S_local entries for source columns,
-        +1.0 for the diagonal.
+        For each row in `target` (all in Ii), scatter the off-diagonal entries
+        in `source` into Sii (sources in Ii) or Sib (sources in Ib), and write
+        the +1 diagonal into Sii.  All per-row column lists are kept sorted.
         """
-        nonlocal nnz_written
+        nonlocal sii_nnz, sib_nnz
         nT = len(target)
         nS = len(source)
-        # Sort source columns once per face; reuse permutation across all nT rows.
-        sort_perm = np.argsort(source, kind='stable')
-        source_sorted = source[sort_perm]
-        S_sorted = -S_local[:, sort_perm]   # shape (nT, nS), columns aligned to source_sorted
 
-        # For each row r = target[k] = ctr + k, the diagonal column is r itself.
-        # Find where r would be inserted into source_sorted to keep monotone order.
-        # Vectorized: for the target range, compute insertion positions.
-        ins_positions = np.searchsorted(source_sorted, target)   # length nT
-        # Each row writes (nS + 1) entries: nS source values + 1 diagonal.
-        # Layout in (data, indices) starting at nnz_written:
-        #   row 0: source_sorted[:ins0], r0, source_sorted[ins0:]   (+1.0 at the inserted slot)
-        #   row 1: ...
-        # We write row by row to keep the code straightforward.
+        # Classify source columns once per face.
+        src_ii_local = global_to_ii[source]   # -1 where source is in Ib
+        src_ib_local = global_to_ib[source]   # -1 where source is in Ii
+        in_ii = src_ii_local >= 0             # boolean mask, length nS
+        in_ib = ~in_ii
+
+        # Sorted local column indices for each sub-matrix (needed for CSR).
+        src_ii_cols = src_ii_local[in_ii]     # already in global order -> sort
+        src_ib_cols = src_ib_local[in_ib]
+
+        # Argsort within each sub-group (global source order is not necessarily
+        # sorted in local Ii / Ib index space).
+        perm_ii = np.argsort(src_ii_cols, kind='stable')
+        perm_ib = np.argsort(src_ib_cols, kind='stable')
+        src_ii_cols_sorted = src_ii_cols[perm_ii]
+        src_ib_cols_sorted = src_ib_cols[perm_ib]
+
+        # S_local columns that map to Ii / Ib (indices into the nS source axis).
+        orig_ii = np.where(in_ii)[0][perm_ii]   # column positions in S_local -> Sii
+        orig_ib = np.where(in_ib)[0][perm_ib]   # column positions in S_local -> Sib
+
         for k in range(nT):
-            ins = int(ins_positions[k])
-            r = int(target[k])
-            base = nnz_written
-            # Left part: source columns before insertion point
-            indices[base:base + ins] = source_sorted[:ins]
-            data[base:base + ins] = S_sorted[k, :ins]
-            # Diagonal entry
-            indices[base + ins] = r
-            data[base + ins] = 1.0
-            # Right part: source columns after insertion point
-            indices[base + ins + 1:base + nS + 1] = source_sorted[ins:]
-            data[base + ins + 1:base + nS + 1] = S_sorted[k, ins:]
-            nnz_written += nS + 1
-            indptr[r + 1] = nnz_written
+            r_global = int(target[k])
+            r_ii     = int(global_to_ii[r_global])   # local Sii row
+
+            # --- Sii row: off-diagonal (Ii sources) + diagonal ---
+            diag_col = r_ii
+            n_ii_src = len(src_ii_cols_sorted)
+            ins = int(np.searchsorted(src_ii_cols_sorted, diag_col))
+
+            # left of diag
+            sii_indices[sii_nnz : sii_nnz + ins] = src_ii_cols_sorted[:ins]
+            sii_data   [sii_nnz : sii_nnz + ins] = -S_local[k, orig_ii[:ins]]
+            sii_nnz += ins
+            # diagonal
+            sii_indices[sii_nnz] = diag_col
+            sii_data   [sii_nnz] = 1.0
+            sii_nnz += 1
+            # right of diag
+            sii_indices[sii_nnz : sii_nnz + n_ii_src - ins] = src_ii_cols_sorted[ins:]
+            sii_data   [sii_nnz : sii_nnz + n_ii_src - ins] = -S_local[k, orig_ii[ins:]]
+            sii_nnz += n_ii_src - ins
+
+            sii_indptr[r_ii + 1] = sii_nnz
+
+            # --- Sib row: Ib sources only (already sorted) ---
+            n_ib_src = len(src_ib_cols_sorted)
+            sib_indices[sib_nnz : sib_nnz + n_ib_src] = src_ib_cols_sorted
+            sib_data   [sib_nnz : sib_nnz + n_ib_src] = -S_local[k, orig_ib]
+            sib_nnz += n_ib_src
+            sib_indptr[r_ii + 1] = sib_nnz
 
     def _write_boundary_face(target):
-        """A boundary face row has only the diagonal entry."""
-        nonlocal nnz_written
-        for k in range(len(target)):
-            r = int(target[k])
-            indices[nnz_written] = r
-            data[nnz_written] = 1.0
-            nnz_written += 1
-            indptr[r + 1] = nnz_written
+        """Boundary DOFs: identity rows in Sii (they are in Ii? No — boundary
+        faces have all their DOFs in Ib, so they produce NO rows in Sii/Sib).
+        We simply skip them; Sii/Sib only have rows for Ii DOFs."""
+        pass  # boundary face DOFs are in Ib; they have no rows in Sii or Sib
 
     for indxyz in range(len(md_vec)):
         match md_vec[indxyz]:
@@ -1310,11 +1443,15 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                     origin = (indx_vec[indxyz] * scl_x,
                               indy_vec[indxyz] * scl_y,
                               (indz_vec[indxyz] - 1) * scl_z)
-                    if forcing is None and ct_pde:
+                    if ct_pde:
                         S_local = Sz
-                        b_local = None
+                        if forcing is not None:
+                            b_local = compute_forcing_trace(
+                                2, geom[2], ops_pkg[2], Lii_lu_z, origin, forcing)
+                        else:
+                            b_local = None
                     else:
-                        S_local, b_local = local_S_fast(
+                        S_local, b_local, _ = local_S_fast(
                             2, geom[2], diffops[2], ops_pkg[2],
                             coeffs, origin, forcing,
                         )
@@ -1353,11 +1490,15 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                     origin = (indx_vec[indxyz] * scl_x,
                               (indy_vec[indxyz] - 1) * scl_y,
                               indz_vec[indxyz] * scl_z)
-                    if forcing is None and ct_pde:
+                    if ct_pde:
                         S_local = Sy
-                        b_local = None
+                        if forcing is not None:
+                            b_local = compute_forcing_trace(
+                                1, geom[1], ops_pkg[1], Lii_lu_y, origin, forcing)
+                        else:
+                            b_local = None
                     else:
-                        S_local, b_local = local_S_fast(
+                        S_local, b_local, _ = local_S_fast(
                             1, geom[1], diffops[1], ops_pkg[1],
                             coeffs, origin, forcing,
                         )
@@ -1401,11 +1542,15 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                     origin = ((indx_vec[indxyz] - 1) * scl_x,
                               indy_vec[indxyz] * scl_y,
                               indz_vec[indxyz] * scl_z)
-                    if forcing is None and ct_pde:
+                    if ct_pde:
                         S_local = Sx
-                        b_local = None
+                        if forcing is not None:
+                            b_local = compute_forcing_trace(
+                                0, geom[0], ops_pkg[0], Lii_lu_x, origin, forcing)
+                        else:
+                            b_local = None
                     else:
-                        S_local, b_local = local_S_fast(
+                        S_local, b_local, _ = local_S_fast(
                             0, geom[0], diffops[0], ops_pkg[0],
                             coeffs, origin, forcing,
                         )
@@ -1414,11 +1559,16 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                         ftild[target] += b_local
                 else:
                     _write_boundary_face(target)
-    assert nnz_written == total_nnz, \
-        f"nnz mismatch: wrote {nnz_written}, expected {total_nnz}"
-    # Build CSR directly from preallocated data/indices/indptr.
-    Stot = sp.csr_matrix((data, indices, indptr), shape=(n_dofs, n_dofs))
-    return Stot, ftild
+
+    Sii = sp.csr_matrix(
+        (sii_data, sii_indices, sii_indptr),
+        shape=(n_ii, n_ii),
+    )
+    Sib = sp.csr_matrix(
+        (sib_data, sib_indices, sib_indptr),
+        shape=(n_ii, n_ib),
+    )
+    return Sii, Sib, ftild
 
 
 def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
@@ -1482,16 +1632,20 @@ def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
 
     if ct_pde:
         if dbg > 0: print("Computing local S matrices (constant-coefficient mode) ...")
-        Sx, _ = local_S_fast(0, geom[0], diffops[0], ops_pkg[0],
-                             coeffs, (0., 0., 0.), None)
-        Sy, _ = local_S_fast(1, geom[1], diffops[1], ops_pkg[1],
-                             coeffs, (0., 0., 0.), None)
-        Sz, _ = local_S_fast(2, geom[2], diffops[2], ops_pkg[2],
-                             coeffs, (0., 0., 0.), None)
+        Sx, _, Lii_lu_x = local_S_fast(0, geom[0], diffops[0], ops_pkg[0],
+                                        coeffs, (0., 0., 0.), None)
+        Sy, _, Lii_lu_y = local_S_fast(1, geom[1], diffops[1], ops_pkg[1],
+                                        coeffs, (0., 0., 0.), None)
+        Sz, _, Lii_lu_z = local_S_fast(2, geom[2], diffops[2], ops_pkg[2],
+                                        coeffs, (0., 0., 0.), None)
         if dbg > 0: print(f"  Sx: {Sx.shape}")
+        # diffops is no longer needed: S_local = Sx/Sy/Sz for all faces,
+        # and b_local uses the cached Lii_lu factors.
+        diffops = None
     else:
         if dbg > 0: print("Variable-coefficient mode: local S computed per face.")
         Sx = Sy = Sz = None
+        Lii_lu_x = Lii_lu_y = Lii_lu_z = None
 
     XYtot, md_vec, b_vec, nxy, nyz, nxz, indx_vec, indy_vec, indz_vec = \
         global_dofs(tiling, px, py, pz, Lx, Ly, Lz)
@@ -1501,16 +1655,8 @@ def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
         unique = np.unique(np.round(XYtot, 12), axis=0)
         assert unique.shape[0] == XYtot.shape[0], "DOF uniqueness violated"
 
-    if dbg > 0: print(f"  n_dofs = {n_dofs}")
-    Stot, ftild = construct_SOMS_sparse(
-        nxy, nyz, nxz, md_vec, b_vec, n_dofs,
-        tiling, indx_vec, indy_vec, indz_vec, Sx, Sy, Sz,
-        ct_pde=ct_pde, coeffs=coeffs, forcing=forcing,
-        px=px, py=py, pz=pz,
-        scl_x=scl_x, scl_y=scl_y, scl_z=scl_z,
-        geom=geom, diffops=diffops, ops_pkg=ops_pkg,
-    )
-
+    # Compute Ii / Ib before assembly so construct_SOMS_sparse can build
+    # Sii and Sib directly without forming the full n_dofs x n_dofs Stot.
     x, y, z = XYtot[:, 0], XYtot[:, 1], XYtot[:, 2]
     Ib = np.where(
         (np.abs(x) < 1e-10) | (np.abs(x - Lx) < 1e-10) |
@@ -1518,6 +1664,16 @@ def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
         (np.abs(z) < 1e-10) | (np.abs(z - Lz) < 1e-10)
     )[0]
     Ii = np.setdiff1d(np.arange(n_dofs), Ib)
-    Sii = Stot[Ii, :][:, Ii]
-    Sib = Stot[Ii, :][:, Ib]
+
+    if dbg > 0: print(f"  n_dofs = {n_dofs}, n_ii = {len(Ii)}, n_ib = {len(Ib)}")
+    Sii, Sib, ftild = construct_SOMS_sparse(
+        nxy, nyz, nxz, md_vec, b_vec, n_dofs,
+        tiling, indx_vec, indy_vec, indz_vec, Sx, Sy, Sz,
+        ct_pde=ct_pde, coeffs=coeffs, forcing=forcing,
+        px=px, py=py, pz=pz,
+        scl_x=scl_x, scl_y=scl_y, scl_z=scl_z,
+        geom=geom, diffops=diffops, ops_pkg=ops_pkg,
+        Ii=Ii, Ib=Ib,
+        Lii_lu_x=Lii_lu_x, Lii_lu_y=Lii_lu_y, Lii_lu_z=Lii_lu_z,
+    )
     return Sii, Sib, ftild, XYtot, Ii, Ib

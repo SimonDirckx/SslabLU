@@ -104,7 +104,7 @@ def main():
     p_results = []
     print(f"\np-refinement (nb = {nb_fixed}):")
     for p in p_list:
-        N, elapsed,elapsed_solve, peak,mem = run_one(p, nb_fixed)
+        N, elapsed,elapsed_solve, peak,mem,mem_tot = run_one(p, nb_fixed)
         print(f"    p={p}\
                     N={N:>6} time_construct={elapsed:.3f}s\
                     time_solve={elapsed_solve:.3f}s\
