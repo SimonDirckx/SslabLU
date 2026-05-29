@@ -1191,16 +1191,92 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
     Otherwise local_S_fast is called per face using the precomputed
     per-direction contexts geom[dir], diffops[dir], ops_pkg[dir].
     """
-    # COO triplet accumulation (much faster than LIL for large n_dofs).
-    # Identity rows for ALL DOFs are added once at the end via sp.eye().
-    rows_list = []
-    cols_list = []
-    data_list = []
+    # --- Direct CSR construction: build data/indices/indptr directly ---
+    # No COO triplet intermediate. Rows are written in monotonically increasing
+    # order (since target = arange(ctr, ctr+nT) and ctr only grows), so we can
+    # populate the CSR arrays linearly.
+    interior_mask = ~b_vec
+    n_int_md0 = int(np.sum(interior_mask & (md_vec == 0)))
+    n_int_md1 = int(np.sum(interior_mask & (md_vec == 1)))
+    n_int_md2 = int(np.sum(interior_mask & (md_vec == 2)))
+
+    # Per-face off-diagonal block size (target rows * source cols):
+    #   md=0 (yz centerline):  target=nyz, source = 2*nyz + 4*nxz + 4*nxy
+    #   md=1 (xz centerline):  target=nxz, source = 4*nyz + 2*nxz + 4*nxy
+    #   md=2 (xy centerline):  target=nxy, source = 4*nyz + 4*nxz + 2*nxy
+    block_md0 = nyz * (2 * nyz + 4 * nxz + 4 * nxy)
+    block_md1 = nxz * (4 * nyz + 2 * nxz + 4 * nxy)
+    block_md2 = nxy * (4 * nyz + 4 * nxz + 2 * nxy)
+
+    total_nnz_off = (
+        n_int_md0 * block_md0
+        + n_int_md1 * block_md1
+        + n_int_md2 * block_md2
+    )
+    # Total nnz including diagonal (+1 per row).
+    total_nnz = total_nnz_off + n_dofs
+
+    data = np.empty(total_nnz, dtype=np.float64)
+    indices = np.empty(total_nnz, dtype=np.int32)
+    indptr = np.empty(n_dofs + 1, dtype=np.int32)
+    indptr[0] = 0
+    nnz_written = 0   # running write offset into data / indices
+
     ftild = np.zeros(n_dofs)
     ctr = 0
     nFYZ = tiling[1] * tiling[2] * nyz
     nFXZ = tiling[2] * nxz
     nFXY = (tiling[2] + 1) * nxy
+
+    def _write_interior_face(target, source, S_local):
+        """
+        Write nT rows for an interior centerline face directly into the CSR
+        arrays. Each row gets `source` columns plus the diagonal column merged
+        in sorted order. data values: -S_local entries for source columns,
+        +1.0 for the diagonal.
+        """
+        nonlocal nnz_written
+        nT = len(target)
+        nS = len(source)
+        # Sort source columns once per face; reuse permutation across all nT rows.
+        sort_perm = np.argsort(source, kind='stable')
+        source_sorted = source[sort_perm]
+        S_sorted = -S_local[:, sort_perm]   # shape (nT, nS), columns aligned to source_sorted
+
+        # For each row r = target[k] = ctr + k, the diagonal column is r itself.
+        # Find where r would be inserted into source_sorted to keep monotone order.
+        # Vectorized: for the target range, compute insertion positions.
+        ins_positions = np.searchsorted(source_sorted, target)   # length nT
+        # Each row writes (nS + 1) entries: nS source values + 1 diagonal.
+        # Layout in (data, indices) starting at nnz_written:
+        #   row 0: source_sorted[:ins0], r0, source_sorted[ins0:]   (+1.0 at the inserted slot)
+        #   row 1: ...
+        # We write row by row to keep the code straightforward.
+        for k in range(nT):
+            ins = int(ins_positions[k])
+            r = int(target[k])
+            base = nnz_written
+            # Left part: source columns before insertion point
+            indices[base:base + ins] = source_sorted[:ins]
+            data[base:base + ins] = S_sorted[k, :ins]
+            # Diagonal entry
+            indices[base + ins] = r
+            data[base + ins] = 1.0
+            # Right part: source columns after insertion point
+            indices[base + ins + 1:base + nS + 1] = source_sorted[ins:]
+            data[base + ins + 1:base + nS + 1] = S_sorted[k, ins:]
+            nnz_written += nS + 1
+            indptr[r + 1] = nnz_written
+
+    def _write_boundary_face(target):
+        """A boundary face row has only the diagonal entry."""
+        nonlocal nnz_written
+        for k in range(len(target)):
+            r = int(target[k])
+            indices[nnz_written] = r
+            data[nnz_written] = 1.0
+            nnz_written += 1
+            indptr[r + 1] = nnz_written
 
     for indxyz in range(len(md_vec)):
         match md_vec[indxyz]:
@@ -1242,11 +1318,11 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             2, geom[2], diffops[2], ops_pkg[2],
                             coeffs, origin, forcing,
                         )
-                    rows_list.append(np.repeat(target, len(source)))
-                    cols_list.append(np.tile(source, len(target)))
-                    data_list.append((-S_local).ravel())
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
                         ftild[target] += b_local
+                else:
+                    _write_boundary_face(target)
             case 1:
                 target = np.arange(ctr, ctr + nxz)
                 step_front = nxz * tiling[2] + nxy * (tiling[2] + 1)
@@ -1285,11 +1361,11 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             1, geom[1], diffops[1], ops_pkg[1],
                             coeffs, origin, forcing,
                         )
-                    rows_list.append(np.repeat(target, len(source)))
-                    cols_list.append(np.tile(source, len(target)))
-                    data_list.append((-S_local).ravel())
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
                         ftild[target] += b_local
+                else:
+                    _write_boundary_face(target)
             case 0:
                 target = np.arange(ctr, ctr + nyz)
                 step_right = (
@@ -1333,22 +1409,15 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             0, geom[0], diffops[0], ops_pkg[0],
                             coeffs, origin, forcing,
                         )
-                    rows_list.append(np.repeat(target, len(source)))
-                    cols_list.append(np.tile(source, len(target)))
-                    data_list.append((-S_local).ravel())
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
                         ftild[target] += b_local
-    # Build CSR from COO triplets + identity on diagonal.
-    # target and source never overlap (a centerline face is never its own
-    # surrounding face), so adding sp.eye does not collide with assigned blocks.
-    if rows_list:
-        rows = np.concatenate(rows_list)
-        cols = np.concatenate(cols_list)
-        data = np.concatenate(data_list)
-        Stot = sp.csr_matrix((data, (rows, cols)), shape=(n_dofs, n_dofs))
-    else:
-        Stot = sp.csr_matrix((n_dofs, n_dofs))
-    Stot = Stot + sp.eye(n_dofs, format='csr')
+                else:
+                    _write_boundary_face(target)
+    assert nnz_written == total_nnz, \
+        f"nnz mismatch: wrote {nnz_written}, expected {total_nnz}"
+    # Build CSR directly from preallocated data/indices/indptr.
+    Stot = sp.csr_matrix((data, indices, indptr), shape=(n_dofs, n_dofs))
     return Stot, ftild
 
 
