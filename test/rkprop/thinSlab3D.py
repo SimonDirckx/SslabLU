@@ -1,148 +1,244 @@
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
 
-from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
-import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
-import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
-import SOMS3D
-import solver.spectral.spectralSolver as spectral
+import SOMS3D_csr
+import torch
+import matAssembly.HBS.slabTree as slabTree
+import matAssembly.HBS.HBStorch as HBStorch
+from scipy.sparse.linalg import LinearOperator
+import solver.stencil.stencilSolver as stencil
+import solver.stencil.geom as geom
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
+import mumps
+import scipy.sparse as sparse
 
-import matAssembly.matAssembler as mA
-import solver.solver as solver
+import os
+def rss_gb():
+    with open(f"/proc/{os.getpid()}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS"):
+                return int(line.split()[1]) / 1e6   # kB -> GB
+    return -1.0
 
-"""
-script that illustrates the 2-box problem in 3D
+def setup_mumps(Sii):
+    ctx = mumps.Context()
+    ctx.analyze(Sii)             # symbolic factorization (uses sparsity pattern only)
+    ctx.factor(Sii)              # numeric factorization
+    return ctx
+def setup_mumps_transpose(Sii):
+    ctx = mumps.Context()
+    ctx.analyze(Sii.T)
+    ctx.factor(Sii.T)
+    return ctx
 
-     ___________ __________
-    |           |           |
-    |   tau     |   sig     |
-  ul|         uc|           |
-    |___________|___________|
 
-Solution map S: ul-> uc has known eigenvalues and eigenfunction, both for Laplace and Helmholtz
-Constructed in two ways: overlapping and non-overlapping
+def bc_laplace(p):
+    """Free-space Green's function with source at (-0.5, -0.5, -0.5)."""
+    r = np.sqrt((p[:,0]+.5)**2+(p[:,1]+.5)**2+(p[:,2]+.5)**2)
+    return 1./(4*np.pi*r)
+def bc_helmholtz(p,kh):
+    """Free-space Green's function with source at (-0.5, -0.5, -0.5)."""
+    r = np.sqrt((p[:,0]+.5)**2+(p[:,1]+.5)**2+(p[:,2]+.5)**2)
+    return np.real(np.exp(1j*kh*r)/(4*np.pi*r))
 
-"""
-
-ky = 2
-kz = 2
-kx = np.sqrt(ky**2+kz**2)
-Lx = 1/8
-Ly = 1
-Lz = 1
-def  c11(p):
-    return torch.ones_like(p[:,0])
-def  c22(p):
-    return torch.ones_like(p[:,1])
-def  c33(p):
-    return torch.ones_like(p[:,2])
-def  bc(p):
-    return torch.sin(np.pi*ky*p[:,1])*torch.sin(np.pi*kz*p[:,2])*torch.sinh(kx*np.pi*(Lx-p[:,0]))/np.sinh(kx*np.pi*Lx)
-def  bc_np(p):
-    return np.sin(np.pi*ky*p[:,1])*np.sin(np.pi*kz*p[:,2])*np.sinh(kx*np.pi*(Lx-p[:,0]))/np.sinh(kx*np.pi*Lx)
-Lapl = pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33)
-
+Lx = 2/16
+Ly = 1.
+Lz = 1.
 cx = Lx/2
-bnds = np.array([[0,0,0],[Lx,Ly,Lz]])
-Om = hpsaltGeom.BoxGeometry(bnds)
-nbz = 8
-nby = 8
-nbx = 2
-ax = .5*(bnds[1,0]/nbx)
-ay = .5*(bnds[1,1]/nby)
-az = .5*(bnds[1,2]/nbz)
-px = 8
-py = 8
-pz = 8
-
-print("px,py,pz = ",px," , ",py," , ",pz)
+slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-solver_hps = hpsalt.Domain_Driver(Om, Lapl, 0, np.array([ax,ay,az]), [px+1,py+1,pz+1], 3)
-solver_hps.build("reduced_cpu", "MUMPS",verbose=False)
+kh = 20.
 
-XX = solver_hps.XX
-XXfull = solver_hps.XXfull
-
-Jb = solver_hps._Jx
-Ji = solver_hps.Ji
-
-print("Ji size = ",len(Ji))
-print("Jb size = ",len(Jb))
-
-XXi = XX[Ji,:]
-XXb = XX[Jb,:]
-
-Jc = np.where(XXi[:,0]==cx)[0]
-Jl = np.where((XXb[:,0]==0))[0]
-
-Aii = np.array(solver_hps.Aii.todense())
-Aib = np.array(solver_hps.Aix.todense())
+def  c11(p):
+    return np.ones_like(p[:,0])
+def  c22(p):
+    return np.ones_like(p[:,0])
+def  c33(p):
+    return np.ones_like(p[:,0])
+def  c(p):
+    return kh*kh*np.ones_like(p[:,0])
+HH = pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
 
-#test if I set it up correctly
-ui = bc(XXi).cpu().detach().numpy()
-rhs = bc(XXb).cpu().detach().numpy()
-ui_hat = -np.linalg.solve(Aii,Aib@rhs)
+coeffs = {'c11': 1., 'c22': 1., 'c33': 1.,'c':kh**2}
+print("============BUILDING SOLVER============")
+solve_method = 'stencil'
+if solve_method == 'SOMS':
+    nbx = 4
+    nby = 16
+    nbz = 16
+    px = 6
+    py = 6
+    pz = 6
+    Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
+         px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
+         coeffs, True, None, weighted=False)
+    
+elif solve_method=='stencil':
+    nx = 32+1
+    ny = 256
+    nz = 256
+    ord = [nx,ny,nz]
+    solver = stencil.stencilSolver(HH,slabGeom,ord)
+    Sii = solver.Aii
+    Sib = solver.Aix
+    XYtot = solver.XX
+    Ii = solver.Ji
+    Ib = solver.Jx
+    wi = np.ones((Sii.shape[0],))
+    wb = np.ones((Sib.shape[1],))
+else:
+    raise ValueError("solver type not recognized")
+print("============  SOLVER DONE  ============")
+diff = Sii - Sii.T
+print("max |Sii - Sii.T| =", abs(diff).max() if diff.nnz else 0.0)
+print("=======================================")
+print("============ FACTOR SOLVER ============")
+ctx = SOMS3D_csr.setup_mumps(Sii)
+if solve_method == 'SOMS':
+    ctxT = SOMS3D_csr.setup_mumps_transpose(Sii)
+else:
+    ctxT = ctx
+print("============    LU DONE    ============")
+print("MEM (GB) ctx = ",ctx.data.nbytes/1e9)
+print("MEM (GB) ctx = ",ctxT.data.nbytes/1e9)
+print("=======================================")
 
-print("err hps = ",np.linalg.norm(ui-ui_hat)/np.linalg.norm(ui))
+XXi = XYtot[Ii, :]
+XXb = XYtot[Ib, :]
+
+tol = 1e-10
+
+# Interior evaluation plane
+Jc  = np.where(np.abs(XXi[:,0] - cx) < tol)[0]   # x = Lx/2
+
+Jc_large  = np.where(np.abs(XYtot[:,0] - cx) < tol)[0]   # x = Lx/2
+Jc_inJc =  np.where((XYtot[Jc_large,1] > tol) &\
+                    (XYtot[Jc_large,1] < Ly-tol) &\
+                    (XYtot[Jc_large,2] > tol) &\
+                    (XYtot[Jc_large,2] < Lz-tol))[0]   # x = Lx/2
+print("|Jc| = ",len(Jc))
+print("|Jc_large| = ",len(Jc_large))
+print("|Jc_inJc| = ",len(Jc_inJc))
+XXc = XXi[Jc,:]
+wi = np.ones((len(Jc_inJc),))
+
+# Boundary index sets (6 faces)
+Jl  = np.where((np.abs(XXb[:,0] - 0. ) < tol))[0]
+Jr  = np.where((np.abs(XXb[:,0] - Lx ) < tol))[0]
+Jb = np.array([i for i in range(XXb.shape[0]) if i not in Jl and i not in Jr],dtype=np.int64)
+XXr = XXb[Jr,:]
+# Boundary and reference interior values
+if kh == 0.:
+    rhsS = bc_laplace(XXb)
+    rhsS   = wb * rhsS
+    uS   = bc_laplace(XXi[Jc, :])
+else:
+    rhsS = bc_helmholtz(XXb,kh)
+    rhsS   = wb * rhsS
+    uS   = bc_helmholtz(XXi[Jc, :],kh)
+
+# Solution operator columns: SS* maps boundary data on face * -> centerline
+# Sii @ u_i = -Sib @ u_b  =>  u_i = -Sii^{-1} Sib u_b
+# Extract rows corresponding to Jc for each boundary face.
+if  torch.cuda.is_available():
+        device = torch.cuda.get_device_name()
+else:
+    device = 'cpu'
+
+if solve_method=='SOMS':
+    tree = slabTree.slabTree(XXc,False,8*8)
+    
+
+    def smatmat(v,transpose=False):
+                
+                if (v.ndim == 1):
+                    v_tmp = v[:,np.newaxis]
+                else:
+                    v_tmp = v
+
+                if (not transpose):
+                    result = (ctx.solve(Sib[:,Jr]@v_tmp))[I,:]
+                else:
+                    result      = np.zeros(shape=(len(Ii),v.shape[1]))
+                    result[I,:] = v_tmp
+                    result      = Sib[:,J].T @ (ctxT.solve(result))
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
+
+    LinOp = LinearOperator(shape=(len(Jc),len(Jr)),\
+        matvec = lambda v:smatmat(v,Jc,Jr), rmatvec = lambda v:smatmat(v,Jc,Jr,transpose=True),\
+        matmat = lambda v:smatmat(v,Jc,Jr), rmatmat = lambda v:smatmat(v,Jc,Jr,transpose=True))
+
+elif solve_method=='stencil':    
+    tree = slabTree.slabTree(XXr,False,8*8)
+    Sib_Jr_T = Sib[:,Jr].T.tocsr()
+    def smatmat(v, transpose=False):
+        if v.ndim == 1:
+            v_tmp = v[:, np.newaxis]
+        else:
+            v_tmp = v
+
+        if not transpose:
+            # Forward:  L v = E_{Jc_inJc -> Jc_large} · P_{Jc ⊂ Ii} · A^{-1} · Sib[:,Jr] · v
+            result_tmp = (ctx.solve(Sib[:, Jr] @ v_tmp))[Jc, :]
+            result = np.zeros((len(Jc_large), v_tmp.shape[1]))
+            result[Jc_inJc, :] = result_tmp
+
+        else:
+            # Transpose:  L^T w = Sib[:,Jr]^T · A^{-T} · P_{Jc}^T · E^T · w
+            k = v_tmp.shape[1]
+            print(f"[T] entry        RSS={rss_gb():.2f} GB", flush=True)
+            # E^T: restrict the global-interface input down to this domain's Jc
+            w_Jc = v_tmp[Jc_inJc, :]            # (|Jc|, k)   -- Jc_inJc indexes Jc_large
+            print("[T] w_Jc", w_Jc.shape, round(w_Jc.nbytes/1e9, 3), "GB", flush=True)
+
+            # P_{Jc}^T: scatter into the interior-sized RHS at rows Jc
+            rhs = np.zeros((len(Ii), k))
+            rhs[Jc, :] = w_Jc                   # Jc is already interior-local
+            print("[T] rhs", rhs.shape, round(rhs.nbytes/1e9, 3), "GB",
+                "| Jc max", int(Jc.max()), "len(Ii)", len(Ii), flush=True)
+
+            # A^{-T}
+            sol = ctxT.solve(rhs)               # (|Ii|, k)
+            print("[T] solve done:", sol.shape, round(sol.nbytes/1e9, 3), "GB",
+                type(sol).__name__, flush=True)
+            del rhs                             # free 1.6 GB before the matmul
+
+            # Sib[:,Jr]^T @ sol  -- canonical CSR, .dot() forces scipy dispatch
+            print("[T] Sib_Jr_T", Sib_Jr_T.shape, "nnz", Sib_Jr_T.nnz,
+                Sib_Jr_T.format, "canonical", Sib_Jr_T.has_canonical_format, flush=True)
+            result = Sib_Jr_T.dot(sol)          # (|Jr|, k)
+            print("[T] matmul done:", result.shape, flush=True)
+            del sol
+        if v.ndim == 1:
+            result = result.flatten()
+        return result
+
+    LinOp = LinearOperator(shape=(len(Jc_large),len(Jr)),\
+        matvec = lambda v:smatmat(v), rmatvec = lambda v:smatmat(v,transpose=True),\
+        matmat = lambda v:smatmat(v), rmatmat = lambda v:smatmat(v,transpose=True))
 
 
-rhsT = bc(XXb).cpu().detach().numpy()
-uT = bc(XXi[Jc,:]).cpu().detach().numpy()
+else:
+    raise ValueError("solve method not recognized")
+print("=========  LINOP CONSTRUCTED  =========")
+SSr = HBStorch.HBSMAT(LinOp,device,tree,False)
+print("============  COMPRESS HBS  ============")
+SSr.construct(50,False)
+print("============    HBS DONE    ============")
 
-ST = -np.linalg.solve(Aii,Aib[:,Jl])[Jc,:]
-print("ST shape = ",ST.shape)
-uhat_T = ST@rhsT[Jl]
+ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
+ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
+ur = -(SSr@rhsS[Jr])[Jc_inJc]
+# Approximate centerline solution as sum over all 6 boundary contributions
+uhat_S = ul+ur+ub
 
-
-
-
-print("err1 = ",np.linalg.norm(uhat_T-uT,ord=2)/np.linalg.norm(uT,ord=2))
-
-Sii,Sib,XYtot,Ii,Ib = SOMS3D.SOMS_solver(px,py,pz,nbx,nby,nbz,Lx,Ly,Lz,0,0)
-
-
-XXi = XYtot[Ii,:]
-XXb = XYtot[Ib,:]
-
-
-Jc = np.where(XXi[:,0]==cx)[0]
-Jl = np.where((XXb[:,0]==0))[0]
-
-
-
-
-AiiS = Sii
-AibS = Sib
-
-rhsS = bc_np(XXb)
-uS = bc_np(XXi[Jc,:])
-SS = -np.linalg.solve(AiiS,AibS[:,Jl])[Jc,:]
-uhat_S = SS@rhsS[Jl]
-
-
-print("err2 = ",np.linalg.norm(uhat_S-uS,ord=2)/np.linalg.norm(uS,ord=2))
-#rk = (px-1)*min(nby*(py-1),nbz*(pz-1))
-rk = 150
-print("rank = ",rk)
-
-assemblerS = mA.rkHMatAssembler((py-1)*(pz-1),rk,tree=None,ndim=3)
-assemblerT = mA.rkHMatAssembler((py-1)*(pz-1),rk,tree=None,ndim=3)
-
-
-SSmap = solver.stMap(SS,XXb[Jl,:],XXi[Jc,:])
-#STmap = solver.stMap(ST,XXb[Jl,:],XXi[Jc,:])
-
-SSlinop = assemblerS.assemble(SSmap)
-#STlinop = assemblerT.assemble(STmap)
-
-E = np.identity(SS.shape[1])
-v=np.random.standard_normal(size=(SS.shape[1],))
-Sv1 = SSlinop@v
-Sv2 = SS@v
-
-print("Hmat err SS = ",np.linalg.norm(Sv1-Sv2)/np.linalg.norm(Sv2))
-print("Hmat compression = ",assemblerS.stats.nbytes/(SS.nbytes))
-#print("Hmat err ST = ",np.linalg.norm(ST-STHdense)/np.linalg.norm(ST))
+err2 = np.linalg.norm(uhat_S - uS, ord=2) / np.linalg.norm(uS, ord=2)
+print(f"err2 = {err2:.6e}")
+uihat = ctx.solve(-Sib@rhsS)
+ui = bc_helmholtz(XXi,kh)
+err2 = np.linalg.norm(uihat - ui, ord=2) / np.linalg.norm(ui, ord=2)
+print(f"err2 = {err2:.6e}")

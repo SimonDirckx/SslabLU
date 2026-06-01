@@ -175,7 +175,7 @@ class HBSMAT:
         if self.fac == 4:
             s = 6*rk+4*self.nl+5
         else:
-            s = 4*rk+2*self.nl+5
+            s = max(4*rk,self.nl)+5
         
         self.nSamples = s
         tic = time.time()
@@ -187,10 +187,12 @@ class HBSMAT:
         Psiprime = torch.zeros_like(Psi_flat); Psiprime[self.perm,:] = Psi_flat
         Omprime_np  = Omprime.cpu().numpy()
         Psiprime_np = Psiprime.cpu().numpy()
-        print("A shape = ",self.A.shape)
-        print("Om shape = ",Omprime_np.shape)
-        Y = self.A@Omprime_np
+        
         Z = self.A.T@Psiprime_np
+        print("Z sampled")
+        Y = self.A@Omprime_np
+        print("Y sampled")
+        
         Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
         Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
         Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,device=self.device)
