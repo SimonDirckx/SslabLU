@@ -242,11 +242,12 @@ class HBSStrong:
 
     # -- apply -------------------------------------------------------------
     def _apply(self, v, transpose=False):
+        vtorch = torch.from_numpy(v)
         if v.ndim == 1:
-            v = v[:, None]; squeeze = True
+            vtorch = vtorch[:, None]; squeeze = True
         else:
             squeeze = False
-        vp = v[self.perm, :]
+        vp = vtorch[self.perm, :]
         Bdown = self.V if not transpose else self.U
         Bup = self.U if not transpose else self.V
 
@@ -289,7 +290,7 @@ class HBSStrong:
         out = torch.zeros_like(u); out[self.perm, :] = u
         if squeeze:
             out = out[:, 0]
-        return out
+        return out.detach().cpu().numpy()
 
     def matvec(self, v): return self._apply(v, False)
     def rmatvec(self, v): return self._apply(v, True)
