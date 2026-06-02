@@ -11,7 +11,7 @@ import solver.stencil.geom as geom
 import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 import mumps
 import scipy.sparse as sparse
-
+import time
 import os
 
 def rss_gb():
@@ -96,11 +96,13 @@ diff = Sii - Sii.T
 print("max |Sii - Sii.T| =", abs(diff).max() if diff.nnz else 0.0)
 print("=======================================")
 print("============ FACTOR SOLVER ============")
+tic = time.time()
 ctx = SOMS3D_csr.setup_mumps(Sii)
 if solve_method == 'SOMS':
     ctxT = SOMS3D_csr.setup_mumps_transpose(Sii)
 else:
     ctxT = ctx
+print("LU factors done in : ",time.time()-tic,"s")
 print("============    LU DONE    ============")
 print("MEM (GB) ctx = ",ctx.data.nbytes/1e9)
 print("MEM (GB) ctx = ",ctxT.data.nbytes/1e9)
@@ -224,7 +226,9 @@ print(set(sizes))   # want a single value
 print("=========  LINOP CONSTRUCTED  =========")
 SSr = HBStorch.HBSStrong(LinOp,device=device,tree=tree)
 print("============  COMPRESS HBS  ============")
+tic = time.time()
 SSr.construct(20)
+print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 
 ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])

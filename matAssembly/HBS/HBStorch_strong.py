@@ -35,6 +35,7 @@ Inputs:
 import numpy as np
 import torch
 import torch.linalg as tla
+import time
 
 torch.set_default_dtype(torch.float64)
 
@@ -71,6 +72,7 @@ class HBSStrong:
                      else torch.as_tensor(perm, dtype=torch.int64))
         self.U = []; self.V = []; self.D = []; self.clevels = []
         self.Aroot = None; self._child_ranks_cache = []
+        self._near_cache = None; self._invperm_cache = None
 
     # -- neighbour access (self-EXCLUDED) ----------------------------------
     def _nbrs(self, lvl, t):
@@ -81,7 +83,21 @@ class HBSStrong:
         return [j for j in self._adj[lvl][t] if j != t]
 
     def _near(self, lvl, t):
-        return [t] + self._nbrs(lvl, t)
+        if self._near_cache is None:
+            self._near_cache = {}
+        key = (lvl, t)
+        v = self._near_cache.get(key)
+        if v is None:
+            v = [t] + self._nbrs(lvl, t)
+            self._near_cache[key] = v
+        return v
+
+    def _invperm(self):
+        if self._invperm_cache is None:
+            ip = torch.empty_like(self.perm)
+            ip[self.perm] = torch.arange(self.N, device=self.device)
+            self._invperm_cache = ip
+        return self._invperm_cache
 
     def _nb_at(self, lvl):
         if self._tree is not None:
@@ -138,38 +154,57 @@ class HBSStrong:
 
     # -- core linear algebra ----------------------------------------------
     @staticmethod
-    def _far_basis(Yt, On, rk):
+    def _far_basis_and_factor(Yt, On, rk):
+        """Far-field basis of one box AND the reusable factorization of its near
+        band On.  One complete QR of On^T serves both: trailing columns give
+        null(On) for the basis; the (Q1, R1) leading part gives the
+        least-squares solve against On for the near-band recovery (no pinv)."""
         gb = On.shape[0]
-        Q = tla.qr(On.mT, mode='complete').Q
-        P = Q[:, gb:]
-        M = Yt @ P
+        QR = tla.qr(On.mT, mode='complete')        # On^T = Q R, Q:(s,s)
+        Q = QR.Q; R = QR.R
+        Pnull = Q[:, gb:]                          # null(On): (s, s-gb)
+        M = Yt @ Pnull
         rr = min(rk, M.shape[1], M.shape[0])
-        return tla.svd(M, full_matrices=False).U[:, :rr]
+        U = tla.svd(M, full_matrices=False).U[:, :rr]
+        Q1 = Q[:, :gb]                             # (s, gb)
+        R1 = R[:gb, :gb]                           # (gb, gb) upper-tri
+        return U, (Q1, R1, gb)
 
-    def _recover_band(self, Yb, Zb, Omb, Psib, U, V, lvl):
+    @staticmethod
+    def _solve_band(Wt, fac):
+        """Least-squares X with X @ On = Wt, using On = R1^T Q1^T (from the QR of
+        On^T).  pinv(On) acts as Q1 R1^{-T}; robust triangular solve."""
+        Q1, R1, gb = fac
+        tmp = Wt @ Q1                              # (b, gb)
+        # X = tmp @ R1^{-T}: solve X R1^T = tmp
+        X = torch.linalg.solve_triangular(R1.mT, tmp, upper=False, left=False)
+        return X                                   # (b, gb)
+
+    def _recover_band(self, Yb, Zb, U, V, facU, facV, lvl):
         nb = len(Yb); b = Yb[0].shape[0]
         T1 = []
         for t in range(nb):
             near = self._near(lvl, t)
-            On = torch.cat([Omb[j] for j in near], dim=0)
             Yperp = Yb[t] - U[t] @ (U[t].mT @ Yb[t])
-            T1.append((Yperp @ tla.pinv(On), near))
+            T1.append((self._solve_band(Yperp, facU[t]), near))
         T2 = []
         for sgn in range(nb):
             near = self._near(lvl, sgn)
-            Pn = torch.cat([Psib[j] for j in near], dim=0)
             Zperp = Zb[sgn] - V[sgn] @ (V[sgn].mT @ Zb[sgn])
-            T2.append((Zperp @ tla.pinv(Pn), near))
+            T2.append((self._solve_band(Zperp, facV[sgn]), near))
         D = {t: {} for t in range(nb)}
         for t in range(nb):
-            UU = U[t] @ U[t].mT
+            Ut = U[t]
             t1mat, near_t = T1[t]
             for jpos, s in enumerate(near_t):
                 t1 = t1mat[:, jpos * b:(jpos + 1) * b]
                 t2mat, near_s = T2[s]
                 ipos = near_s.index(t)
                 t2 = t2mat[:, ipos * b:(ipos + 1) * b].mT
-                D[t][s] = (t1 - UU @ t1) + UU @ t2
+                # D = (I-PU) t1 + PU t2 ; apply PU as U(U^* x), never form UU
+                Pu_t1 = Ut @ (Ut.mT @ t1)
+                Pu_t2 = Ut @ (Ut.mT @ t2)
+                D[t][s] = (t1 - Pu_t1) + Pu_t2
         return D
 
     # -- construction ------------------------------------------------------
@@ -183,14 +218,15 @@ class HBSStrong:
                           for lvl in range(2, self.L + 1)), default=1)
         s = min(maxdeg * max(nl, self.fac * rk) + rk + p, self.N)
         self.nSamples = s
-
+        tic = time.time()
         Om = torch.randn(self.N, s, device=self.device)
         Psi = torch.randn(self.N, s, device=self.device)
-        Omp = torch.zeros_like(Om); Omp[self.perm, :] = Om
-        Psp = torch.zeros_like(Psi); Psp[self.perm, :] = Psi
-        Y = self._apply_A(Omp, adjoint=False)[self.perm, :]
-        Z = self._apply_A(Psp, adjoint=True)[self.perm, :]
-
+        # sketch without allocating separate permuted full-size copies:
+        # A acts in native order; scatter box-order samples into native order
+        # by index, apply, then gather rows back to box order.
+        Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
+        Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
+        print("sample done in : ",time.time()-tic,"s")
         def split(M, nb):
             bb = M.shape[0] // nb
             return [M[i * bb:(i + 1) * bb, :] for i in range(nb)]
@@ -207,15 +243,16 @@ class HBSStrong:
                 break
             self._check_symmetry(lvl)
 
-            U = []; V = []
+            U = []; V = []; facU = []; facV = []
             for t in range(nb):
                 near = self._near(lvl, t)
                 On = torch.cat([Omb[j] for j in near], dim=0)
                 Pn = torch.cat([Psib[j] for j in near], dim=0)
-                U.append(self._far_basis(Yb[t], On, rk))
-                V.append(self._far_basis(Zb[t], Pn, rk))
+                Ut, fu = self._far_basis_and_factor(Yb[t], On, rk)
+                Vt, fv = self._far_basis_and_factor(Zb[t], Pn, rk)
+                U.append(Ut); V.append(Vt); facU.append(fu); facV.append(fv)
 
-            D = self._recover_band(Yb, Zb, Omb, Psib, U, V, lvl)
+            D = self._recover_band(Yb, Zb, U, V, facU, facV, lvl)
             self.U.append(U); self.V.append(V); self.D.append(D)
             self.clevels.append(lvl)
 
@@ -242,12 +279,14 @@ class HBSStrong:
 
     # -- apply -------------------------------------------------------------
     def _apply(self, v, transpose=False):
-        vtorch = torch.from_numpy(v).to(self.device)
-        if v.ndim == 1:
-            vtorch = vtorch[:, None]; squeeze = True
+        was_np = isinstance(v, np.ndarray)
+        vt = (torch.as_tensor(v, dtype=torch.float64, device=self.device)
+              if was_np else v.to(self.device))
+        if vt.ndim == 1:
+            vt = vt[:, None]; squeeze = True
         else:
             squeeze = False
-        vp = vtorch[self.perm, :]
+        vp = vt[self.perm, :]
         Bdown = self.V if not transpose else self.U
         Bup = self.U if not transpose else self.V
 
@@ -290,7 +329,9 @@ class HBSStrong:
         out = torch.zeros_like(u); out[self.perm, :] = u
         if squeeze:
             out = out[:, 0]
-        return out.detach().cpu().numpy()
+        if was_np:
+            return out.detach().cpu().numpy()
+        return out
 
     def matvec(self, v): return self._apply(v, False)
     def rmatvec(self, v): return self._apply(v, True)
