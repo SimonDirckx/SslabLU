@@ -36,7 +36,6 @@ import numpy as np
 import torch
 import torch.linalg as tla
 import time
-
 torch.set_default_dtype(torch.float64)
 
 
@@ -70,6 +69,7 @@ class HBSStrong:
         self.Nb = Nb; self.nl = self.N // Nb; self.L = L
         self.perm = (torch.arange(self.N, dtype=torch.int64) if perm is None
                      else torch.as_tensor(perm, dtype=torch.int64))
+        self.perm = self.perm.to(self.device)
         self.U = []; self.V = []; self.D = []; self.clevels = []
         self.Aroot = None; self._child_ranks_cache = []
         self._near_cache = None; self._invperm_cache = None
@@ -95,7 +95,7 @@ class HBSStrong:
     def _invperm(self):
         if self._invperm_cache is None:
             ip = torch.empty_like(self.perm)
-            ip[self.perm] = torch.arange(self.N, device=self.device)
+            ip[self.perm] = torch.arange(self.N, device=self.perm.device)
             self._invperm_cache = ip
         return self._invperm_cache
 
@@ -226,7 +226,7 @@ class HBSStrong:
         # by index, apply, then gather rows back to box order.
         Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
         Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
-        print("sample done in : ",time.time()-tic,"s")
+        print("HBS sampling done in : ",time.time()-tic,"s")
         def split(M, nb):
             bb = M.shape[0] // nb
             return [M[i * bb:(i + 1) * bb, :] for i in range(nb)]
