@@ -7,26 +7,17 @@ import torch
 import matAssembly.HBS.HBSnew as HBSnew
 #sparse block matrix operations
 
-def block_col(A,rk,device):
-    # batched: A is (Nb, n, k)
-    U = tla.svd(A, full_matrices=False).U
-    return U[:,:,:rk]
+def _rsolve(P, B, fast=False):
+    # batched min-residual solution of  X @ B = P  (i.e. X = P @ pinv(B)).
+    # fast=False: SVD-based pseudoinverse (handles rank deficiency via rcond).
+    # fast=True : QR-based batched least squares; assumes full column rank.
+    if fast:
+        return tla.lstsq(B.mT, P.mT).solution.mT
+    return torch.bmm(P, tla.pinv(B))
 
-def block_col_full(A,device):
-    # batched QR: A is (Nb, n, k)
-    return tla.qr(A, mode='complete').Q
-
-def block_null(A,rk,device):
-    # batched: A is (Nb, n, k); return last rk right singular vectors
-    Vh = tla.svd(A, full_matrices=True).Vh   # (Nb, k, k)
-    return Vh.mT[:,:,-rk:]                   # (Nb, k, rk)
-
-def block_solve_r(A,B,device):
-    Nb = B.shape[0]
-    C  = torch.zeros(size=(Nb, A.shape[1], B.shape[1]), device=device, dtype=A.dtype)
-    for i in range(Nb):
-        C[i,:,:] = A[i,:,:] @ tla.pinv(B[i,:,:])
-    return C
+def block_solve_r(A,B,device,fast=False):
+    # batched: solves X[i] = A[i] @ pinv(B[i]) over the block dim
+    return _rsolve(A, B, fast=fast)
 
 def block_mult(A,B,device,mode='N'):
     # A: (Nb, n, k), B: (Nb, k, m)
@@ -63,28 +54,21 @@ def block_mult_and_reduce(A,B,fac,device,mode='N'):
     else:
         raise ValueError("mode not recognized")
 
-def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,device):
-    Nb = Om_ell.shape[0]
-    C  = torch.zeros(size=(Nb, U_ell.shape[1], Om_ell.shape[1]), device=device, dtype=Y_ell.dtype)
-    for i in range(Nb):
-        Usub   = U_ell[i,:,:]
-        Vsub   = V_ell[i,:,:]
-        Ysub   = Y_ell[i,:,:]
-        Zsub   = Z_ell[i,:,:]
-        Omsub  = Om_ell[i,:,:]
-        Psisub = Psi_ell[i,:,:]
-        C[i,:,:] = (Ysub - Usub@(Usub.T@Ysub)) @ tla.pinv(Omsub) \
-                 + Usub @ (Usub.T @ (((Zsub - Vsub@(Vsub.T@Zsub)) @ tla.pinv(Psisub)).T))
-    return C
+def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,device,fast=False):
+    # batched over the block dim; same per-block algebra as before
+    Yperp = Y_ell - torch.bmm(U_ell, torch.bmm(U_ell.mT, Y_ell))
+    Zperp = Z_ell - torch.bmm(V_ell, torch.bmm(V_ell.mT, Z_ell))
+    term1 = _rsolve(Yperp, Om_ell, fast=fast)
+    inner = _rsolve(Zperp, Psi_ell, fast=fast).mT
+    term2 = torch.bmm(U_ell, torch.bmm(U_ell.mT, inner))
+    return term1 + term2
 
 def compute_UV(Om,Y,rk,device):
-    Nb = Om.shape[0]
-    n  = Om.shape[1]
-    U  = torch.zeros(size=(Nb, Y.shape[1], rk), device=device, dtype=Y.dtype)
-    for i in range(Nb):
-        Q = tla.qr(Om[i,:,:].T, mode='complete').Q
-        U[i,:,:] = (tla.svd(Y[i,:,:] @ Q[:,-n:])[0])[:,:rk]
-    return U
+    # batched over the block dim; same complete QR + SVD per block as before
+    n = Om.shape[1]
+    Q = tla.qr(Om.mT, mode='complete').Q          # (Nb, s, s)
+    M = torch.bmm(Y, Q[:,:,-n:])                   # (Nb, ny, n)
+    return tla.svd(M, full_matrices=False).U[:,:,:rk]
 
 
 class HBSMAT:
@@ -118,7 +102,6 @@ class HBSMAT:
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
-            self.shape  = A.shape
             self.dtype  = A.dtype
             self.device = device
             torch.set_default_dtype(torch.float64)
@@ -164,13 +147,13 @@ class HBSMAT:
         ctr+=sum([V.nbytes for V in self.Vmats])
         ctr+=sum([D.nbytes for D in self.Dmats])
         return ctr
-    def construct(self,rk,compute_ULV=False):
+    def construct(self,rk,compute_ULV=False,fast=False):
         if compute_ULV:
-            self.constructHBS_ULV(rk)
+            self.constructHBS_ULV(rk,fast=fast)
         else: 
-            self.constructHBS(rk)
+            self.constructHBS(rk,fast=fast)
 
-    def constructHBS(self,rk):
+    def constructHBS(self,rk,fast=False):
         # we compute an HBS compression of permuted op
         if self.fac == 4:
             s = 6*rk+4*self.nl+5
@@ -231,14 +214,14 @@ class HBSMAT:
                 V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
                 self.nullTime+=time.time()-tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
                 self.Vmats+=[V_ell]
             else:
                 tic = time.time()
-                D_ell = block_solve_r(Y_ell,Om_ell,self.device)
+                D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
                 self.blockSolveTime+=time.time()-tic
                 # pin leaf-level matrices to CPU to save VRAM
                 if self.device == 'cpu':
@@ -247,7 +230,7 @@ class HBSMAT:
                     self.Dmats+=[D_ell.cpu().pin_memory()]
             self.Nbvec+=[Nb]
         self.tCompress = time.time()-tic
-    def constructHBS_ULV(self,rk):
+    def constructHBS_ULV(self,rk,fast=False):
         torch.set_default_dtype(torch.float64)
         if self.fac == 4:
             s = 6*rk+4*self.nl+5
@@ -306,14 +289,14 @@ class HBSMAT:
                 U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
                 V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
                 self.Vmats+=[V_ell]
             else:
                 tic = time.time()
-                D_ell = block_solve_r(Y_ell,Om_ell,self.device)
+                D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
                 self.blockSolveTime+=time.time()-tic
                 # pin leaf-level matrix to CPU to save VRAM
                 if self.device == 'cpu':

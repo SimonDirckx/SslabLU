@@ -127,7 +127,8 @@ class slabTree:
     """
 
     def __init__(self, XX: np.ndarray, quad: bool = False,
-                 min_leaf_size: int = 1,max_level=np.inf, line_tol: float = 1e-8):
+                 min_leaf_size: int = 1,max_level=np.inf, line_tol: float = 1e-8,
+                 adjacency: str = 'partial'):
 
         # -- normalise input --------------------------------------------------
         XX = np.asarray(XX, dtype=float)
@@ -146,6 +147,9 @@ class slabTree:
 
         self._XX            = XX
         self._quad          = quad
+        if adjacency not in ('partial', 'full'):
+            raise ValueError("adjacency must be 'partial' or 'full'.")
+        self._adjacency     = adjacency
         self._min_leaf_size = min_leaf_size
         self._max_level = max_level
         self._boxes: dict[int, _Node] = {}
@@ -343,6 +347,9 @@ class slabTree:
             self._build_adjacency_binary()
 
     def _build_adjacency_binary(self):
+        if self._adjacency == 'full':
+            self._build_adjacency_binary_full()
+            return
         adjacency = []
         for lvl in range(self.nlevels):
             split_x = (lvl % 2 == 1)
@@ -365,6 +372,73 @@ class slabTree:
                         adj_lvl+=[(self.get_node(gr[0]).children[0].index,self.get_node(gr[1]).children[0].index,opp_dir)]
                         adj_lvl+=[(self.get_node(gr[0]).children[1].index,self.get_node(gr[1]).children[1].index,opp_dir)]
                 adjacency+=[adj_lvl]
+        self.adjacency = adjacency
+
+    @staticmethod
+    def _axis_gap(a_lo, a_hi, b_lo, b_hi):
+        """Signed gap between intervals [a_lo,a_hi] and [b_lo,b_hi]:
+        negative if overlapping, 0 if sharing an endpoint, +sep if separated."""
+        return max(a_lo - b_hi, b_lo - a_hi)
+
+    def _boxes_touch(self, P, Q, alpha=1e-3):
+        """Geometric contact test from node bounds, robust to all eps cases.
+
+        Two boxes are 'in contact' iff the signed gap on EVERY axis is within a
+        size-relative tolerance alpha*h (h = smaller box's width on that axis).
+        This treats truly-overlapping (gap<0), exactly-shared (gap=0) and
+        eps-separated (0<gap<<h) arrangements identically as touching, while
+        alpha<1 guarantees a non-touching box one full width away is excluded.
+        """
+        bp, bq = P.bounds, Q.bounds
+        if len(bp) == 2:                                   # line geometry
+            h = min(bp[1] - bp[0], bq[1] - bq[0])
+            return self._axis_gap(bp[0], bp[1], bq[0], bq[1]) <= alpha * h
+        axl, axh, ayl, ayh = bp
+        bxl, bxh, byl, byh = bq
+        hx = min(axh - axl, bxh - bxl)
+        hy = min(ayh - ayl, byh - byl)
+        gx = self._axis_gap(axl, axh, bxl, bxh)
+        gy = self._axis_gap(ayl, ayh, byl, byh)
+        return (gx <= alpha * hx) and (gy <= alpha * hy)
+
+    def _build_adjacency_binary_full(self):
+        """
+        Geometric ('full') adjacency, computed efficiently.
+
+        Candidate neighbour pairs at level l are restricted by the tree
+        structure: since two touching boxes must have parents that touch or
+        coincide, candidates are only (a) siblings and (b) children of adjacent
+        parents at level l-1.  That is O(1) candidates per box (O(N) total).
+        Each candidate is confirmed by the exact geometric gap test
+        (_boxes_touch), so the result is the true geometric (Moore) adjacency
+        -- every real neighbour kept, no spurious ones, no full O(n^2) scan.
+        """
+        adjacency = []
+        for lvl in range(self.nlevels):
+            adj_lvl = []
+            if lvl == 0:
+                adjacency.append(adj_lvl)
+                continue
+            # (a) sibling candidates
+            cand = []
+            for node in self.get_nodes_level(lvl - 1):
+                if node.is_leaf:
+                    continue
+                c = node.children
+                cand.append((c[0], c[1]))
+            # (b) children-of-adjacent-parents candidates
+            for (ai, bi, _d) in adjacency[lvl - 1]:
+                A = self.get_node(ai); B = self.get_node(bi)
+                if A.is_leaf or B.is_leaf:
+                    continue
+                for ca in A.children:
+                    for cb in B.children:
+                        cand.append((ca, cb))
+            # confirm by geometry
+            for (P, Q) in cand:
+                if self._boxes_touch(P, Q):
+                    adj_lvl.append((P.index, Q.index, None))
+            adjacency.append(adj_lvl)
         self.adjacency = adjacency
 
     def _build_adjacency_quad(self):

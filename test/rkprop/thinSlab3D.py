@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import SOMS3D_csr
 import torch
 import matAssembly.HBS.slabTree as slabTree
-import matAssembly.HBS.HBStorch as HBStorch
+import matAssembly.HBS.HBStorch_strong as HBStorch
 from scipy.sparse.linalg import LinearOperator
 import solver.stencil.stencilSolver as stencil
 import solver.stencil.geom as geom
@@ -41,14 +41,14 @@ def bc_helmholtz(p,kh):
     r = np.sqrt((p[:,0]+.5)**2+(p[:,1]+.5)**2+(p[:,2]+.5)**2)
     return np.real(np.exp(1j*kh*r)/(4*np.pi*r))
 
-Lx = 2/16
+Lx = 32/65
 Ly = 1.
 Lz = 1.
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-kh = 20.
+kh = 5.
 
 def  c11(p):
     return np.ones_like(p[:,0])
@@ -77,8 +77,8 @@ if solve_method == 'SOMS':
     
 elif solve_method=='stencil':
     nx = 32+1
-    ny = 256
-    nz = 256
+    ny = 64
+    nz = 64
     ord = [nx,ny,nz]
     solver = stencil.stencilSolver(HH,slabGeom,ord)
     Sii = solver.Aii
@@ -142,8 +142,8 @@ else:
 # Solution operator columns: SS* maps boundary data on face * -> centerline
 # Sii @ u_i = -Sib @ u_b  =>  u_i = -Sii^{-1} Sib u_b
 # Extract rows corresponding to Jc for each boundary face.
-if  torch.cuda.is_available():
-        device = torch.cuda.get_device_name()
+if torch.cuda.is_available():
+    device = 'cuda'          # or 'cuda:0' to pin a specific GPU
 else:
     device = 'cpu'
 
@@ -173,7 +173,7 @@ if solve_method=='SOMS':
         matmat = lambda v:smatmat(v,Jc,Jr), rmatmat = lambda v:smatmat(v,Jc,Jr,transpose=True))
 
 elif solve_method=='stencil':    
-    tree = slabTree.slabTree(XXr,False,8*8)
+    tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
     def smatmat(v, transpose=False):
         if v.ndim == 1:
@@ -224,15 +224,26 @@ elif solve_method=='stencil':
 
 else:
     raise ValueError("solve method not recognized")
+print("=========     PERM TEST:     =========")
+print(np.allclose(np.sort(XXr[:,1]), np.sort(XYtot[Jc_large][:,1])))   # same y-set?
+# row-by-row alignment in (y,z), in the orders actually used:
+print(np.allclose(XXr[:,1:3], XYtot[Jc_large][:,1:3]))
+assert tree.perm_leaf.shape[0] == XXr.shape[0]
+assert np.unique(tree.perm_leaf).size == XXr.shape[0]
+sizes = [len(tree.get_box_inds(l)) for l in tree.get_leaves()]
+print(set(sizes))   # want a single value
 print("=========  LINOP CONSTRUCTED  =========")
-SSr = HBStorch.HBSMAT(LinOp,device,tree,False)
+SSr = HBStorch.HBSStrong(LinOp,device=device,tree=tree)
 print("============  COMPRESS HBS  ============")
-SSr.construct(50,False)
+SSr.construct(20)
 print("============    HBS DONE    ============")
 
 ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
 ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
 ur = -(SSr@rhsS[Jr])[Jc_inJc]
+ur = ur.detach().cpu().numpy()
+print("ur type = ",type(ur))
+print("ur shape = ",ur.shape)
 # Approximate centerline solution as sum over all 6 boundary contributions
 uhat_S = ul+ur+ub
 
