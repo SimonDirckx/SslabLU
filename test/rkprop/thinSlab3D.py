@@ -13,6 +13,7 @@ import mumps
 import scipy.sparse as sparse
 
 import os
+
 def rss_gb():
     with open(f"/proc/{os.getpid()}/status") as f:
         for line in f:
@@ -148,11 +149,8 @@ else:
     device = 'cpu'
 
 if solve_method=='SOMS':
-    tree = slabTree.slabTree(XXc,False,8*8)
-    
-
-    def smatmat(v,transpose=False):
-                
+    tree = slabTree.slabTree(XXc,False,8*8) 
+    def smatmat(v,transpose=False):                
                 if (v.ndim == 1):
                     v_tmp = v[:,np.newaxis]
                 else:
@@ -190,28 +188,21 @@ elif solve_method=='stencil':
         else:
             # Transpose:  L^T w = Sib[:,Jr]^T · A^{-T} · P_{Jc}^T · E^T · w
             k = v_tmp.shape[1]
-            print(f"[T] entry        RSS={rss_gb():.2f} GB", flush=True)
-            # E^T: restrict the global-interface input down to this domain's Jc
             w_Jc = v_tmp[Jc_inJc, :]            # (|Jc|, k)   -- Jc_inJc indexes Jc_large
-            print("[T] w_Jc", w_Jc.shape, round(w_Jc.nbytes/1e9, 3), "GB", flush=True)
-
-            # P_{Jc}^T: scatter into the interior-sized RHS at rows Jc
-            rhs = np.zeros((len(Ii), k))
-            rhs[Jc, :] = w_Jc                   # Jc is already interior-local
-            print("[T] rhs", rhs.shape, round(rhs.nbytes/1e9, 3), "GB",
-                "| Jc max", int(Jc.max()), "len(Ii)", len(Ii), flush=True)
-
-            # A^{-T}
-            sol = ctxT.solve(rhs)               # (|Ii|, k)
-            print("[T] solve done:", sol.shape, round(sol.nbytes/1e9, 3), "GB",
-                type(sol).__name__, flush=True)
+            m = len(Jc)
+            rhs = sparse.csc_matrix(
+                (
+                    w_Jc.ravel(order="F"),          # data, column-major
+                    np.tile(Jc, k),                 # row indices
+                    np.arange(0, m*k + 1, m)        # column pointers
+                ),
+                shape=(len(Ii), k),
+            )
+            sol = ctxT._solve_sparse(rhs)               # (|Ii|, k)
             del rhs                             # free 1.6 GB before the matmul
-
-            # Sib[:,Jr]^T @ sol  -- canonical CSR, .dot() forces scipy dispatch
-            print("[T] Sib_Jr_T", Sib_Jr_T.shape, "nnz", Sib_Jr_T.nnz,
-                Sib_Jr_T.format, "canonical", Sib_Jr_T.has_canonical_format, flush=True)
-            result = Sib_Jr_T.dot(sol)          # (|Jr|, k)
-            print("[T] matmul done:", result.shape, flush=True)
+            ctxT.mumps_instance.icntl[20]=0
+            result = Sib_Jr_T@sol
+            # costa
             del sol
         if v.ndim == 1:
             result = result.flatten()
@@ -220,8 +211,6 @@ elif solve_method=='stencil':
     LinOp = LinearOperator(shape=(len(Jc_large),len(Jr)),\
         matvec = lambda v:smatmat(v), rmatvec = lambda v:smatmat(v,transpose=True),\
         matmat = lambda v:smatmat(v), rmatmat = lambda v:smatmat(v,transpose=True))
-
-
 else:
     raise ValueError("solve method not recognized")
 print("=========     PERM TEST:     =========")
@@ -241,10 +230,6 @@ print("============    HBS DONE    ============")
 ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
 ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
 ur = -(SSr@rhsS[Jr])[Jc_inJc]
-ur = ur.detach().cpu().numpy()
-print("ur type = ",type(ur))
-print("ur shape = ",ur.shape)
-# Approximate centerline solution as sum over all 6 boundary contributions
 uhat_S = ul+ur+ub
 
 err2 = np.linalg.norm(uhat_S - uS, ord=2) / np.linalg.norm(uS, ord=2)

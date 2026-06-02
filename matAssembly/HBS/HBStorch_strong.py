@@ -242,7 +242,7 @@ class HBSStrong:
 
     # -- apply -------------------------------------------------------------
     def _apply(self, v, transpose=False):
-        vtorch = torch.from_numpy(v)
+        vtorch = torch.from_numpy(v).to(self.device)
         if v.ndim == 1:
             vtorch = vtorch[:, None]; squeeze = True
         else:
