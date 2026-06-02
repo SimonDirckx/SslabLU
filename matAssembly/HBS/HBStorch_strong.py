@@ -1,9 +1,9 @@
 """
-HBStorch_strong.py  (consolidated)
+HBStorch_strong.py  (consolidated, tagging removed)
 =====================================================================
 Strong-admissibility HBS *compression* from black-box matvecs.
 
-Adjacency convention (NEW):
+Adjacency convention:
   * The neighbour structure supplied EXCLUDES self.  A tree's
     level_adj_list[lvl][t] lists boxes adjacent to t at level lvl, NOT t.
   * Internally the compressor always uses the NEAR band
@@ -20,6 +20,11 @@ The near band appears in four places, all self-inclusive via _near():
 
 Adjacency assumed SYMMETRIC (checked).  Compression only.  Variable neighbour
 degree supported via per-box loops.
+
+Operator interface: A may be a scipy LinearOperator (uses matmat / rmatmat) or
+any object exposing matmat/rmatmat, matvec/rmatvec, or @ and conj().T.  No .mT
+is required.  Torch<->numpy and host<->device transfers are handled at the two
+sketch calls only (scipy operators run on host numpy).
 
 Inputs:
     HBSStrong(A, tree=T)                          # T gives adjacency, perm, sizes
@@ -67,6 +72,7 @@ class HBSStrong:
         self.U = []; self.V = []; self.D = []; self.clevels = []
         self.Aroot = None; self._child_ranks_cache = []
 
+    # -- neighbour access (self-EXCLUDED) ----------------------------------
     def _nbrs(self, lvl, t):
         if self._nbr_mode == '1d':
             return neighbors_1d_excl(t, self._nb_at(lvl))
@@ -107,6 +113,30 @@ class HBSStrong:
         nb = self._nb_at(lvl)
         return [[2 * P, 2 * P + 1] for P in range(nb // self.fac)]
 
+    # -- operator application (scipy LinearOperator: matmat / rmatmat) -----
+    def _apply_A(self, Xt, adjoint=False):
+        """Apply A (or A^*) to a torch matrix Xt.  Handles the torch<->numpy and
+        host<->device boundary: scipy LinearOperators require host numpy input.
+        No .mT used."""
+        Xnp = Xt.detach().cpu().numpy()
+        Op = self.A
+        if adjoint:
+            if hasattr(Op, 'rmatmat'):
+                Ynp = Op.rmatmat(Xnp)
+            elif hasattr(Op, 'rmatvec'):
+                Ynp = np.column_stack([Op.rmatvec(Xnp[:, j]) for j in range(Xnp.shape[1])])
+            else:
+                Ynp = (Op.conj().T) @ Xnp
+        else:
+            if hasattr(Op, 'matmat'):
+                Ynp = Op.matmat(Xnp)
+            elif hasattr(Op, 'matvec'):
+                Ynp = np.column_stack([Op.matvec(Xnp[:, j]) for j in range(Xnp.shape[1])])
+            else:
+                Ynp = Op @ Xnp
+        return torch.as_tensor(np.asarray(Ynp), dtype=Xt.dtype, device=Xt.device)
+
+    # -- core linear algebra ----------------------------------------------
     @staticmethod
     def _far_basis(Yt, On, rk):
         gb = On.shape[0]
@@ -142,6 +172,7 @@ class HBSStrong:
                 D[t][s] = (t1 - UU @ t1) + UU @ t2
         return D
 
+    # -- construction ------------------------------------------------------
     def construct(self, rk, p=10):
         nl = self.nl
         if self._nbr_mode == '1d' or self._adj is None:
@@ -151,13 +182,14 @@ class HBSStrong:
                                for t in range(self._nb_at(lvl))), default=1)
                           for lvl in range(2, self.L + 1)), default=1)
         s = min(maxdeg * max(nl, self.fac * rk) + rk + p, self.N)
+        self.nSamples = s
 
         Om = torch.randn(self.N, s, device=self.device)
         Psi = torch.randn(self.N, s, device=self.device)
         Omp = torch.zeros_like(Om); Omp[self.perm, :] = Om
         Psp = torch.zeros_like(Psi); Psp[self.perm, :] = Psi
-        Y = torch.from_numpy((self.A @ Omp)[self.perm, :])
-        Z = torch.from_numpy((self.A.T @ Psp)[self.perm, :])
+        Y = self._apply_A(Omp, adjoint=False)[self.perm, :]
+        Z = self._apply_A(Psp, adjoint=True)[self.perm, :]
 
         def split(M, nb):
             bb = M.shape[0] // nb
@@ -208,6 +240,7 @@ class HBSStrong:
             lvl -= 1
         return self
 
+    # -- apply -------------------------------------------------------------
     def _apply(self, v, transpose=False):
         if v.ndim == 1:
             v = v[:, None]; squeeze = True
@@ -308,9 +341,11 @@ def _build_exact_hbs_1d(L, m, r, seed=0):
 
 
 if __name__ == "__main__":
-    print("regression: 1D exact-HBS, self-excluded 1D adjacency")
+    from scipy.sparse.linalg import aslinearoperator
+    print("regression: 1D exact-HBS via scipy LinearOperator (no .mT)")
     A = _build_exact_hbs_1d(3, 100, 5, seed=0); N = A.shape[0]
-    H = HBSStrong(A, Nb=8, L=3).construct(rk=5, p=10)
+    LinOp = aslinearoperator(A.numpy())
+    H = HBSStrong(LinOp, Nb=8, L=3).construct(rk=5, p=10)
     relF = (H @ torch.eye(N) - A).norm() / torch.linalg.matrix_norm(A, ord='fro')
     print(f"  full ||A_h - A||_F / ||A||_F = {relF:.3e}  "
           f"({'machine precision' if relF < 1e-10 else 'FAIL'})")
