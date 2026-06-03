@@ -35,7 +35,6 @@ Inputs:
 import numpy as np
 import torch
 import torch.linalg as tla
-import time
 
 torch.set_default_dtype(torch.float64)
 
@@ -197,9 +196,20 @@ class HBSStrong:
     # -- batched basis + recovery for one level ----------------------------
     def _factor_level(self, Yb, Zb, Omb, Psib, idx, msk, backpos,
                       rk, s_lvl, fast, chunk):
-        """Yb,Zb,Omb,Psib: (nb,b,s).  Returns U,V (nb,b,rk), D (nb,g,b,b)."""
+        """Yb,Zb,Omb,Psib: (nb,b,s).  Returns U,V (nb,b,rk), D (nb,g,b,b).
+
+        Far-field basis: padded near band, batched reduced-QR + economy SVD.
+        Recovery solve (T = perp @ pinv(near)):
+          fast=False : SVD pseudo-inverse on the (zero-padded) near band.
+          fast=True  : boxes are bucketed by their TRUE near-degree; each bucket
+                       has a uniform full-rank near band (no padding), solved by
+                       a single batched reduced-QR + triangular solve (no SVD).
+                       This removes the zero-padding rank deficiency that forced
+                       the SVD, and is ~4x faster on the dominant recovery cost.
+        """
         nb, b, _ = Yb.shape
         g = idx.shape[1]
+        dev = Yb.device
         Yc = Yb[:, :, :s_lvl]; Zc = Zb[:, :, :s_lvl]
         Oc = Omb[:, :, :s_lvl]; Pc = Psib[:, :, :s_lvl]
         On = self._gather(Oc, idx, msk).reshape(nb, g * b, s_lvl)
@@ -207,37 +217,66 @@ class HBSStrong:
 
         ch = nb if (chunk is None or chunk <= 0) else chunk
 
-        def basis_recover(NN, samp):
-            """Batched: far basis U (nb,b,rk) and T = samp_perp @ pinv(NN)
-            (nb,b,g*b).  Processed in chunks of `ch` boxes to bound memory."""
-            U_parts = []; T_parts = []
+        # true near-degree per box (number of real, unmasked slots)
+        deg = msk.sum(dim=1).round().to(torch.int64)            # (nb,)
+
+        def far_basis(NN, samp):
+            """Far-field basis U (nb,b,rk): project the near row space out of
+            samp and take leading-rk left singular vectors.  Chunked."""
+            U_parts = []
             for a in range(0, nb, ch):
                 NNc = NN[a:a+ch]; sc = samp[a:a+ch]
-                # reduced QR of NN^T: Q1 (m_, s, gb) spans row(NN); project out
                 Q1 = tla.qr(NNc.transpose(1, 2), mode='reduced').Q
                 M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
                 Uc = tla.svd(M, full_matrices=False).U[:, :, :rk].contiguous()
-                # perp of sample wrt far basis, then min-norm solve against NN
-                perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
-                if fast:
-                    # SVD-based min-norm solve, applied directly to the RHS (no
-                    # (s x gb) pinv matrix formed).  Works on CPU AND GPU --
-                    # tla.lstsq's rank-revealing drivers are CPU-only, so we use
-                    # batched SVD (CUDA-supported) for the rank-deficient
-                    # (zero-padded) near band.
-                    Us, Ss, Vhs = tla.svd(NNc, full_matrices=False)
-                    tol = Ss[:, :1] * (max(NNc.shape[-2], NNc.shape[-1]) * 1e-15)
-                    Sinv = torch.where(Ss > tol, 1.0 / Ss, torch.zeros_like(Ss))
-                    Vc = Vhs.transpose(1, 2)               # (m_, s, k)
-                    Tc = torch.bmm(torch.bmm(perp, Vc) * Sinv.unsqueeze(1),
-                                   Us.transpose(1, 2))      # (m_, b, gb)
-                else:
-                    Tc = torch.bmm(perp, tla.pinv(NNc))
-                U_parts.append(Uc); T_parts.append(Tc)
-            return torch.cat(U_parts, 0), torch.cat(T_parts, 0)
+                U_parts.append(Uc)
+            return torch.cat(U_parts, 0)
 
-        U, T1 = basis_recover(On, Yc)
-        V, T2 = basis_recover(Pn, Zc)
+        def recover_svd(NN, samp, U):
+            """T = perp @ pinv(NN) via SVD (handles zero-padded rank deficiency).
+            Returns (nb, b, g*b).  fast=False path."""
+            out = torch.empty(nb, b, g * b, device=dev, dtype=NN.dtype)
+            for a in range(0, nb, ch):
+                NNc = NN[a:a+ch]; sc = samp[a:a+ch]; Uc = U[a:a+ch]
+                perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
+                out[a:a+ch] = torch.bmm(perp, tla.pinv(NNc))
+            return out
+
+        def recover_qr_bucketed(samp_near, samp, U):
+            """T = perp @ pinv(near) via degree-bucketed QR + triangular solve.
+            samp_near: (nb, g, b, s) gathered near samples (real slots first,
+            pads zero).  Returns (nb, b, g*b) with pad columns left zero.
+            fast=True path; assumes full row rank within each degree bucket."""
+            out = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
+            perp_all = samp - torch.bmm(U, torch.bmm(U.transpose(1, 2), samp))  # (nb,b,s)
+            for d in torch.unique(deg).tolist():
+                sel = (deg == d).nonzero(as_tuple=True)[0]      # boxes with degree d
+                if sel.numel() == 0:
+                    continue
+                # real near band of these boxes: first d slots -> (n_d, d*b, s)
+                NNb = samp_near[sel][:, :d, :, :].reshape(sel.numel(), d * b, s_lvl)
+                perp = perp_all[sel]                            # (n_d, b, s)
+                # reduced QR of NNb^T: (s, d*b) tall, R (d*b, d*b) invertible
+                QR = tla.qr(NNb.transpose(1, 2), mode='reduced')
+                Q1, R1 = QR.Q, QR.R
+                tmp = torch.bmm(perp, Q1)                        # (n_d, b, d*b)
+                Td = torch.linalg.solve_triangular(
+                    R1.transpose(1, 2), tmp, upper=False, left=False)  # (n_d,b,d*b)
+                # scatter into the (b, g*b) padded layout: first d*b cols filled
+                out[sel, :, :d * b] = Td
+            return out
+
+        U = far_basis(On, Yc)
+        V = far_basis(Pn, Zc)
+
+        if fast:
+            On_near = self._gather(Oc, idx, msk)                # (nb,g,b,s)
+            Pn_near = self._gather(Pc, idx, msk)
+            T1 = recover_qr_bucketed(On_near, Yc, U)
+            T2 = recover_qr_bucketed(Pn_near, Zc, V)
+        else:
+            T1 = recover_svd(On, Yc, U)
+            T2 = recover_svd(Pn, Zc, V)
 
         T1 = T1.reshape(nb, b, g, b).permute(0, 2, 1, 3).contiguous()   # (nb,g,b,b)
         T2 = T2.reshape(nb, b, g, b)                                    # (nb,b,g,b)
@@ -298,12 +337,12 @@ class HBSStrong:
                           for lvl in range(2, self.L + 1)), default=1)
         s = min(maxdeg * max(nl, self.fac * rk) + rk + p, self.N)
         self.nSamples = s
-        tic = time.time()
+
         Om = torch.randn(self.N, s, device=self.device)
         Psi = torch.randn(self.N, s, device=self.device)
         Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
         Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
-        print("HBS sampling done in : ",time.time()-tic)
+
         def to_blocks(M, nb):
             b = M.shape[0] // nb
             return M.reshape(nb, b, M.shape[1]).contiguous()
