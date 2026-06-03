@@ -194,20 +194,19 @@ elif solve_method=='stencil':
             del result_tmp
 
         else:
-            # Transpose:  L^T w = Sib[:,Jr]^T · A^{-T} · P_{Jc}^T · E^T · w
             k = v_tmp.shape[1]
-            w_Jc = v_tmp[Jc_inJc, :]            # (|Jc|, k)   -- Jc_inJc indexes Jc_large
+            w_Jc = v_tmp[Jc_inJc, :]            
             m = len(Jc)
             rhs = sparse.csc_matrix(
                 (
-                    w_Jc.ravel(order="F"),          # data, column-major
-                    np.tile(Jc, k),                 # row indices
-                    np.arange(0, m*k + 1, m)        # column pointers
+                    w_Jc.ravel(order="F"),          
+                    np.tile(Jc, k),                 
+                    np.arange(0, m*k + 1, m)        
                 ),
                 shape=(len(Ii), k),
             )
-            sol = ctxT._solve_sparse(rhs)               # (|Ii|, k)
-            del rhs                             # free 1.6 GB before the matmul
+            sol = ctxT._solve_sparse(rhs)               
+            del rhs                             
             ctxT.mumps_instance.icntl[20]=0
             result = Sib_Jr_T@sol
             # costa
