@@ -16,10 +16,12 @@ one tensor D[i] of shape (nb, g_max, b, b).  No s x s factor is ever formed
 chunk= bounds that by processing boxes in groups.
 
 Zero-padded near rows make On rank-deficient; the recovery solve therefore uses
-a min-norm pseudo-inverse:
-    fast=False : SVD pinv  (tla.pinv)
-    fast=True  : batched least squares (tla.lstsq, driver gelsd) -- both give the
-                 min-norm solution on the padded system.
+a min-norm pseudo-inverse, computed with batched SVD so it runs on CPU AND GPU
+(torch.linalg.lstsq's rank-revealing drivers are CPU-only):
+    fast=False : Wt @ tla.pinv(On)          (forms the pinv matrix, then applies)
+    fast=True  : SVD-solve applied to the RHS directly (no (s x gb) pinv matrix;
+                 same SVD, fewer flops / less memory in the apply).
+Both give the min-norm solution on the padded system.
 
 Operator A: scipy LinearOperator (matmat/rmatmat) or @/conj().T; no .mT on A.
 Internal storage (U,V,D,index/mask) is private; matvec/rmatvec/@ + constructor
@@ -218,8 +220,17 @@ class HBSStrong:
                 # perp of sample wrt far basis, then min-norm solve against NN
                 perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
                 if fast:
-                    Tc = tla.lstsq(NNc.transpose(1, 2), perp.transpose(1, 2),
-                                   driver='gelsd').solution.transpose(1, 2)
+                    # SVD-based min-norm solve, applied directly to the RHS (no
+                    # (s x gb) pinv matrix formed).  Works on CPU AND GPU --
+                    # tla.lstsq's rank-revealing drivers are CPU-only, so we use
+                    # batched SVD (CUDA-supported) for the rank-deficient
+                    # (zero-padded) near band.
+                    Us, Ss, Vhs = tla.svd(NNc, full_matrices=False)
+                    tol = Ss[:, :1] * (max(NNc.shape[-2], NNc.shape[-1]) * 1e-15)
+                    Sinv = torch.where(Ss > tol, 1.0 / Ss, torch.zeros_like(Ss))
+                    Vc = Vhs.transpose(1, 2)               # (m_, s, k)
+                    Tc = torch.bmm(torch.bmm(perp, Vc) * Sinv.unsqueeze(1),
+                                   Us.transpose(1, 2))      # (m_, b, gb)
                 else:
                     Tc = torch.bmm(perp, tla.pinv(NNc))
                 U_parts.append(Uc); T_parts.append(Tc)
@@ -292,7 +303,7 @@ class HBSStrong:
         Psi = torch.randn(self.N, s, device=self.device)
         Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
         Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
-        print("HBS sampling done in : ",time.time()-tic,"s")
+        print("HBS sampling done in : ",time.time()-tic)
         def to_blocks(M, nb):
             b = M.shape[0] // nb
             return M.reshape(nb, b, M.shape[1]).contiguous()
