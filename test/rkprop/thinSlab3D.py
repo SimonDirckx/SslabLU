@@ -42,7 +42,7 @@ def bc_helmholtz(p,kh):
     r = np.sqrt((p[:,0]+.5)**2+(p[:,1]+.5)**2+(p[:,2]+.5)**2)
     return np.real(np.exp(1j*kh*r)/(4*np.pi*r))
 
-Lx = 32/65
+Lx = 1./8.
 Ly = 1.
 Lz = 1.
 cx = Lx/2
@@ -77,9 +77,10 @@ if solve_method == 'SOMS':
          coeffs, True, None, weighted=False)
     
 elif solve_method=='stencil':
-    nx = 32+1
-    ny = 64
-    nz = 64
+    n = 128
+    nx = int(Lx*128) + 1
+    ny = n
+    nz = n
     ord = [nx,ny,nz]
     solver = stencil.stencilSolver(HH,slabGeom,ord)
     Sii = solver.Aii
@@ -227,7 +228,7 @@ print("=========  LINOP CONSTRUCTED  =========")
 SSr = HBStorch.HBSStrong(LinOp,device=device,tree=tree)
 print("============  COMPRESS HBS  ============")
 tic = time.time()
-SSr.construct(20)
+SSr.construct(20,fast = True)
 print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 

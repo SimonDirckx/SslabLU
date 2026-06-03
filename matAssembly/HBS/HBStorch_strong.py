@@ -212,17 +212,18 @@ class HBSStrong:
         dev = Yb.device
         Yc = Yb[:, :, :s_lvl]; Zc = Zb[:, :, :s_lvl]
         Oc = Omb[:, :, :s_lvl]; Pc = Psib[:, :, :s_lvl]
-        On = self._gather(Oc, idx, msk).reshape(nb, g * b, s_lvl)
-        Pn = self._gather(Pc, idx, msk).reshape(nb, g * b, s_lvl)
+        if not fast:
+            On = self._gather(Oc, idx, msk).reshape(nb, g * b, s_lvl)
+            Pn = self._gather(Pc, idx, msk).reshape(nb, g * b, s_lvl)
 
         ch = nb if (chunk is None or chunk <= 0) else chunk
 
         # true near-degree per box (number of real, unmasked slots)
         deg = msk.sum(dim=1).round().to(torch.int64)            # (nb,)
 
-        def far_basis(NN, samp):
-            """Far-field basis U (nb,b,rk): project the near row space out of
-            samp and take leading-rk left singular vectors.  Chunked."""
+        def far_basis_padded(NN, samp):
+            """fast=False basis: padded near band, reduced QR for the null-space
+            projector, economy SVD for the leading-rk basis.  Chunked."""
             U_parts = []
             for a in range(0, nb, ch):
                 NNc = NN[a:a+ch]; sc = samp[a:a+ch]
@@ -242,39 +243,44 @@ class HBSStrong:
                 out[a:a+ch] = torch.bmm(perp, tla.pinv(NNc))
             return out
 
-        def recover_qr_bucketed(samp_near, samp, U):
-            """T = perp @ pinv(near) via degree-bucketed QR + triangular solve.
-            samp_near: (nb, g, b, s) gathered near samples (real slots first,
-            pads zero).  Returns (nb, b, g*b) with pad columns left zero.
-            fast=True path; assumes full row rank within each degree bucket."""
-            out = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
-            perp_all = samp - torch.bmm(U, torch.bmm(U.transpose(1, 2), samp))  # (nb,b,s)
+        def basis_and_recover_bucketed(samp_near, samp):
+            """fast=True: bucket boxes by TRUE near-degree.  ONE reduced QR of
+            the unpadded near band per bucket serves BOTH:
+              * the far-field basis  (null-space projector I - Q1 Q1^*),
+              * the recovery solve   (T = perp @ pinv(near) = (perp Q1) R1^{-T}).
+            samp_near: (nb,g,b,s) real-slots-first; samp: (nb,b,s).
+            Returns U (nb,b,rk) and T (nb,b,g*b) (pad cols zero)."""
+            U = torch.empty(nb, b, rk, device=dev, dtype=samp.dtype)
+            T = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
             for d in torch.unique(deg).tolist():
-                sel = (deg == d).nonzero(as_tuple=True)[0]      # boxes with degree d
+                sel = (deg == d).nonzero(as_tuple=True)[0]
                 if sel.numel() == 0:
                     continue
-                # real near band of these boxes: first d slots -> (n_d, d*b, s)
                 NNb = samp_near[sel][:, :d, :, :].reshape(sel.numel(), d * b, s_lvl)
-                perp = perp_all[sel]                            # (n_d, b, s)
-                # reduced QR of NNb^T: (s, d*b) tall, R (d*b, d*b) invertible
+                sc = samp[sel]                                  # (n_d, b, s)
+                # single reduced QR of the unpadded near band^T: (s, d*b)
                 QR = tla.qr(NNb.transpose(1, 2), mode='reduced')
-                Q1, R1 = QR.Q, QR.R
-                tmp = torch.bmm(perp, Q1)                        # (n_d, b, d*b)
+                Q1, R1 = QR.Q, QR.R                             # Q1:(n_d,s,d*b)
+                # far-field basis: project near row space out of sample
+                M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
+                U[sel] = tla.svd(M, full_matrices=False).U[:, :, :rk].contiguous()
+                # recovery: perp wrt the just-found basis, then triangular solve
+                Uc = U[sel]
+                perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
+                tmp = torch.bmm(perp, Q1)                        # (n_d,b,d*b)
                 Td = torch.linalg.solve_triangular(
-                    R1.transpose(1, 2), tmp, upper=False, left=False)  # (n_d,b,d*b)
-                # scatter into the (b, g*b) padded layout: first d*b cols filled
-                out[sel, :, :d * b] = Td
-            return out
-
-        U = far_basis(On, Yc)
-        V = far_basis(Pn, Zc)
+                    R1.transpose(1, 2), tmp, upper=False, left=False)
+                T[sel, :, :d * b] = Td
+            return U, T
 
         if fast:
             On_near = self._gather(Oc, idx, msk)                # (nb,g,b,s)
             Pn_near = self._gather(Pc, idx, msk)
-            T1 = recover_qr_bucketed(On_near, Yc, U)
-            T2 = recover_qr_bucketed(Pn_near, Zc, V)
+            U, T1 = basis_and_recover_bucketed(On_near, Yc)
+            V, T2 = basis_and_recover_bucketed(Pn_near, Zc)
         else:
+            U = far_basis_padded(On, Yc)
+            V = far_basis_padded(Pn, Zc)
             T1 = recover_svd(On, Yc, U)
             T2 = recover_svd(Pn, Zc, V)
 
