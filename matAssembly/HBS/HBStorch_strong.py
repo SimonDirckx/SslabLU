@@ -567,7 +567,7 @@ def _build_exact_hbs_1d(L, m, r, seed=0):
                 A[a*m:(a+1)*m, bb*m:(bb+1)*m] = rng.standard_normal((m, m))
     return torch.from_numpy(A)
 
-
+# little test
 if __name__ == "__main__":
     from scipy.sparse.linalg import aslinearoperator
     A = _build_exact_hbs_1d(3, 100, 5, seed=0); N = A.shape[0]
