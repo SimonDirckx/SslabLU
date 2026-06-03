@@ -177,43 +177,33 @@ elif solve_method=='stencil':
     tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
     Sib_Jr = Sib[:,Jr].tocsc()
+    BLK = 64                                   # tune; see note below
+    ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
+    ctxT.mumps_instance.icntl[27] = BLK
+
     def smatmat(v, transpose=False):
-        if v.ndim == 1:
-            v_tmp = v[:, np.newaxis]
-        else:
-            v_tmp = v
-
+        v_tmp = v[:, None] if v.ndim == 1 else v
+        k = v_tmp.shape[1]
         if not transpose:
-            # Forward:  L v = E_{Jc_inJc -> Jc_large} · P_{Jc ⊂ Ii} · A^{-1} · Sib[:,Jr] · v
-            rhs = (Sib_Jr @ sparse.csc_matrix(v_tmp)).tocsc()
-            result_tmp = (ctx._solve_sparse(rhs))[Jc, :]
-            del rhs
-            ctx.mumps_instance.icntl[20]=0
-            result = np.zeros((len(Jc_large), v_tmp.shape[1]))
-            result[Jc_inJc, :] = result_tmp
-            del result_tmp
-
+            out = np.zeros((len(Jc_large), k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                rhs = (Sib_Jr @ sparse.csc_matrix(v_tmp[:, c])).tocsc()
+                sol = ctx._solve_sparse(rhs)              # dense (len(Ii) x BLK) — bounded
+                out[Jc_inJc, c] = sol[Jc, :]
+                del rhs, sol
         else:
-            k = v_tmp.shape[1]
-            w_Jc = v_tmp[Jc_inJc, :]            
-            m = len(Jc)
-            rhs = sparse.csc_matrix(
-                (
-                    w_Jc.ravel(order="F"),          
-                    np.tile(Jc, k),                 
-                    np.arange(0, m*k + 1, m)        
-                ),
-                shape=(len(Ii), k),
-            )
-            sol = ctxT._solve_sparse(rhs)               
-            del rhs                             
-            ctxT.mumps_instance.icntl[20]=0
-            result = Sib_Jr_T@sol
-            # costa
-            del sol
-        if v.ndim == 1:
-            result = result.flatten()
-        return result
+            out = np.zeros((len(Jr), k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                w  = v_tmp[Jc_inJc, c]; bw = w.shape[1]; m = len(Jc)
+                rhs = sparse.csc_matrix(
+                    (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
+                    shape=(len(Ii), bw))
+                sol = ctxT._solve_sparse(rhs)
+                out[:, c] = Sib_Jr_T @ sol
+                del rhs, sol
+        return out.flatten() if v.ndim == 1 else out
 
     LinOp = LinearOperator(shape=(len(Jc_large),len(Jr)),\
         matvec = lambda v:smatmat(v), rmatvec = lambda v:smatmat(v,transpose=True),\
