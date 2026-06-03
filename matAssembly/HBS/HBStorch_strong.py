@@ -210,6 +210,9 @@ class HBSStrong:
         nb, b, _ = Yb.shape
         g = idx.shape[1]
         dev = Yb.device
+        # a b-row block has rank <= b, so the far-field basis has at most b
+        # columns; cap the requested rank accordingly (uniform b per level).
+        reff = min(rk, b)
         Yc = Yb[:, :, :s_lvl]; Zc = Zb[:, :, :s_lvl]
         Oc = Omb[:, :, :s_lvl]; Pc = Psib[:, :, :s_lvl]
         if not fast:
@@ -229,7 +232,7 @@ class HBSStrong:
                 NNc = NN[a:a+ch]; sc = samp[a:a+ch]
                 Q1 = tla.qr(NNc.transpose(1, 2), mode='reduced').Q
                 M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
-                Uc = tla.svd(M, full_matrices=False).U[:, :, :rk].contiguous()
+                Uc = tla.svd(M, full_matrices=False).U[:, :, :reff].contiguous()
                 U_parts.append(Uc)
             return torch.cat(U_parts, 0)
 
@@ -250,7 +253,7 @@ class HBSStrong:
               * the recovery solve   (T = perp @ pinv(near) = (perp Q1) R1^{-T}).
             samp_near: (nb,g,b,s) real-slots-first; samp: (nb,b,s).
             Returns U (nb,b,rk) and T (nb,b,g*b) (pad cols zero)."""
-            U = torch.empty(nb, b, rk, device=dev, dtype=samp.dtype)
+            U = torch.empty(nb, b, reff, device=dev, dtype=samp.dtype)
             T = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
             for d in torch.unique(deg).tolist():
                 sel = (deg == d).nonzero(as_tuple=True)[0]
@@ -263,7 +266,7 @@ class HBSStrong:
                 Q1, R1 = QR.Q, QR.R                             # Q1:(n_d,s,d*b)
                 # far-field basis: project near row space out of sample
                 M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
-                U[sel] = tla.svd(M, full_matrices=False).U[:, :, :rk].contiguous()
+                U[sel] = tla.svd(M, full_matrices=False).U[:, :, :reff].contiguous()
                 # recovery: perp wrt the just-found basis, then triangular solve
                 Uc = U[sel]
                 perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
