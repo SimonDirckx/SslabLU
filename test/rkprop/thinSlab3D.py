@@ -183,11 +183,14 @@ elif solve_method=='stencil':
             v_tmp = v
 
         if not transpose:
-            # Forward:  L v = E_{Jc_inJc -> Jc_large} · P_{Jc ⊂ Ii} · A^{-1} · Sib[:,Jr] · v
-            result_tmp = (ctx.solve(Sib[:, Jr] @ v_tmp))[Jc, :]
+            rhs = (Sib[:, Jr] @ sparse.csc_matrix(v_tmp)).tocsc()   # (|Ii|, k), row-sparse
+            sol = ctx._solve_sparse(rhs)                            # (|Ii|, k)
+            del rhs
+            ctx.mumps_instance.icntl[20] = 0
+            result_tmp = sol[Jc, :]
+            del sol
             result = np.zeros((len(Jc_large), v_tmp.shape[1]))
             result[Jc_inJc, :] = result_tmp
-
         else:
             # Transpose:  L^T w = Sib[:,Jr]^T · A^{-T} · P_{Jc}^T · E^T · w
             k = v_tmp.shape[1]
