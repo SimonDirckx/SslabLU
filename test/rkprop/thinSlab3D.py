@@ -177,7 +177,7 @@ elif solve_method=='stencil':
     tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
     Sib_Jr = Sib[:,Jr].tocsc()
-    BLK = 64                                   # tune; see note below
+    BLK = 128                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
     ctxT.mumps_instance.icntl[27] = BLK
 
@@ -192,6 +192,7 @@ elif solve_method=='stencil':
                 sol = ctx._solve_sparse(rhs)              # dense (len(Ii) x BLK) — bounded
                 out[Jc_inJc, c] = sol[Jc, :]
                 del rhs, sol
+                ctx.mumps_instance.icntl[20]=0
         else:
             out = np.zeros((len(Jr), k))
             for s in range(0, k, BLK):
@@ -203,6 +204,7 @@ elif solve_method=='stencil':
                 sol = ctxT._solve_sparse(rhs)
                 out[:, c] = Sib_Jr_T @ sol
                 del rhs, sol
+                ctx.mumps_instance.icntl[20]=0
         return out.flatten() if v.ndim == 1 else out
 
     LinOp = LinearOperator(shape=(len(Jc_large),len(Jr)),\
@@ -220,20 +222,23 @@ sizes = [len(tree.get_box_inds(l)) for l in tree.get_leaves()]
 print(set(sizes))   # want a single value
 print("=========  LINOP CONSTRUCTED  =========")
 SSr = HBStorch.HBSStrong(LinOp,device=device,tree=tree)
+
+ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
+ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
+uihat = ctx.solve(-Sib@rhsS)
 print("============  COMPRESS HBS  ============")
 tic = time.time()
 SSr.construct(20,fast = True)
 print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 
-ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
-ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
+
 ur = -(SSr@rhsS[Jr])[Jc_inJc]
 uhat_S = ul+ur+ub
 
 err2 = np.linalg.norm(uhat_S - uS, ord=2) / np.linalg.norm(uS, ord=2)
 print(f"err2 = {err2:.6e}")
-uihat = ctx.solve(-Sib@rhsS)
+
 ui = bc_helmholtz(XXi,kh)
 err2 = np.linalg.norm(uihat - ui, ord=2) / np.linalg.norm(ui, ord=2)
 print(f"err2 = {err2:.6e}")

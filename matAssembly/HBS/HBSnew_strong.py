@@ -390,9 +390,10 @@ class HBSStrong:
             raise ValueError(
                 f"non-uniform boxes: N={self.N} not divisible by nleaves="
                 f"{self.Nb}; leaves are ragged.")
-
-    def construct(self, rk, p=10, fast=False, chunk=None):
+    
+    def sample(self,rk,p=10,del_op=False):
         self._check_uniform_boxes()
+        lvl = self.L; nb = self._nb_at(lvl)
         nl = self.nl
         if self._nbr_mode == '1d' or self._adj is None:
             maxdeg = 3
@@ -411,10 +412,18 @@ class HBSStrong:
         def to_blocks(M, nb):
             b = M.shape[0] // nb
             return M.reshape(nb, b, M.shape[1]).contiguous()
+        self._Yb = to_blocks(Y, nb); self._Zb = to_blocks(Z, nb)
+        self._Omb = to_blocks(Om, nb); self._Psib = to_blocks(Psi, nb)
+        if del_op:
+            self.A = None
+
+    def construct(self, rk, p=10, fast=False, chunk=None):
 
         lvl = self.L; nb = self._nb_at(lvl)
-        Yb = to_blocks(Y, nb); Zb = to_blocks(Z, nb)
-        Omb = to_blocks(Om, nb); Psib = to_blocks(Psi, nb)
+        Yb = self._Yb
+        Zb = self._Zb
+        Omb = self._Omb
+        Psib = self._Psib
 
         while True:
             nb = Yb.shape[0]
