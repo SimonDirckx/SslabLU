@@ -76,6 +76,7 @@ class HBSStrong:
         self._nmsk = []          # per clevel: (nb, g_max) near mask
         self._nbpos = []         # per clevel: (nb, g_max) back-position
         self._near_cache = None; self._invperm_cache = None
+        self._mem_budget_gb = 4.0   # batched-factorization working-set cap (GiB)
 
     # -- neighbour access (self-EXCLUDED) ----------------------------------
     def _nbrs(self, lvl, t):
@@ -182,18 +183,34 @@ class HBSStrong:
         return out
 
     @staticmethod
-    def _band_apply(D, src, idx):
+    def _tile_size(chunk, n, per_box_elems, budget_elems):
+        """Boxes-per-tile for a batched factorization, chosen DETERMINISTICALLY
+        from a fixed working-memory budget (no live free-memory query, which is
+        non-deterministic and composes badly with other allocators).  An explicit
+        positive `chunk` overrides.  Otherwise the largest tile whose working set
+        (per_box_elems fp64 numbers/box) fits in budget_elems, clamped to [1, n].
+        Peak per tile is then ~ per_box_elems*ch*8 bytes <= budget, by design."""
+        if chunk is not None and chunk > 0:
+            return min(int(chunk), n)
+        ch = int(budget_elems) // max(int(per_box_elems), 1)
+        return max(1, min(ch, n))
+
+    @staticmethod
+    def _band_apply(D, src, idx, chunk=None):
         """Contract a near-band operator with gathered sources WITHOUT ever
         materializing the (nb,g,b,*) gather:
             out[t] = sum_j D[t,j] @ src[idx[t,j]]            -> (nb,b,s)
         Equivalent to einsum('tgbc,tgcs->tbs', D, gather(src)).  D (nb,g,b,b)
         must already be masked (padded slots zero); src (nb,b,s).  Peak working
-        set is (nb,b,s) per slot instead of (nb,g,b,s) -- this is the dominant
-        construct/apply OOM source removed."""
+        set is (nb,b,s) per slot instead of (nb,g,b,s); `chunk` further tiles
+        the box axis so the per-tile transient is (chunk,b,s)."""
         nb, g, b, _ = D.shape
         out = torch.zeros(nb, b, src.shape[2], device=src.device, dtype=src.dtype)
-        for j in range(g):
-            out += torch.bmm(D[:, j], src[idx[:, j]])
+        ch = nb if (chunk is None or chunk <= 0) else int(chunk)
+        for a in range(0, nb, ch):
+            sl = slice(a, a + ch)
+            for j in range(g):
+                out[sl] += torch.bmm(D[sl, j], src[idx[sl, j]])
         return out
 
     @staticmethod
@@ -214,7 +231,7 @@ class HBSStrong:
 
     # -- batched basis + recovery for one level ----------------------------
     def _factor_level(self, Yb, Zb, Omb, Psib, idx, msk, backpos,
-                      rk, s_lvl, fast, chunk):
+                      rk, s_lvl, fast, chunk, mem_budget_gb=4.0):
         """Yb,Zb,Omb,Psib: (nb,b,s).  Returns U,V (nb,b,rk), D (nb,g,b,b).
 
         Far-field basis: padded near band, batched reduced-QR + economy SVD.
@@ -238,7 +255,15 @@ class HBSStrong:
             On = self._gather(Oc, idx, msk).reshape(nb, g * b, s_lvl)
             Pn = self._gather(Pc, idx, msk).reshape(nb, g * b, s_lvl)
 
-        ch = nb if (chunk is None or chunk <= 0) else chunk
+        # deterministic working-memory budget (fp64 elements).  The batched QR's
+        # peak is dominated by the near band + its QR copy + the Q factor, each
+        # ~ ch*s_lvl*(deg*b); COEF_QR=5 covers those plus cuSOLVER workspace, so
+        # the per-tile peak stays under the budget.  ch is sized PER BUCKET below
+        # on the fast path (using that bucket's true degree d), and once here for
+        # the padded non-fast path (worst-case degree g).
+        budget_elems = int(mem_budget_gb * 2**30) // 8
+        COEF_QR = 5
+        ch = self._tile_size(chunk, nb, COEF_QR * s_lvl * g * b, budget_elems)
 
         # true near-degree per box (number of real, unmasked slots)
         deg = msk.sum(dim=1).round().to(torch.int64)            # (nb,)
@@ -280,31 +305,38 @@ class HBSStrong:
             U = torch.empty(nb, b, reff, device=dev, dtype=samp.dtype)
             T = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
             for d in torch.unique(deg).tolist():
-                sel = (deg == d).nonzero(as_tuple=True)[0]
-                if sel.numel() == 0:
+                sel_all = (deg == d).nonzero(as_tuple=True)[0]
+                if sel_all.numel() == 0:
                     continue
-                nd = sel.numel()
-                # gather only the d real neighbour source blocks (no pad, no mask)
-                src_idx = idx[sel, :d].reshape(-1)              # (nd*d,)
-                NNb = src[src_idx].reshape(nd, d * b, s_lvl)
-                sc = samp[sel]                                  # (n_d, b, s)
-                # single reduced QR of the unpadded near band^T: (s, d*b)
-                QR = tla.qr(NNb.transpose(1, 2), mode='reduced')
-                Q1, R1 = QR.Q, QR.R                             # Q1:(n_d,s,d*b)
-                # far-field basis: project near row space out of the sample
-                M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
-                # leading reff left singular vectors of M == top-reff eigenvectors
-                # of the b x b SPD Gram M M^* (eigh ascending -> take/flip tail).
-                G = torch.bmm(M, M.transpose(1, 2))             # (n_d,b,b)
-                evecs = torch.linalg.eigh(G).eigenvectors       # ascending order
-                U[sel] = evecs[:, :, -reff:].flip(-1).contiguous()
-                # recovery: perp wrt the just-found basis, then triangular solve
-                Uc = U[sel]
-                perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
-                tmp = torch.bmm(perp, Q1)                        # (n_d,b,d*b)
-                Td = torch.linalg.solve_triangular(
-                    R1.transpose(1, 2), tmp, upper=False, left=False)
-                T[sel, :, :d * b] = Td
+                # per-bucket tile: the QR working set scales with this bucket's
+                # true degree d, so degree-9 boxes get smaller tiles than degree-4.
+                ch_d = self._tile_size(chunk, sel_all.numel(),
+                                       COEF_QR * s_lvl * d * b, budget_elems)
+                for a in range(0, sel_all.numel(), ch_d):
+                    sel = sel_all[a:a + ch_d]
+                    nd = sel.numel()
+                    # gather only the d real neighbour source blocks (no pad/mask)
+                    src_idx = idx[sel, :d].reshape(-1)          # (nd*d,)
+                    NNb = src[src_idx].reshape(nd, d * b, s_lvl)
+                    sc = samp[sel]                              # (nd, b, s)
+                    # single reduced QR of the unpadded near band^T: (s, d*b)
+                    QR = tla.qr(NNb.transpose(1, 2), mode='reduced')
+                    Q1, R1 = QR.Q, QR.R                         # Q1:(nd,s,d*b)
+                    del NNb, QR                                 # free band + copy
+                    # far-field basis: project near row space out of the sample
+                    M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
+                    # leading reff left singular vectors of M == top-reff eigen-
+                    # vectors of the b x b SPD Gram M M^* (eigh ascending: flip).
+                    G = torch.bmm(M, M.transpose(1, 2))         # (nd,b,b)
+                    evecs = torch.linalg.eigh(G).eigenvectors
+                    U[sel] = evecs[:, :, -reff:].flip(-1).contiguous()
+                    # recovery: perp wrt the just-found basis, triangular solve
+                    Uc = U[sel]
+                    perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
+                    tmp = torch.bmm(perp, Q1)                    # (nd,b,d*b)
+                    Td = torch.linalg.solve_triangular(
+                        R1.transpose(1, 2), tmp, upper=False, left=False)
+                    T[sel, :, :d * b] = Td
             return U, T
 
         if fast:
@@ -366,8 +398,9 @@ class HBSStrong:
                 f"non-uniform boxes: N={self.N} not divisible by nleaves="
                 f"{self.Nb}; leaves are ragged.")
 
-    def construct(self, rk, p=10, fast=False, chunk=None):
+    def construct(self, rk, p=10, fast=False, chunk=None, mem_budget_gb=4.0):
         self._check_uniform_boxes()
+        self._mem_budget_gb = mem_budget_gb
         nl = self.nl
         if self._nbr_mode == '1d' or self._adj is None:
             maxdeg = 3
@@ -377,15 +410,11 @@ class HBSStrong:
                           for lvl in range(2, self.L + 1)), default=1)
         s = min(maxdeg * max(nl, self.fac * rk) + rk + p, self.N)
         self.nSamples = s
-        import time
 
         Om = torch.randn(self.N, s, device=self.device)
         Psi = torch.randn(self.N, s, device=self.device)
-        tic = time.time()
         Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
-        print(Om.shape[1]," samples of A done in : ",time.time()-tic,"s")
         Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
-        print(Psi.shape[1]," samples of At done in : ",time.time()-tic,"s")
 
         def to_blocks(M, nb):
             b = M.shape[0] // nb
@@ -410,17 +439,20 @@ class HBSStrong:
             s_lvl = min(g * b_lvl + rk + p, Yb.shape[2])
 
             U, V, D = self._factor_level(Yb, Zb, Omb, Psib, idx, msk, backpos,
-                                         rk, s_lvl, fast, chunk)
+                                         rk, s_lvl, fast, chunk, mem_budget_gb)
             self.U.append(U); self.V.append(V); self.D.append(D)
             self.clevels.append(lvl)
             self._nidx.append(idx); self._nmsk.append(msk); self._nbpos.append(backpos)
 
             # reduction (batched): subtract near band (diag incl), project, merge.
-            # The near-band contraction is done slot-by-slot (no (nb,g,b,s) gather)
-            # so peak stays at (nb,b,s) -- this was the dominant OOM source.
-            Ynear = self._band_apply(D, Omb, idx)
+            # The near-band contraction is slot-by-slot (no (nb,g,b,s) gather) and
+            # tiled over boxes deterministically from the budget; per-tile
+            # transient ~ (chunk,b,s).
+            budget_elems = int(mem_budget_gb * 2**30) // 8
+            red_ch = self._tile_size(chunk, nb, 3 * Yb.shape[2] * b_lvl, budget_elems)
+            Ynear = self._band_apply(D, Omb, idx, chunk=red_ch)
             Dt = self._transpose_band(D, idx, backpos, msk)
-            Znear = self._band_apply(Dt, Psib, idx)
+            Znear = self._band_apply(Dt, Psib, idx, chunk=red_ch)
             tY = torch.bmm(U.transpose(1, 2), Yb - Ynear)
             tZ = torch.bmm(V.transpose(1, 2), Zb - Znear)
             tOm = torch.bmm(V.transpose(1, 2), Omb)
@@ -477,7 +509,10 @@ class HBSStrong:
                                   device=self.device, dtype=far.dtype)
             far_box[child] = far
             Duse = D if not transpose else self._transpose_band(D, idx, backpos, msk)
-            near = self._band_apply(Duse, g[i], idx)
+            budget_elems = int(getattr(self, '_mem_budget_gb', 4.0) * 2**30) // 8
+            ap_ch = self._tile_size(None, nb, 3 * g[i].shape[2] * Bu.shape[1],
+                                    budget_elems)
+            near = self._band_apply(Duse, g[i], idx, chunk=ap_ch)
             w_par = far_box + near
             g[i] = None
 
