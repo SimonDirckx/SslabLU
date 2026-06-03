@@ -172,10 +172,29 @@ class HBSStrong:
     # -- batched gather of the near band -----------------------------------
     @staticmethod
     def _gather(blocks, idx, msk):
-        """blocks (nb,b,c) -> (nb,g,b,c) gathered over near idx, pad slots zeroed."""
+        """blocks (nb,b,c) -> (nb,g,b,c) gathered over near idx, pad slots zeroed.
+        The advanced index already returns a fresh copy, so the mask is applied
+        in place to avoid allocating a second full-size tensor."""
         nb, b, c = blocks.shape
         g = idx.shape[1]
-        return blocks[idx.reshape(-1)].reshape(nb, g, b, c) * msk.reshape(nb, g, 1, 1)
+        out = blocks[idx.reshape(-1)].reshape(nb, g, b, c)
+        out.mul_(msk.reshape(nb, g, 1, 1))
+        return out
+
+    @staticmethod
+    def _band_apply(D, src, idx):
+        """Contract a near-band operator with gathered sources WITHOUT ever
+        materializing the (nb,g,b,*) gather:
+            out[t] = sum_j D[t,j] @ src[idx[t,j]]            -> (nb,b,s)
+        Equivalent to einsum('tgbc,tgcs->tbs', D, gather(src)).  D (nb,g,b,b)
+        must already be masked (padded slots zero); src (nb,b,s).  Peak working
+        set is (nb,b,s) per slot instead of (nb,g,b,s) -- this is the dominant
+        construct/apply OOM source removed."""
+        nb, g, b, _ = D.shape
+        out = torch.zeros(nb, b, src.shape[2], device=src.device, dtype=src.dtype)
+        for j in range(g):
+            out += torch.bmm(D[:, j], src[idx[:, j]])
+        return out
 
     @staticmethod
     def _gather_pos(T, idx, backpos):
@@ -246,27 +265,39 @@ class HBSStrong:
                 out[a:a+ch] = torch.bmm(perp, tla.pinv(NNc))
             return out
 
-        def basis_and_recover_bucketed(samp_near, samp):
+        def basis_and_recover_bucketed(src, samp):
             """fast=True: bucket boxes by TRUE near-degree.  ONE reduced QR of
             the unpadded near band per bucket serves BOTH:
               * the far-field basis  (null-space projector I - Q1 Q1^*),
               * the recovery solve   (T = perp @ pinv(near) = (perp Q1) R1^{-T}).
-            samp_near: (nb,g,b,s) real-slots-first; samp: (nb,b,s).
-            Returns U (nb,b,rk) and T (nb,b,g*b) (pad cols zero)."""
+            src: (nb,b,s) source blocks (Oc/Pc); samp: (nb,b,s) samples (Yc/Zc).
+            The near band is gathered PER BUCKET straight from src using the
+            first d (real) slots of idx -- no padded (nb,g,b,s) tensor and no
+            mask, since a degree-d box has exactly d real slots at [:d].
+            The leading-reff left basis is taken from an eigh of the b x b Gram
+            M M^* (b is small) rather than an SVD over the long sample axis.
+            Returns U (nb,b,reff) and T (nb,b,g*b) (pad cols zero)."""
             U = torch.empty(nb, b, reff, device=dev, dtype=samp.dtype)
             T = torch.zeros(nb, b, g * b, device=dev, dtype=samp.dtype)
             for d in torch.unique(deg).tolist():
                 sel = (deg == d).nonzero(as_tuple=True)[0]
                 if sel.numel() == 0:
                     continue
-                NNb = samp_near[sel][:, :d, :, :].reshape(sel.numel(), d * b, s_lvl)
+                nd = sel.numel()
+                # gather only the d real neighbour source blocks (no pad, no mask)
+                src_idx = idx[sel, :d].reshape(-1)              # (nd*d,)
+                NNb = src[src_idx].reshape(nd, d * b, s_lvl)
                 sc = samp[sel]                                  # (n_d, b, s)
                 # single reduced QR of the unpadded near band^T: (s, d*b)
                 QR = tla.qr(NNb.transpose(1, 2), mode='reduced')
                 Q1, R1 = QR.Q, QR.R                             # Q1:(n_d,s,d*b)
-                # far-field basis: project near row space out of sample
+                # far-field basis: project near row space out of the sample
                 M = sc - torch.bmm(torch.bmm(sc, Q1), Q1.transpose(1, 2))
-                U[sel] = tla.svd(M, full_matrices=False).U[:, :, :reff].contiguous()
+                # leading reff left singular vectors of M == top-reff eigenvectors
+                # of the b x b SPD Gram M M^* (eigh ascending -> take/flip tail).
+                G = torch.bmm(M, M.transpose(1, 2))             # (n_d,b,b)
+                evecs = torch.linalg.eigh(G).eigenvectors       # ascending order
+                U[sel] = evecs[:, :, -reff:].flip(-1).contiguous()
                 # recovery: perp wrt the just-found basis, then triangular solve
                 Uc = U[sel]
                 perp = sc - torch.bmm(Uc, torch.bmm(Uc.transpose(1, 2), sc))
@@ -277,10 +308,10 @@ class HBSStrong:
             return U, T
 
         if fast:
-            On_near = self._gather(Oc, idx, msk)                # (nb,g,b,s)
-            Pn_near = self._gather(Pc, idx, msk)
-            U, T1 = basis_and_recover_bucketed(On_near, Yc)
-            V, T2 = basis_and_recover_bucketed(Pn_near, Zc)
+            # near band is gathered per bucket inside the routine straight from
+            # Oc/Pc; no (nb,g,b,s) tensor is formed on the fast path.
+            U, T1 = basis_and_recover_bucketed(Oc, Yc)
+            V, T2 = basis_and_recover_bucketed(Pc, Zc)
         else:
             U = far_basis_padded(On, Yc)
             V = far_basis_padded(Pn, Zc)
@@ -346,11 +377,15 @@ class HBSStrong:
                           for lvl in range(2, self.L + 1)), default=1)
         s = min(maxdeg * max(nl, self.fac * rk) + rk + p, self.N)
         self.nSamples = s
+        import time
 
         Om = torch.randn(self.N, s, device=self.device)
         Psi = torch.randn(self.N, s, device=self.device)
+        tic = time.time()
         Y = self._apply_A(Om[self._invperm(), :], adjoint=False)[self.perm, :]
+        print(Om.shape[1]," samples of A done in : ",time.time()-tic,"s")
         Z = self._apply_A(Psi[self._invperm(), :], adjoint=True)[self.perm, :]
+        print(Psi.shape[1]," samples of At done in : ",time.time()-tic,"s")
 
         def to_blocks(M, nb):
             b = M.shape[0] // nb
@@ -380,12 +415,12 @@ class HBSStrong:
             self.clevels.append(lvl)
             self._nidx.append(idx); self._nmsk.append(msk); self._nbpos.append(backpos)
 
-            # reduction (batched): subtract near band (diag incl), project, merge
-            Om_near = self._gather(Omb, idx, msk)             # (nb,g,b,s)
-            Psi_near = self._gather(Psib, idx, msk)
-            Ynear = torch.einsum('tgbc,tgcs->tbs', D, Om_near)
+            # reduction (batched): subtract near band (diag incl), project, merge.
+            # The near-band contraction is done slot-by-slot (no (nb,g,b,s) gather)
+            # so peak stays at (nb,b,s) -- this was the dominant OOM source.
+            Ynear = self._band_apply(D, Omb, idx)
             Dt = self._transpose_band(D, idx, backpos, msk)
-            Znear = torch.einsum('tgbc,tgcs->tbs', Dt, Psi_near)
+            Znear = self._band_apply(Dt, Psib, idx)
             tY = torch.bmm(U.transpose(1, 2), Yb - Ynear)
             tZ = torch.bmm(V.transpose(1, 2), Zb - Znear)
             tOm = torch.bmm(V.transpose(1, 2), Omb)
@@ -442,8 +477,7 @@ class HBSStrong:
                                   device=self.device, dtype=far.dtype)
             far_box[child] = far
             Duse = D if not transpose else self._transpose_band(D, idx, backpos, msk)
-            g_near = self._gather(g[i], idx, msk)
-            near = torch.einsum('tgbc,tgcs->tbs', Duse, g_near)
+            near = self._band_apply(Duse, g[i], idx)
             w_par = far_box + near
             g[i] = None
 

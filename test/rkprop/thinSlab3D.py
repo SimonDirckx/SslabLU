@@ -176,7 +176,7 @@ if solve_method=='SOMS':
 elif solve_method=='stencil':    
     tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
-    Sib_Jr = Sib[:,Jr].tocsr()
+    Sib_Jr = Sib[:,Jr].tocsc()
     def smatmat(v, transpose=False):
         if v.ndim == 1:
             v_tmp = v[:, np.newaxis]
