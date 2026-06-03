@@ -78,7 +78,7 @@ if solve_method == 'SOMS':
     
 elif solve_method=='stencil':
     n = 128
-    nx = int(Lx*128) + 1
+    nx = int(Lx*n) + 1
     ny = n
     nz = n
     ord = [nx,ny,nz]
@@ -176,6 +176,7 @@ if solve_method=='SOMS':
 elif solve_method=='stencil':    
     tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
+    Sib_Jr = Sib[:,Jr].tocsr()
     def smatmat(v, transpose=False):
         if v.ndim == 1:
             v_tmp = v[:, np.newaxis]
@@ -183,14 +184,15 @@ elif solve_method=='stencil':
             v_tmp = v
 
         if not transpose:
-            rhs = (Sib[:, Jr] @ sparse.csc_matrix(v_tmp)).tocsc()   # (|Ii|, k), row-sparse
-            sol = ctx._solve_sparse(rhs)                            # (|Ii|, k)
+            # Forward:  L v = E_{Jc_inJc -> Jc_large} · P_{Jc ⊂ Ii} · A^{-1} · Sib[:,Jr] · v
+            rhs = (Sib_Jr @ sparse.csc_matrix(v_tmp)).tocsc()
+            result_tmp = (ctx._solve_sparse(rhs))[Jc, :]
             del rhs
-            ctx.mumps_instance.icntl[20] = 0
-            result_tmp = sol[Jc, :]
-            del sol
+            ctx.mumps_instance.icntl[20]=0
             result = np.zeros((len(Jc_large), v_tmp.shape[1]))
             result[Jc_inJc, :] = result_tmp
+            del result_tmp
+
         else:
             # Transpose:  L^T w = Sib[:,Jr]^T · A^{-T} · P_{Jc}^T · E^T · w
             k = v_tmp.shape[1]
