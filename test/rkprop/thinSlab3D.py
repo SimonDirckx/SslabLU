@@ -174,7 +174,7 @@ if solve_method=='SOMS':
         matmat = lambda v:smatmat(v,Jc,Jr), rmatmat = lambda v:smatmat(v,Jc,Jr,transpose=True))
 
 elif solve_method=='stencil':    
-    tree = slabTree.slabTree(XXr,False,4*4,adjacency='full')
+    tree = slabTree.slabTree(XXr,False,8*8,adjacency='full')
     Sib_Jr_T = Sib[:,Jr].T.tocsr()
     Sib_Jr = Sib[:,Jr].tocsc()
     BLK = 128                                   # tune; see note below
@@ -221,18 +221,24 @@ assert np.unique(tree.perm_leaf).size == XXr.shape[0]
 sizes = [len(tree.get_box_inds(l)) for l in tree.get_leaves()]
 print(set(sizes))   # want a single value
 print("=========  LINOP CONSTRUCTED  =========")
-SSr = HBStorch.HBSStrong(LinOp,device=device,tree=tree)
+SSr = HBStorch.HBSMAT(LinOp,device=device,tree=tree)
 
 ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
 ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
 uihat = ctx.solve(-Sib@rhsS)
 print("============  COMPRESS HBS  ============")
-tic = time.time()
-SSr.sample(20,del_op=True)
-del LinOp, ctx, ctxT                   # drop the remaining references
-import gc; gc.collect()                # break closure cycles -> MUMPS JOB=-2 fires
 
-SSr.construct(fast = True)
+nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+rk = 20
+s = 9*max(2*rk,nl)+rk+10
+N = LinOp.shape[0]
+Om = np.random.standard_normal((N,s))
+Psi = np.random.standard_normal((N,s))
+Nb = N//nl
+
+Y = LinOp@Om
+Z = LinOp.T@Psi
+SSr.construct(rk,Om,Psi,Y,Z)
 print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 
