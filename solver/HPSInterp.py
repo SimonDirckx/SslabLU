@@ -1,5 +1,4 @@
 import numpy as np
-import jax.numpy as jnp
 import tensorly as tl
 import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
@@ -17,11 +16,14 @@ def interp(solver,p,f,typestr):
         raise ValueError("ndim must be 2 or 3")
     
 
-def interp_2d(solver,pts,f):
+def interp_2d(solver,pts,f,typestr=None):
     g = np.zeros(shape=(pts.shape[0],))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_2d(npan_dim,solver.geom)
-    ord=[solver.p,solver.p]
+    if typestr == "hpsalt":
+        ord = [int(v) for v in solver.p]
+    else:
+        ord=[int(solver.p),int(solver.p)]
     for box in boxes:
         I = idxs_2d(pts,box)
         J = idxs_2d(solver._XXfull,box)
@@ -158,7 +160,7 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
         raise ValueError("solver type not recognized")
     _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
     f0    = f[I0]
-    F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
+    F = np.reshape(f0,(ord[0],ord[1],ord[2]))
     
     core,U0,U1,U2 = tucker_tol(F,1e-12)
     F_approx = np.zeros(shape =(pts.shape[0],))
@@ -179,15 +181,25 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
     return F_approx
 def local_interp_2d(pts,f,XX,box,ord0):
     ord = [ord0[0],ord0[1]]
-    _,I0  = np.unique(XX,axis=0,return_index=True)
-    f0      = f[I0]
-    F = np.reshape(f0,shape=(ord[0],ord[1]))
+    XX_unique,I0 = np.unique(XX.round(decimals=10),axis=0,return_index=True)
+    f0 = f[I0]
+    if f0.size != ord[0]*ord[1]:
+        ord = [
+            len(np.unique(XX_unique[:,0])),
+            len(np.unique(XX_unique[:,1])),
+        ]
+
+    xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
+    ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
+
+    F = np.zeros((ord[0],ord[1]),dtype=f0.dtype)
+    for xx, val in zip(XX_unique, f0):
+        ix = np.argmin(np.abs(xpts - xx[0]))
+        iy = np.argmin(np.abs(ypts - xx[1]))
+        F[ix,iy] = val
     
     [U,s,Vh]=np.linalg.svd(F)
     F_approx = np.zeros(shape =(pts.shape[0],))
-    
-    xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
-    ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
     cx = chebInterpFromSamples(xpts,U,pts[:,0]).T
     cy = chebInterpFromSamples(ypts,Vh.T,pts[:,1]).T
     

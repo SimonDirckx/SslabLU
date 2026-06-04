@@ -8,7 +8,6 @@ from scipy.sparse.linalg   import LinearOperator
 from solver.solver import stMap
 import time
 import sys
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 #import gc
@@ -280,7 +279,7 @@ class oms:
 
         def smatmat(v,transpose=False):
             if (v.ndim == 1):
-                v_tmp = v[...,jnp.newaxis].astype('float64')
+                v_tmp = v[...,np.newaxis].astype('float64')
             else:
                 v_tmp = v.astype('float64')
             result  = v_tmp.copy()
