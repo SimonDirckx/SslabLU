@@ -228,7 +228,11 @@ ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
 uihat = ctx.solve(-Sib@rhsS)
 print("============  COMPRESS HBS  ============")
 tic = time.time()
-SSr.construct(20,fast = True)
+SSr.sample(20,del_op=True)
+del LinOp, ctx, ctxT                   # drop the remaining references
+import gc; gc.collect()                # break closure cycles -> MUMPS JOB=-2 fires
+
+SSr.construct(fast = True)
 print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 
