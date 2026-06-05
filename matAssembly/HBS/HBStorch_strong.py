@@ -59,6 +59,122 @@ from __future__ import annotations
 import torch
 import numpy as np
 import time
+from collections import defaultdict
+from contextlib import contextmanager
+
+
+def _cpu_rss_bytes():
+    """Resident host memory of this process, in bytes (best-effort)."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss
+    except Exception:
+        try:
+            import resource, sys
+            ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # ru_maxrss is KB on Linux, bytes on macOS
+            return ru * (1024 if sys.platform != 'darwin' else 1)
+        except Exception:
+            return 0
+
+
+class ConstructProfiler:
+    """
+    Per-phase profiler for HBSMAT.construct.
+
+    Two granularities:
+      * top-level PHASES (input_load, basis_UV@lvl, recover_E@lvl, reduction@lvl,
+        offload@lvl) -- recorded chronologically, each with an isolated GPU peak
+        (reset_peak_memory_stats at the phase boundary).
+      * DETAIL subroutines inside a phase (the QR / SVD / Gram pieces of the
+        basis computation) -- these fire once per chunk per level, so they are
+        AGGREGATED by name (summed time, summed GPU net delta, max resident,
+        call count).  Detail blocks do NOT reset the peak counter, so they don't
+        corrupt the enclosing phase's peak measurement.
+
+    Each phase is kind='compute' or kind='transfer' (data movement).  Wall clock
+    with a CUDA sync at boundaries.  Nothing prints automatically; call
+    HBSMAT.print_profile().
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.on_cuda = str(device).startswith('cuda')
+        self.records = []            # chronological top-level phases
+        self.detail = {}             # name -> aggregated subroutine stats
+        self.total_compute = 0.0
+        self.total_transfer = 0.0
+        self.enabled = True
+        self.detail_enabled = True
+
+    @contextmanager
+    def phase(self, name, kind='compute'):
+        """Top-level phase: isolated GPU peak via reset, recorded chronologically."""
+        if not self.enabled:
+            yield
+            return
+        if self.on_cuda:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+            gpu_before = torch.cuda.memory_allocated(self.device)
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.on_cuda:
+                torch.cuda.synchronize(self.device)
+            dt = time.perf_counter() - t0
+            if self.on_cuda:
+                gpu_peak = torch.cuda.max_memory_allocated(self.device)
+                gpu_after = torch.cuda.memory_allocated(self.device)
+            else:
+                gpu_peak = gpu_after = gpu_before = 0
+            self.records.append(dict(
+                name=name, kind=kind, time=dt, gpu_peak=gpu_peak,
+                gpu_delta=(gpu_after - gpu_before) if self.on_cuda else 0,
+                cpu_rss=_cpu_rss_bytes()))
+            if kind == 'transfer':
+                self.total_transfer += dt
+            else:
+                self.total_compute += dt
+
+    @contextmanager
+    def sub(self, name, parent):
+        """
+        Detail subroutine inside a phase.  Aggregated by name across all calls
+        (chunks, U and V).  Does NOT reset the peak counter (so the enclosing
+        phase's GPU peak stays valid); reports net GPU delta + resident-after.
+        """
+        if not (self.enabled and self.detail_enabled):
+            yield
+            return
+        cur0 = torch.cuda.memory_allocated(self.device) if self.on_cuda else 0
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.on_cuda:
+                torch.cuda.synchronize(self.device)
+            dt = time.perf_counter() - t0
+            cur1 = torch.cuda.memory_allocated(self.device) if self.on_cuda else 0
+            cpu = _cpu_rss_bytes()
+            d = self.detail.get(name)
+            if d is None:
+                d = dict(name=name, parent=parent, calls=0, time=0.0,
+                         gpu_delta=0, gpu_after=0, cpu_after=0)
+                self.detail[name] = d
+            d['calls']     += 1
+            d['time']      += dt
+            d['gpu_delta'] += (cur1 - cur0)
+            d['gpu_after']  = max(d['gpu_after'], cur1)
+            d['cpu_after']  = max(d['cpu_after'], cpu)
+
+    def reset(self):
+        self.records.clear()
+        self.detail.clear()
+        self.total_compute = 0.0
+        self.total_transfer = 0.0
+
 
 # =============================================================================
 #  Near-field bookkeeping: turn ragged adjacency into grouped, padded gathers
@@ -212,7 +328,8 @@ def _pinv_rhs_via_qr(rhs, Snf, rcond=1e-12):
 # =============================================================================
 
 def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
-                         device=None, group_chunk=None, fast=True):
+                         device=None, group_chunk=None, fast=True,
+                         prof=None, tag=''):
     """
     Compute one cluster-basis tensor (rows: pass Omega & Y ; cols: pass Psi & Z).
 
@@ -223,11 +340,23 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
                     SVD).  Forms the (chunk, m, s) stack (use group_chunk), but
                     conditioning is kappa(Snf), not kappa(Snf)^2.
     group_chunk: max clusters per batched call (bounds the s-carrying transient).
+    prof, tag  : optional ConstructProfiler and a label suffix; if given, the
+                 internal subroutines are timed/measured as aggregated 'detail'
+                 entries under parent f'basis_UV{tag}'.
     returns    : basis (Nb, b, rk)
     """
+    from contextlib import nullcontext
+    parent = f'basis_UV{tag}'
+    def sub(name):
+        return prof.sub(f'{name}{tag}', parent) if prof is not None else nullcontext()
+
     Nb, b, s = S_blk.shape
     out = S_blk.new_zeros(Nb, b, rk)
-    Uq = _block_thinQR(S_blk) if fast else None
+    if fast:
+        with sub('  block_thinQR'):
+            Uq = _block_thinQR(S_blk)
+    else:
+        Uq = None
     for grp in nearfield.groups:
         k       = grp['k']
         ranks   = grp['ranks']
@@ -240,13 +369,18 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
             nf_c  = nf_idx[c0:c0+cs]
             Yi    = Sketch_blk[r_c]                # (Gc, b, s)
             if fast:
-                M, Wb = _cross_gram(Uq, nf_c)
-                basis = _gram_range(Yi, Wb, M, rk_g)
+                with sub('  cross_gram (W*W)'):
+                    M, Wb = _cross_gram(Uq, nf_c)
+                with sub('  gram_range (eigh)'):
+                    basis = _gram_range(Yi, Wb, M, rk_g)
                 del M, Wb
             else:
-                Snf   = S_blk[nf_c].reshape(nf_c.shape[0], k * b, s)
-                Q     = _nf_rowspace(Snf)
-                basis = _range_via_projection(Yi, Q, rk_g)
+                with sub('  gather_Snf'):
+                    Snf = S_blk[nf_c].reshape(nf_c.shape[0], k * b, s)
+                with sub('  nf_rowspace (SVD)'):
+                    Q = _nf_rowspace(Snf)
+                with sub('  range_proj (SVD)'):
+                    basis = _range_via_projection(Yi, Q, rk_g)
                 del Snf, Q
             if rk_g < rk:
                 basis = torch.nn.functional.pad(basis, (0, rk - rk_g))
@@ -637,8 +771,9 @@ class HBSMAT:
             self.tree   =   tree
             self.perm   =   tree.perm_leaf
             self.Nb = tree.nleaves
-            self.nl = self.A.shape[0]//self.Nb
+            self.nl = len(self.perm)//self.Nb
             self.L = tree.nlevels
+            self.shape = (len(self.perm),len(self.perm))
             
             
         self.blockSolveTime = 0
@@ -649,6 +784,7 @@ class HBSMAT:
         self.tConstruct = 0
         self.Nbvec = []
         self.quad = quad
+        self.profiler = None     # populated by construct(); see print_profile()
         if quad:
             self.fac = 4
         else:
@@ -678,26 +814,33 @@ class HBSMAT:
         return ctr
     
     def construct(self,rk,Om,Psi,Y,Z,group_chunk=None,store_device=None,
-                  empty_cache=True,fast=True):
+                  empty_cache=True,fast=True,profile=True,profile_detail=True):
         #assume numpy input here:
         if group_chunk is not None: self.group_chunk = group_chunk
         if store_device is not None: self.store_device = store_device
+        self.profiler = ConstructProfiler(self.device)
+        self.profiler.enabled = profile
+        self.profiler.detail_enabled = profile_detail
+        prof = self.profiler
+        t_all = time.perf_counter()
         Nb = self.Nb
         nl = Om.shape[0]//Nb
         # single host->device move per array, in the target dtype, then permute
         # with a device-resident index (avoids a CPU-index-into-GPU sync).
-        perm = torch.as_tensor(self.perm, dtype=torch.long, device=self.device)
-        dt = self.dtype
-        Ompr  = torch.from_numpy(Om ).to(device=self.device, dtype=dt)[perm, :]
-        Psipr = torch.from_numpy(Psi).to(device=self.device, dtype=dt)[perm, :]
-        Ypr   = torch.from_numpy(Y  ).to(device=self.device, dtype=dt)[perm, :]
-        Zpr   = torch.from_numpy(Z  ).to(device=self.device, dtype=dt)[perm, :]
-        Om_blk  = to_block_tensor(Ompr,  Nb, nl)
-        Psi_blk = to_block_tensor(Psipr, Nb, nl)
-        Y_blk   = to_block_tensor(Ypr,   Nb, nl)
-        Z_blk   = to_block_tensor(Zpr,   Nb, nl)
-        del Ompr, Psipr, Ypr, Zpr
+        with prof.phase('input_load (H2D)', kind='transfer'):
+            perm = torch.as_tensor(self.perm, dtype=torch.long, device=self.device)
+            dt = self.dtype
+            Ompr  = torch.from_numpy(Om ).to(device=self.device, dtype=dt)[perm, :]
+            Psipr = torch.from_numpy(Psi).to(device=self.device, dtype=dt)[perm, :]
+            Ypr   = torch.from_numpy(Y  ).to(device=self.device, dtype=dt)[perm, :]
+            Zpr   = torch.from_numpy(Z  ).to(device=self.device, dtype=dt)[perm, :]
+            Om_blk  = to_block_tensor(Ompr,  Nb, nl)
+            Psi_blk = to_block_tensor(Psipr, Nb, nl)
+            Y_blk   = to_block_tensor(Ypr,   Nb, nl)
+            Z_blk   = to_block_tensor(Zpr,   Nb, nl)
+            del Ompr, Psipr, Ypr, Zpr
         self.constructHBS(rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=empty_cache,fast=fast)
+        self.tConstruct = time.perf_counter() - t_all
 
     def constructHBS(self,rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=True,fast=True):
         Nb = self.Nb
@@ -706,6 +849,8 @@ class HBSMAT:
         rkm = rkm = min(rk,nl)
         Nbvec = [Nb]
         sdev = self.store_device
+        prof = self.profiler
+        gc = self.group_chunk
         on_cuda = (str(self.device).startswith('cuda'))
         def _free():
             if empty_cache and on_cuda:
@@ -714,40 +859,127 @@ class HBSMAT:
             adj_level = self.tree.level_adj_list[lvl]
 
             if has_farfield(adj_level):
-                # Recover U,V,E on the COMPUTE device.  E is consumed by the Y/Z
-                # update immediately below, so keeping its tiles on-device avoids
-                # a CPU->GPU copy-back; it is offloaded once, AFTER the update.
-                U, V, E, _ = compress_level_strong(
-                    Om_blk, Psi_blk, Y_blk, Z_blk, adj_level, rkm,
-                    device=self.device, group_chunk=self.group_chunk,
-                    tile_device=self.device, fast=fast)
-                # --- reduction (everything already on the compute device) ---
-                Nb = Nb // self.fac
-                rkm_used = U.shape[-1]
-
-                Y_blk = Y_blk - E @ Om_blk
-                Y_blk = torch.bmm(U.transpose(-2, -1), Y_blk).reshape(Nb, self.fac*rkm_used, s)
-
-                Z_blk = Z_blk - E.T @ Psi_blk
-                Z_blk = torch.bmm(V.transpose(-2, -1), Z_blk).reshape(Nb, self.fac*rkm_used, s)
-
-                Om_blk  = torch.bmm(V.transpose(-2, -1), Om_blk).reshape(Nb, self.fac*rkm_used, s)
-                Psi_blk = torch.bmm(U.transpose(-2, -1), Psi_blk).reshape(Nb, self.fac*rkm_used, s)
-
-                # --- now offload completed-level operators, once, to host ---
-                self.Umats += [U.to(sdev)]
-                self.Vmats += [V.to(sdev)]
-                self.Emats += [E.to(sdev)]
+                # NearField indices on the sketch device
+                nfo = NearField(adj_level, device=Om_blk.device)
+                # --- basis U, V (compute), with subroutine detail ---
+                with prof.phase(f'basis_UV@lvl{lvl}', kind='compute'):
+                    U = compute_basis_strong(Om_blk, Y_blk, nfo, rkm,
+                                             device=self.device, group_chunk=gc, fast=fast,
+                                             prof=prof, tag=f'@lvl{lvl}')
+                    V = compute_basis_strong(Psi_blk, Z_blk, nfo, rkm,
+                                             device=self.device, group_chunk=gc, fast=fast,
+                                             prof=prof, tag=f'@lvl{lvl}')
+                # --- error term E (compute), tiles kept on compute device ---
+                with prof.phase(f'recover_E@lvl{lvl}', kind='compute'):
+                    E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo,
+                                         device=self.device, group_chunk=gc,
+                                         tile_device=self.device, fast=fast)
+                # --- reduction to next coarser level (compute) ---
+                with prof.phase(f'reduction@lvl{lvl}', kind='compute'):
+                    Nb = Nb // self.fac
+                    rkm_used = U.shape[-1]
+                    Y_blk = Y_blk - E @ Om_blk
+                    Y_blk = torch.bmm(U.transpose(-2, -1), Y_blk).reshape(Nb, self.fac*rkm_used, s)
+                    Z_blk = Z_blk - E.T @ Psi_blk
+                    Z_blk = torch.bmm(V.transpose(-2, -1), Z_blk).reshape(Nb, self.fac*rkm_used, s)
+                    Om_blk  = torch.bmm(V.transpose(-2, -1), Om_blk).reshape(Nb, self.fac*rkm_used, s)
+                    Psi_blk = torch.bmm(U.transpose(-2, -1), Psi_blk).reshape(Nb, self.fac*rkm_used, s)
+                # --- offload completed-level operators to host (transfer) ---
+                with prof.phase(f'offload@lvl{lvl} (D2H)', kind='transfer'):
+                    self.Umats += [U.to(sdev)]
+                    self.Vmats += [V.to(sdev)]
+                    self.Emats += [E.to(sdev)]
                 self.Nbvec += [Nb]
                 del U, V, E
                 _free()
                 rkm = rk
             else:
-                E = compute_final_E(Y_blk, Om_blk, device=self.device)
-                self.Emats += [E.to(sdev)]
+                with prof.phase(f'final_E@lvl{lvl}', kind='compute'):
+                    E = compute_final_E(Y_blk, Om_blk, device=self.device)
+                with prof.phase(f'offload@lvl{lvl} (D2H)', kind='transfer'):
+                    self.Emats += [E.to(sdev)]
                 del E
                 _free()
                 break
+
+    def print_profile(self, sort_by=None):
+        """
+        Print per-phase construction stats gathered by the profiler.  Call this
+        manually after construct(); nothing prints on its own.
+
+        Columns: phase | kind | time(s) | GPU peak | GPU delta | CPU RSS.
+        `sort_by` in {None,'time','gpu_peak'}; None keeps chronological order.
+        """
+        prof = getattr(self, 'profiler', None)
+        if prof is None or not prof.records:
+            print("[HBSMAT] no profile available — run construct(..., profile=True) first.")
+            return
+
+        def fmt_bytes(n):
+            if n is None: return '   -   '
+            for unit in ('B','KB','MB','GB','TB'):
+                if abs(n) < 1024 or unit == 'TB':
+                    return f"{n:7.1f}{unit}"
+                n /= 1024
+
+        recs = list(prof.records)
+        if sort_by == 'time':
+            recs = sorted(recs, key=lambda r: -r['time'])
+        elif sort_by == 'gpu_peak':
+            recs = sorted(recs, key=lambda r: -r['gpu_peak'])
+
+        on_cuda = prof.on_cuda
+        W = 26
+        print("=" * 92)
+        print(f"HBSMAT.construct profile   (device={self.device}, "
+              f"store={self.store_device}, group_chunk={self.group_chunk})")
+        print("-" * 92)
+        print(f"{'phase':<{W}}{'kind':<10}{'time(s)':>10}"
+              f"{'GPU peak':>13}{'GPU delta':>13}{'CPU RSS':>13}")
+        print("-" * 92)
+        for r in recs:
+            print(f"{r['name']:<{W}}{r['kind']:<10}{r['time']:>10.4f}"
+                  f"{fmt_bytes(r['gpu_peak']) if on_cuda else '   -   ':>13}"
+                  f"{fmt_bytes(r['gpu_delta']) if on_cuda else '   -   ':>13}"
+                  f"{fmt_bytes(r['cpu_rss']):>13}")
+        print("-" * 92)
+        gpu_peak_overall = max((r['gpu_peak'] for r in recs), default=0)
+        cpu_peak_overall = max((r['cpu_rss'] for r in recs), default=0)
+        print(f"{'TOTAL compute':<{W}}{'':<10}{prof.total_compute:>10.4f}")
+        print(f"{'TOTAL transfer':<{W}}{'':<10}{prof.total_transfer:>10.4f}")
+        print(f"{'TOTAL wall (construct)':<{W}}{'':<10}{getattr(self,'tConstruct',0.0):>10.4f}")
+        if on_cuda:
+            print(f"{'peak GPU (any phase)':<{W}}{'':<10}{'':>10}{fmt_bytes(gpu_peak_overall):>13}")
+        print(f"{'peak CPU RSS':<{W}}{'':<10}{'':>10}{'':>13}{'':>13}{fmt_bytes(cpu_peak_overall):>13}")
+        print("=" * 92)
+
+        # ---- subroutine detail (aggregated across chunks; U and V combined) ---
+        if prof.detail:
+            WD = 30
+            print("\nBASIS SUBROUTINE DETAIL  (aggregated over chunks; U+V combined)")
+            print("-" * 92)
+            print(f"{'subroutine':<{WD}}{'calls':>7}{'time(s)':>10}"
+                  f"{'GPU net':>13}{'GPU after':>13}{'CPU after':>13}")
+            print("-" * 92)
+            # group by parent phase, preserve first-seen order
+            parents = []
+            for d in prof.detail.values():
+                if d['parent'] not in parents:
+                    parents.append(d['parent'])
+            for p in parents:
+                print(f"[{p}]")
+                items = [d for d in prof.detail.values() if d['parent'] == p]
+                if sort_by == 'time':
+                    items = sorted(items, key=lambda d: -d['time'])
+                for d in items:
+                    print(f"{d['name']:<{WD}}{d['calls']:>7}{d['time']:>10.4f}"
+                          f"{fmt_bytes(d['gpu_delta']) if on_cuda else '   -   ':>13}"
+                          f"{fmt_bytes(d['gpu_after']) if on_cuda else '   -   ':>13}"
+                          f"{fmt_bytes(d['cpu_after']):>13}")
+            print("-" * 92)
+            print("GPU net = net allocated change over the subroutine (summed over calls);")
+            print("GPU after / CPU after = max resident observed at the subroutine's exit.")
+            print("=" * 92)
     @property
     def T(self):
         view = object.__new__(self.__class__)
