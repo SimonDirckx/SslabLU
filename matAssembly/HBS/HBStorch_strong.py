@@ -413,6 +413,7 @@ class BlockSparseE:
         self.col = col.to(val.device)
         self.n, self.b = n, b
         self.mode='N'
+        self.nnz_chunk = None     # bound the (nnz,b,s) matvec transient; None = whole
 
     def to(self, device):
         """Move tiles and coordinates to `device` (cheap if already there).
@@ -465,6 +466,11 @@ class BlockSparseE:
         """
         Multiply the block-sparse matrix by a tensor T of shape (n,b,s).
 
+        The (nnz, b, s) gather/product transient (= k_max x a full sketch at the
+        leaf) is built and accumulated in batches of `self.nnz_chunk` nonzeros,
+        so the reduction's peak is bounded independent of the total nnz.
+        Set nnz_chunk=None (default) to do it in one batch.
+
         Returns
         -------
         out : (n,b,s)
@@ -472,38 +478,24 @@ class BlockSparseE:
         assert T.ndim == 3
         assert T.shape[0] == self.n
         assert T.shape[1] == self.b
-        if self.mode == 'N':
-            blocks = T[self.col]                    # (nnz,b,s)
-            contrib = torch.matmul(self.val, blocks)  # (nnz,b,s)
-
-            out = torch.zeros(
-                (self.n, self.b, T.shape[2]),
-                dtype=T.dtype,
-                device=T.device,
-            )
-
-            out.index_add_(0, self.row, contrib)
-        elif self.mode=='T':
-            blocks = T[self.row]                      # (nnz, b, s)
-
-            # Multiply by transposed tiles
-            contrib = torch.matmul(
-                self.val.transpose(-2, -1),           # (nnz, b, b)
-                blocks                                # (nnz, b, s)
-            )                                         # (nnz, b, s)
-
-            out = torch.zeros(
-                (self.n, self.b, T.shape[2]),
-                dtype=T.dtype,
-                device=T.device,
-            )
-
-            # Accumulate into original column indices
-            out.index_add_(0, self.col, contrib)
-        else:
+        if self.mode not in ('N', 'T'):
             raise ValueError("mode not recognized")
-
-
+        nnz = self.nnz
+        src = self.col if self.mode == 'N' else self.row   # gather index
+        dst = self.row if self.mode == 'N' else self.col   # scatter index
+        out = torch.zeros((self.n, self.b, T.shape[2]),
+                          dtype=T.dtype, device=T.device)
+        nc = getattr(self, 'nnz_chunk', None)
+        step = nnz if nc is None else nc
+        for p0 in range(0, nnz, step):
+            p1 = min(p0 + step, nnz)
+            blocks = T[src[p0:p1]]                           # (chunk, b, s)
+            if self.mode == 'N':
+                contrib = torch.matmul(self.val[p0:p1], blocks)
+            else:
+                contrib = torch.matmul(self.val[p0:p1].transpose(-2, -1), blocks)
+            out.index_add_(0, dst[p0:p1], contrib)
+            del blocks, contrib
         return out
 
     def matvec(self, T, transpose=False):
@@ -754,6 +746,7 @@ class HBSMAT:
         self.mode   =   'N'
         self._tree  =   None
         torch.set_default_dtype(torch.float64)
+        self.dtype = torch.float64
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
@@ -876,14 +869,23 @@ class HBSMAT:
                                          tile_device=self.device, fast=fast)
                 # --- reduction to next coarser level (compute) ---
                 with prof.phase(f'reduction@lvl{lvl}', kind='compute'):
+                    Nb_prev = Nb
                     Nb = Nb // self.fac
                     rkm_used = U.shape[-1]
+                    # bound the BlockSparseE matvec's (nnz,b,s) transient to about
+                    # group_chunk block-rows' worth of tiles (avg degree nnz/Nb_prev).
+                    if gc is not None:
+                        avg_deg = max(1, E.nnz // max(1, Nb_prev))
+                        E.nnz_chunk = max(1, gc * avg_deg)
+                    # process Y (uses E, Om_blk, U) then free what each step kills.
                     Y_blk = Y_blk - E @ Om_blk
                     Y_blk = torch.bmm(U.transpose(-2, -1), Y_blk).reshape(Nb, self.fac*rkm_used, s)
                     Z_blk = Z_blk - E.T @ Psi_blk
                     Z_blk = torch.bmm(V.transpose(-2, -1), Z_blk).reshape(Nb, self.fac*rkm_used, s)
-                    Om_blk  = torch.bmm(V.transpose(-2, -1), Om_blk).reshape(Nb, self.fac*rkm_used, s)
-                    Psi_blk = torch.bmm(U.transpose(-2, -1), Psi_blk).reshape(Nb, self.fac*rkm_used, s)
+                    Om_new  = torch.bmm(V.transpose(-2, -1), Om_blk).reshape(Nb, self.fac*rkm_used, s)
+                    del Om_blk; Om_blk = Om_new; del Om_new
+                    Psi_new = torch.bmm(U.transpose(-2, -1), Psi_blk).reshape(Nb, self.fac*rkm_used, s)
+                    del Psi_blk; Psi_blk = Psi_new; del Psi_new
                 # --- offload completed-level operators to host (transfer) ---
                 with prof.phase(f'offload@lvl{lvl} (D2H)', kind='transfer'):
                     self.Umats += [U.to(sdev)]
