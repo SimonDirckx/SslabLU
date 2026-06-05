@@ -754,11 +754,12 @@ class HBSMAT:
         self.mode   =   'N'
         self._tree  =   None
         torch.set_default_dtype(torch.float64)
+        self.dtype = torch.float64
+        self.device = device
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
             self.dtype  = A.dtype
-            self.device = device
         # where completed-level U/V/E are parked between construct and matvec.
         # 'cpu' keeps device memory free during construction (the leaf level is
         # the binding allocation); set to self.device to keep everything resident.
