@@ -221,7 +221,7 @@ assert np.unique(tree.perm_leaf).size == XXr.shape[0]
 sizes = [len(tree.get_box_inds(l)) for l in tree.get_leaves()]
 print(set(sizes))   # want a single value
 print("=========  LINOP CONSTRUCTED  =========")
-SSr = HBStorch.HBSMAT(LinOp,device=device,tree=tree)
+SSr = HBStorch.HBSMAT(device=device,tree=tree)
 
 ul  = -(ctx.solve(Sib[:, Jl ]@rhsS[Jl])[Jc])
 ub  = -(ctx.solve(Sib[:, Jb ]@rhsS[Jb ])[Jc])
@@ -229,7 +229,7 @@ uihat = ctx.solve(-Sib@rhsS)
 print("============  COMPRESS HBS  ============")
 
 nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-rk = 20
+rk = 30
 s = 9*max(2*rk,nl)+rk+10
 N = LinOp.shape[0]
 Om = np.random.standard_normal((N,s))

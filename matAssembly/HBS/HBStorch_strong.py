@@ -538,17 +538,19 @@ class HBSMAT:
         self.mode   =   'N'
         self._tree  =   None
         torch.set_default_dtype(torch.float64)
+        self.device = device
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
             self.dtype  = A.dtype
-            self.device = device
+            
 
         if tree is not None:
             self.tree   =   tree
             self.perm   =   tree.perm_leaf
             self.Nb = tree.nleaves
-            self.nl = self.A.shape[0]//self.Nb
+            self.nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+            self.shape = (self.nl*self.Nb,self.nl*self.Nb)
             self.L = tree.nlevels
             
             
