@@ -751,7 +751,7 @@ class HBSMAT:
             self.A      =   A
             self.shape  =   self.A.shape
             self.dtype  = A.dtype
-            self.device = device
+        self.device = device
         # where completed-level U/V/E are parked between construct and matvec.
         # 'cpu' keeps device memory free during construction (the leaf level is
         # the binding allocation); set to self.device to keep everything resident.
@@ -764,9 +764,9 @@ class HBSMAT:
             self.tree   =   tree
             self.perm   =   tree.perm_leaf
             self.Nb = tree.nleaves
-            self.nl = len(self.perm)//self.Nb
-            self.L = tree.nlevels
             self.shape = (len(self.perm),len(self.perm))
+            self.nl = self.shape[0]//self.Nb
+            self.L = tree.nlevels
             
             
         self.blockSolveTime = 0

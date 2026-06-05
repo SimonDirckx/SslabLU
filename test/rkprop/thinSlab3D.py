@@ -77,7 +77,7 @@ if solve_method == 'SOMS':
          coeffs, True, None, weighted=False)
     
 elif solve_method=='stencil':
-    n = 128
+    n = 256
     nx = int(Lx*n) + 1
     ny = n
     nz = n
@@ -238,7 +238,8 @@ Nb = N//nl
 
 Y = LinOp@Om
 Z = LinOp.T@Psi
-SSr.construct(rk,Om,Psi,Y,Z)
+SSr.construct(rk,Om,Psi,Y,Z,group_chunk=128)
+SSr.print_profile()
 print("HBS done in : ",time.time()-tic,"s")
 print("============    HBS DONE    ============")
 
