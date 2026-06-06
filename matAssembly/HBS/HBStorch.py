@@ -7,6 +7,13 @@ import torch
 import matAssembly.HBS.HBSnew as HBSnew
 #sparse block matrix operations
 
+
+
+def to_block_tensor(M, n, b):
+    """(n*b, s) -> (n, b, s) block tensor (analogue of convert_to_torch_tens)."""
+    s = M.shape[1]
+    return M.reshape(n, b, s)
+
 def _rsolve(P, B, fast=False):
     # batched min-residual solution of  X @ B = P  (i.e. X = P @ pinv(B)).
     # fast=False: SVD-based pseudoinverse (handles rank deficiency via rcond).
@@ -88,7 +95,7 @@ class HBSMAT:
 
     """
 
-    def __init__(self,A=None,device=None,tree=None,quad=True):
+    def __init__(self,A=None,device=None,tree=None,quad=False):
         self.Umats  =   []
         self.Vmats  =   []
         self.Dmats  =   []
@@ -96,22 +103,23 @@ class HBSMAT:
         self.Rlist  =   []
         self.Wlist  =   []
         self.Uulist =   []
+        torch.set_default_dtype(torch.float64)
 
         self.mode   =   'N'
         self._tree  =   None
+        self.device = device
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
             self.dtype  = A.dtype
-            self.device = device
-            torch.set_default_dtype(torch.float64)
 
         if tree is not None:
             self.tree   =   tree
             self.perm   =   tree.perm_leaf
             self.Nb = tree.nleaves
-            self.nl = self.A.shape[0]//self.Nb
+            self.nl = len(self.perm)//self.Nb
             self.L = tree.nlevels
+            self.shape = (len(self.perm),len(self.perm))
             
         self.blockSolveTime = 0
         self.nullTime = 0
@@ -147,45 +155,41 @@ class HBSMAT:
         ctr+=sum([V.nbytes for V in self.Vmats])
         ctr+=sum([D.nbytes for D in self.Dmats])
         return ctr
-    def construct(self,rk,compute_ULV=False,fast=False):
+    def construct(self,rk,Om,Psi,Y,Z,compute_ULV=False,fast=False):
         if compute_ULV:
             self.constructHBS_ULV(rk,fast=fast)
         else: 
-            self.constructHBS(rk,fast=fast)
+            self.constructHBS(rk,Om,Psi,Y,Z,fast=fast)
 
-    def constructHBS(self,rk,fast=False):
-        # we compute an HBS compression of permuted op
-        if self.fac == 4:
-            s = 6*rk+4*self.nl+5
-        else:
-            s = max(4*rk,self.nl)+5
-        
+    def constructHBS(self,rk,Om0,Psi0,Y0,Z0,fast=False):
+        s = Om0.shape[1]
+        Nb = self.Nb
+        self.Nbvec = [Nb]
+        nl = self.nl
         self.nSamples = s
         tic = time.time()
-        # generate Om/Psi directly as torch tensors on device
-        Om_flat  = torch.randn(self.shape[1], s, dtype=torch.float64, device=self.device)
-        Psi_flat = torch.randn(self.shape[0], s, dtype=torch.float64, device=self.device)
-        # permute for matvec, convert to numpy for A (which expects numpy)
-        Omprime  = torch.zeros_like(Om_flat);  Omprime[self.perm,:]  = Om_flat
-        Psiprime = torch.zeros_like(Psi_flat); Psiprime[self.perm,:] = Psi_flat
-        Omprime_np  = Omprime.cpu().numpy()
-        Psiprime_np = Psiprime.cpu().numpy()
         
-        Z = self.A.T@Psiprime_np
-        print("Z sampled")
-        Y = self.A@Omprime_np
-        print("Y sampled")
+        Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
+        Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
+        Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
+        Zpr   = torch.from_numpy(Z0  ).to(device=self.device)[self.perm, :]
+
+        Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
+        Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
+        Om  = ULVsparse.convert_to_torch_tens(Ompr, self.Nb, device=self.device)
+        Psi = ULVsparse.convert_to_torch_tens(Psipr,self.Nb, device=self.device)
+
+
+        #Om  = to_block_tensor(Ompr,  Nb, nl)
+        #Psi = to_block_tensor(Psipr, Nb, nl)
+        #Y   = to_block_tensor(Ypr,   Nb, nl)
+        #Z   = to_block_tensor(Zpr,   Nb, nl)
         
-        Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
-        Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
-        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,device=self.device)
-        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb,device=self.device)
-        Om  = ULVsparse.convert_to_torch_tens(Om_flat, self.Nb, device=self.device)
-        Psi = ULVsparse.convert_to_torch_tens(Psi_flat,self.Nb, device=self.device)
-        Nb = self.Nb
+        
         nl = self.nl
         self.setupTime+=time.time()-tic
         self.tSample+=time.time()-tic
+        tic_compress = time.time()
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -229,7 +233,7 @@ class HBSMAT:
                 else:
                     self.Dmats+=[D_ell.cpu().pin_memory()]
             self.Nbvec+=[Nb]
-        self.tCompress = time.time()-tic
+        self.tCompress = time.time()-tic_compress
     def constructHBS_ULV(self,rk,fast=False):
         torch.set_default_dtype(torch.float64)
         if self.fac == 4:

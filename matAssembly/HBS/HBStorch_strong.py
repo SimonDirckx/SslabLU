@@ -260,7 +260,7 @@ def _cross_gram(Uq, nf_idx):
     return M, Wb
 
 
-def _gram_range(Yi, Wb, M, rk, eps=0.0):
+def _gram_range(Yi, Wb, M, rk, eps=1e-12):
     """
     Far-field range of  Y_i (I - W M^{-1} W^*)  from its b x b Gram, via eigh.
 
@@ -276,7 +276,13 @@ def _gram_range(Yi, Wb, M, rk, eps=0.0):
     # batched: einsum over k
     YW = torch.einsum('gbs,gksp->gbkp', Yi, Wb).reshape(G, b, k * b)   # (G, b, k*b)
     # solve M X = YW^*  ->  X = M^{-1} (YW)^*  : (G, k*b, b)
-    Minv_YWt = torch.linalg.lstsq(M, YW.transpose(-2, -1),rcond = 1e-12).solution
+    I = torch.eye(k*b, device=M.device, dtype=M.dtype)
+    L = torch.linalg.cholesky(M + eps * I)
+    Minv_YWt = torch.cholesky_solve(
+    YW.transpose(-2, -1),
+    L
+    )
+    #Minv_YWt = torch.linalg.lstsq(M, YW.transpose(-2, -1),rcond = 1e-12).solution
     Ggram = torch.bmm(Yi, Yi.transpose(-2, -1)) - torch.bmm(YW, Minv_YWt)  # (G,b,b)
     # symmetrise for numerical safety
     Ggram = 0.5 * (Ggram + Ggram.transpose(-2, -1))
