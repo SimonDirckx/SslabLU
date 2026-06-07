@@ -115,12 +115,14 @@ _parser = argparse.ArgumentParser(
 _parser.add_argument("--type", choices=["SOMS", "stencil"], default="stencil",
                      help="discretization / solver type")
 _parser.add_argument("--order", nargs="+", default=None,
-                     help="(nx ny nz) for stencil or (px py pz) for SOMS; "
-                          "space- or comma-separated")
+                     help="(nx ny nz) for stencil [nx is overridden = int(ny*Lx)+1] "
+                          "or (px py pz) for SOMS; space- or comma-separated")
 _parser.add_argument("--shape", nargs="+", default=["1/16", "1", "1"],
                      help="domain extents Lx Ly Lz (fractions like 1/16 allowed)")
 _parser.add_argument("--admissibility", choices=["full", "partial"], default="full",
                      help="HBS tree adjacency / admissibility")
+_parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
+                     help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -131,6 +133,7 @@ else:
     order = _ints3(args.order)
 Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
+gmres_iters = args.gmres_iters
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
@@ -186,8 +189,10 @@ if solve_method == 'SOMS':
     ur = bc_helmholtz(XXr,kh)
     ub = bc_helmholtz(XXb[Jb,:],kh)
 
+    tic_lu = time.time()
     ctx = setup_mumps(Sii,blr=False)
     ctxT = setup_mumps_transpose(Sii,blr=False)
+    print("LU decomposition total time = ", time.time()-tic_lu)
 
 
     BLK = 32                                   # tune; see note below
@@ -304,12 +309,15 @@ if solve_method == 'SOMS':
     u = bc_helmholtz(XXif,kh)
     res = A_balance@u-rhs
     print("res = ",np.linalg.norm(res))
-    tic = time.time()
-    uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=75,restart=75)
-    niter = gInfo.niter
-    print("time = ",time.time()-tic)
-    print("niter = ",niter)
-    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        niter = gInfo.niter
+        print("time = ",time.time()-tic)
+        print("niter = ",niter)
+        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    else:
+        print("GMRES solve skipped (gmres_iters = 0)")
 
     print("===============  HBS version  ===============")
 
@@ -370,19 +378,23 @@ if solve_method == 'SOMS':
     u = bc_helmholtz(XXif,kh)
     res = A_balance_HBS@u-rhs
     print("res = ",np.linalg.norm(res))
-    tic = time.time()
-    uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=75,restart=75)
-    niter = gInfo.niter
-    print("time = ",time.time()-tic)
-    print("niter = ",niter)
-    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        niter = gInfo.niter
+        print("time = ",time.time()-tic)
+        print("niter = ",niter)
+        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    else:
+        print("GMRES solve skipped (gmres_iters = 0)")
 
 # ###########################################################################
 # ###########################   STENCIL PATH   ##############################
 # ###########################################################################
 elif solve_method == 'stencil':
-    nx, ny, nz = order            # grid points per dimension (CLI --order)
-    nx = int(ny*Lx)+1
+    nx, ny, nz = order            # ny, nz from CLI --order (nx is overridden below)
+    nx = int(ny*Lx) + 1           # derive nx so the centre plane x = cx lands on-grid
+    print("stencil nx (derived from ny, Lx) = ", nx)
     ord = [nx,ny,nz]
     solver = stencil.stencilSolver(HH,slabGeom,ord)
     Sii = solver.Aii
@@ -438,8 +450,10 @@ elif solve_method == 'stencil':
         out[Jc_inJc] = vec_Jc
         return out
 
+    tic_lu = time.time()
     ctx = setup_mumps(Sii,blr=False)
     ctxT = setup_mumps_transpose(Sii,blr=False)
+    print("LU decomposition total time = ", time.time()-tic_lu)
 
     BLK = 32                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
@@ -574,12 +588,15 @@ elif solve_method == 'stencil':
     u = u_true
     res = A_balance@u-rhs
     print("res = ",np.linalg.norm(res))
-    tic = time.time()
-    uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=75,restart=75)
-    niter = gInfo.niter
-    print("time = ",time.time()-tic)
-    print("niter = ",niter)
-    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        niter = gInfo.niter
+        print("time = ",time.time()-tic)
+        print("niter = ",niter)
+        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    else:
+        print("GMRES solve skipped (gmres_iters = 0)")
 
     print("===============  HBS version  ===============")
 
@@ -641,12 +658,15 @@ elif solve_method == 'stencil':
     u = u_true
     res = A_balance_HBS@u-rhs
     print("res = ",np.linalg.norm(res))
-    tic = time.time()
-    uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=75,restart=75)
-    niter = gInfo.niter
-    print("time = ",time.time()-tic)
-    print("niter = ",niter)
-    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        niter = gInfo.niter
+        print("time = ",time.time()-tic)
+        print("niter = ",niter)
+        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    else:
+        print("GMRES solve skipped (gmres_iters = 0)")
 
 else:
     raise ValueError("solve method not recognized")
