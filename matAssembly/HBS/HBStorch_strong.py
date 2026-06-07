@@ -224,108 +224,66 @@ class NearField:
 
 
 # =============================================================================
-#  Shared per-block thin QR  (the only s-carrying, un-replicated table)
+#  Stable near-field algebra  (truncated SVD; conditioning kappa, not kappa^2)
+# =============================================================================
+#
+#  The Gram framework (per-block thin QR + assembled W^*W + eigh of a PSD
+#  difference + normal-equations right-solve) was removed: it squares the
+#  conditioning and loses the weak coarse far-field to cancellation.  Every
+#  near-field operation now goes through ONE truncated SVD of the near-field
+#  Gaussian stack  S_nf (G, m, s),  m = k*b:
+#
+#      S_nf = U_s diag(S) Vh        (full_matrices=False ; U_s:(G,m,r), Vh:(G,r,s))
+#
+#  from which we read off, with no extra factorisation,
+#      * the orthonormal near-field ROW-space basis  Q = (Vh truncated)^T   and
+#      * the pseudo-inverse right-solve              X = rhs @ pinv(S_nf).
+#
+#  basis-U and E-term1 both act against the Omega near-field stack, and basis-V
+#  and E-term2 both act against the Psi near-field stack, so the SVD is computed
+#  once per (level, group, chunk) and reused via NFStackCache.
 # =============================================================================
 
-def _block_thinQR(S_blk):
-    """
-    S_blk : (Nb, b, s)   one Gaussian sketch block per cluster (e.g. Omega).
-    Returns Uq : (Nb, s, b) with orthonormal columns spanning each block's row
-    space  (i.e. column space of S_blk[i]^T).  Stored once; shared by every
-    near-field that contains the block.  No replication.
-    """
-    # reduced QR of S_blk^T : (Nb, s, b) -> Q (Nb, s, b)
-    return torch.linalg.qr(S_blk.transpose(-2, -1), mode='reduced').Q
+
+class NFStackCache:
+    """Per-(group, chunk) cache of the truncated SVD of the near-field stack
+    S_nf (G, m, s).  Keyed by (group_index, chunk_start).  compute_basis_strong
+    fills it; recover_E_strong reads it (and recomputes on a miss, so the two
+    functions remain usable independently)."""
+    def __init__(self):
+        self.store = {}
+    def get(self, key):
+        return self.store.get(key)
+    def put(self, key, U, S, Vh):
+        self.store[key] = (U, S, Vh)
 
 
-def _cross_gram(Uq, nf_idx):
-    """
-    Assemble, for every cluster in a group, the m x m Gram  M = W^* W  where
-    W = [Uq[j] : j in near-field], WITHOUT forming W (no s-wide stack).
-
-    Uq      : (Nb, s, b)
-    nf_idx  : (G, k) long   near-field block ranks per cluster in the group
-    returns : M (G, k*b, k*b)
-    """
-    G, k = nf_idx.shape
-    b = Uq.shape[-1]
-    # gather the k near-field U-blocks for each cluster: (G, k, s, b)
-    Wb = Uq[nf_idx]                                  # advanced index -> (G, k, s, b)
-    # M[g] has (a,c) tile = Uq[ja]^* Uq[jc]  (b x b)
-    # compute all tiles via batched matmul over (G, k, k)
-    # reshape to do one big bmm: (G, k, b, s) x (G, 1, s, k*b)? Simpler: einsum.
-    # Wb: (G,k,s,b)  ->  tiles[g,a,c] = Wb[g,a].T @ Wb[g,c]  (b,b)
-    M = torch.einsum('gasp,gcsq->gacpq', Wb, Wb)     # (G, k, k, b, b)
-    M = M.permute(0, 1, 3, 2, 4).reshape(G, k * b, k * b).contiguous()
-    return M, Wb
+def _svd_nf(Snf):
+    """Truncated (reduced) SVD of the near-field stack.  Snf:(G,m,s) ->
+    U:(G,m,r), S:(G,r), Vh:(G,r,s) with r=min(m,s)."""
+    return torch.linalg.svd(Snf, full_matrices=False)
 
 
-def _gram_range(Yi, Wb, M, rk, eps=1e-12):
-    """
-    Far-field range of  Y_i (I - W M^{-1} W^*)  from its b x b Gram, via eigh.
-
-    Yi : (G, b, s)        target block-row of the sketch (Y for U, Z for V)
-    Wb : (G, k, s, b)     near-field U-blocks (from _cross_gram)
-    M  : (G, k*b, k*b)    assembled W^*W
-    Returns basis (G, b, rk) : leading eigenvectors of the projected Gram.
-
-    G_tau = Yi Yi^* - (Yi W) M^{-1} (Yi W)^* ,   all contractions land in b-dim.
-    """
-    G, k, s, b = Wb.shape
-    # Yi W : (G, b, k*b).  Yi (G,b,s) times each Wb[:,a] (G,s,b) -> (G,b,b), concat.
-    # batched: einsum over k
-    YW = torch.einsum('gbs,gksp->gbkp', Yi, Wb).reshape(G, b, k * b)   # (G, b, k*b)
-    # solve M X = YW^*  ->  X = M^{-1} (YW)^*  : (G, k*b, b)
-    I = torch.eye(k*b, device=M.device, dtype=M.dtype)
-    L = torch.linalg.cholesky(M + eps * I)
-    Minv_YWt = torch.cholesky_solve(
-    YW.transpose(-2, -1),
-    L
-    )
-    #Minv_YWt = torch.linalg.lstsq(M, YW.transpose(-2, -1),rcond = 1e-12).solution
-    Ggram = torch.bmm(Yi, Yi.transpose(-2, -1)) - torch.bmm(YW, Minv_YWt)  # (G,b,b)
-    # symmetrise for numerical safety
-    Ggram = 0.5 * (Ggram + Ggram.transpose(-2, -1))
-    w, V = torch.linalg.eigh(Ggram)               # ascending
-    # take rk largest -> last rk columns, reorder to descending
-    Vtop = V[..., -rk:].flip(-1)                  # (G, b, rk)
-    return Vtop
-
-
-def _nf_rowspace(Snf, rcond=1e-12):
-    """
-    [fast=False]  Orthonormal basis Q of the near-field ROW space via a
-    rcond-truncated SVD of the stack -- conditioning kappa(Snf), not
-    kappa(Snf)^2, and robust to rank deficiency (small directions dropped).
-
-    Snf : (G, m, s)   near-field stack (m = k*b rows).
-    returns Q : (G, s, m)  (columns beyond the numerical rank are zeroed).
-    """
-    _, S, Vh = torch.linalg.svd(Snf, full_matrices=False)   # Vh: (G, m, s)
-    keep = (S > rcond * S[..., :1]).to(Snf.dtype).unsqueeze(-1)
-    return (Vh * keep).transpose(-2, -1)                    # (G, s, m)
+def _rowspace_from_svd(S, Vh, rcond=1e-12):
+    """Orthonormal near-field ROW-space basis Q:(G,s,m) from a cached SVD.
+    Columns past the numerical rank (relative tol rcond) are zeroed."""
+    keep = (S > rcond * S[..., :1]).to(Vh.dtype).unsqueeze(-1)
+    return (Vh * keep).transpose(-2, -1)
 
 
 def _range_via_projection(Yi, Q, rk):
-    """
-    [fast=False]  Far-field range of Y_i (I - Q Q^*) via SVD of the projected
-    sketch -- no Gram, no PSD difference, no cancellation.
-    Yi:(G,b,s) ; Q:(G,s,m). Returns (G,b,rk) leading left singular vectors.
-    """
+    """Far-field range of Y_i (I - Q Q^*) via SVD of the projected sketch -- no
+    Gram, no PSD difference, no cancellation.
+    Yi:(G,b,s) ; Q:(G,s,m). Returns (G,b,rk) leading left singular vectors."""
     Yperp = Yi - torch.bmm(torch.bmm(Yi, Q), Q.transpose(-2, -1))
     return torch.linalg.svd(Yperp, full_matrices=False).U[..., :rk]
 
 
-def _pinv_rhs_via_qr(rhs, Snf, rcond=1e-12):
-    """
-    [fast=False]  Batched right-solve X = rhs @ pinv(S_nf) via a rcond-truncated
-    SVD of the near-field stack -- conditioning kappa(S_nf), robust to rank
-    deficiency.  S_nf = U S V^* ; pinv = V S^+ U^* ; X = rhs V S^+ U^*.
-    rhs:(G,b,s) ; Snf:(G,m,s).  returns X:(G,b,m).
-    """
-    U, S, Vh = torch.linalg.svd(Snf, full_matrices=False)   # U:(G,m,r) Vh:(G,r,s)
-    sinv = torch.where(S > rcond * S[..., :1], 1.0/S, torch.zeros_like(S))
-    rV  = torch.bmm(rhs, Vh.transpose(-2, -1))              # (G, b, r)
+def _pinv_rhs_from_svd(rhs, U, S, Vh, rcond=1e-12):
+    """Batched right-solve X = rhs @ pinv(S_nf) from a cached truncated SVD.
+    pinv = V S^+ U^* ; X = (rhs V) S^+ U^*.  rhs:(G,b,s) -> X:(G,b,m)."""
+    sinv = torch.where(S > rcond * S[..., :1], 1.0 / S, torch.zeros_like(S))
+    rV = torch.bmm(rhs, Vh.transpose(-2, -1))               # (G, b, r)
     return torch.bmm(rV * sinv.unsqueeze(-2), U.transpose(-2, -1))   # (G, b, m)
 
 
@@ -334,22 +292,24 @@ def _pinv_rhs_via_qr(rhs, Snf, rcond=1e-12):
 # =============================================================================
 
 def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
-                         device=None, group_chunk=None, fast=True,
+                         device=None, group_chunk=None, cache: 'NFStackCache' = None,
                          prof=None, tag=''):
     """
     Compute one cluster-basis tensor (rows: pass Omega & Y ; cols: pass Psi & Z).
 
-    fast : True  -> Gram path (per-block QR + W^*W + eigh).  Low memory; squares
-                    conditioning, so coarse far-field can be lost to cancellation
-                    when weak.  Default (matches the existing behaviour).
-           False -> stable path (truncated-SVD near-field projector + projected
-                    SVD).  Forms the (chunk, m, s) stack (use group_chunk), but
-                    conditioning is kappa(Snf), not kappa(Snf)^2.
-    group_chunk: max clusters per batched call (bounds the s-carrying transient).
-    prof, tag  : optional ConstructProfiler and a label suffix; if given, the
-                 internal subroutines are timed/measured as aggregated 'detail'
-                 entries under parent f'basis_UV{tag}'.
-    returns    : basis (Nb, b, rk)
+    Stable (truncated-SVD) path only -- the Gram path was removed.  For each
+    group/chunk we form the near-field stack  S_nf (Gc, k*b, s), take ONE
+    truncated SVD, build the row-space projector Q = (Vh trunc)^T, and read off
+    the far-field range of the projected sketch.  Conditioning is kappa(S_nf),
+    not kappa(S_nf)^2.
+
+    The (chunk, k*b, s) stack is the only s-carrying transient; bound it with
+    group_chunk on large levels.
+
+    cache : optional NFStackCache.  If given, the per-chunk SVD (U,S,Vh) of S_nf
+            is stored under (group_index, chunk_start) so recover_E_strong can
+            reuse it (basis-U / E-term1 share Omega; basis-V / E-term2 share Psi).
+    returns : basis (Nb, b, rk)
     """
     from contextlib import nullcontext
     parent = f'basis_UV{tag}'
@@ -358,12 +318,7 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
 
     Nb, b, s = S_blk.shape
     out = S_blk.new_zeros(Nb, b, rk)
-    if fast:
-        with sub('  block_thinQR'):
-            Uq = _block_thinQR(S_blk)
-    else:
-        Uq = None
-    for grp in nearfield.groups:
+    for gi, grp in enumerate(nearfield.groups):
         k       = grp['k']
         ranks   = grp['ranks']
         nf_idx  = grp['nf_idx']
@@ -374,24 +329,19 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
             r_c   = ranks[c0:c0+cs]
             nf_c  = nf_idx[c0:c0+cs]
             Yi    = Sketch_blk[r_c]                # (Gc, b, s)
-            if fast:
-                with sub('  cross_gram (W*W)'):
-                    M, Wb = _cross_gram(Uq, nf_c)
-                with sub('  gram_range (eigh)'):
-                    basis = _gram_range(Yi, Wb, M, rk_g)
-                del M, Wb
-            else:
-                with sub('  gather_Snf'):
-                    Snf = S_blk[nf_c].reshape(nf_c.shape[0], k * b, s)
-                with sub('  nf_rowspace (SVD)'):
-                    Q = _nf_rowspace(Snf)
-                with sub('  range_proj (SVD)'):
-                    basis = _range_via_projection(Yi, Q, rk_g)
-                del Snf, Q
+            with sub('  gather_Snf'):
+                Snf = S_blk[nf_c].reshape(nf_c.shape[0], k * b, s)
+            with sub('  svd_nf (SVD)'):
+                Usvd, Ssvd, Vh = _svd_nf(Snf)
+            if cache is not None:
+                cache.put((gi, c0), Usvd, Ssvd, Vh)
+            with sub('  rowspace + range (SVD)'):
+                Q = _rowspace_from_svd(Ssvd, Vh)
+                basis = _range_via_projection(Yi, Q, rk_g)
             if rk_g < rk:
                 basis = torch.nn.functional.pad(basis, (0, rk - rk_g))
             out[r_c] = basis
-            del Yi, basis
+            del Yi, Snf, Q, basis
     return out
 
 
@@ -421,20 +371,39 @@ class BlockSparseE:
         self.mode='N'
         self.nnz_chunk = None     # bound the (nnz,b,s) matvec transient; None = whole
 
+    # default near-field apply strategy; 'bucket' won the bench_matvec.py study
+    # (batched dense GEMM per degree group, no atomic scatter).  'flat' is the
+    # old gather + index_add; 'bsr' uses torch.sparse_bsr_tensor @ dense.
+    apply_strategy = 'bucket'
+
     def to(self, device):
         """Move tiles and coordinates to `device` (cheap if already there).
-        Used to offload completed-level E to host during construction and to
-        stream it back to the compute device in matvec."""
+        Resets any prepared apply cache so it rebuilds on the new device (matvec
+        runs after the final device placement, so it is built exactly once)."""
         v = object.__new__(self.__class__)
         v.__dict__ = self.__dict__.copy()
         v.val = self.val.to(device)
         v.row = self.row.to(device)
         v.col = self.col.to(device)
+        v._invalidate_prepared()
         return v
+
+    def _invalidate_prepared(self):
+        for a in ('_prepared', '_info_N', '_info_T', '_bsr_N', '_bsr_T'):
+            if hasattr(self, a):
+                delattr(self, a)
 
     @property
     def device(self):
         return self.val.device
+
+    @property
+    def shape(self):
+        return (self.n * self.b, self.n * self.b)
+
+    @property
+    def dtype(self):
+        return self.val.dtype
 
     @property
     def nbytes(self):
@@ -455,61 +424,129 @@ class BlockSparseE:
             M[i*b:(i+1)*b, j*b:(j+1)*b] = self.val[t]
         return M
 
-    def to_sparse_bsr(self):
+    def to_sparse_bsr(self, row=None, col=None, val=None):
         """Convert to a torch sparse BSR tensor of shape (n*b, n*b)."""
-        # sort by (row, col) into CSR-of-blocks layout
-        order = torch.argsort(self.row * self.n + self.col)
-        row_s = self.row[order]; col_s = self.col[order]; val_s = self.val[order]
+        row = self.row if row is None else row
+        col = self.col if col is None else col
+        val = self.val if val is None else val
+        order = torch.argsort(row * self.n + col)
+        row_s = row[order]; col_s = col[order]; val_s = val[order].contiguous()
         crow = torch.zeros(self.n + 1, dtype=torch.long, device=val_s.device)
         counts = torch.bincount(row_s, minlength=self.n)
         crow[1:] = torch.cumsum(counts, 0)
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return torch.sparse_bsr_tensor(crow, col_s, val_s,
-                                           size=(self.n * self.b, self.n * self.b))
-    def __matmul__(self, T):
-        """
-        Multiply the block-sparse matrix by a tensor T of shape (n,b,s).
+            return torch.sparse_bsr_tensor(crow.to(torch.int32), col_s.to(torch.int32),
+                                           val_s, size=(self.n * self.b, self.n * self.b))
 
-        The (nnz, b, s) gather/product transient (= k_max x a full sketch at the
-        leaf) is built and accumulated in batches of `self.nnz_chunk` nonzeros,
-        so the reduction's peak is bounded independent of the total nnz.
-        Set nnz_chunk=None (default) to do it in one batch.
+    # ------------------------------------------------------------------
+    #  Prepared apply structures (built once; the sparsity pattern is fixed
+    #  across every GMRES iteration).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _coord_buckets(self_coord, other_coord, nnz):
+        """Group tile indices by `self_coord` node; within a bucket every node
+        shares degree k.  Returns list of (nodes(G,), nbr(G,k), tile(G,k))."""
+        dev = self_coord.device
+        cs = self_coord.cpu().numpy(); co = other_coord.cpu().numpy()
+        by = defaultdict(list)
+        for t in range(nnz):
+            by[int(cs[t])].append((int(co[t]), t))
+        degs = defaultdict(list)
+        for node, lst in by.items():
+            degs[len(lst)].append(node)
+        out = []
+        for k, nodes in sorted(degs.items()):
+            nodes = sorted(nodes)
+            nbr  = [[o for o, _ in by[node]] for node in nodes]
+            tile = [[t for _, t in by[node]] for node in nodes]
+            out.append((torch.tensor(nodes, dtype=torch.long, device=dev),
+                        torch.tensor(nbr,  dtype=torch.long, device=dev),
+                        torch.tensor(tile, dtype=torch.long, device=dev)))
+        return out
 
-        Returns
-        -------
-        out : (n,b,s)
-        """
-        assert T.ndim == 3
-        assert T.shape[0] == self.n
-        assert T.shape[1] == self.b
-        if self.mode not in ('N', 'T'):
-            raise ValueError("mode not recognized")
+    def _prepare(self):
+        """Degree-bucket structures.  Forward (N) packs tiles into bucket order
+        in place (no extra tile memory, no per-call gather); transpose (T) keeps
+        bucket indices and gathers/transposes per bucket at apply time (rare)."""
+        if getattr(self, '_prepared', False):
+            return
+        # --- N: group by row, then reorder val so each bucket is contiguous ---
+        bk_N = self._coord_buckets(self.row, self.col, self.nnz)
+        perm = torch.cat([tile.reshape(-1) for _, _, tile in bk_N]) \
+            if bk_N else torch.arange(self.nnz, device=self.val.device)
+        self.val = self.val[perm].contiguous()
+        self.row = self.row[perm].contiguous()
+        self.col = self.col[perm].contiguous()
+        info_N, off = [], 0
+        for nodes, nbr, tile in bk_N:
+            G, k = nbr.shape
+            info_N.append((nodes, nbr.reshape(-1), off, G, k)); off += G * k
+        self._info_N = info_N
+        # --- T: group by col (on the reordered coords), gather tiles at apply ---
+        bk_T = self._coord_buckets(self.col, self.row, self.nnz)
+        self._info_T = [(nodes, nbr.reshape(-1), tile.reshape(-1), nbr.shape[0], nbr.shape[1])
+                        for nodes, nbr, tile in bk_T]
+        self._prepared = True
+
+    def _apply_bucket(self, T, transpose):
+        n, b, cols = T.shape
+        out = torch.empty((n, b, cols), dtype=T.dtype, device=T.device)
+        if transpose:
+            for nodes, nbr, tile, G, k in self._info_T:
+                tiles = self.val[tile].transpose(-2, -1)          # (G*k,b,b)
+                xs = T[nbr]                                        # (G*k,b,cols)
+                prod = torch.bmm(tiles, xs).reshape(G, k, b, cols)
+                out[nodes] = prod.sum(dim=1)
+        else:
+            for nodes, nbr, off, G, k in self._info_N:
+                xs = T[nbr]                                        # (G*k,b,cols)
+                prod = torch.bmm(self.val[off:off + G * k], xs).reshape(G, k, b, cols)
+                out[nodes] = prod.sum(dim=1)
+        return out
+
+    def _apply_flat(self, T, transpose):
+        """Old gather + index_add path (fallback / reference)."""
         nnz = self.nnz
-        src = self.col if self.mode == 'N' else self.row   # gather index
-        dst = self.row if self.mode == 'N' else self.col   # scatter index
-        out = torch.zeros((self.n, self.b, T.shape[2]),
-                          dtype=T.dtype, device=T.device)
+        src = self.col if not transpose else self.row
+        dst = self.row if not transpose else self.col
+        out = torch.zeros((self.n, self.b, T.shape[2]), dtype=T.dtype, device=T.device)
         nc = getattr(self, 'nnz_chunk', None)
         step = nnz if nc is None else nc
         for p0 in range(0, nnz, step):
             p1 = min(p0 + step, nnz)
-            blocks = T[src[p0:p1]]                           # (chunk, b, s)
-            if self.mode == 'N':
-                contrib = torch.matmul(self.val[p0:p1], blocks)
-            else:
-                contrib = torch.matmul(self.val[p0:p1].transpose(-2, -1), blocks)
-            out.index_add_(0, dst[p0:p1], contrib)
-            del blocks, contrib
+            blocks = T[src[p0:p1]]
+            v = self.val[p0:p1] if not transpose else self.val[p0:p1].transpose(-2, -1)
+            out.index_add_(0, dst[p0:p1], torch.matmul(v, blocks))
         return out
+
+    def _apply_bsr(self, T, transpose):
+        n, b, cols = T.shape
+        if transpose and not hasattr(self, '_bsr_T'):
+            self._bsr_T = self.to_sparse_bsr(self.col, self.row,
+                                             self.val.transpose(-2, -1).contiguous())
+        if (not transpose) and not hasattr(self, '_bsr_N'):
+            self._bsr_N = self.to_sparse_bsr()
+        A = self._bsr_T if transpose else self._bsr_N
+        return (A @ T.reshape(n * b, cols)).reshape(n, b, cols)
 
     def matvec(self, T, transpose=False):
         """Block-sparse apply with an explicit transpose flag.
-        T : (n, b, cols) -> (n, b, cols).  Equivalent to (self.T @ T) when
-        transpose else (self @ T); lets callers pass a runtime flag instead of
-        building a transposed view."""
-        return (self.T @ T) if transpose else (self @ T)
+        T : (n, b, cols) -> (n, b, cols)."""
+        assert T.ndim == 3 and T.shape[0] == self.n and T.shape[1] == self.b
+        strat = self.apply_strategy
+        if strat == 'flat':
+            return self._apply_flat(T, transpose)
+        if strat == 'bsr':
+            return self._apply_bsr(T, transpose)
+        self._prepare()
+        return self._apply_bucket(T, transpose)
+
+    def __matmul__(self, T):
+        if self.mode not in ('N', 'T'):
+            raise ValueError("mode not recognized")
+        return self.matvec(T, transpose=(self.mode == 'T'))
 
     @property
     def T(self):
@@ -518,75 +555,26 @@ class BlockSparseE:
         view.mode = 'T'
         return view
 
-def _pinv_rhs_via_gram(rhs, Sg, M):
-    """
-    Batched min-norm right-solve  X (S_nf) = rhs   i.e.  X = rhs @ pinv(S_nf),
-    via the m x m Gram (S_nf S_nf^*); the s-wide (G,m,s) stack is never formed.
-
-        X = rhs @ S_nf^* (S_nf S_nf^*)^{-1}
-
-    rhs : (G, b, s)
-    Sg  : (G, k, b, s)   near-field blocks, gathered once (also used for M).
-    M   : (G, k*b, k*b)  = S_nf S_nf^*   (from _assemble_raw_gram)
-    returns X : (G, b, k*b)
-    """
-    G, k, b, s = Sg.shape
-    # rhs @ S_nf^* , block a = rhs @ Sg[:,a]^* ; s summed inside einsum
-    rhs_St = torch.einsum('gbs,gkcs->gbkc', rhs, Sg).reshape(G, b, k * b)
-    X = (torch.linalg.lstsq(M, rhs_St.transpose(-2, -1),rcond = 1e-12).solution).transpose(-2, -1)
-    return X                                          # (G, b, k*b)
-
-
-def _pairwise_gram_table(S_blk):
-    """
-    Cache of all b x b cross-Grams  G[i,j] = S_blk[i] S_blk[j]^*  needed later,
-    computed once.  Returns a (Nb, Nb, b, b) tensor.  This carries NO s-axis
-    (the s dimension is contracted out) so it is cheap: Nb^2 * b^2, and in
-    practice only the near-field-co-occurring (i,j) are ever read.
-
-    For large Nb prefer `_assemble_raw_gram` which computes only the needed
-    tiles per group; this dense table is a convenience for small/medium levels.
-    """
-    # G[i,j] = S_i S_j^* ; do it as one contraction (Nb,b,s)x(Nb,b,s)->(Nb,Nb,b,b)
-    return torch.einsum('ibs,jcs->ijbc', S_blk, S_blk)
-
-
-def _assemble_raw_gram(S_blk, nf_idx):
-    """
-    Assemble  M[g] = S_NF(g) S_NF(g)^*   (m x m, m=k*b) for every cluster in a
-    group, from b x b raw cross-Gram tiles, WITHOUT forming the (G,m,s) stack.
-
-    S_blk  : (Nb, b, s)
-    nf_idx : (G, k) long
-    returns M : (G, k*b, k*b)
-
-    Tile (a,c) of M[g] is  S[nf_idx[g,a]] S[nf_idx[g,c]]^* , a b x b matrix.
-    We gather the k near-field blocks (G,k,b,s) and contract pairwise; the s
-    axis is summed inside the einsum, so the only s-carrying object is the
-    gathered near-field blocks themselves -- the same (G,k,b,s) we already need
-    for the right-hand side, not an additional m x s replicated stack.
-    """
-    G, k = nf_idx.shape
-    b = S_blk.shape[1]
-    Sg = S_blk[nf_idx]                                # (G, k, b, s)
-    M = torch.einsum('gabs,gcds->gacbd', Sg, Sg)      # (G,k,k,b,b)
-    M = M.permute(0, 1, 3, 2, 4).reshape(G, k * b, k * b).contiguous()
-    return M, Sg
-
-
 def recover_E_strong(U_ell, V_ell, Y_blk, Z_blk, Om_blk, Psi_blk,
                      nearfield: NearField, device=None, group_chunk=None,
-                     tile_device=None, fast=True):
+                     tile_device=None, cache_Om: 'NFStackCache' = None,
+                     cache_Psi: 'NFStackCache' = None):
     """
     Recover the block-sparse near-field error term E from sketches only.
 
     For every near-field pair (i, j), j in NF(i):
         E_ij = (I - U_i U_i^*) A_ij  +  U_i U_i^* A_ij (I - V_j V_j^*)
 
-    fast        : True  -> Gram normal-equations solve (squares conditioning).
-                  False -> truncated-SVD right-solve (stable).
-    group_chunk : max clusters per batched solve; bounds the (chunk,k,b,s)
-                  transient.  None = whole group.
+    Stable truncated-SVD right-solve only (the Gram normal-equations path was
+    removed).  X = rhs @ pinv(S_NF) is read off the SVD of the near-field stack.
+
+    cache_Om / cache_Psi : optional NFStackCache filled by compute_basis_strong.
+        term1 reuses the Omega-stack SVD (shared with basis-U); term2 reuses the
+        Psi-stack SVD (shared with basis-V).  On a miss the SVD is recomputed.
+
+    group_chunk : max clusters per batched solve; bounds the (chunk, k*b, s)
+                  transient.  Must match the value used for compute_basis_strong
+                  for the cache keys to line up.
     tile_device : where recovered (b,b) tiles accumulate (default: sketch device).
 
     U_ell, V_ell : (Nb, b, rk) ; Y_blk, Z_blk, Om_blk, Psi_blk : (Nb, b, s)
@@ -601,23 +589,23 @@ def recover_E_strong(U_ell, V_ell, Y_blk, Z_blk, Om_blk, Psi_blk,
         for c0 in range(0, G, cs):
             yield c0, min(c0 + cs, G)
 
-    def right_solve(rhs, S_blk_, nf_c, k):
-        """X = rhs @ pinv(S_NF) for the chunk, via Gram (fast) or trunc-SVD."""
+    def right_solve(rhs, S_blk_, nf_c, k, cache, gi, c0):
+        """X = rhs @ pinv(S_NF), reusing the cached SVD of S_NF when available."""
         Gc = nf_c.shape[0]
-        if fast:
-            M, Sg = _assemble_raw_gram(S_blk_, nf_c)         # (Gc,kb,kb),(Gc,k,b,s)
-            return _pinv_rhs_via_gram(rhs, Sg, M)            # (Gc, b, k*b)
-        Snf = S_blk_[nf_c].reshape(Gc, k * b, s)             # (Gc, m, s)
-        return _pinv_rhs_via_qr(rhs, Snf)                    # (Gc, b, k*b)
+        fac = cache.get((gi, c0)) if cache is not None else None
+        if fac is None:
+            Snf = S_blk_[nf_c].reshape(Gc, k * b, s)
+            fac = _svd_nf(Snf)
+        return _pinv_rhs_from_svd(rhs, *fac)                 # (Gc, b, k*b)
 
     # --- term1: per cluster i, solve against its OWN near-field Omega stack ---
-    for grp in nearfield.groups:
+    for gi, grp in enumerate(nearfield.groups):
         k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']; G = grp['G']
         for c0, c1 in chunks(G):
             r_c  = ranks[c0:c1]; nf_c = nf_idx[c0:c1]; Gc = r_c.shape[0]
             Yi   = Y_blk[r_c]; Ui = U_ell[r_c]
             Yperp = Yi - torch.bmm(Ui, torch.bmm(Ui.transpose(-2, -1), Yi))
-            X1   = right_solve(Yperp, Om_blk, nf_c, k).reshape(Gc, b, k, b)
+            X1   = right_solve(Yperp, Om_blk, nf_c, k, cache_Om, gi, c0).reshape(Gc, b, k, b)
             X1c  = X1.to(tdev)
             for g in range(Gc):
                 i = int(r_c[g])
@@ -626,13 +614,13 @@ def recover_E_strong(U_ell, V_ell, Y_blk, Z_blk, Om_blk, Psi_blk,
             del Yi, Ui, Yperp, X1, X1c
 
     # --- term2: per cluster j, solve against its OWN near-field Psi stack ------
-    for grp in nearfield.groups:
+    for gi, grp in enumerate(nearfield.groups):
         k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']; G = grp['G']
         for c0, c1 in chunks(G):
             r_c  = ranks[c0:c1]; nf_c = nf_idx[c0:c1]; Gc = r_c.shape[0]
             Zj   = Z_blk[r_c]; Vj = V_ell[r_c]
             Zperp = Zj - torch.bmm(Vj, torch.bmm(Vj.transpose(-2, -1), Zj))
-            X2   = right_solve(Zperp, Psi_blk, nf_c, k).reshape(Gc, b, k, b)
+            X2   = right_solve(Zperp, Psi_blk, nf_c, k, cache_Psi, gi, c0).reshape(Gc, b, k, b)
             for g in range(Gc):
                 j = int(r_c[g])
                 for a in range(k):
@@ -687,23 +675,26 @@ def to_block_tensor(M, n, b):
 
 
 def compress_level_strong(Om_blk,Psi_blk,Y_blk,Z_blk, adj_sets, rk,device=None,
-                          group_chunk=None, tile_device=None, fast=True):
+                          group_chunk=None, tile_device=None):
     """
     One-level strong-admissibility compression.  Returns (U, V, E, nfo).
 
-    fast        : Gram path (True, default) vs stable trunc-SVD path (False).
-    group_chunk : bounds the (chunk,k,*,s) transient on the compute device.
+    Stable truncated-SVD path only.  The Omega/Psi near-field-stack SVDs are
+    computed during the basis step and reused in E recovery.
+    group_chunk : bounds the (chunk,k*b,s) transient on the compute device.
     tile_device : where E's (b,b) tiles accumulate (default = data device).
     NearField indices are pinned to the SKETCH device so gathers don't mismatch.
     """
     n = len(adj_sets)
     nfo = NearField(adj_sets, device=Om_blk.device)
+    cache_Om, cache_Psi = NFStackCache(), NFStackCache()
     U = compute_basis_strong(Om_blk,  Y_blk, nfo, rk, device=device,
-                             group_chunk=group_chunk, fast=fast)
+                             group_chunk=group_chunk, cache=cache_Om)
     V = compute_basis_strong(Psi_blk, Z_blk, nfo, rk, device=device,
-                             group_chunk=group_chunk, fast=fast)
+                             group_chunk=group_chunk, cache=cache_Psi)
     E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo, device=device,
-                         group_chunk=group_chunk, tile_device=tile_device, fast=fast)
+                         group_chunk=group_chunk, tile_device=tile_device,
+                         cache_Om=cache_Om, cache_Psi=cache_Psi)
     return U, V, E, nfo
 
 def has_farfield(adj_sets):
@@ -713,19 +704,57 @@ def has_farfield(adj_sets):
     compress and we are at the base case."""
     n = len(adj_sets)
     return any(len(set(adj_sets[r]) | {r}) < n for r in range(n))
+class DenseBase:
+    """Dense coarse base operator B (n*b x n*b), applied as a single GEMM.
+
+    The all-pairs base is dense, so applying it through the block-sparse
+    gather/scatter machinery is wasteful (n^2 tiny tiles + scatter).  This
+    wrapper keeps B dense and applies it as one (n*b)x(n*b) . (n*b)xcols matmul.
+    Exposes the BlockSparseE-compatible surface used by HBSMAT._sweep
+    (matvec / to / dtype / device / nbytes)."""
+    def __init__(self, B, n, b):
+        self.B = B; self.n = n; self.b = b
+        self.mode = 'N'
+
+    @property
+    def dtype(self):
+        return self.B.dtype
+
+    @property
+    def shape(self):
+        return tuple(self.B.shape)
+
+    @property
+    def device(self):
+        return self.B.device
+
+    @property
+    def nbytes(self):
+        return self.B.element_size() * self.B.nelement()
+
+    def to(self, device):
+        v = object.__new__(self.__class__)
+        v.__dict__ = self.__dict__.copy()
+        v.B = self.B.to(device)
+        return v
+
+    def matvec(self, T, transpose=False):
+        n, b, cols = T.shape
+        x = T.reshape(n * b, cols)
+        y = (self.B.transpose(-2, -1) @ x) if transpose else (self.B @ x)
+        return y.reshape(n, b, cols)
+
+
 def compute_final_E(Y_blk, Om_blk, device=None):
     """Base case (no far-field left): the whole reduced operator is near-field.
     Recover the dense reduced operator B from  B Om = Y  (B = Y pinv(Om)) and
-    pack it as an all-pairs BlockSparseE.  Exact when s >= n*b."""
+    return it as a DenseBase (applied as one GEMM in matvec).  Exact when
+    s >= n*b."""
     n, b, s = Y_blk.shape
     Yf = Y_blk.reshape(n * b, s)
     Of = Om_blk.reshape(n * b, s)
     B  = Yf @ torch.linalg.pinv(Of)                      # (n*b, n*b)
-    idx = [(i, j) for i in range(n) for j in range(n)]
-    val = torch.stack([B[i*b:(i+1)*b, j*b:(j+1)*b] for i, j in idx], 0)
-    row = torch.tensor([i for i, _ in idx], dtype=torch.long, device=device)
-    col = torch.tensor([j for _, j in idx], dtype=torch.long, device=device)
-    return BlockSparseE(val, row, col, n, b)
+    return DenseBase(B, n, b)
 
 class HBSMAT:
     """
@@ -765,6 +794,11 @@ class HBSMAT:
         # clusters processed per batched solve in the basis / E recovery; bounds
         # the (chunk,k,*,s) transient on the compute device.  None = whole level.
         self.group_chunk = None
+        # after construction, migrate operators to the compute device once and
+        # keep them resident (no per-matvec streaming).  Set False for low-VRAM
+        # use, then matvec requires operators already on self.device.
+        self.migrate_after_construct = True
+        self._matvec_perm = None      # cached device-resident leaf permutation
 
         if tree is not None:
             self.tree   =   tree
@@ -803,17 +837,20 @@ class HBSMAT:
         self.fac = fac
         self.Nb = Nbvec[0]
         self.shape = torch.tensor([Emats[0].shape[0],Emats[0].shape[0]],dtype = torch.int64)
-        self.dtype = Emats[0][0].dtype
+        self.dtype = Emats[0].dtype
     @property
     def nbytes(self):
         ctr = 0
         ctr+=sum([U.nbytes for U in self.Umats])
         ctr+=sum([V.nbytes for V in self.Vmats])
-        ctr+=sum([D.nbytes for D in self.Dmats])
+        ctr+=sum([E.nbytes for E in self.Emats])
         return ctr
     
     def construct(self,rk,Om,Psi,Y,Z,group_chunk=None,store_device=None,
-                  empty_cache=True,fast=True,profile=True,profile_detail=True):
+                  empty_cache=True,fast=None,profile=True,profile_detail=True):
+        # `fast` is accepted for backward compatibility but ignored: the Gram
+        # "fast path" was removed (it squared the conditioning); the stable
+        # truncated-SVD path is now the only path.
         #assume numpy input here:
         if group_chunk is not None: self.group_chunk = group_chunk
         if store_device is not None: self.store_device = store_device
@@ -838,10 +875,10 @@ class HBSMAT:
             Y_blk   = to_block_tensor(Ypr,   Nb, nl)
             Z_blk   = to_block_tensor(Zpr,   Nb, nl)
             del Ompr, Psipr, Ypr, Zpr
-        self.constructHBS(rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=empty_cache,fast=fast)
+        self.constructHBS(rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=empty_cache)
         self.tConstruct = time.perf_counter() - t_all
 
-    def constructHBS(self,rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=True,fast=True):
+    def constructHBS(self,rk,Om_blk,Psi_blk,Y_blk,Z_blk,empty_cache=True):
         Nb = self.Nb
         nl = self.nl
         s = Om_blk.shape[2]
@@ -860,19 +897,23 @@ class HBSMAT:
             if has_farfield(adj_level):
                 # NearField indices on the sketch device
                 nfo = NearField(adj_level, device=Om_blk.device)
+                # SVD-of-near-field-stack caches shared basis<->E (Omega / Psi).
+                cache_Om, cache_Psi = NFStackCache(), NFStackCache()
                 # --- basis U, V (compute), with subroutine detail ---
                 with prof.phase(f'basis_UV@lvl{lvl}', kind='compute'):
                     U = compute_basis_strong(Om_blk, Y_blk, nfo, rkm,
-                                             device=self.device, group_chunk=gc, fast=fast,
-                                             prof=prof, tag=f'@lvl{lvl}')
+                                             device=self.device, group_chunk=gc,
+                                             cache=cache_Om, prof=prof, tag=f'@lvl{lvl}')
                     V = compute_basis_strong(Psi_blk, Z_blk, nfo, rkm,
-                                             device=self.device, group_chunk=gc, fast=fast,
-                                             prof=prof, tag=f'@lvl{lvl}')
+                                             device=self.device, group_chunk=gc,
+                                             cache=cache_Psi, prof=prof, tag=f'@lvl{lvl}')
                 # --- error term E (compute), tiles kept on compute device ---
                 with prof.phase(f'recover_E@lvl{lvl}', kind='compute'):
                     E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo,
                                          device=self.device, group_chunk=gc,
-                                         tile_device=self.device, fast=fast)
+                                         tile_device=self.device,
+                                         cache_Om=cache_Om, cache_Psi=cache_Psi)
+                    del cache_Om, cache_Psi
                 # --- reduction to next coarser level (compute) ---
                 with prof.phase(f'reduction@lvl{lvl}', kind='compute'):
                     Nb_prev = Nb
@@ -884,9 +925,11 @@ class HBSMAT:
                         avg_deg = max(1, E.nnz // max(1, Nb_prev))
                         E.nnz_chunk = max(1, gc * avg_deg)
                     # process Y (uses E, Om_blk, U) then free what each step kills.
-                    Y_blk = Y_blk - E @ Om_blk
+                    # Use the nnz-chunked flat apply here so the construction-time
+                    # transient stays bounded (the bucket path is for the matvec).
+                    Y_blk = Y_blk - E._apply_flat(Om_blk, False)
                     Y_blk = torch.bmm(U.transpose(-2, -1), Y_blk).reshape(Nb, self.fac*rkm_used, s)
-                    Z_blk = Z_blk - E.T @ Psi_blk
+                    Z_blk = Z_blk - E._apply_flat(Psi_blk, True)
                     Z_blk = torch.bmm(V.transpose(-2, -1), Z_blk).reshape(Nb, self.fac*rkm_used, s)
                     Om_new  = torch.bmm(V.transpose(-2, -1), Om_blk).reshape(Nb, self.fac*rkm_used, s)
                     del Om_blk; Om_blk = Om_new; del Om_new
@@ -909,6 +952,26 @@ class HBSMAT:
                 del E
                 _free()
                 break
+
+        # Operators were parked on store_device (default 'cpu') to bound peak
+        # device memory during construction.  Once construction is done that
+        # pressure is gone, so migrate everything to the compute device ONCE and
+        # leave it resident -- the matvec then streams nothing (the per-iteration
+        # H2D of every U/V/E was the dominant strong-case matvec cost in GMRES).
+        if self.migrate_after_construct and str(self.device).startswith('cuda'):
+            self.to_device(self.device)
+
+    def to_device(self, device=None):
+        """Move all U/V/E operators to `device` (default self.device) once and
+        keep them resident.  matvec asserts the operators live here, so no
+        per-iteration host<->device transfer happens.  Returns self."""
+        device = self.device if device is None else device
+        self.Umats = [U.to(device) for U in self.Umats]
+        self.Vmats = [V.to(device) for V in self.Vmats]
+        self.Emats = [E.to(device) for E in self.Emats]
+        self.store_device = device
+        self._matvec_perm = None      # rebuilt on the new device at next matvec
+        return self
 
     def print_profile(self, sort_by=None):
         """
@@ -1028,9 +1091,20 @@ class HBSMAT:
         if numpy_input:
             v = torch.from_numpy(v)
         cdev = self.device                       # compute device
-        ref_dtype = self.Emats[-1].val.dtype
+        ref_dtype = self.Emats[-1].dtype         # DenseBase / BlockSparseE both expose .dtype
         v = v.to(device=cdev, dtype=ref_dtype)   # single move (device + dtype)
-        perm = torch.as_tensor(self.perm, dtype=torch.long, device=cdev)
+
+        # Operators are kept resident on the compute device after construction
+        # (see to_device / migrate_after_construct), so the sweep streams nothing
+        # and never re-wraps a BlockSparseE (which would drop its prepared apply
+        # cache).  In low-VRAM mode (migration disabled) operators are streamed.
+        resident = (str(self.store_device) == str(cdev))
+        def dev(x):
+            return x if resident else x.to(cdev)
+
+        if self._matvec_perm is None or self._matvec_perm.device != torch.device(cdev):
+            self._matvec_perm = torch.as_tensor(self.perm, dtype=torch.long, device=cdev)
+        perm = self._matvec_perm
         col_vec = (v.ndim == 1)
         vperm = v[perm, None] if col_vec else v[perm, :]
         cols = vperm.shape[1]
@@ -1039,29 +1113,25 @@ class HBSMAT:
         upmats   = self.Umats if mode == 'N' else self.Vmats
         transpose = (mode == 'T')
 
-        # ---- down-sweep: project + regroup fac children into a parent block.
-        # Mats are streamed from store_device to the compute device per level and
-        # released immediately, so matvec peak stays bounded just like construct.
+        # ---- down-sweep: project + regroup fac children into a parent block ----
         VV = [vperm.reshape(self.Nb, self.nl, cols)]
         for lvl in range(nlev):
-            A = downmats[lvl].to(cdev)                         # (Nb_lvl, b_lvl, rk)
+            A = dev(downmats[lvl])                             # (Nb_lvl, b_lvl, rk)
             proj = torch.bmm(A.transpose(-2, -1), VV[lvl])     # (Nb_lvl, rk, cols)
             Nb_lvl, rk_lvl = A.shape[0], A.shape[2]
             VV.append(proj.reshape(Nb_lvl // self.fac, self.fac * rk_lvl, cols))
-            del A
 
-        # ---- dense base ----
-        uperm = self.Emats[-1].to(cdev).matvec(VV[-1], transpose=transpose)
+        # ---- dense base (single GEMM) ----
+        uperm = dev(self.Emats[-1]).matvec(VV[-1], transpose=transpose)
 
         # ---- up-sweep: split parent back to children, U(coarse) + E(this) ----
         for lvl in range(nlev - 1, -1, -1):
-            U = upmats[lvl].to(cdev)                           # (Nb_lvl, b_lvl, rk)
+            U = dev(upmats[lvl])                                # (Nb_lvl, b_lvl, rk)
             Nb_lvl, rk_lvl = U.shape[0], U.shape[2]
             uperm = uperm.reshape(Nb_lvl, rk_lvl, cols)
             far  = torch.bmm(U, uperm)                          # (Nb_lvl, b_lvl, cols)
-            near = self.Emats[lvl].to(cdev).matvec(VV[lvl], transpose=transpose)
+            near = dev(self.Emats[lvl]).matvec(VV[lvl], transpose=transpose)
             uperm = far + near
-            del U, far, near
 
         # ---- flatten, un-permute, restore input shape ----
         uperm = uperm.reshape(-1, cols)
