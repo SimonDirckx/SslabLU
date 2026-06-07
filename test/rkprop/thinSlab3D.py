@@ -614,25 +614,35 @@ elif solve_method == 'stencil':
     print("Sl shape = ",LinOp_l.shape)
     print("Sr shape = ",LinOp_r.shape)
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    rk = 20
-    s = 10*max(2*rk,nl)+rk+10
+    rk = 40
+    if admissibility == 'full':
+        s = max(9*2*rk,9*nl)+rk+10
+    else:
+        s = max(5*2*rk,5*nl)+rk+10
     N = LinOp_r.shape[0]
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Nb = N//nl
+    tic_sample = time.time()
     Y = LinOp_r@Om
     Z = LinOp_r.T@Psi
+    time_sample = time.time()-tic_sample
     tic = time.time()
     SSr.construct(rk,Om,Psi,Y,Z,fast=True)
+    print("sample done in :",time_sample)
     print("HBS done in :",time.time()-tic)
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Nb = N//nl
+    tic_sample = time.time()
     Y = LinOp_l@Om
     Z = LinOp_l.T@Psi
+    time_sample = time.time()-tic_sample
     tic = time.time()
     SSl.construct(rk,Om,Psi,Y,Z,fast=True)
+    print("sample done in :",time_sample)
     print("HBS done in :",time.time()-tic)
+    SSl.print_profile()
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
