@@ -246,45 +246,96 @@ class NearField:
 
 
 class NFStackCache:
-    """Per-(group, chunk) cache of the truncated SVD of the near-field stack
-    S_nf (G, m, s).  Keyed by (group_index, chunk_start).  compute_basis_strong
-    fills it; recover_E_strong reads it (and recomputes on a miss, so the two
-    functions remain usable independently)."""
+    """Per-(group, chunk) cache of the near-field-stack factorization (a tagged
+    tuple: ('qr', Q, R) or ('svd', U, S, Vh)).  Keyed by (group_index,
+    chunk_start).  The basis pass fills it; recover_E_strong reads it (and
+    recomputes on a miss, so the two stay usable independently)."""
     def __init__(self):
         self.store = {}
     def get(self, key):
         return self.store.get(key)
-    def put(self, key, U, S, Vh):
-        self.store[key] = (U, S, Vh)
+    def put(self, key, fac):
+        self.store[key] = fac
 
 
-def _svd_nf(Snf):
-    """Truncated (reduced) SVD of the near-field stack.  Snf:(G,m,s) ->
-    U:(G,m,r), S:(G,r), Vh:(G,r,s) with r=min(m,s)."""
-    return torch.linalg.svd(Snf, full_matrices=False)
+def _factor_nf(Snf, rcond=1e-12, stats=None):
+    """Factor the near-field stack S_nf (G, m, s), m = k*b, for both the
+    row-space projector and the pseudo-inverse right-solve.
+
+    Fast path -- QR of S_nf^T:  S_nf^T = Q R,  Q:(G,s,m) orthonormal columns
+    spanning row(S_nf), R:(G,m,m) upper-triangular.  Valid when m <= s and the
+    stack is full row rank (generic for Gaussian sketches).  This computes no
+    singular values (the projector only needs an orthonormal row-space basis,
+    the right-solve only needs R) and uses geqrf/orgqr + trsm, which are far
+    faster than batched gesvd -- especially on GPU.
+
+    Safe fallback -- truncated SVD:  taken when m > s, or when min|diag(R)| is a
+    tiny fraction of max|diag(R)| (near rank-deficient), so R can't be inverted
+    safely.  Conditioning is kappa(S_nf) on both paths (never squared).
+
+    Returns a tagged tuple consumed by _rowspace / _pinv_rhs.  `stats`, if given,
+    counts how often each path is taken (for the construct profiler)."""
+    G, m, s = Snf.shape
+    if m <= s:
+        Q, R = torch.linalg.qr(Snf.transpose(-2, -1), mode='reduced')   # (G,s,m),(G,m,m)
+        d = torch.diagonal(R, dim1=-2, dim2=-1).abs()                    # (G, m)
+        if bool((d.amin(dim=-1) > rcond * d.amax(dim=-1).clamp_min(0)).all()):
+            if stats is not None: stats['qr'] = stats.get('qr', 0) + 1
+            return ('qr', Q, R)
+    U, S, Vh = torch.linalg.svd(Snf, full_matrices=False)
+    if stats is not None: stats['svd'] = stats.get('svd', 0) + 1
+    return ('svd', U, S, Vh)
+
+
+def _rowspace(fac, rcond=1e-12):
+    """Orthonormal near-field ROW-space basis Q:(G,s,m) from a factorization."""
+    if fac[0] == 'qr':
+        return fac[1]
+    return _rowspace_from_svd(fac[2], fac[3], rcond)
 
 
 def _rowspace_from_svd(S, Vh, rcond=1e-12):
-    """Orthonormal near-field ROW-space basis Q:(G,s,m) from a cached SVD.
-    Columns past the numerical rank (relative tol rcond) are zeroed."""
+    """Row-space basis from a (fallback) SVD; near-rank columns zeroed."""
     keep = (S > rcond * S[..., :1]).to(Vh.dtype).unsqueeze(-1)
     return (Vh * keep).transpose(-2, -1)
 
 
-def _range_via_projection(Yi, Q, rk):
-    """Far-field range of Y_i (I - Q Q^*) via SVD of the projected sketch -- no
-    Gram, no PSD difference, no cancellation.
-    Yi:(G,b,s) ; Q:(G,s,m). Returns (G,b,rk) leading left singular vectors."""
-    Yperp = Yi - torch.bmm(torch.bmm(Yi, Q), Q.transpose(-2, -1))
-    return torch.linalg.svd(Yperp, full_matrices=False).U[..., :rk]
-
-
-def _pinv_rhs_from_svd(rhs, U, S, Vh, rcond=1e-12):
-    """Batched right-solve X = rhs @ pinv(S_nf) from a cached truncated SVD.
-    pinv = V S^+ U^* ; X = (rhs V) S^+ U^*.  rhs:(G,b,s) -> X:(G,b,m)."""
+def _pinv_rhs(rhs, fac, rcond=1e-12):
+    """Batched right-solve X = rhs @ pinv(S_nf) from a factorization.
+    rhs:(G,b,s) -> X:(G,b,m)."""
+    if fac[0] == 'qr':
+        _, Q, R = fac
+        # pinv(S_nf) = Q R^{-T} ; X = (rhs Q) R^{-T}  ->  X^T solves R X^T = (rhs Q)^T
+        W = torch.bmm(rhs, Q)                                   # (G, b, m)
+        XT = torch.linalg.solve_triangular(R, W.transpose(-2, -1), upper=True, left=True)
+        return XT.transpose(-2, -1)
+    _, U, S, Vh = fac
     sinv = torch.where(S > rcond * S[..., :1], 1.0 / S, torch.zeros_like(S))
-    rV = torch.bmm(rhs, Vh.transpose(-2, -1))               # (G, b, r)
-    return torch.bmm(rV * sinv.unsqueeze(-2), U.transpose(-2, -1))   # (G, b, m)
+    rV = torch.bmm(rhs, Vh.transpose(-2, -1))                   # (G, b, r)
+    return torch.bmm(rV * sinv.unsqueeze(-2), U.transpose(-2, -1))
+
+
+def _range_via_projection(Yi, Q, rk):
+    """Far-field range of Y_i (I - Q Q^*): leading rk left singular vectors of
+    the projected sketch Yperp (G,b,s), b <= s.
+
+    Computed EXACTLY but without a fat-matrix SVD: QR of Yperp^T (s x b) gives
+    Yperp = R^T Q_y^T with Q_y orthonormal columns, so the left singular vectors
+    of Yperp equal those of the tiny (b x b) matrix R^T.  This is an exact SVD
+    (not randomized) -- it just moves the only gesvd onto a b x b matrix, which
+    avoids the cuSOLVER batched-gesvd convergence fallback that the (b x s) SVD
+    triggers, and is far cheaper.
+    Yi:(G,b,s) ; Q:(G,s,m). Returns (G,b,rk)."""
+    Yperp = Yi - torch.bmm(torch.bmm(Yi, Q), Q.transpose(-2, -1))   # (G,b,s)
+    _, R = torch.linalg.qr(Yperp.transpose(-2, -1), mode='reduced')  # R:(G,b,b)
+    Ur = torch.linalg.svd(R.transpose(-2, -1), full_matrices=False).U  # (G,b,b)
+    return Ur[..., :rk]
+
+
+def _basis_from_factor(Yi, fac, rk_g):
+    """Far-field basis (G,b,rk_g) for target sketch Yi from a near-field-stack
+    factorization: project out the near-field row space, then range via SVD."""
+    return _range_via_projection(Yi, _rowspace(fac), rk_g)
 
 
 # =============================================================================
@@ -293,20 +344,18 @@ def _pinv_rhs_from_svd(rhs, U, S, Vh, rcond=1e-12):
 
 def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
                          device=None, group_chunk=None, cache: 'NFStackCache' = None,
-                         prof=None, tag=''):
+                         prof=None, tag='', stats=None):
     """
     Compute one cluster-basis tensor (rows: pass Omega & Y ; cols: pass Psi & Z).
 
-    Stable (truncated-SVD) path only -- the Gram path was removed.  For each
-    group/chunk we form the near-field stack  S_nf (Gc, k*b, s), take ONE
-    truncated SVD, build the row-space projector Q = (Vh trunc)^T, and read off
-    the far-field range of the projected sketch.  Conditioning is kappa(S_nf),
-    not kappa(S_nf)^2.
+    For each group/chunk we form the near-field stack S_nf (Gc, k*b, s), factor
+    it once (QR fast path / SVD fallback, see _factor_nf), build the row-space
+    projector, and read off the far-field range of the projected sketch.
 
     The (chunk, k*b, s) stack is the only s-carrying transient; bound it with
     group_chunk on large levels.
 
-    cache : optional NFStackCache.  If given, the per-chunk SVD (U,S,Vh) of S_nf
+    cache : optional NFStackCache.  If given, the per-chunk factorization of S_nf
             is stored under (group_index, chunk_start) so recover_E_strong can
             reuse it (basis-U / E-term1 share Omega; basis-V / E-term2 share Psi).
     returns : basis (Nb, b, rk)
@@ -319,30 +368,83 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
     Nb, b, s = S_blk.shape
     out = S_blk.new_zeros(Nb, b, rk)
     for gi, grp in enumerate(nearfield.groups):
-        k       = grp['k']
-        ranks   = grp['ranks']
-        nf_idx  = grp['nf_idx']
-        rk_g    = min(rk, b)
-        G       = ranks.shape[0]
-        cs      = G if group_chunk is None else group_chunk
+        k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']
+        rk_g = min(rk, b); G = ranks.shape[0]
+        cs = G if group_chunk is None else group_chunk
         for c0 in range(0, G, cs):
-            r_c   = ranks[c0:c0+cs]
-            nf_c  = nf_idx[c0:c0+cs]
-            Yi    = Sketch_blk[r_c]                # (Gc, b, s)
+            r_c = ranks[c0:c0+cs]; nf_c = nf_idx[c0:c0+cs]
+            Yi  = Sketch_blk[r_c]                  # (Gc, b, s)
             with sub('  gather_Snf'):
                 Snf = S_blk[nf_c].reshape(nf_c.shape[0], k * b, s)
-            with sub('  svd_nf (SVD)'):
-                Usvd, Ssvd, Vh = _svd_nf(Snf)
+            with sub('  factor_nf (QR/SVD)'):
+                fac = _factor_nf(Snf, stats=stats)
             if cache is not None:
-                cache.put((gi, c0), Usvd, Ssvd, Vh)
-            with sub('  rowspace + range (SVD)'):
-                Q = _rowspace_from_svd(Ssvd, Vh)
-                basis = _range_via_projection(Yi, Q, rk_g)
+                cache.put((gi, c0), fac)
+            with sub('  range (SVD)'):
+                basis = _basis_from_factor(Yi, fac, rk_g)
             if rk_g < rk:
                 basis = torch.nn.functional.pad(basis, (0, rk - rk_g))
             out[r_c] = basis
-            del Yi, Snf, Q, basis
+            del Yi, Snf, fac, basis
     return out
+
+
+def compute_bases_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nearfield: NearField, rk,
+                         device=None, group_chunk=None, cache_Om: 'NFStackCache' = None,
+                         cache_Psi: 'NFStackCache' = None, prof=None, tag='', stats=None):
+    """
+    Compute BOTH cluster bases U (Omega/Y) and V (Psi/Z) in one pass.
+
+    The Omega and Psi near-field stacks are factored SEPARATELY (one resident at
+    a time) so the s-carrying transient -- and thus GPU peak -- is the same as
+    computing a single basis; only one stack of shape (Gc, k*b, s) is alive at
+    once.  (Concatenating the two into a 2*Gc batch would halve launch count but
+    double that transient, which is not worth it when device memory is the
+    binding constraint.)  Each side's factorization is cached so
+    recover_E_strong reuses it.
+
+    returns : (U, V), each (Nb, b, rk)
+    """
+    from contextlib import nullcontext
+    parent = f'basis_UV{tag}'
+    def sub(name):
+        return prof.sub(f'{name}{tag}', parent) if prof is not None else nullcontext()
+
+    Nb, b, s = Om_blk.shape
+    U = Om_blk.new_zeros(Nb, b, rk)
+    V = Om_blk.new_zeros(Nb, b, rk)
+    for gi, grp in enumerate(nearfield.groups):
+        k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']
+        rk_g = min(rk, b); G = ranks.shape[0]
+        cs = G if group_chunk is None else group_chunk
+        for c0 in range(0, G, cs):
+            r_c = ranks[c0:c0+cs]; nf_c = nf_idx[c0:c0+cs]; Gc = r_c.shape[0]
+            # --- U side (Omega / Y) ---
+            with sub('  gather_Snf'):
+                Snf = Om_blk[nf_c].reshape(Gc, k * b, s)
+            with sub('  factor_nf (QR/SVD)'):
+                fac = _factor_nf(Snf, stats=stats)
+            del Snf
+            if cache_Om is not None: cache_Om.put((gi, c0), fac)
+            with sub('  range (QR+svd)'):
+                Ublk = _basis_from_factor(Y_blk[r_c], fac, rk_g)
+            del fac
+            # --- V side (Psi / Z) ---
+            with sub('  gather_Snf'):
+                Snf = Psi_blk[nf_c].reshape(Gc, k * b, s)
+            with sub('  factor_nf (QR/SVD)'):
+                fac = _factor_nf(Snf, stats=stats)
+            del Snf
+            if cache_Psi is not None: cache_Psi.put((gi, c0), fac)
+            with sub('  range (QR+svd)'):
+                Vblk = _basis_from_factor(Z_blk[r_c], fac, rk_g)
+            del fac
+            if rk_g < rk:
+                Ublk = torch.nn.functional.pad(Ublk, (0, rk - rk_g))
+                Vblk = torch.nn.functional.pad(Vblk, (0, rk - rk_g))
+            U[r_c] = Ublk; V[r_c] = Vblk
+            del Ublk, Vblk
+    return U, V
 
 
 # =============================================================================
@@ -590,13 +692,14 @@ def recover_E_strong(U_ell, V_ell, Y_blk, Z_blk, Om_blk, Psi_blk,
             yield c0, min(c0 + cs, G)
 
     def right_solve(rhs, S_blk_, nf_c, k, cache, gi, c0):
-        """X = rhs @ pinv(S_NF), reusing the cached SVD of S_NF when available."""
+        """X = rhs @ pinv(S_NF), reusing the cached factorization of S_NF (QR
+        fast path / SVD fallback) when available; recompute on a miss."""
         Gc = nf_c.shape[0]
         fac = cache.get((gi, c0)) if cache is not None else None
         if fac is None:
             Snf = S_blk_[nf_c].reshape(Gc, k * b, s)
-            fac = _svd_nf(Snf)
-        return _pinv_rhs_from_svd(rhs, *fac)                 # (Gc, b, k*b)
+            fac = _factor_nf(Snf)
+        return _pinv_rhs(rhs, fac)                           # (Gc, b, k*b)
 
     # --- term1: per cluster i, solve against its OWN near-field Omega stack ---
     for gi, grp in enumerate(nearfield.groups):
@@ -688,10 +791,9 @@ def compress_level_strong(Om_blk,Psi_blk,Y_blk,Z_blk, adj_sets, rk,device=None,
     n = len(adj_sets)
     nfo = NearField(adj_sets, device=Om_blk.device)
     cache_Om, cache_Psi = NFStackCache(), NFStackCache()
-    U = compute_basis_strong(Om_blk,  Y_blk, nfo, rk, device=device,
-                             group_chunk=group_chunk, cache=cache_Om)
-    V = compute_basis_strong(Psi_blk, Z_blk, nfo, rk, device=device,
-                             group_chunk=group_chunk, cache=cache_Psi)
+    U, V = compute_bases_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nfo, rk,
+                                device=device, group_chunk=group_chunk,
+                                cache_Om=cache_Om, cache_Psi=cache_Psi)
     E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo, device=device,
                          group_chunk=group_chunk, tile_device=tile_device,
                          cache_Om=cache_Om, cache_Psi=cache_Psi)
@@ -799,6 +901,8 @@ class HBSMAT:
         # use, then matvec requires operators already on self.device.
         self.migrate_after_construct = True
         self._matvec_perm = None      # cached device-resident leaf permutation
+        # counts of near-field factorizations taken on each path during construct
+        self.factor_stats = {'qr': 0, 'svd': 0}
 
         if tree is not None:
             self.tree   =   tree
@@ -857,6 +961,7 @@ class HBSMAT:
         self.profiler = ConstructProfiler(self.device)
         self.profiler.enabled = profile
         self.profiler.detail_enabled = profile_detail
+        self.factor_stats = {'qr': 0, 'svd': 0}
         prof = self.profiler
         t_all = time.perf_counter()
         Nb = self.Nb
@@ -897,16 +1002,15 @@ class HBSMAT:
             if has_farfield(adj_level):
                 # NearField indices on the sketch device
                 nfo = NearField(adj_level, device=Om_blk.device)
-                # SVD-of-near-field-stack caches shared basis<->E (Omega / Psi).
+                # near-field-stack factorization caches shared basis<->E (Om/Psi)
                 cache_Om, cache_Psi = NFStackCache(), NFStackCache()
-                # --- basis U, V (compute), with subroutine detail ---
+                # --- bases U, V (one pass; QR fast path) with subroutine detail ---
                 with prof.phase(f'basis_UV@lvl{lvl}', kind='compute'):
-                    U = compute_basis_strong(Om_blk, Y_blk, nfo, rkm,
-                                             device=self.device, group_chunk=gc,
-                                             cache=cache_Om, prof=prof, tag=f'@lvl{lvl}')
-                    V = compute_basis_strong(Psi_blk, Z_blk, nfo, rkm,
-                                             device=self.device, group_chunk=gc,
-                                             cache=cache_Psi, prof=prof, tag=f'@lvl{lvl}')
+                    U, V = compute_bases_strong(
+                        Om_blk, Psi_blk, Y_blk, Z_blk, nfo, rkm,
+                        device=self.device, group_chunk=gc,
+                        cache_Om=cache_Om, cache_Psi=cache_Psi,
+                        prof=prof, tag=f'@lvl{lvl}', stats=self.factor_stats)
                 # --- error term E (compute), tiles kept on compute device ---
                 with prof.phase(f'recover_E@lvl{lvl}', kind='compute'):
                     E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo,
@@ -1022,6 +1126,11 @@ class HBSMAT:
         if on_cuda:
             print(f"{'peak GPU (any phase)':<{W}}{'':<10}{'':>10}{fmt_bytes(gpu_peak_overall):>13}")
         print(f"{'peak CPU RSS':<{W}}{'':<10}{'':>10}{'':>13}{'':>13}{fmt_bytes(cpu_peak_overall):>13}")
+        fs = getattr(self, 'factor_stats', None)
+        if fs:
+            tot = fs.get('qr', 0) + fs.get('svd', 0)
+            print(f"{'near-field factor':<{W}}{'':<10}"
+                  f"QR {fs.get('qr',0)} / SVD-fallback {fs.get('svd',0)}  (of {tot})")
         print("=" * 92)
 
         # ---- subroutine detail (aggregated across chunks; U and V combined) ---
