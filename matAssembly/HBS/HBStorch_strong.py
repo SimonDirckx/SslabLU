@@ -389,64 +389,6 @@ def compute_basis_strong(S_blk, Sketch_blk, nearfield: NearField, rk,
     return out
 
 
-def compute_bases_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nearfield: NearField, rk,
-                         device=None, group_chunk=None, cache_Om: 'NFStackCache' = None,
-                         cache_Psi: 'NFStackCache' = None, prof=None, tag='', stats=None):
-    """
-    Compute BOTH cluster bases U (Omega/Y) and V (Psi/Z) in one pass.
-
-    The Omega and Psi near-field stacks are factored SEPARATELY (one resident at
-    a time) so the s-carrying transient -- and thus GPU peak -- is the same as
-    computing a single basis; only one stack of shape (Gc, k*b, s) is alive at
-    once.  (Concatenating the two into a 2*Gc batch would halve launch count but
-    double that transient, which is not worth it when device memory is the
-    binding constraint.)  Each side's factorization is cached so
-    recover_E_strong reuses it.
-
-    returns : (U, V), each (Nb, b, rk)
-    """
-    from contextlib import nullcontext
-    parent = f'basis_UV{tag}'
-    def sub(name):
-        return prof.sub(f'{name}{tag}', parent) if prof is not None else nullcontext()
-
-    Nb, b, s = Om_blk.shape
-    U = Om_blk.new_zeros(Nb, b, rk)
-    V = Om_blk.new_zeros(Nb, b, rk)
-    for gi, grp in enumerate(nearfield.groups):
-        k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']
-        rk_g = min(rk, b); G = ranks.shape[0]
-        cs = G if group_chunk is None else group_chunk
-        for c0 in range(0, G, cs):
-            r_c = ranks[c0:c0+cs]; nf_c = nf_idx[c0:c0+cs]; Gc = r_c.shape[0]
-            # --- U side (Omega / Y) ---
-            with sub('  gather_Snf'):
-                Snf = Om_blk[nf_c].reshape(Gc, k * b, s)
-            with sub('  factor_nf (QR/SVD)'):
-                fac = _factor_nf(Snf, stats=stats)
-            del Snf
-            if cache_Om is not None: cache_Om.put((gi, c0), fac)
-            with sub('  range (QR+svd)'):
-                Ublk = _basis_from_factor(Y_blk[r_c], fac, rk_g)
-            del fac
-            # --- V side (Psi / Z) ---
-            with sub('  gather_Snf'):
-                Snf = Psi_blk[nf_c].reshape(Gc, k * b, s)
-            with sub('  factor_nf (QR/SVD)'):
-                fac = _factor_nf(Snf, stats=stats)
-            del Snf
-            if cache_Psi is not None: cache_Psi.put((gi, c0), fac)
-            with sub('  range (QR+svd)'):
-                Vblk = _basis_from_factor(Z_blk[r_c], fac, rk_g)
-            del fac
-            if rk_g < rk:
-                Ublk = torch.nn.functional.pad(Ublk, (0, rk - rk_g))
-                Vblk = torch.nn.functional.pad(Vblk, (0, rk - rk_g))
-            U[r_c] = Ublk; V[r_c] = Vblk
-            del Ublk, Vblk
-    return U, V
-
-
 # =============================================================================
 #  Public: block-sparse error term E
 # =============================================================================
@@ -742,6 +684,115 @@ def recover_E_strong(U_ell, V_ell, Y_blk, Z_blk, Om_blk, Psi_blk,
     return BlockSparseE(val, row, col, nearfield.n, b)
 
 
+def compute_bases_and_E_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nearfield: NearField,
+                               rk, device=None, group_chunk=None, tile_device=None,
+                               prof=None, tag='', stats=None):
+    """
+    Fused single-factorization construction of the bases U, V AND the near-field
+    error term E -- mathematically identical to
+    compute_bases_strong(...) followed by recover_E_strong(...), but each
+    near-field stack is factored exactly ONCE and reused for both its basis and
+    its E term, instead of being factored for the bases and then recomputed in
+    recover_E.  That halves the (dominant) factorization count.
+
+    For every near-field pair (i, j), j in NF(i):
+        E_ij = (I - U_i U_i^*) A_ij  +  U_i U_i^* A_ij (I - V_j V_j^*)
+               '------------ term1 ------------'  '----------- term2 -----------'
+
+      Pass 1 (Omega stack):  factor -> U[chunk]  and  term1 tiles
+      Pass 2 (Psi   stack):  factor -> V[chunk]  and  term2 tiles
+
+    term2 of column-cluster j needs U_i for every i in NF(j); those may live in
+    other chunks, which is safe because ALL of U is produced in pass 1 before
+    pass 2 starts.  Only the current chunk's factorization is ever resident, so
+    peak memory is bounded by group_chunk exactly as in the two-pass design --
+    this is a pure compute win (~2x fewer factorizations), memory-neutral.
+
+    group_chunk : max clusters per batched factorization/solve (bounds the
+                  (chunk, k*b, s) transient).
+    tile_device : where recovered (b,b) tiles accumulate (default: data device).
+    returns (U, V, E)
+    """
+    from contextlib import nullcontext
+    parent = f'bases_E{tag}'
+    def sub(name):
+        return prof.sub(f'{name}{tag}', parent) if prof is not None else nullcontext()
+
+    Nb, b, s = Om_blk.shape
+    tdev = tile_device if tile_device is not None else Om_blk.device
+    U = Om_blk.new_zeros(Nb, b, rk)
+    V = Om_blk.new_zeros(Nb, b, rk)
+    tile = {}                                   # (i,j) -> (b,b) running E tile
+
+    def chunks(G):
+        cs = G if group_chunk is None else group_chunk
+        for c0 in range(0, G, cs):
+            yield c0, min(c0 + cs, G)
+
+    # ---- Pass 1: Omega factor -> basis U  +  term1 = (I - U_iU_i*) A_ij --------
+    for gi, grp in enumerate(nearfield.groups):
+        k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']; G = grp['G']
+        rk_g = min(rk, b)
+        for c0, c1 in chunks(G):
+            r_c = ranks[c0:c1]; nf_c = nf_idx[c0:c1]; Gc = r_c.shape[0]
+            with sub('  gather_Snf'):
+                Snf = Om_blk[nf_c].reshape(Gc, k * b, s)
+            with sub('  factor_nf (QR/SVD)'):
+                fac = _factor_nf(Snf, stats=stats)
+            del Snf
+            Yi = Y_blk[r_c]
+            with sub('  range (QR+svd)'):
+                Ublk = _basis_from_factor(Yi, fac, rk_g)
+            if rk_g < rk:
+                Ublk = torch.nn.functional.pad(Ublk, (0, rk - rk_g))
+            U[r_c] = Ublk
+            with sub('  term1 (pinv+assembly)'):
+                Yperp = Yi - torch.bmm(Ublk, torch.bmm(Ublk.transpose(-2, -1), Yi))
+                X1 = _pinv_rhs(Yperp, fac).reshape(Gc, b, k, b).to(tdev)
+                for g in range(Gc):
+                    i = int(r_c[g])
+                    for a in range(k):
+                        tile[(i, int(nf_c[g, a]))] = X1[g, :, a, :].clone()
+            del fac, Yi, Ublk, Yperp, X1
+
+    # ---- Pass 2: Psi factor -> basis V  +  term2 = U_iU_i* A_ij (I - V_jV_j*) --
+    for gi, grp in enumerate(nearfield.groups):
+        k = grp['k']; ranks = grp['ranks']; nf_idx = grp['nf_idx']; G = grp['G']
+        rk_g = min(rk, b)
+        for c0, c1 in chunks(G):
+            r_c = ranks[c0:c1]; nf_c = nf_idx[c0:c1]; Gc = r_c.shape[0]
+            with sub('  gather_Snf'):
+                Snf = Psi_blk[nf_c].reshape(Gc, k * b, s)
+            with sub('  factor_nf (QR/SVD)'):
+                fac = _factor_nf(Snf, stats=stats)
+            del Snf
+            Zj = Z_blk[r_c]
+            with sub('  range (QR+svd)'):
+                Vblk = _basis_from_factor(Zj, fac, rk_g)
+            if rk_g < rk:
+                Vblk = torch.nn.functional.pad(Vblk, (0, rk - rk_g))
+            V[r_c] = Vblk
+            with sub('  term2 (pinv+assembly)'):
+                Zperp = Zj - torch.bmm(Vblk, torch.bmm(Vblk.transpose(-2, -1), Zj))
+                X2 = _pinv_rhs(Zperp, fac).reshape(Gc, b, k, b)
+                for g in range(Gc):
+                    j = int(r_c[g])
+                    for a in range(k):
+                        i = int(nf_c[g, a])
+                        Aij_perp = X2[g, :, a, :].transpose(-2, -1)        # (b,b)
+                        Ui = U[i]
+                        t2 = (Ui @ (Ui.transpose(-2, -1) @ Aij_perp)).to(tdev)
+                        tile[(i, j)] = tile[(i, j)] + t2 if (i, j) in tile else t2
+            del fac, Zj, Vblk, Zperp, X2
+
+    # ---- assemble E (on tdev) ------------------------------------------------
+    pairs = sorted(tile.keys())
+    val = torch.stack([tile[p] for p in pairs], 0)
+    row = torch.tensor([p[0] for p in pairs], dtype=torch.long, device=tdev)
+    col = torch.tensor([p[1] for p in pairs], dtype=torch.long, device=tdev)
+    return U, V, BlockSparseE(val, row, col, nearfield.n, b)
+
+
 # =============================================================================
 #  Convenience: build an admissible test operator and a level driver
 # =============================================================================
@@ -790,13 +841,9 @@ def compress_level_strong(Om_blk,Psi_blk,Y_blk,Z_blk, adj_sets, rk,device=None,
     """
     n = len(adj_sets)
     nfo = NearField(adj_sets, device=Om_blk.device)
-    cache_Om, cache_Psi = NFStackCache(), NFStackCache()
-    U, V = compute_bases_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nfo, rk,
-                                device=device, group_chunk=group_chunk,
-                                cache_Om=cache_Om, cache_Psi=cache_Psi)
-    E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo, device=device,
-                         group_chunk=group_chunk, tile_device=tile_device,
-                         cache_Om=cache_Om, cache_Psi=cache_Psi)
+    U, V, E = compute_bases_and_E_strong(Om_blk, Psi_blk, Y_blk, Z_blk, nfo, rk,
+                                         device=device, group_chunk=group_chunk,
+                                         tile_device=tile_device)
     return U, V, E, nfo
 
 def has_farfield(adj_sets):
@@ -1002,22 +1049,16 @@ class HBSMAT:
             if has_farfield(adj_level):
                 # NearField indices on the sketch device
                 nfo = NearField(adj_level, device=Om_blk.device)
-                # near-field-stack factorization caches shared basis<->E (Om/Psi)
-                cache_Om, cache_Psi = NFStackCache(), NFStackCache()
-                # --- bases U, V (one pass; QR fast path) with subroutine detail ---
-                with prof.phase(f'basis_UV@lvl{lvl}', kind='compute'):
-                    U, V = compute_bases_strong(
+                # --- bases U, V AND error term E in one fused pass: each
+                #     near-field stack is factored exactly once (QR fast path)
+                #     and reused for its basis and its E term.  Peak is bounded
+                #     by group_chunk; ~2x fewer factorizations than basis-then-
+                #     recover_E. ---
+                with prof.phase(f'bases_E@lvl{lvl}', kind='compute'):
+                    U, V, E = compute_bases_and_E_strong(
                         Om_blk, Psi_blk, Y_blk, Z_blk, nfo, rkm,
-                        device=self.device, group_chunk=gc,
-                        cache_Om=cache_Om, cache_Psi=cache_Psi,
+                        device=self.device, group_chunk=gc, tile_device=self.device,
                         prof=prof, tag=f'@lvl{lvl}', stats=self.factor_stats)
-                # --- error term E (compute), tiles kept on compute device ---
-                with prof.phase(f'recover_E@lvl{lvl}', kind='compute'):
-                    E = recover_E_strong(U, V, Y_blk, Z_blk, Om_blk, Psi_blk, nfo,
-                                         device=self.device, group_chunk=gc,
-                                         tile_device=self.device,
-                                         cache_Om=cache_Om, cache_Psi=cache_Psi)
-                    del cache_Om, cache_Psi
                 # --- reduction to next coarser level (compute) ---
                 with prof.phase(f'reduction@lvl{lvl}', kind='compute'):
                     Nb_prev = Nb
