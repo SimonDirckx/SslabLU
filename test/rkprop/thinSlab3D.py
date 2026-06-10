@@ -123,6 +123,8 @@ _parser.add_argument("--admissibility", choices=["full", "partial"], default="fu
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
+_parser.add_argument("--rank", dest="rk", type=int, default=50,
+                     help="HBS compression rank")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -134,11 +136,12 @@ else:
 Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
+rk = args.rk
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-kh = 5.2
+kh = 5.
 
 def  c11(p):
     return np.ones_like(p[:,0])
@@ -161,9 +164,9 @@ print(f"type={solve_method}  order={order}  shape=({Lx},{Ly},{Lz})  "
 # ###########################################################################
 if solve_method == 'SOMS':
     px, py, pz = order            # polynomial order per block (CLI --order)
-    nbx = 2                       # 2 blocks in x -> interface at the centre x = cx
-    nby = 16
-    nbz = 16
+    nbx = 4                       # 2 blocks in x -> interface at the centre x = cx
+    nby = 8
+    nbz = 8
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
          px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
          coeffs, True, None, weighted=False)
@@ -192,7 +195,8 @@ if solve_method == 'SOMS':
     tic_lu = time.time()
     ctx = setup_mumps(Sii,blr=False)
     ctxT = setup_mumps_transpose(Sii,blr=False)
-    print("LU decomposition total time = ", time.time()-tic_lu)
+    tMUMPS = time.time()-tic_lu
+    print("LU decomposition total time = ", tMUMPS)
 
 
     BLK = 32                                   # tune; see note below
@@ -334,25 +338,35 @@ if solve_method == 'SOMS':
     print("Sl shape = ",LinOp_l.shape)
     print("Sr shape = ",LinOp_r.shape)
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    rk = 50
-    s = 10*max(2*rk,nl)+rk+10
+    if admissibility=='full':
+        s = 10*max(2*rk,nl)+rk+10
+    else:
+        s = 5*max(2*rk,nl)+rk+10
+    tHBS = 0
+    tSample = 0
     N = LinOp_r.shape[0]
+    tic = time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Nb = N//nl
     Y = LinOp_r@Om
     Z = LinOp_r.T@Psi
+    tSample+=time.time()-tic
     tic = time.time()
     SSr.construct(rk,Om,Psi,Y,Z,fast=True)
-    print("HBS done in :",time.time()-tic)
+    tHBS+=time.time()-tic
+
+    tic = time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Nb = N//nl
     Y = LinOp_l@Om
     Z = LinOp_l.T@Psi
+    tSample+=time.time()-tic
     tic = time.time()
     SSl.construct(rk,Om,Psi,Y,Z,fast=True)
-    print("HBS done in :",time.time()-tic)
+    tHBS+=time.time()-tic
+    
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -388,6 +402,33 @@ if solve_method == 'SOMS':
     else:
         print("GMRES solve skipped (gmres_iters = 0)")
 
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(20):
+        v = A_balance_HBS@v
+    tMV = (time.time()-tic)/20
+
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(20):
+        v = A_balance@v
+    tLUMV = (time.time()-tic)/20
+
+    res_LU = np.linalg.norm(A_balance@u-rhs)
+    res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
+
+    print("================ SUMMARY ====================")
+    print("total LU mem             = ",ndslab*(ctx.mumps_instance.info[3])*8/1e9,"GB")
+    print("total LU time             = ",ndslab*tMUMPS,"s")
+    print("total HBS mem            = ",ndslab*2*(SSl.nbytes)/1e9,"GB")
+    print("sample time              = ",tSample*ndslab,"s")
+    print("HBS compressions time    = ",tHBS*ndslab,"s")
+    print("HBS equilib. matvec time = ",tMV,'s')
+    print("LU equilib. matvec time  = ",tLUMV,'s')
+    print("res HBS                  = ",res_HBS)
+    print("res LU                   = ",res_LU)
+    print("=============================================")
+
 # ###########################################################################
 # ###########################   STENCIL PATH   ##############################
 # ###########################################################################
@@ -406,17 +447,6 @@ elif solve_method == 'stencil':
     wb = np.ones((Sib.shape[1],))
     tree_leaf = 8*8            # max leaf size for the HBS tree on the interface plane
 
-    # -----------------------------------------------------------------------
-    # Interface / face index machinery.
-    #   Jc       : strictly-interior interface DOFs (subset of the interior Ii)
-    #              on the plane x = cx.
-    #   Jc_large : the FULL plane x = cx, INCLUDING its (y,z)-boundary ring.
-    #              We carry the whole plane so the HBS tree (built on Jc_large)
-    #              is clean / uniform.
-    #   Jc_inJc  : positions of Jc inside Jc_large.  The interior solve produces
-    #              len(Jc) values which we scatter into these rows; the ring rows
-    #              carry KNOWN Dirichlet data (handled in the RHS, not as zeros).
-    # -----------------------------------------------------------------------
     tol = 1e-9
     XXi = XYtot[Ii,:]
     XXb = XYtot[Ib,:]

@@ -124,6 +124,8 @@ _parser.add_argument("--admissibility", choices=["full", "partial"], default="fu
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
+_parser.add_argument("--rank", dest="rk", type=int, default=50,
+                     help="rank of HBS approximation")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -135,11 +137,12 @@ else:
 Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
+rk = args.rk
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-kh = 0
+kh = 0.
 
 def  c11(p):
     return torch.ones_like(p[...,0])
@@ -157,13 +160,13 @@ print(f"type={solve_method}  order={order}  shape=({Lx},{Ly},{Lz})  "
       f"admissibility={admissibility}")
 
 # ###########################################################################
-# #############################   SOMS PATH   ###############################
+# #############################   HPS SOLVER   ##############################
 # ###########################################################################
 if solve_method == 'HPS':
     px, py, pz = order            # polynomial order per block (CLI --order)
     nbx = 4                       # 2 blocks in x -> interface at the centre x = cx
-    nby = 16
-    nbz = 16
+    nby = 8
+    nbz = 8
     
     # HPS solver here
     a = np.array([Lx/2/nbx,Ly/2/nby,Lz/2/nbz])
@@ -277,9 +280,10 @@ if solve_method == 'HPS':
 
     Trb_l = lambda u: Abb[Jr,...][...,Jrc]@u - Abi[Jr,...]@(solver_ii@(Aib[...,Jrc]@u))
     Tlb_r = lambda u: Abb[Jl,...][...,Jlc]@u - Abi[Jl,...]@(solver_ii@(Aib[...,Jlc]@u))
-
+    XXif = np.zeros(((nSlab-1)*ndofs_if,3))
     for j in range(nSlab):
         XXbloc = XXb+j*torch.from_numpy(np.array([Lx,0,0]))
+        
         if j == 0 :
             ub_loc = bc_helmholtz(XXbloc[Jrc,:],kh) 
             rhs[j*ndofs_if:(j+1)*ndofs_if]-= Trb_l(ub_loc)
@@ -292,6 +296,7 @@ if solve_method == 'HPS':
             rhs[(j-1)*ndofs_if:j*ndofs_if]-= Tlb(ub_loc)
         if j<nSlab-1:
             u_if[j*ndofs_if:(j+1)*ndofs_if] = bc_helmholtz(XXbloc[Jr,:],kh)
+            XXif[j*ndofs_if:(j+1)*ndofs_if,:] = XXbloc[Jr,:]
 
 
     A_balance = LinearOperator(shape=((nSlab-1)*ndofs_if, (nSlab-1)*ndofs_if),
@@ -312,41 +317,66 @@ if solve_method == 'HPS':
     TTrl = HBStorch.HBSMAT(device=device,tree=tree)
     
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    rk = 20
     s = 10*max(2*rk,nl)+rk+10
     N = LinOp_rr.shape[0]
     
     Nb = N//nl
-    
+    tHBS = 0
+    tSample = 0
+    tic = time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
+    tSample+=time.time()-tic
     Y = LinOp_rr@Om
     Z = LinOp_rr.T@Psi
+    
+    tic=time.time()
     tic = time.time()
     TTrr.construct(rk,Om,Psi,Y,Z,fast=True)
+    tHBS += time.time() - tic
 
+    tic=time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Y = LinOp_ll@Om
     Z = LinOp_ll.T@Psi
+    tSample+=time.time()-tic
     tic = time.time()
     TTll.construct(rk,Om,Psi,Y,Z,fast=True)
-
+    tHBS += time.time() - tic
+    
+    tic=time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Y = LinOp_rl@Om
     Z = LinOp_rl.T@Psi
+    tSample+=time.time()-tic
     tic = time.time()
     TTrl.construct(rk,Om,Psi,Y,Z,fast=True)
+    tHBS += time.time() - tic
 
+    tic=time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     Y = LinOp_lr@Om
     Z = LinOp_lr.T@Psi
+    tSample+=time.time()-tic
     tic = time.time()
     TTlr.construct(rk,Om,Psi,Y,Z,fast=True)
+    tHBS += time.time() - tic
+    
+    
+    
 
-
+    v = np.random.standard_normal((N,10))
+    err_rr = np.linalg.norm(TTrr@v-LinOp_rr@v)/np.linalg.norm(v)
+    err_ll = np.linalg.norm(TTll@v-LinOp_ll@v)/np.linalg.norm(v)
+    err_lr = np.linalg.norm(TTlr@v-LinOp_lr@v)/np.linalg.norm(v)
+    err_rl = np.linalg.norm(TTrl@v-LinOp_rl@v)/np.linalg.norm(v)
+    print("err_rr = ",err_rr)
+    print("err_ll = ",err_ll)
+    print("err_lr = ",err_lr)
+    print("err_rl = ",err_rl)
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -365,7 +395,45 @@ if solve_method == 'HPS':
     A_balance_HBS = LinearOperator(shape=((nSlab-1)*ndofs_if, (nSlab-1)*ndofs_if),
                                matvec=apply_balance_HBS, dtype=float)
     
-    print("res = ",torch.linalg.norm(rhs-A_balance_HBS@u_if))
+    gInfo = gmres_info()
+    u = u_if#bc_helmholtz(XXif,kh)
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        niter = gInfo.niter
+        print("time = ",time.time()-tic)
+        print("niter = ",niter)
+        print("u err = ",np.linalg.norm(_np(uhat)-_np(u))/np.linalg.norm(_np(u)))
+    else:
+        print("GMRES solve skipped (gmres_iters = 0)")
+
+
+    v = np.random.standard_normal(((nSlab-1)*ndofs_if,))
+    tic = time.time()
+    for i in range(20):
+        v = A_balance_HBS@v
+    tMV = (time.time()-tic)/20
+
+    v = np.random.standard_normal(((nSlab-1)*ndofs_if,))
+    tic = time.time()
+    for i in range(20):
+        v = A_balance@v
+    tLUMV = (time.time()-tic)/20
+
+    res_LU = np.linalg.norm(A_balance@_np(u)-_np(rhs))
+    res_HBS = np.linalg.norm(A_balance_HBS@_np(u)-_np(rhs))
+
+    print("================ SUMMARY ====================")
+    print("total LU mem             = ",nSlab*(solver.MUMPS_mem)*8/1e9,"GB")
+    print("total LU time            = ",nSlab*(solver.tMUMPS),"s")
+    print("total HBS mem            = ",((nSlab-2)*4+2)*(TTll.nbytes)/1e9,"GB")
+    print("sample time              = ",tSample*((nSlab-2)),"s")
+    print("total HBS time           = ",tHBS*((nSlab-2)),"s")
+    print("HBS equilib. matvec time = ",tMV,'s')
+    print("LU equilib. matvec time  = ",tLUMV,'s')
+    print("res HBS                  = ",res_HBS)
+    print("res LU                   = ",res_LU)
+    print("=============================================")
     
     
     
