@@ -4,3 +4,7 @@
 [submodule "simpleoctree"]
 	path = matAssembly/HBS/simpleoctree
 	url = https://github.com/annayesy/simpleoctree
+[submodule "hpsmultidomain"]
+	path = solver/hpsmultidomain
+	url = https://github.com/hpslib/hpsmultidomain.git
+	branch = iti_map

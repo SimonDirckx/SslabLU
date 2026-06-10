@@ -1,14 +1,21 @@
 
 import numpy as np
+import sys
+from pathlib import Path
 from scipy.sparse.linalg   import LinearOperator
+
+_HPSMULTIDOMAIN_ROOT = Path(__file__).resolve().parent / "hpsmultidomain"
+if str(_HPSMULTIDOMAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HPSMULTIDOMAIN_ROOT))
+
 from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
 
 # Things we need to add:
-from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
-import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
+from hpsmultidomain import domain_driver as hpsalt
+import hpsmultidomain.geom as hpsaltGeom
 
 
 from time import time
@@ -170,4 +177,3 @@ class solverWrapper:
             return interp.interp(self.solver,pts,f,'hpsalt')
         else:
             raise ValueError("interp not implemented yet")
-
