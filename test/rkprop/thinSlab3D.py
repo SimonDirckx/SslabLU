@@ -125,6 +125,8 @@ _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
 _parser.add_argument("--rank", dest="rk", type=int, default=50,
                      help="HBS compression rank")
+_parser.add_argument("--blr", dest="blr", type=float, default=0,
+                     help="HBS compression rank")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -137,6 +139,9 @@ Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
+blr_tol = args.blr
+if blr_tol > 0:
+    blr = True
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
@@ -194,8 +199,8 @@ if solve_method == 'SOMS':
 
     tic_lu = time.time()
     BLK = 32                                   # tune; see note below
-    ctx  = setup_mumps(Sii, blr=False)
-    ctxT = setup_mumps_transpose(Sii, blr=False)
+    ctx  = setup_mumps(Sii, blr=blr,blr_tol = blr_tol)
+    ctxT = setup_mumps_transpose(Sii, blr=blr,blr_tol = blr_tol)
     tMUMPS = time.time()-tic_lu
     print("LU decomposition total time = ", tMUMPS)
 
