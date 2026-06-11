@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import SOMS3D_csr
 import torch
 import matAssembly.HBS.slabTree as slabTree
-import matAssembly.HBS.HBStorch_strong as HBStorch
+import matAssembly.HBS.HBStorch_strong as HBStorch_strong
+import matAssembly.HBS.HBStorch as HBStorch
 from scipy.sparse.linalg import LinearOperator
 import solver.stencil.stencilSolver as stencil
 import solver.stencil.geom as geom
@@ -127,6 +128,10 @@ _parser.add_argument("--rank", dest="rk", type=int, default=50,
                      help="HBS compression rank")
 _parser.add_argument("--blr", dest="blr", type=float, default=0,
                      help="HBS compression rank")
+_parser.add_argument("--nb", dest="nb", type=int, default=8,
+                     help="SOMS number of blocks")
+_parser.add_argument("--kh", dest="kh", type=float, default=0.,
+                     help="wavenumber")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -139,6 +144,7 @@ Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
+nb= args.nb
 blr_tol = args.blr
 blr = False
 
@@ -149,7 +155,7 @@ cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-kh = 5.
+kh = args.kh
 
 def  c11(p):
     return np.ones_like(p[:,0])
@@ -172,9 +178,9 @@ print(f"type={solve_method}  order={order}  shape=({Lx},{Ly},{Lz})  "
 # ###########################################################################
 if solve_method == 'SOMS':
     px, py, pz = order            # polynomial order per block (CLI --order)
-    nbx = 4                       # 2 blocks in x -> interface at the centre x = cx
-    nby = 8
-    nbz = 8
+    nbx = int(2*Lx*nb)                      # 2 blocks in x -> interface at the centre x = cx
+    nby = nb
+    nbz = nb
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
          px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
          coeffs, True, None, weighted=False)
@@ -337,18 +343,22 @@ if solve_method == 'SOMS':
     else:
         device = 'cpu'
 
-    tree = slabTree.slabTree(XXc,False,py*pz,adjacency=admissibility)
-
-    SSr = HBStorch.HBSMAT(device=device,tree=tree)
-    SSl = HBStorch.HBSMAT(device=device,tree=tree)
-
-    print("Sl shape = ",LinOp_l.shape)
-    print("Sr shape = ",LinOp_r.shape)
-    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    if admissibility=='full':
-        s = 10*max(2*rk,nl)+rk+10
+    if admissibility=='weak':
+        tree = slabTree.slabTree(XXl,False,py*pz)
+        SSl = HBStorch.HBSMAT(device=device,tree=tree)
+        SSr = HBStorch.HBSMAT(device=device,tree=tree)
+        kmax = 1
     else:
-        s = 5*max(2*rk,nl)+rk+10
+        tree = slabTree.slabTree(XXl,False,py*pz,adjacency=admissibility)
+        SSl = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        SSr = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        if admissibility == 'strong': 
+            kmax = 9 
+        else: 
+            kmax = 5
+    
+    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+    s = kmax*max(2*rk,nl)+rk+10
     tHBS = 0
     tSample = 0
 
@@ -441,15 +451,18 @@ if solve_method == 'SOMS':
 
     v = np.random.standard_normal((ndslab*ndofs_if,))
     tic = time.time()
-    for i in range(20):
+    for i in range(3):
         v = A_balance@v
-    tLUMV = (time.time()-tic)/20
+    tLUMV = (time.time()-tic)/3
 
     res_LU = np.linalg.norm(A_balance@u-rhs)
     res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
-
+    if ctx.mumps_instance.info[3]<0:
+        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
+    else:
+        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
     print("================ SUMMARY ====================")
-    print("total LU mem             = ",ndslab*(ctx.mumps_instance.info[3])*8/1e9,"GB")
+    print("total LU mem             = ",ndslab*memLU,"GB")
     print("total LU time             = ",ndslab*tMUMPS,"s")
     print("total HBS mem            = ",ndslab*2*(SSl.nbytes)/1e9,"GB")
     print("sample time              = ",tSample*ndslab,"s")

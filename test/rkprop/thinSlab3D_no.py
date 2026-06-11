@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import SOMS3D_csr
 import torch
 import matAssembly.HBS.slabTree as slabTree
-import matAssembly.HBS.HBStorch_strong as HBStorch
+import matAssembly.HBS.HBStorch_strong as HBStorch_strong
+import matAssembly.HBS.HBStorch as HBStorch
 from scipy.sparse.linalg import LinearOperator
 import solver.stencil.stencilSolver as stencil
 import solver.stencil.geom as geom
@@ -120,12 +121,16 @@ _parser.add_argument("--order", nargs="+", default=None,
                           "or (px py pz) for SOMS; space- or comma-separated")
 _parser.add_argument("--shape", nargs="+", default=["1/16", "1", "1"],
                      help="domain extents Lx Ly Lz (fractions like 1/16 allowed)")
-_parser.add_argument("--admissibility", choices=["full", "partial"], default="full",
+_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="full",
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
 _parser.add_argument("--rank", dest="rk", type=int, default=50,
                      help="rank of HBS approximation")
+_parser.add_argument("--nb", dest="nb", type=int, default=8,
+                     help="number of blocks in HPS")
+_parser.add_argument("--kh", dest="kh", type=float, default=0.,
+                     help="wavenumber")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -138,11 +143,11 @@ Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
-cx = Lx/2
+nb = args.nb
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
-kh = 0.
+kh = args.kh
 
 def  c11(p):
     return torch.ones_like(p[...,0])
@@ -164,9 +169,9 @@ print(f"type={solve_method}  order={order}  shape=({Lx},{Ly},{Lz})  "
 # ###########################################################################
 if solve_method == 'HPS':
     px, py, pz = order            # polynomial order per block (CLI --order)
-    nbx = 4                       # 2 blocks in x -> interface at the centre x = cx
-    nby = 8
-    nbz = 8
+    nbx = int(Lx*nb)                       # 2 blocks in x -> interface at the centre x = cx
+    nby = nb
+    nbz = nb
     
     # HPS solver here
     a = np.array([Lx/2/nbx,Ly/2/nby,Lz/2/nbz])
@@ -187,14 +192,10 @@ if solve_method == 'HPS':
     XXi = XYtot[Ji,:]
     XXb = XYtot[Jb,:]
     
-    Jc = (torch.where(XXi[...,0]==cx)[0]).detach().cpu().numpy()
-    
     Jl = (torch.where(XXb[...,0]==0)[0]).detach().cpu().numpy()
     Jr = (torch.where(XXb[...,0]==Lx)[0]).detach().cpu().numpy()
     Jlc = np.array([i for i in range(len(Jb)) if not i in Jl])
     Jrc = np.array([i for i in range(len(Jb)) if not i in Jr])
-
-    XXc = XXi[Jc,...]
     XXl = XXb[Jl,:]
     XXr = XXb[Jr,:]
 
@@ -205,7 +206,6 @@ if solve_method == 'HPS':
     
     print("|Jl| = ",len(Jl))
     print("|Jr| = ",len(Jr))
-    print("|Jc| = ",len(Jc))
 
 
     def txx_matmat(v,J1,J0, transpose=False):
@@ -308,16 +308,27 @@ if solve_method == 'HPS':
         device = 'cuda'          # or 'cuda:0' to pin a specific GPU
     else:
         device = 'cpu'
-
-    tree = slabTree.slabTree(XXl,False,py*pz,adjacency=admissibility)
-
-    TTrr = HBStorch.HBSMAT(device=device,tree=tree)
-    TTll = HBStorch.HBSMAT(device=device,tree=tree)
-    TTlr = HBStorch.HBSMAT(device=device,tree=tree)
-    TTrl = HBStorch.HBSMAT(device=device,tree=tree)
+    if admissibility=='weak':
+        tree = slabTree.slabTree(XXl,False,py*pz)
+        TTrr = HBStorch.HBSMAT(device=device,tree=tree)
+        TTll = HBStorch.HBSMAT(device=device,tree=tree)
+        TTlr = HBStorch.HBSMAT(device=device,tree=tree)
+        TTrl = HBStorch.HBSMAT(device=device,tree=tree)
+        kmax = 1
+    else:
+        tree = slabTree.slabTree(XXl,False,py*pz,adjacency=admissibility)
+        TTrr = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        TTll = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        TTlr = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        TTrl = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        if admissibility == 'strong': 
+            kmax = 9 
+        else: 
+            kmax = 5
     
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    s = 10*max(2*rk,nl)+rk+10
+
+    s = kmax*max(2*rk,nl)+rk+10
     N = LinOp_rr.shape[0]
     
     Nb = N//nl
@@ -416,15 +427,25 @@ if solve_method == 'HPS':
 
     v = np.random.standard_normal(((nSlab-1)*ndofs_if,))
     tic = time.time()
-    for i in range(20):
+    for i in range(3):
         v = A_balance@v
-    tLUMV = (time.time()-tic)/20
+    tLUMV = (time.time()-tic)/3
 
     res_LU = np.linalg.norm(A_balance@_np(u)-_np(rhs))
     res_HBS = np.linalg.norm(A_balance_HBS@_np(u)-_np(rhs))
 
+
+    res_LU = np.linalg.norm(A_balance@u-rhs)
+    res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
+    if solver.MUMPS_mem<0:
+        memLU = 2*abs(solver.MUMPS_mem)*(1e6)*8/1e9
+    else:
+        memLU = 2*solver.MUMPS_mem*8/1e9
+
+
     print("================ SUMMARY ====================")
-    print("total LU mem             = ",nSlab*(solver.MUMPS_mem)*8/1e9,"GB")
+    print("N                        = ",Aii.shape[0])
+    print("total LU mem             = ",nSlab*memLU,"GB")
     print("total LU time            = ",nSlab*(solver.tMUMPS),"s")
     print("total HBS mem            = ",((nSlab-2)*4+2)*(TTll.nbytes)/1e9,"GB")
     print("sample time              = ",tSample*((nSlab-2)),"s")
