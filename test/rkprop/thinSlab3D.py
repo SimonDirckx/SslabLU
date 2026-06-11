@@ -193,13 +193,12 @@ if solve_method == 'SOMS':
     ub = bc_helmholtz(XXb[Jb,:],kh)
 
     tic_lu = time.time()
-    ctx = setup_mumps(Sii,blr=False)
-    ctxT = setup_mumps_transpose(Sii,blr=False)
+    BLK = 32                                   # tune; see note below
+    ctx  = setup_mumps(Sii, blr=False)
+    ctxT = setup_mumps_transpose(Sii, blr=False)
     tMUMPS = time.time()-tic_lu
     print("LU decomposition total time = ", tMUMPS)
 
-
-    BLK = 32                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
     ctxT.mumps_instance.icntl[27] = BLK
 
@@ -344,29 +343,74 @@ if solve_method == 'SOMS':
         s = 5*max(2*rk,nl)+rk+10
     tHBS = 0
     tSample = 0
-    N = LinOp_r.shape[0]
-    tic = time.time()
-    Om = np.random.standard_normal((N,s))
-    Psi = np.random.standard_normal((N,s))
-    Nb = N//nl
-    Y = LinOp_r@Om
-    Z = LinOp_r.T@Psi
-    tSample+=time.time()-tic
-    tic = time.time()
-    SSr.construct(rk,Om,Psi,Y,Z,fast=True)
-    tHBS+=time.time()-tic
+
+    # ------------------------------------------------------------------ #
+    #  Batched sampling straight through the interior factorization.      #
+    #                                                                     #
+    #  LinOp_{l,r} = -(Sii^{-1} Sib[:,J])[Jc,:] (and adjoints). Instead   #
+    #  of four independent sketches routed through the LinearOperator     #
+    #  matvecs, we exploit the shared geometry:                           #
+    #                                                                     #
+    #   * Forward (range): both faces share Sii^{-1}, so one stacked      #
+    #     solve over [ Sib[:,Jl]@Om_l | Sib[:,Jr]@Om_r ] (width 2s)       #
+    #     yields Y_l, Y_r from the Jc rows.                               #
+    #   * Adjoint (corange): both faces share the SAME output rows Jc,    #
+    #     so a SINGLE solve  Sii^{-T}(E_c^T Psi) = W (width s) serves      #
+    #     both -- Z_l = -Sib[:,Jl]^T W, Z_r = -Sib[:,Jr]^T W. This        #
+    #     halves the adjoint work (4s -> 3s solve-columns overall).       #
+    #                                                                     #
+    #  Psi is shared across SSl and SSr: each operator still sees an      #
+    #  independent Gaussian corange test matrix, so the per-operator      #
+    #  randomized-SVD guarantee is unaffected (the two sketches are       #
+    #  correlated with each other, but are never combined).               #
+    #  All solves are chunked by BLK so the dense interior solution is    #
+    #  never fully materialized.                                          #
+    # ------------------------------------------------------------------ #
+    def _forward_stacked(Om_l, Om_r):
+        """One stacked forward solve -> (Y_l, Y_r) on the Jc rows."""
+        Bf = sparse.hstack([Sib[:, Jl] @ sparse.csc_matrix(Om_l),
+                            Sib[:, Jr] @ sparse.csc_matrix(Om_r)],
+                           format="csc")                    # (len(Ii) x 2s), sparse
+        Yf = np.empty((len(Jc), 2*s))
+        for a in range(0, 2*s, BLK):
+            c = slice(a, min(a + BLK, 2*s))
+            sol = ctx._solve_sparse(Bf[:, c].tocsc())       # (len(Ii) x <=BLK) — bounded
+            Yf[:, c] = -sol[Jc, :]
+            del sol
+            ctx.mumps_instance.icntl[20] = 0
+        return Yf[:, :s], Yf[:, s:]
+
+    def _adjoint_shared(Psi):
+        """One shared adjoint solve (Sii^{-T} E_c^T Psi) -> (Z_l, Z_r)."""
+        m = len(Jc)
+        Z_l = np.empty((len(Jl), s)); Z_r = np.empty((len(Jr), s))
+        SiblT = Sib[:, Jl].T.tocsr(); SibrT = Sib[:, Jr].T.tocsr()
+        for a in range(0, s, BLK):
+            c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
+            w = Psi[:, c]
+            rhs = sparse.csc_matrix(
+                (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
+                shape=(len(Ii), bw))
+            sol = ctxT._solve_sparse(rhs)                   # (len(Ii) x bw) — bounded
+            Z_l[:, c] = -(SiblT @ sol)
+            Z_r[:, c] = -(SibrT @ sol)
+            del sol
+            ctxT.mumps_instance.icntl[20] = 0
+        return Z_l, Z_r
 
     tic = time.time()
-    Om = np.random.standard_normal((N,s))
-    Psi = np.random.standard_normal((N,s))
-    Nb = N//nl
-    Y = LinOp_l@Om
-    Z = LinOp_l.T@Psi
-    tSample+=time.time()-tic
+    Om_r = np.random.standard_normal((len(Jr), s))
+    Om_l = np.random.standard_normal((len(Jl), s))
+    Psi  = np.random.standard_normal((len(Jc), s))   # shared corange test matrix
+    Y_l, Y_r = _forward_stacked(Om_l, Om_r)          # forward: one stacked solve
+    Z_l, Z_r = _adjoint_shared(Psi)                  # adjoint: one shared solve
+    tSample += time.time()-tic
+
     tic = time.time()
-    SSl.construct(rk,Om,Psi,Y,Z,fast=True)
-    tHBS+=time.time()-tic
-    
+    SSr.construct(rk, Om_r, Psi, Y_r, Z_r, fast=True)
+    SSl.construct(rk, Om_l, Psi, Y_l, Z_l, fast=True)
+    tHBS += time.time()-tic
+
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -420,7 +464,7 @@ if solve_method == 'SOMS':
     print("================ SUMMARY ====================")
     print("total LU mem             = ",ndslab*(ctx.mumps_instance.info[3])*8/1e9,"GB")
     print("total LU time             = ",ndslab*tMUMPS,"s")
-    print("total HBS mem            = ",(ndslab-1)*2*(SSl.nbytes)/1e9,"GB")
+    print("total HBS mem            = ",ndslab*2*(SSl.nbytes)/1e9,"GB")
     print("sample time              = ",tSample*ndslab,"s")
     print("HBS compressions time    = ",tHBS*ndslab,"s")
     print("HBS equilib. matvec time = ",tMV,'s')
@@ -481,11 +525,11 @@ elif solve_method == 'stencil':
         return out
 
     tic_lu = time.time()
-    ctx = setup_mumps(Sii,blr=False)
-    ctxT = setup_mumps_transpose(Sii,blr=False)
+    BLK = 32                                   # tune; see note below
+    ctx  = setup_mumps(Sii, blr=False)
+    ctxT = setup_mumps_transpose(Sii, blr=False)
     print("LU decomposition total time = ", time.time()-tic_lu)
 
-    BLK = 32                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
     ctxT.mumps_instance.icntl[27] = BLK
 
