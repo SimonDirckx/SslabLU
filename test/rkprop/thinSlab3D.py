@@ -48,6 +48,135 @@ def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8):
     return ctxT
 
 
+# ###########################################################################
+# ####################   cuDSS (GPU) SOLVE BACKEND   ########################
+# ###########################################################################
+# Drop-in replacement for the python-mumps Context used by the interface map,
+# backed by NVIDIA cuDSS through nvmath-python's stateful DirectSolver. cuDSS
+# does the analysis + numeric factorization once (on the GPU) and reuses it for
+# every right-hand side, which is exactly the factor-once / solve-many pattern
+# the randomized sampling needs. cuDSS has no transpose solve, so Sii^T is
+# factorized as a separate context (mirrors setup_mumps_transpose).
+#
+# Requires a matched nvmath-python + cuDSS install, e.g.
+#     pip install nvmath-python[cu12]      (plus the corresponding
+#     nvidia-cudss-cu12 wheel -- the two versions must agree)
+# API verified against nvmath-python 0.6.x (nvmath.sparse.advanced.DirectSolver).
+
+CUDSS_BLK = 256        # GPU solve block width; wider => better BLAS-3 use, more
+                       # device memory for the (len(Ii) x CUDSS_BLK) solution.
+
+
+class _MumpsShim(object):
+    """Absorbs the handful of ``ctx.mumps_instance.*`` accesses this script makes
+    (icntl[..] = .. writes, info[..] reads) so a CuDSSContext is drop-in
+    compatible with the MUMPS Context. Writes are no-ops; reads return 0
+    (cuDSS factor memory is not surfaced through this path)."""
+    class _Absorb(dict):
+        def __setitem__(self, k, v):
+            pass
+        def __getitem__(self, k):
+            return 0
+
+    def __init__(self):
+        self.icntl = _MumpsShim._Absorb()
+        self.cntl = _MumpsShim._Absorb()
+        self.info = _MumpsShim._Absorb()
+
+
+class CuDSSContext(object):
+    """cuDSS-backed stand-in exposing the subset of the mumps Context API used
+    here: ``solve(b)`` and ``_solve_sparse(b)`` (returning dense host arrays with
+    the same conventions as python-mumps), plus a no-op ``mumps_instance`` shim.
+
+    All right-hand sides are solved in fixed-width blocks of ``solve_width`` (zero
+    padded on the last/narrow block). Keeping the RHS shape constant means the
+    cuDSS "problem specification" never changes, so the expensive numeric
+    factorization is computed once in __init__ and reused for every solve."""
+
+    def __init__(self, A, transpose=False, solve_width=CUDSS_BLK, dtype=None):
+        import numpy as _np
+        import scipy.sparse as _sp
+        try:
+            import nvmath  # noqa: F401  (pulls in the cuDSS backend)
+        except ImportError as e:
+            raise ImportError(
+                "--cudss requires nvmath-python with the cuDSS backend. Install a "
+                "matched pair, e.g. `pip install nvmath-python[cu12]` together with "
+                "the corresponding nvidia-cudss-cu12 wheel (versions must agree)."
+            ) from e
+        self._np, self._sp, self._nvmath = _np, _sp, nvmath
+        self.n = A.shape[0]
+        self.W = int(solve_width)
+
+        A = A.T if transpose else A
+        A = _sp.csr_matrix(A)
+        A.sort_indices()
+        self._dtype = _np.dtype(dtype or A.dtype)
+        if self._dtype not in (_np.dtype(_np.float32), _np.dtype(_np.float64),
+                               _np.dtype(_np.complex64), _np.dtype(_np.complex128)):
+            self._dtype = _np.dtype(_np.float64)
+        self.A = A.astype(self._dtype)
+
+        # Representative RHS fixes the solve "shape" for planning/factorization.
+        probe = _np.zeros((self.n, self.W), order="F", dtype=self._dtype)
+        # execution defaults to CUDA when a GPU is available; pass host (numpy)
+        # operands -- nvmath moves them to the device. For peak throughput one
+        # could instead hand in CuPy/torch arrays already resident on the GPU.
+        self._solver = nvmath.sparse.advanced.DirectSolver(self.A, probe)
+        self._solver.plan()        # reordering + symbolic factorization
+        self._solver.factorize()   # numeric factorization (the expensive part)
+
+        self.mumps_instance = _MumpsShim()
+
+    def _solve_fixed(self, Bcols):
+        """Solve one block of up to W columns; returns (n, k) dense."""
+        np = self._np
+        k = Bcols.shape[1]
+        b = np.zeros((self.n, self.W), order="F", dtype=self._dtype)
+        b[:, :k] = Bcols
+        self._solver.reset_operands(b=b)            # reuse the factorization
+        X = np.asarray(self._solver.solve())
+        return np.array(X[:, :k], order="F")
+
+    def _solve_dense(self, B, overwrite_b=False):
+        np = self._np
+        B = np.asarray(B, dtype=self._dtype)
+        was_1d = (B.ndim == 1)
+        if was_1d:
+            B = B.reshape(self.n, 1)
+        B = np.asfortranarray(B)
+        k = B.shape[1]
+        out = np.empty((self.n, k), order="F", dtype=self._dtype)
+        for s in range(0, k, self.W):
+            c = slice(s, min(s + self.W, k))
+            out[:, c] = self._solve_fixed(B[:, c])
+        return out[:, 0] if was_1d else out
+
+    def _solve_sparse(self, B):
+        Bd = B.toarray() if self._sp.issparse(B) else self._np.asarray(B)
+        return self._solve_dense(Bd)
+
+    def solve(self, b, overwrite_b=False):
+        if self._sp.issparse(b):
+            return self._solve_sparse(b)
+        return self._solve_dense(b, overwrite_b)
+
+    def free(self):
+        try:
+            self._solver.free()
+        except Exception:
+            pass
+
+
+def setup_cudss(Sii, width=CUDSS_BLK):
+    return CuDSSContext(Sii, transpose=False, solve_width=width)
+
+
+def setup_cudss_transpose(Sii, width=CUDSS_BLK):
+    return CuDSSContext(Sii, transpose=True, solve_width=width)
+
+
 def bc_laplace(p):
     """Free-space Green's function with source at (-0.5, -0.5, -0.5)."""
     r = np.sqrt((p[:,0]+.5)**2+(p[:,1]+.5)**2+(p[:,2]+.5)**2)
@@ -125,6 +254,9 @@ _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
 _parser.add_argument("--rank", dest="rk", type=int, default=50,
                      help="HBS compression rank")
+_parser.add_argument("--cudss", action="store_true",
+                     help="use NVIDIA cuDSS (GPU) for the interior solves "
+                          "instead of MUMPS (CPU); requires nvmath-python + cuDSS")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -137,6 +269,7 @@ Lx, Ly, Lz = _nums3(args.shape)
 admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
+use_cudss = args.cudss
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
@@ -193,15 +326,21 @@ if solve_method == 'SOMS':
     ub = bc_helmholtz(XXb[Jb,:],kh)
 
     tic_lu = time.time()
-    ctx = setup_mumps(Sii,blr=False)
-    ctxT = setup_mumps_transpose(Sii,blr=False)
+    if use_cudss:
+        BLK = CUDSS_BLK                        # wide GPU BLAS-3 solve blocks
+        ctx  = setup_cudss(Sii, BLK)           # factor Sii   on the GPU (cuDSS)
+        ctxT = setup_cudss_transpose(Sii, BLK) # factor Sii^T on the GPU (no T-solve)
+        print(f"[cudss] factorized Sii and Sii^T on GPU (block width={BLK}); "
+              f"the MUMPS LU-memory stat is not tracked on this path.")
+    else:
+        BLK = 32                               # tune; see note below
+        ctx  = setup_mumps(Sii, blr=False)
+        ctxT = setup_mumps_transpose(Sii, blr=False)
     tMUMPS = time.time()-tic_lu
     print("LU decomposition total time = ", tMUMPS)
 
-
-    BLK = 32                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
-    ctxT.mumps_instance.icntl[27] = BLK
+    ctxT.mumps_instance.icntl[27] = BLK        # (no-op under --cudss)
 
     def smatmat(v,J , transpose=False):
         v_tmp = v[:, None] if v.ndim == 1 else v
@@ -481,13 +620,19 @@ elif solve_method == 'stencil':
         return out
 
     tic_lu = time.time()
-    ctx = setup_mumps(Sii,blr=False)
-    ctxT = setup_mumps_transpose(Sii,blr=False)
+    if use_cudss:
+        BLK = CUDSS_BLK                        # wide GPU BLAS-3 solve blocks
+        ctx  = setup_cudss(Sii, BLK)           # factor Sii   on the GPU (cuDSS)
+        ctxT = setup_cudss_transpose(Sii, BLK) # factor Sii^T on the GPU (no T-solve)
+        print(f"[cudss] factorized Sii and Sii^T on GPU (block width={BLK}).")
+    else:
+        BLK = 32                               # tune; see note below
+        ctx  = setup_mumps(Sii, blr=False)
+        ctxT = setup_mumps_transpose(Sii, blr=False)
     print("LU decomposition total time = ", time.time()-tic_lu)
 
-    BLK = 32                                   # tune; see note below
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
-    ctxT.mumps_instance.icntl[27] = BLK
+    ctxT.mumps_instance.icntl[27] = BLK        # (no-op under --cudss)
 
     def smatmat(v, J, transpose=False):
         """Apply the interface map  -(Sii^{-1} Sib_J)  (or its transpose).
