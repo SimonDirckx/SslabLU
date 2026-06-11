@@ -349,43 +349,22 @@ if solve_method == 'SOMS':
     tHBS = 0
     tSample = 0
 
-    # ------------------------------------------------------------------ #
-    #  Batched sampling straight through the interior factorization.      #
-    #                                                                     #
-    #  LinOp_{l,r} = -(Sii^{-1} Sib[:,J])[Jc,:] (and adjoints). Instead   #
-    #  of four independent sketches routed through the LinearOperator     #
-    #  matvecs, we exploit the shared geometry:                           #
-    #                                                                     #
-    #   * Forward (range): both faces share Sii^{-1}, so one stacked      #
-    #     solve over [ Sib[:,Jl]@Om_l | Sib[:,Jr]@Om_r ] (width 2s)       #
-    #     yields Y_l, Y_r from the Jc rows.                               #
-    #   * Adjoint (corange): both faces share the SAME output rows Jc,    #
-    #     so a SINGLE solve  Sii^{-T}(E_c^T Psi) = W (width s) serves      #
-    #     both -- Z_l = -Sib[:,Jl]^T W, Z_r = -Sib[:,Jr]^T W. This        #
-    #     halves the adjoint work (4s -> 3s solve-columns overall).       #
-    #                                                                     #
-    #  Psi is shared across SSl and SSr: each operator still sees an      #
-    #  independent Gaussian corange test matrix, so the per-operator      #
-    #  randomized-SVD guarantee is unaffected (the two sketches are       #
-    #  correlated with each other, but are never combined).               #
-    #  All solves are chunked by BLK so the dense interior solution is    #
-    #  never fully materialized.                                          #
-    # ------------------------------------------------------------------ #
-    def _forward_stacked(Om_l, Om_r):
-        """One stacked forward solve -> (Y_l, Y_r) on the Jc rows."""
-        Bf = sparse.hstack([Sib[:, Jl] @ sparse.csc_matrix(Om_l),
-                            Sib[:, Jr] @ sparse.csc_matrix(Om_r)],
-                           format="csc")                    # (len(Ii) x 2s), sparse
-        Yf = np.empty((len(Jc), 2*s))
-        for a in range(0, 2*s, BLK):
-            c = slice(a, min(a + BLK, 2*s))
-            sol = ctx._solve_sparse(Bf[:, c].tocsc())       # (len(Ii) x <=BLK) — bounded
-            Yf[:, c] = -sol[Jc, :]
+    
+    Jlr = np.append(Jl,Jr)
+    Sib_Jlr = Sib[:,Jlr].tocsc()
+    def _sample_lr(Om_l, Om_r):
+        Som = sparse.csc_matrix(np.hstack((Sib[:,Jl]@Om_l,Sib[:,Jr]@Om_r)))
+        s = Om_l.shape[1]+Om_r.shape[1]
+        out = np.zeros((len(Jc), s))
+        for l in range(0, s, BLK):
+            c = slice(l, min(l + BLK, s))
+            sol = ctx._solve_sparse(Som[:,c])              # dense (len(Ii) x BLK) — bounded
+            out[:, c] = -sol[Jc, :]
             del sol
-            ctx.mumps_instance.icntl[20] = 0
-        return Yf[:, :s], Yf[:, s:]
+            ctx.mumps_instance.icntl[20]=0
+        return out[:,:Om_l.shape[1]],out[:,Om_l.shape[1]:]
 
-    def _adjoint_shared(Psi):
+    def _adjoint_sample_lr(Psi):
         """One shared adjoint solve (Sii^{-T} E_c^T Psi) -> (Z_l, Z_r)."""
         m = len(Jc)
         Z_l = np.empty((len(Jl), s)); Z_r = np.empty((len(Jr), s))
@@ -407,8 +386,8 @@ if solve_method == 'SOMS':
     Om_r = np.random.standard_normal((len(Jr), s))
     Om_l = np.random.standard_normal((len(Jl), s))
     Psi  = np.random.standard_normal((len(Jc), s))   # shared corange test matrix
-    Y_l, Y_r = _forward_stacked(Om_l, Om_r)          # forward: one stacked solve
-    Z_l, Z_r = _adjoint_shared(Psi)                  # adjoint: one shared solve
+    Y_l, Y_r = _sample_lr(Om_l, Om_r)          # forward: one stacked solve
+    Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
     tSample += time.time()-tic
 
     tic = time.time()
