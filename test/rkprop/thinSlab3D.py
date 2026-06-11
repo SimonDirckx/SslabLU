@@ -140,8 +140,11 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 blr_tol = args.blr
+blr = False
+
 if blr_tol > 0:
     blr = True
+
 cx = Lx/2
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 

@@ -74,7 +74,11 @@ def compute_UV(Om,Y,rk,device):
     # batched over the block dim; same complete QR + SVD per block as before
     n = Om.shape[1]
     Q = tla.qr(Om.mT, mode='complete').Q          # (Nb, s, s)
-    M = torch.bmm(Y, Q[:,:,-n:])                   # (Nb, ny, n)
+    # Null space of Om_i = trailing s-n columns of Q (indices n..s-1).
+    # Projecting Y onto these annihilates the diagonal-block term D@Om.
+    # NB: must use Q[:,:,n:], NOT Q[:,:,-n:]; the two coincide only when
+    # s >= 2n, which fails once the per-level block size n grows past s/2.
+    M = torch.bmm(Y, Q[:,:,n:])                    # (Nb, ny, s-n)
     return tla.svd(M, full_matrices=False).U[:,:,:rk]
 
 
