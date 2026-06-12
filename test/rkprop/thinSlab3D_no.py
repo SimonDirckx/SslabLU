@@ -157,7 +157,6 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb = args.nb
-nleaf = args.nleaf
 splitting = args.splitting
 if splitting and admissibility != 'weak':
     raise SystemExit(
@@ -179,7 +178,6 @@ def  c(p):
     return -kh*kh*torch.ones_like(p[...,0])
 HH = pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
-
 def  c11_np(p):
     return np.ones_like(p[:,0])
 def  c22_np(p):
@@ -187,7 +185,7 @@ def  c22_np(p):
 def  c33_np(p):
     return np.ones_like(p[:,0])
 def  c_np(p):
-    return -kh*kh*np.ones_like(p[:,0])
+    return -kh*kh*np.ones_like(p[...,0])
 HH_np = pdo.PDO_3d(c11=c11_np,c22=c22_np,c33=c33_np,c=c_np)
 
 
@@ -600,6 +598,10 @@ elif solve_method == 'stencil':
     Abb = solver.Axx.tocsr()
     Ni  = Aii.shape[0]
 
+    # Interior factorization: MUMPS (METIS nested dissection), NOT scipy splu.
+    # The thin-slab interior is 3D-structured; COLAMD/splu produces catastrophic
+    # fill (bandwidth ~ Ny*Nz) and makes the multi-RHS sampling solves crawl.
+    # This mirrors the overlapping-stencil and HPS paths.
     BLK = 32
     tic  = time.time()
     ctx  = setup_mumps(Aii, blr=False)
@@ -661,12 +663,16 @@ elif solve_method == 'stencil':
     print("|Jl| = ", len(Jl), "  |Jr| = ", len(Jr),
           "  |ring| = ", len(ring), "  |JJ| = ", len(JJ))
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     def _np(x):
         return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
     def _t(x):
-        # HBStorch maps apply to torch tensors; the stencil path is numpy.
-        return x if torch.is_tensor(x) else torch.from_numpy(np.ascontiguousarray(x))
+        # HBStorch maps apply to torch tensors on their own device; this path is
+        # numpy on the host, so move onto the HBS device (cuda/cpu).
+        t = x if torch.is_tensor(x) else torch.from_numpy(np.ascontiguousarray(x))
+        return t.to(device)
 
     # ---- local Schur (conormal) map  T_{J1,J0} = Abb[J1,J0] - Abi[J1] Aii^-1 Aib[:,J0]
     # The ring OUTPUT rows are zeroed (their conormal is the discarded edge value);
@@ -772,29 +778,24 @@ elif solve_method == 'stencil':
 
     print("res = ", np.linalg.norm(rhs - A_balance @ u_if))
 
-    gInfo = gmres_info()
-    if gmres_iters > 0:
-        tic = time.time()
-        uhat, _ = gmres(A_balance, rhs, rtol=1e-8, callback=gInfo,
-                        maxiter=gmres_iters, restart=gmres_iters)
-        solve_time_LU = time.time() - tic
-        niter = gInfo.niter
-        gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
-        print("time = ", solve_time_LU)
-        print("niter = ", niter)
-        print("u err = ", gmres_err)
-    else:
-        solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
-        print("GMRES solve skipped (gmres_iters = 0)")
+    #gInfo = gmres_info()
+    #if gmres_iters > 0:
+    #    tic = time.time()
+    #    uhat, _ = gmres(A_balance, rhs, rtol=1e-8, callback=gInfo,
+    #                    maxiter=gmres_iters, restart=gmres_iters)
+    #    solve_time_LU = time.time() - tic
+    #    niter = gInfo.niter
+    #    gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
+    #    print("time = ", solve_time_LU)
+    #    print("niter = ", niter)
+    #    print("u err = ", gmres_err)
+    #else:
+    #    solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
+    #    print("GMRES solve skipped (gmres_iters = 0)")
 
     # =====================  HBS-compressed balance  =======================
     print("===============  HBS version  ===============")
-    if torch.cuda.is_available():
-        device = 'cuda'
-    else:
-        device = 'cpu'
-
-    tree_leaf = nleaf
+    tree_leaf = 64
     if admissibility == 'weak':
         tree = slabTree.slabTree(XXl, False, tree_leaf)
         TTrr = HBStorch.HBSMAT(device=device, tree=tree)
