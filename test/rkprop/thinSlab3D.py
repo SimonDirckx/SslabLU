@@ -326,15 +326,8 @@ if solve_method == 'SOMS':
     u = bc_helmholtz(XXif,kh)
     res = A_balance@u-rhs
     print("res = ",np.linalg.norm(res))
-    if gmres_iters > 0:
-        tic = time.time()
-        uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
-        niter = gInfo.niter
-        print("time = ",time.time()-tic)
-        print("niter = ",niter)
-        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-    else:
-        print("GMRES solve skipped (gmres_iters = 0)")
+    # LU GMRES solve disabled: only the HBS system is solved. The LU solve time is
+    # estimated as niter * tLUMV (same iteration count, LU matvec cost) in the CSV.
 
     print("===============  HBS version  ===============")
 
@@ -436,11 +429,16 @@ if solve_method == 'SOMS':
     if gmres_iters > 0:
         tic = time.time()
         uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        solve_time_HBS = time.time()-tic
         niter = gInfo.niter
-        print("time = ",time.time()-tic)
+        gmres_err = np.linalg.norm(uhat-u)/np.linalg.norm(u)
+        print("time = ",solve_time_HBS)
         print("niter = ",niter)
-        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+        print("u err = ",gmres_err)
     else:
+        solve_time_HBS = float('nan')
+        niter = float('nan')
+        gmres_err = float('nan')
         print("GMRES solve skipped (gmres_iters = 0)")
 
     v = np.random.standard_normal((ndslab*ndofs_if,))
@@ -464,18 +462,51 @@ if solve_method == 'SOMS':
     v = np.random.standard_normal((ndslab*ndofs_if,))
     Av = A_balance@v
     errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
+    # ---- aggregate totals --------------------------------------------------
+    # The balance operator drops one off-diagonal map at each of the two end
+    # interfaces (interface 0 has no SSl term, interface ndslab-1 has no SSr
+    # term), so the true number of map instances is 2*(ndslab-1), not 2*ndslab.
+    # Memory and construction split cleanly per map -> edge-corrected x(ndslab-1).
+    # Sampling uses one shared interior solve for both maps, so a per-map
+    # fractional correction is ill-defined -> left at x ndslab.
+    total_LU_mem_GB   = ndslab*memLU
+    total_LU_time_s   = ndslab*tMUMPS
+    total_HBS_mem_GB  = 2*(ndslab-1)*(SSl.nbytes)/1e9
+    sample_time_s     = tSample*ndslab
+    total_HBS_time_s  = tHBS*(ndslab-1)
+    solve_time_LU_est = niter*tLUMV       # estimate: same iter count, LU matvec cost
+
     print("================ SUMMARY ====================")
-    print("total LU mem             = ",ndslab*memLU,"GB")
-    print("total LU time            = ",ndslab*tMUMPS,"s")
-    print("total HBS mem            = ",ndslab*2*(SSl.nbytes)/1e9,"GB")
-    print("sample time              = ",tSample*ndslab,"s")
-    print("HBS compressions time    = ",tHBS*ndslab,"s")
+    print("total LU mem             = ",total_LU_mem_GB,"GB")
+    print("total LU time            = ",total_LU_time_s,"s")
+    print("total HBS mem            = ",total_HBS_mem_GB,"GB")
+    print("sample time              = ",sample_time_s,"s")
+    print("HBS compressions time    = ",total_HBS_time_s,"s")
     print("HBS equilib. matvec time = ",tMV,'s')
     print("LU equilib. matvec time  = ",tLUMV,'s')
     print("err HBS                  = ",errHBS)
     print("res HBS                  = ",res_HBS)
     print("res LU                   = ",res_LU)
     print("=============================================")
+
+    # ---- append results to resultsSform.csv (create with header if absent) -
+    _csv_path = "resultsSform.csv"
+    _header = ["H", "gmres_err", "niter",
+               "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
+               "HBS_matvec_time_s", "LU_matvec_time_s",
+               "total_LU_mem_GB", "total_HBS_mem_GB",
+               "solve_time_HBS_s", "solve_time_LU_est_s"]
+    _row = [Lx, gmres_err, niter,
+            total_LU_time_s, total_HBS_time_s, sample_time_s,
+            tMV, tLUMV,
+            total_LU_mem_GB, total_HBS_mem_GB,
+            solve_time_HBS, solve_time_LU_est]
+    _need_header = not os.path.exists(_csv_path)
+    with open(_csv_path, "a") as _f:
+        if _need_header:
+            _f.write(",".join(_header) + "\n")
+        _f.write(",".join(repr(x) for x in _row) + "\n")
+    print(f"appended results row to {_csv_path}")
 
 # ###########################################################################
 # ###########################   STENCIL PATH   ##############################

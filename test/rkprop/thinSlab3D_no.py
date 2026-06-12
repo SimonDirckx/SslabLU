@@ -542,12 +542,12 @@ if solve_method == 'HPS':
 
     # ---- append results to resultsTform.csv (create with header if absent) ---
     _csv_path = "resultsTform.csv"
-    _header = ["H", "gmres_err",
+    _header = ["H", "gmres_err", "niter",
                "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
                "HBS_matvec_time_s", "LU_matvec_time_s",
                "total_LU_mem_GB", "total_HBS_mem_GB",
                "solve_time_HBS_s", "solve_time_LU_est_s"]
-    _row = [Lx, gmres_err,
+    _row = [Lx, gmres_err, niter,
             total_LU_time_s, total_HBS_time_s, sample_time_s,
             tMV, tLUMV,
             total_LU_mem_GB, total_HBS_mem_GB,
