@@ -475,11 +475,16 @@ if solve_method == 'HPS':
     if gmres_iters > 0:
         tic = time.time()
         uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        solve_time_HBS = time.time()-tic
         niter = gInfo.niter
-        print("time = ",time.time()-tic)
+        gmres_err = np.linalg.norm(_np(uhat)-_np(u))/np.linalg.norm(_np(u))
+        print("time = ",solve_time_HBS)
         print("niter = ",niter)
-        print("u err = ",np.linalg.norm(_np(uhat)-_np(u))/np.linalg.norm(_np(u)))
+        print("u err = ",gmres_err)
     else:
+        solve_time_HBS = float('nan')
+        niter = float('nan')
+        gmres_err = float('nan')
         print("GMRES solve skipped (gmres_iters = 0)")
 
 
@@ -508,18 +513,48 @@ if solve_method == 'HPS':
     else:
         memLU = 2*solver.MUMPS_mem*8/1e9
 
+    # ---- aggregate totals (edge-corrected) -----------------------------------
+    # Each slab carries 4 maps; the 2 edge slabs are missing maps (a physical
+    # boundary replaces one neighbour), so the naive *nSlab over-counts by 2 maps'
+    # worth.  Subtract half the single-slab cost (= 2 of the 4 maps) from sampling
+    # and construction.  (Previously the HBS line subtracted 2*tSample, too much.)
+    total_LU_mem_GB   = nSlab*memLU
+    total_LU_time_s   = nSlab*(solver.tMUMPS)
+    total_HBS_mem_GB  = ((nSlab-2)*4+2)*(TTll.nbytes)/1e9
+    sample_time_s     = tSample*nSlab - tSample/2
+    total_HBS_time_s  = tHBS*nSlab - tHBS/2
+    solve_time_LU_est = niter*tLUMV          # estimate: same iter count, LU matvec cost
 
     print("================ SUMMARY ====================")
     print("splitting                = ",splitting)
     print("N                        = ",Aii.shape[0])
-    print("total LU mem             = ",nSlab*memLU,"GB")
-    print("total LU time            = ",nSlab*(solver.tMUMPS),"s")
-    print("total HBS mem            = ",((nSlab-2)*4+2)*(TTll.nbytes)/1e9,"GB")
-    print("sample time              = ",tSample*nSlab,"s")
-    print("total HBS time           = ",tHBS*nSlab-2*tSample,"s")
+    print("total LU mem             = ",total_LU_mem_GB,"GB")
+    print("total LU time            = ",total_LU_time_s,"s")
+    print("total HBS mem            = ",total_HBS_mem_GB,"GB")
+    print("sample time              = ",sample_time_s,"s")
+    print("total HBS time           = ",total_HBS_time_s,"s")
     print("HBS equilib. matvec time = ",tMV,'s')
     print("LU equilib. matvec time  = ",tLUMV,'s')
     print("err HBS                  = ",errHBS)
     print("res HBS                  = ",res_HBS)
     print("res LU                   = ",res_LU)
     print("=============================================")
+
+    # ---- append results to resultsTform.csv (create with header if absent) ---
+    _csv_path = "resultsTform.csv"
+    _header = ["H", "gmres_err",
+               "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
+               "HBS_matvec_time_s", "LU_matvec_time_s",
+               "total_LU_mem_GB", "total_HBS_mem_GB",
+               "solve_time_HBS_s", "solve_time_LU_est_s"]
+    _row = [Lx, gmres_err,
+            total_LU_time_s, total_HBS_time_s, sample_time_s,
+            tMV, tLUMV,
+            total_LU_mem_GB, total_HBS_mem_GB,
+            solve_time_HBS, solve_time_LU_est]
+    _need_header = not os.path.exists(_csv_path)
+    with open(_csv_path, "a") as _f:
+        if _need_header:
+            _f.write(",".join(_header) + "\n")
+        _f.write(",".join(repr(x) for x in _row) + "\n")
+    print(f"appended results row to {_csv_path}")
