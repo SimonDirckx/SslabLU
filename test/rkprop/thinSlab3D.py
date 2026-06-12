@@ -693,6 +693,12 @@ elif solve_method == 'stencil':
         s = max(9*2*rk,9*nl)+rk+10
     else:
         s = max(5*2*rk,5*nl)+rk+10
+    
+
+    
+
+
+
     N = LinOp_r.shape[0]
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
