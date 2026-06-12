@@ -151,8 +151,8 @@ blr = False
 if blr_tol > 0:
     blr = True
 
-cx = Lx/2
-slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
+cx = Lx
+slabGeom = geom.BoxGeometry(np.array([[0,0,0],[2*Lx,Ly,Lz]]))
 
 
 kh = args.kh
@@ -182,7 +182,7 @@ if solve_method == 'SOMS':
     nby = nb
     nbz = nb
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
-         px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
+         px, py, pz, nbx, nby, nbz, 2*Lx, Ly, Lz,
          coeffs, True, None, weighted=False)
 
     XXi = XYtot[Ii,:]
@@ -191,7 +191,7 @@ if solve_method == 'SOMS':
     XXc = XXi[Jc,:]
     Jl = np.where(XXb[:,0]==0)[0]
     XXl = XXb[Jl,:]
-    Jr = np.where(XXb[:,0]==Lx)[0]
+    Jr = np.where(XXb[:,0]==2*Lx)[0]
 
     print("|Jl| = ",len(Jl))
     print("|Jr| = ",len(Jr))

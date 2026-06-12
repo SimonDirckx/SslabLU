@@ -256,6 +256,7 @@ if solve_method == 'HPS':
     
     print("equilib1 = ",np.linalg.norm(Trr_l+Tll_r+Trb_l+Tlb_r,ord=np.inf))
     nSlab = int(1/Lx)
+    print("nSlab = ",nSlab)
     ndofs_if = len(Jl)
     def apply_balance(u):
         if u.ndim == 1:
