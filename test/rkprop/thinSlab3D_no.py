@@ -112,6 +112,12 @@ def _nums3(tokens):
             out.append(float(t))
     return out
 
+def _str2bool(s):
+    """Parse a boolean given as a CLI string, so `--splitting True/False` works."""
+    if isinstance(s, bool):
+        return s
+    return str(s).strip().lower() in ("1", "true", "t", "yes", "y")
+
 _parser = argparse.ArgumentParser(
     description="Thin-slab interface-map GMRES solve (LU and HBS-compressed).")
 _parser.add_argument("--type", choices=["HPS", "stencil"], default="stencil",
@@ -131,6 +137,11 @@ _parser.add_argument("--nb", dest="nb", type=int, default=8,
                      help="number of blocks in HPS")
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
+_parser.add_argument("--splitting", dest="splitting", type=_str2bool, default=False,
+                     help="sparse self-block extraction (HBS path only): keep the local "
+                          "block Abb[Jx,Jx] exact and HBS-compress ONLY the smoothing "
+                          "remainder -Abi Aii^{-1} Aib. Requires --admissibility weak "
+                          "(must not use the HBS_strong interface).")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -144,6 +155,12 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb = args.nb
+splitting = args.splitting
+if splitting and admissibility != 'weak':
+    raise SystemExit(
+        "--splitting requires --admissibility weak: the sparse self-block "
+        "extraction uses the weak HBS interface (HBStorch) and must not coexist "
+        "with the HBS_strong interface (full/partial admissibility).")
 slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
 
 
@@ -217,6 +234,19 @@ if solve_method == 'HPS':
             out = (Abb[J1,...][...,J0]).T@v_tmp - Aib[...,J0].T@(solver_ii.T@(Abi[J1,...].T@v_tmp))
         return out.flatten() if v.ndim == 1 else out
 
+    def txx_matmat_rem(v,J1,J0, transpose=False):
+        """Smoothing remainder of the interface map: T_{J1 J0} minus its local
+        boundary block Abb[J1,J0].  Equals  -Abi[J1] Aii^{-1} Aib[:,J0], the
+        purely interior-mediated (integral, asymptotically smooth) part.  This is
+        what gets HBS-compressed for the self blocks when --splitting is on; the
+        local Abb[Jx,Jx] block is kept exact and added back at apply time."""
+        v_tmp = v[..., None] if v.ndim == 1 else v
+        if not transpose:
+            out = - Abi[J1,...]@(solver_ii@(Aib[...,J0]@v_tmp))
+        else:
+            out = - Aib[...,J0].T@(solver_ii.T@(Abi[J1,...].T@v_tmp))
+        return out.flatten() if v.ndim == 1 else out
+
     # lr / rl means "left from right" / "right from left"
 
     LinOp_ll = LinearOperator(shape=(len(Jl),len(Jl)),\
@@ -232,6 +262,15 @@ if solve_method == 'HPS':
     LinOp_rl = LinearOperator(shape=(len(Jr),len(Jr)),\
         matvec = lambda v:txx_matmat(v,Jr,Jl), rmatvec = lambda v:txx_matmat(v,Jr,Jl,transpose=True),\
         matmat = lambda v:txx_matmat(v,Jr,Jl), rmatmat = lambda v:txx_matmat(v,Jr,Jl,transpose=True))
+
+    # remainder (smoothing-only) operators for the SELF blocks; sampled by HBS
+    # when --splitting is on so the construction never sees the local Abb stencil.
+    LinOp_ll_rem = LinearOperator(shape=(len(Jl),len(Jl)),\
+        matvec = lambda v:txx_matmat_rem(v,Jl,Jl), rmatvec = lambda v:txx_matmat_rem(v,Jl,Jl,transpose=True),\
+        matmat = lambda v:txx_matmat_rem(v,Jl,Jl), rmatmat = lambda v:txx_matmat_rem(v,Jl,Jl,transpose=True))
+    LinOp_rr_rem = LinearOperator(shape=(len(Jr),len(Jr)),\
+        matvec = lambda v:txx_matmat_rem(v,Jr,Jr), rmatvec = lambda v:txx_matmat_rem(v,Jr,Jr,transpose=True),\
+        matmat = lambda v:txx_matmat_rem(v,Jr,Jr), rmatmat = lambda v:txx_matmat_rem(v,Jr,Jr,transpose=True))
     
     
     
@@ -333,14 +372,26 @@ if solve_method == 'HPS':
     N = LinOp_rr.shape[0]
     
     Nb = N//nl
+    if splitting:
+        assert len(Jl) == len(Jr), \
+            "splitting assumes |Jl| == |Jr| so D_ll and D_rr act on the same interface block"
+        # exact local in-face blocks: plain slices of Abb (NOT Schur complements, no
+        # Aii^{-1}); these carry the singular/differential part of the self maps and
+        # are kept exact, added back at apply time.
+        D_rr = Abb[Jr,...][...,Jr]
+        D_ll = Abb[Jl,...][...,Jl]
+        # construct the self-block HBS from the smoothing remainder -Abi Aii^{-1} Aib only
+        src_rr, src_ll = LinOp_rr_rem, LinOp_ll_rem
+    else:
+        src_rr, src_ll = LinOp_rr, LinOp_ll
     tHBS = 0
     tSample = 0
     tic = time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
     tSample+=time.time()-tic
-    Y = LinOp_rr@Om
-    Z = LinOp_rr.T@Psi
+    Y = src_rr@Om
+    Z = src_rr.T@Psi
     
     tic=time.time()
     tic = time.time()
@@ -350,8 +401,8 @@ if solve_method == 'HPS':
     tic=time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
-    Y = LinOp_ll@Om
-    Z = LinOp_ll.T@Psi
+    Y = src_ll@Om
+    Z = src_ll.T@Psi
     tSample+=time.time()-tic
     tic = time.time()
     TTll.construct(rk,Om,Psi,Y,Z,fast=True)
@@ -380,9 +431,21 @@ if solve_method == 'HPS':
     
     
 
+    # Effective self maps. Without splitting these are just the HBS blocks; with
+    # splitting the exact local block D_xx is kept and only the remainder is HBS,
+    # so the self map is D_xx + TT.  err_rr/err_ll below compare these against the
+    # TRUE self Schur maps LinOp_rr/LinOp_ll, so under splitting they report the
+    # remainder-compression error (expected ~ the cross-block level).
+    if splitting:
+        def selfmat_rr(x): return _np(D_rr@x) + _np(TTrr@x)
+        def selfmat_ll(x): return _np(D_ll@x) + _np(TTll@x)
+    else:
+        def selfmat_rr(x): return _np(TTrr@x)
+        def selfmat_ll(x): return _np(TTll@x)
+
     v = np.random.standard_normal((N,10))
-    err_rr = np.linalg.norm(TTrr@v-LinOp_rr@v)/np.linalg.norm(v)
-    err_ll = np.linalg.norm(TTll@v-LinOp_ll@v)/np.linalg.norm(v)
+    err_rr = np.linalg.norm(selfmat_rr(v)-_np(LinOp_rr@v))/np.linalg.norm(v)
+    err_ll = np.linalg.norm(selfmat_ll(v)-_np(LinOp_ll@v))/np.linalg.norm(v)
     err_lr = np.linalg.norm(TTlr@v-LinOp_lr@v)/np.linalg.norm(v)
     err_rl = np.linalg.norm(TTrl@v-LinOp_rl@v)/np.linalg.norm(v)
     print("err_rr = ",err_rr)
@@ -397,7 +460,7 @@ if solve_method == 'HPS':
             utmp = u
         out = torch.zeros(utmp.shape)
         for j in range(nSlab-1):
-            out[j*ndofs_if:(j+1)*ndofs_if,:] = torch.from_numpy( TTll@utmp[j*ndofs_if:(j+1)*ndofs_if,:]+TTrr@utmp[j*ndofs_if:(j+1)*ndofs_if,:])
+            out[j*ndofs_if:(j+1)*ndofs_if,:] = torch.from_numpy( selfmat_ll(utmp[j*ndofs_if:(j+1)*ndofs_if,:]) + selfmat_rr(utmp[j*ndofs_if:(j+1)*ndofs_if,:]) )
             if j > 0:          out[j*ndofs_if:(j+1)*ndofs_if,:] += torch.from_numpy(TTrl@(utmp[(j-1)*ndofs_if:j*ndofs_if,:]))
             if j < nSlab-2:      out[j*ndofs_if:(j+1)*ndofs_if,:] += torch.from_numpy(TTlr@(utmp[(j+1)*ndofs_if:(j+2)*ndofs_if,:]))
         if u.ndim == 1:
@@ -447,11 +510,12 @@ if solve_method == 'HPS':
 
 
     print("================ SUMMARY ====================")
+    print("splitting                = ",splitting)
     print("N                        = ",Aii.shape[0])
     print("total LU mem             = ",nSlab*memLU,"GB")
     print("total LU time            = ",nSlab*(solver.tMUMPS),"s")
     print("total HBS mem            = ",((nSlab-2)*4+2)*(TTll.nbytes)/1e9,"GB")
-    print("sample time              = ",tSample*nSlab-2*tSample,"s")
+    print("sample time              = ",tSample*nSlab,"s")
     print("total HBS time           = ",tHBS*nSlab-2*tSample,"s")
     print("HBS equilib. matvec time = ",tMV,'s')
     print("LU equilib. matvec time  = ",tLUMV,'s')
@@ -459,7 +523,3 @@ if solve_method == 'HPS':
     print("res HBS                  = ",res_HBS)
     print("res LU                   = ",res_LU)
     print("=============================================")
-    
-    
-    
-    

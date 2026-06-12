@@ -258,7 +258,7 @@ if solve_method == 'SOMS':
     print("err = ",np.linalg.norm(err))
 
     ndofs_if = len(Jc)
-    ndslab = int(1/cx)-1
+    ndslab = int(1./cx)-1
     XXif = np.zeros((ndslab*ndofs_if,3))
     rhs = np.zeros((ndslab*ndofs_if,))
     for i in range(ndslab):
