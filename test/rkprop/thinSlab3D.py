@@ -513,7 +513,7 @@ if solve_method == 'SOMS':
 # ###########################################################################
 elif solve_method == 'stencil':
     nx, ny, nz = order            # ny, nz from CLI --order (nx is overridden below)
-    nx = int(ny*Lx) + 1           # derive nx so the centre plane x = cx lands on-grid
+    nx = int(2*ny*Lx) + 1           # derive nx so the centre plane x = cx lands on-grid
     print("stencil nx (derived from ny, Lx) = ", nx)
     ord = [nx,ny,nz]
     solver = stencil.stencilSolver(HH,slabGeom,ord)
@@ -532,7 +532,8 @@ elif solve_method == 'stencil':
 
     Jc = np.where(np.abs(XXi[:,0]-cx) < tol)[0]               # interior interface DOFs
     Jl = np.where(np.abs(XXb[:,0]-0.) < tol)[0]               # physical x = 0  face
-    Jr = np.where(np.abs(XXb[:,0]-Lx) < tol)[0]               # physical x = Lx face
+    XXl = XXb[Jl,:]
+    Jr = np.where(np.abs(XXb[:,0]-2*Lx) < tol)[0]               # physical x = Lx face
     Jb = np.setdiff1d(np.arange(XXb.shape[0]),
                       np.concatenate([Jl, Jr])).astype(np.int64)   # the four (y,z) faces
 
@@ -559,11 +560,12 @@ elif solve_method == 'stencil':
         out[Jc_inJc] = vec_Jc
         return out
 
-    tic_lu = time.time()
+    tic = time.time()
     BLK = 32                                   # tune; see note below
     ctx  = setup_mumps(Sii, blr=False)
     ctxT = setup_mumps_transpose(Sii, blr=False)
-    print("LU decomposition total time = ", time.time()-tic_lu)
+    tMUMPS = time.time()-tic
+    print("LU decomposition total time = ", tMUMPS)
 
     ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
     ctxT.mumps_instance.icntl[27] = BLK
@@ -714,50 +716,69 @@ elif solve_method == 'stencil':
     else:
         device = 'cpu'
 
-    # tree on the FULL interface plane Jc_large (clean / uniform leaves)
-    tree = slabTree.slabTree(XYtot[Jc_large],False,tree_leaf,adjacency=admissibility)
-
-    SSr = HBStorch.HBSMAT(device=device,tree=tree)
-    SSl = HBStorch.HBSMAT(device=device,tree=tree)
-
-    print("Sl shape = ",LinOp_l.shape)
-    print("Sr shape = ",LinOp_r.shape)
-    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    rk = 40
-    if admissibility == 'full':
-        s = max(9*2*rk,9*nl)+rk+10
+    if admissibility=='weak':
+        tree = slabTree.slabTree(XXl,False,tree_leaf)
+        SSl = HBStorch.HBSMAT(device=device,tree=tree)
+        SSr = HBStorch.HBSMAT(device=device,tree=tree)
+        kmax = 1
     else:
-        s = max(5*2*rk,5*nl)+rk+10
+        tree = slabTree.slabTree(XXl,False,tree_leaf,adjacency=admissibility)
+        SSl = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        SSr = HBStorch_strong.HBSMAT(device=device,tree=tree)
+        if admissibility == 'strong': 
+            kmax = 9 
+        else: 
+            kmax = 5
     
+    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+    s = kmax*max(2*rk,nl)+rk+10
 
-    
+    def _sample_lr(Om_l, Om_r):
+        Som = sparse.csc_matrix(np.hstack((Sib[:,Jl]@Om_l,Sib[:,Jr]@Om_r)))
+        s = Om_l.shape[1]+Om_r.shape[1]
+        out = np.zeros((len(Jc_large), s))
+        for l in range(0, s, BLK):
+            c = slice(l, min(l + BLK, s))
+            sol = ctx._solve_sparse(Som[:,c])              # dense (len(Ii) x BLK) — bounded
+            out[Jc_inJc, c] = -sol[Jc, :]
+            del sol
+            ctx.mumps_instance.icntl[20]=0
+        return out[:,:Om_l.shape[1]],out[:,Om_l.shape[1]:]
+
+    def _adjoint_sample_lr(Psi):
+        """One shared adjoint solve (Sii^{-T} E_c^T Psi) -> (Z_l, Z_r)."""
+        m = len(Jc)
+        Z_l = np.empty((len(Jl), s)); Z_r = np.empty((len(Jr), s))
+        SiblT = Sib[:, Jl].T.tocsr(); SibrT = Sib[:, Jr].T.tocsr()
+        for a in range(0, s, BLK):
+            c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
+            w = Psi[Jc_inJc, c]
+            rhs = sparse.csc_matrix(
+                (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
+                shape=(len(Ii), bw))
+            sol = ctxT._solve_sparse(rhs)                   # (len(Ii) x bw) — bounded
+            Z_l[:, c] = -(SiblT @ sol)
+            Z_r[:, c] = -(SibrT @ sol)
+            del sol
+            ctxT.mumps_instance.icntl[20] = 0
+        return Z_l, Z_r
 
 
-
-    N = LinOp_r.shape[0]
-    Om = np.random.standard_normal((N,s))
-    Psi = np.random.standard_normal((N,s))
-    Nb = N//nl
-    tic_sample = time.time()
-    Y = LinOp_r@Om
-    Z = LinOp_r.T@Psi
-    time_sample = time.time()-tic_sample
+    tSample = 0
+    tHBS = 0
     tic = time.time()
-    SSr.construct(rk,Om,Psi,Y,Z,fast=True)
-    print("sample done in :",time_sample)
-    print("HBS done in :",time.time()-tic)
-    Om = np.random.standard_normal((N,s))
-    Psi = np.random.standard_normal((N,s))
-    Nb = N//nl
-    tic_sample = time.time()
-    Y = LinOp_l@Om
-    Z = LinOp_l.T@Psi
-    time_sample = time.time()-tic_sample
+    Om_r = np.random.standard_normal((len(Jr), s))
+    Om_l = np.random.standard_normal((len(Jl), s))
+    Psi  = np.random.standard_normal((len(Jc_large), s))   # shared corange test matrix
+    Y_l, Y_r = _sample_lr(Om_l, Om_r)          # forward: one stacked solve
+    Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
+    tSample += time.time()-tic
+
     tic = time.time()
-    SSl.construct(rk,Om,Psi,Y,Z,fast=True)
-    print("sample done in :",time_sample)
-    print("HBS done in :",time.time()-tic)
-    SSl.print_profile()
+    SSr.construct(rk, Om_r, Psi, Y_r, Z_r, fast=True)
+    SSl.construct(rk, Om_l, Psi, Y_l, Z_l, fast=True)
+    tHBS += time.time()-tic
+
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -778,20 +799,86 @@ elif solve_method == 'stencil':
     v = np.random.standard_normal((N,))
     tic =time.time()
     bb = A_balance_HBS@v
-    print("matvec time = ",time.time()-tic)
     gInfo = gmres_info()
     u = u_true
     res = A_balance_HBS@u-rhs
-    print("res = ",np.linalg.norm(res))
     if gmres_iters > 0:
         tic = time.time()
         uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+        solve_time_HBS = time.time()-tic
         niter = gInfo.niter
         print("time = ",time.time()-tic)
         print("niter = ",niter)
-        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+        gmres_err = np.linalg.norm(uhat-u)/np.linalg.norm(u)
+        print("u err = ",gmres_err)
     else:
         print("GMRES solve skipped (gmres_iters = 0)")
+    
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(20):
+        v = A_balance_HBS@v
+    tMV = (time.time()-tic)/20
+
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(3):
+        v = A_balance@v
+    tLUMV = (time.time()-tic)/3
+
+    res_LU = np.linalg.norm(A_balance@u-rhs)
+    res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
+    if ctx.mumps_instance.info[3]<0:
+        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
+    else:
+        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    Av = A_balance@v
+    errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
+    # ---- aggregate totals --------------------------------------------------
+    # The balance operator drops one off-diagonal map at each of the two end
+    # interfaces (interface 0 has no SSl term, interface ndslab-1 has no SSr
+    # term), so the true number of map instances is 2*(ndslab-1), not 2*ndslab.
+    # Memory and construction split cleanly per map -> edge-corrected x(ndslab-1).
+    # Sampling uses one shared interior solve for both maps, so a per-map
+    # fractional correction is ill-defined -> left at x ndslab.
+    total_LU_mem_GB   = ndslab*memLU
+    total_LU_time_s   = ndslab*tMUMPS
+    total_HBS_mem_GB  = 2*(ndslab-1)*(SSl.nbytes)/1e9
+    sample_time_s     = tSample*ndslab
+    total_HBS_time_s  = tHBS*(ndslab-1)
+    solve_time_LU_est = niter*tLUMV       # estimate: same iter count, LU matvec cost
+
+    print("================ SUMMARY ====================")
+    print("total LU mem             = ",total_LU_mem_GB,"GB")
+    print("total LU time            = ",total_LU_time_s,"s")
+    print("total HBS mem            = ",total_HBS_mem_GB,"GB")
+    print("sample time              = ",sample_time_s,"s")
+    print("HBS compressions time    = ",total_HBS_time_s,"s")
+    print("HBS equilib. matvec time = ",tMV,'s')
+    print("LU equilib. matvec time  = ",tLUMV,'s')
+    print("err HBS                  = ",errHBS)
+    print("res HBS                  = ",res_HBS)
+    print("res LU                   = ",res_LU)
+    print("=============================================")
+
+    _csv_path = "resultsSform_stencil.csv"
+    _header = ["H", "gmres_err", "niter",
+               "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
+               "HBS_matvec_time_s", "LU_matvec_time_s",
+               "total_LU_mem_GB", "total_HBS_mem_GB",
+               "solve_time_HBS_s", "solve_time_LU_est_s"]
+    _row = [Lx, gmres_err, niter,
+            total_LU_time_s, total_HBS_time_s, sample_time_s,
+            tMV, tLUMV,
+            total_LU_mem_GB, total_HBS_mem_GB,
+            solve_time_HBS, solve_time_LU_est]
+    _need_header = not os.path.exists(_csv_path)
+    with open(_csv_path, "a") as _f:
+        if _need_header:
+            _f.write(",".join(_header) + "\n")
+        _f.write(",".join(repr(x) for x in _row) + "\n")
+    print(f"appended results row to {_csv_path}")
 
 else:
     raise ValueError("solve method not recognized")
