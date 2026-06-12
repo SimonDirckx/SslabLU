@@ -16,7 +16,6 @@ import scipy.sparse as sparse
 import time
 import os
 from scipy.sparse.linalg import gmres
-from scipy.sparse.linalg import splu
 torch.set_default_dtype(torch.float64)
 def rss_gb():
     with open(f"/proc/{os.getpid()}/status") as f:
@@ -139,7 +138,7 @@ _parser.add_argument("--nb", dest="nb", type=int, default=8,
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
 _parser.add_argument("--nleaf", dest="nleaf", type=int, default=64,
-                     help="number of points per leaf")
+                     help="number of DOFs per leaf")
 _parser.add_argument("--splitting", dest="splitting", type=_str2bool, default=False,
                      help="sparse self-block extraction (HBS path only): keep the local "
                           "block Abb[Jx,Jx] exact and HBS-compress ONLY the smoothing "
@@ -179,6 +178,7 @@ def  c33(p):
 def  c(p):
     return -kh*kh*torch.ones_like(p[...,0])
 HH = pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
+
 
 def  c11_np(p):
     return np.ones_like(p[:,0])
@@ -594,20 +594,39 @@ elif solve_method == 'stencil':
     solver = stencil.stencilSolver(HH_np, slabGeom, ord_)
 
     # ---- four blocks (interior solve + conormal boundary rows) ----
-    Aii = solver.Aii.tocsr()
+    Aii = solver.Aii
     Aib = solver.Aix.tocsc()        # column slicing  Aib[:, J0]
     Abi = solver.Axi.tocsr()        # row    slicing  Abi[J1]
     Abb = solver.Axx.tocsr()
-    tic = time.time()
-    lu  = splu(Aii.tocsc())
-    tLU = time.time() - tic
-    print("LU (splu) factorization time = ", tLU)
     Ni  = Aii.shape[0]
+
+    BLK = 32
+    tic  = time.time()
+    ctx  = setup_mumps(Aii, blr=False)
+    ctxT = setup_mumps_transpose(Aii, blr=False)
+    tLU  = time.time() - tic
+    print("MUMPS factorization time = ", tLU)
+    ctx.mumps_instance.icntl[27]  = BLK     # one wide BLAS-3 block per chunk
+    ctxT.mumps_instance.icntl[27] = BLK
+
+    def _mumps_solve(ctx_, B):
+        """Apply Aii^-1 (ctx) or Aii^-T (ctxT) to a 1-D or 2-D rhs, BLK-chunked."""
+        B = np.asarray(B)
+        one_d = (B.ndim == 1)
+        if one_d:
+            B = B[:, None]
+        out = np.empty((B.shape[0], B.shape[1]), dtype=np.float64)
+        for c0 in range(0, B.shape[1], BLK):
+            c = slice(c0, min(c0 + BLK, B.shape[1]))
+            out[:, c] = ctx_._solve_sparse(sparse.csc_matrix(B[:, c]))
+            ctx_.mumps_instance.icntl[20] = 0
+        return out[:, 0] if one_d else out
+
     solver_ii = LinearOperator((Ni, Ni), dtype=np.float64,
-                               matvec  = lu.solve,
-                               matmat  = lu.solve,
-                               rmatvec = lambda b: lu.solve(b, trans='T'),
-                               rmatmat = lambda b: lu.solve(b, trans='T'))
+                               matvec  = lambda b: _mumps_solve(ctx,  b),
+                               matmat  = lambda b: _mumps_solve(ctx,  b),
+                               rmatvec = lambda b: _mumps_solve(ctxT, b),
+                               rmatmat = lambda b: _mumps_solve(ctxT, b))
 
     XYtot = solver.XX
     Ji = np.asarray(solver.Ji)
@@ -887,7 +906,10 @@ elif solve_method == 'stencil':
         v = A_balance @ v
     tLUMV = (time.time() - tic) / 3
 
-    memLU = (lu.L.nnz + lu.U.nnz) * 8 / 1e9
+    if ctx.mumps_instance.info[3] < 0:
+        memLU = 2 * abs(ctx.mumps_instance.info[3]) * (1e6) * 8 / 1e9
+    else:
+        memLU = 2 * ctx.mumps_instance.info[3] * 8 / 1e9
     res_LU  = np.linalg.norm(_np(A_balance @ u_if)     - _np(rhs))
     res_HBS = np.linalg.norm(_np(A_balance_HBS @ u_if) - _np(rhs))
     v  = np.random.standard_normal((A_balance.shape[0],))
