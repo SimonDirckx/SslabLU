@@ -8,6 +8,7 @@
 #   SSLABLU_RUN_GMRES=1: run GMRES diagnostics on the meaningful direct-solve RHS.
 #   SSLABLU_COND_NIT=20: use 20 randomized power iterations in condition estimates.
 #   SSLABLU_NPAN_X=<nx>, SSLABLU_NPAN_Y=<ny>: refine the local panel grid with fixed subdomains.
+#   SSLABLU_CHECK_ITI_CAYLEY=1: verify local ItI maps against DtN maps by Cayley transform.
 #   SSLABLU_REF_PATH=/path/ref.npy: compare variable-coefficient runs to a refined reference.
 #   SSLABLU_SAVE_REF_PATH=/path/ref.npy: save the current variable-coefficient S solution as reference.
 #   SSLABLU_SHARED_POINT_VALIDATION=1: compare S interface traces to a saved refined trace.
@@ -335,10 +336,24 @@ def build_macro_t_dtn_system(N, H, opts, diff_op, bc_func, s_coords, eta=None):
     }
 
 
+def check_iti_cayley_transform(Tcc, Tcx, Rloc, bloc, bdry_vals, eta, seed):
+    rng = np.random.default_rng(seed)
+    u_probe = rng.standard_normal(Tcc.shape[0]) + 1j * rng.standard_normal(Tcc.shape[0])
+    flux = Tcc @ u_probe + Tcx @ bdry_vals
+    incoming = 1j * eta * u_probe - flux
+    outgoing = 1j * eta * u_probe + flux
+    outgoing_from_iti = Rloc @ incoming + bloc
+    denom = max(np.linalg.norm(outgoing), 1.0)
+    return np.linalg.norm(outgoing_from_iti - outgoing) / denom
+
+
 def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta):
     if eta == 0:
         raise ValueError("T-ItI is Helmholtz-only and needs nonzero impedance eta.")
 
+    check_cayley = os.environ.get("SSLABLU_CHECK_ITI_CAYLEY", "0") != "0"
+    cayley_tol = float(os.environ.get("SSLABLU_CHECK_ITI_CAYLEY_TOL", "1e-8"))
+    cayley_errs = []
     coord_to_ind = {coord_key(x): i for i, x in enumerate(s_coords)}
     ndofs = s_coords.shape[0]
     ndirected = 2 * ndofs
@@ -375,6 +390,18 @@ def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
         M_inv = np.linalg.inv(1j * eta * eye - Tcc)
         Rloc = (Tcc + 1j * eta * eye) @ M_inv
         bloc = 2j * eta * (M_inv @ (Tcx @ bdry_vals))
+        if check_cayley:
+            cayley_errs.append(
+                check_iti_cayley_transform(
+                    Tcc,
+                    Tcx,
+                    Rloc,
+                    bloc,
+                    bdry_vals,
+                    eta,
+                    seed=7919 + slab_ind,
+                )
+            )
 
         blocks.append((dir_inds, dir_inds, Rloc))
         nnz += Rloc.size
@@ -393,6 +420,13 @@ def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
     for row_inds, col_inds, block in blocks:
         add_dense_block(builder, row_inds, col_inds, block, (ndirected, ndirected))
     Rdir = builder.tocsr()
+    if check_cayley:
+        max_err = max(cayley_errs) if cayley_errs else 0.0
+        print("SANITY local ItI Cayley-vs-DtN max relerr = %5.5e" % max_err)
+        if max_err > cayley_tol:
+            raise AssertionError(
+                "local ItI Cayley transform check failed: relerr=%5.5e > tol=%5.5e" % (max_err, cayley_tol)
+            )
 
     return {
         'Rdir': Rdir,
@@ -445,21 +479,30 @@ def build_macro_t_iti_schur_system(N, H, opts, diff_op, bc_func, s_coords, eta):
     return data
 
 
-def block_left_precondition(Tmacro, s_coords):
-    Tprec = np.zeros_like(Tmacro)
+def apply_block_left_precondition_to_vector(Tmacro, s_coords, rhs):
+    out = np.zeros_like(rhs, dtype=np.result_type(rhs.dtype, Tmacro.dtype, np.complex128))
     for xval in np.unique(np.round(s_coords[:, 0], 12)):
         block = np.where(np.abs(s_coords[:, 0] - xval) < 1e-12)[0]
-        Tprec[block, :] = np.linalg.solve(Tmacro[np.ix_(block, block)], Tmacro[block, :])
-    return Tprec
+        Tblock = Tmacro[block, :][:, block].toarray()
+        out[block] = np.linalg.solve(Tblock, rhs[block])
+    return out
 
 
-def check_preconditioned_t_matches_s(Sdense, dslabs, N, H, opts, diff_op, tol=1e-8):
+def check_preconditioned_t_matches_s(Sop, dslabs, N, H, opts, diff_op, tol=1e-8):
     s_coords = get_s_target_coords(dslabs, opts, diff_op)
     zero_bc = lambda points: np.zeros(points.shape[0], dtype=np.complex128)
     Tmacro = build_macro_t_dtn_system(N, H, opts, diff_op, zero_bc, s_coords)['A']
-    Tprec = block_left_precondition(Tmacro, s_coords)
-    relerr = np.linalg.norm(Tprec - Sdense) / np.linalg.norm(Sdense)
-    print("SANITY preconditioned macro T-DtN vs S relerr = %5.5e" % relerr)
+    rng = np.random.default_rng(2601)
+    # The SlabLU S linear operator currently applies real-valued probes.
+    probe = rng.standard_normal(Tmacro.shape[1])
+    S_probe = Sop @ probe
+    T_probe = Tmacro @ probe
+    Tprec_probe = apply_block_left_precondition_to_vector(Tmacro, s_coords, T_probe)
+    probe_norm = np.linalg.norm(probe)
+    relerr = np.linalg.norm(Tprec_probe - S_probe) / max(np.linalg.norm(S_probe), 1.0)
+    print("SANITY random-probe preconditioned macro T-DtN vs S relerr = %5.5e" % relerr)
+    if probe_norm < 1e-12:
+        raise AssertionError("preconditioned macro T-DtN vs S check used a near-zero probe.")
     if relerr > tol:
         raise AssertionError(
             "preconditioned macro T-DtN did not match S: relerr=%5.5e > tol=%5.5e" % (relerr, tol)
@@ -838,9 +881,8 @@ for indp in range(len(pvec)):
     s_dtype = np.result_type(rhs_dtype, *block_dtypes)
     Ssparse, _ = timed_step("S sparse CSR assembly", lambda: build_s_sparse_matrix(OMS, S_rk_list, Ntot, s_dtype))
     if os.environ.get("SSLABLU_CHECK_T_PRECOND_EQUALS_S", "0") != "0":
-        Sdense = timed_step("S dense materialization for check", lambda: Stot@np.identity(Stot.shape[0]))[0]
         check_preconditioned_t_matches_s(
-            Sdense,
+            Stot,
             dSlabs,
             N,
             H,
