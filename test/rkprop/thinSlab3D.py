@@ -461,6 +461,9 @@ if solve_method == 'SOMS':
         memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
     else:
         memLU = 2*ctx.mumps_instance.info[3]*8/1e9
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    Av = A_balance@v
+    errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     print("================ SUMMARY ====================")
     print("total LU mem             = ",ndslab*memLU,"GB")
     print("total LU time             = ",ndslab*tMUMPS,"s")
@@ -469,6 +472,7 @@ if solve_method == 'SOMS':
     print("HBS compressions time    = ",tHBS*ndslab,"s")
     print("HBS equilib. matvec time = ",tMV,'s')
     print("LU equilib. matvec time  = ",tLUMV,'s')
+    print("err HBS                  = ",errHBS)
     print("res HBS                  = ",res_HBS)
     print("res LU                   = ",res_LU)
     print("=============================================")
