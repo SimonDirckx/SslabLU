@@ -138,6 +138,8 @@ _parser.add_argument("--nb", dest="nb", type=int, default=8,
                      help="number of blocks in HPS")
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
+_parser.add_argument("--nleaf", dest="nleaf", type=int, default=64,
+                     help="number of points per leaf")
 _parser.add_argument("--splitting", dest="splitting", type=_str2bool, default=False,
                      help="sparse self-block extraction (HBS path only): keep the local "
                           "block Abb[Jx,Jx] exact and HBS-compress ONLY the smoothing "
@@ -156,6 +158,7 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb = args.nb
+nleaf = args.nleaf
 splitting = args.splitting
 if splitting and admissibility != 'weak':
     raise SystemExit(
@@ -176,6 +179,16 @@ def  c33(p):
 def  c(p):
     return -kh*kh*torch.ones_like(p[...,0])
 HH = pdo.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
+
+def  c11_np(p):
+    return np.ones_like(p[:,0])
+def  c22_np(p):
+    return np.ones_like(p[:,0])
+def  c33_np(p):
+    return np.ones_like(p[:,0])
+def  c_np(p):
+    return -kh*kh*np.ones_like(p[:,0])
+HH_np = pdo.PDO_3d(c11=c11_np,c22=c22_np,c33=c33_np,c=c_np)
 
 
 print("============BUILDING SOLVER============")
@@ -578,7 +591,7 @@ elif solve_method == 'stencil':
     nx = int(ny * Lx) + 1            # single-width slab; nx so x=Lx lands on-grid
     print("stencil nx (derived from ny, Lx) = ", nx)
     ord_ = [nx, ny, nz]
-    solver = stencil.stencilSolver(HH, slabGeom, ord_)
+    solver = stencil.stencilSolver(HH_np, slabGeom, ord_)
 
     # ---- four blocks (interior solve + conormal boundary rows) ----
     Aii = solver.Aii.tocsr()
@@ -602,14 +615,15 @@ elif solve_method == 'stencil':
     XXi = XYtot[Ji, :]
     XXb = XYtot[Jb, :]
 
-    # ---- interface unknowns = strictly-interior x-faces (ring -> known) ----
+    # ---- interface unknowns = the FULL x-faces (ring kept in the block) ----
+    # The full structured face is needed downstream (e.g. the HBS slabTree).  The
+    # ring (x-face met by a physical y/z boundary) is global Dirichlet data: its
+    # measured conormal derivative is the imbalanced edge value, so we THROW IT
+    # AWAY (zero those rows of every map) and identity-pin the ring to the known
+    # trace in the balance operator and rhs instead.
     tol = 1e-9
-    Jl = np.where((np.abs(XXb[:, 0] - 0.) < tol) &
-                  (XXb[:, 1] > tol) & (XXb[:, 1] < Ly - tol) &
-                  (XXb[:, 2] > tol) & (XXb[:, 2] < Lz - tol))[0]
-    Jr = np.where((np.abs(XXb[:, 0] - Lx) < tol) &
-                  (XXb[:, 1] > tol) & (XXb[:, 1] < Ly - tol) &
-                  (XXb[:, 2] > tol) & (XXb[:, 2] < Lz - tol))[0]
+    Jl = np.where(np.abs(XXb[:, 0] - 0.) < tol)[0]
+    Jr = np.where(np.abs(XXb[:, 0] - Lx) < tol)[0]
     _sl, _sr = set(Jl.tolist()), set(Jr.tolist())
     JJ  = np.array([i for i in range(len(Jb)) if i not in _sl and i not in _sr])
     Jlc = np.array([i for i in range(len(Jb)) if i not in _sl])
@@ -618,14 +632,28 @@ elif solve_method == 'stencil':
     assert len(Jl) == len(Jr), "left/right interface face sizes differ"
     XXl = XXb[Jl, :]
     XXr = XXb[Jr, :]
-    print("|Jl| = ", len(Jl), "  |Jr| = ", len(Jr), "  |JJ| = ", len(JJ))
+    assert np.allclose(XXb[Jl][:, 1:3], XXb[Jr][:, 1:3]), \
+        "Jl/Jr (y,z) orderings not aligned"
+    # ring / interior positions WITHIN a face (shared by Jl and Jr by alignment)
+    ring = np.where((XXl[:, 1] < tol) | (XXl[:, 1] > Ly - tol) |
+                    (XXl[:, 2] < tol) | (XXl[:, 2] > Lz - tol))[0]
+    inn  = np.where((XXl[:, 1] > tol) & (XXl[:, 1] < Ly - tol) &
+                    (XXl[:, 2] > tol) & (XXl[:, 2] < Lz - tol))[0]
+    print("|Jl| = ", len(Jl), "  |Jr| = ", len(Jr),
+          "  |ring| = ", len(ring), "  |JJ| = ", len(JJ))
 
     def _np(x):
         return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
+    def _t(x):
+        # HBStorch maps apply to torch tensors; the stencil path is numpy.
+        return x if torch.is_tensor(x) else torch.from_numpy(np.ascontiguousarray(x))
+
     # ---- local Schur (conormal) map  T_{J1,J0} = Abb[J1,J0] - Abi[J1] Aii^-1 Aib[:,J0]
-    # Precompute the sliced sub-blocks once; with_local=False gives the smoothing
-    # remainder  -Abi Aii^-1 Aib  used by the --splitting self blocks.
+    # The ring OUTPUT rows are zeroed (their conormal is the discarded edge value);
+    # the transpose correspondingly zeros the ring INPUT rows.  Ring COLUMNS stay
+    # active so an interior node's conormal still sees the (pinned) ring trace.
+    # with_local=False gives the smoothing remainder -Abi Aii^-1 Aib for --splitting.
     def make_T(J1, J0, with_local=True):
         Bbi = Abi[J1].tocsr()
         Bib = Aib[:, J0].tocsc()
@@ -635,9 +663,11 @@ elif solve_method == 'stencil':
             out = -np.asarray(Bbi @ (solver_ii @ np.asarray(Bib @ v2)))
             if Bbb is not None:
                 out = out + np.asarray(Bbb @ v2)
+            out[ring, :] = 0.0                       # throw away ring conormal rows
             return out.ravel() if v.ndim == 1 else out
         def adj(v):
-            v2 = v[:, None] if v.ndim == 1 else v
+            v2 = (v[:, None] if v.ndim == 1 else v).copy()
+            v2[ring, :] = 0.0                        # transpose of zeroing output rows
             out = -np.asarray(Bib.T @ (solver_ii.T @ np.asarray(Bbi.T @ v2)))
             if Bbb is not None:
                 out = out + np.asarray(Bbb.T @ v2)
@@ -678,17 +708,20 @@ elif solve_method == 'stencil':
     print("nSlab = ", nSlab)
 
     # ---- block-tridiagonal balance operator (LU/exact maps) ----
+    # Interior-face rows carry the conormal flux balance; ring rows are identity
+    # (the discarded conormal is replaced by  u_ring = known trace).
     def apply_balance(u):
         utmp = u[:, None] if u.ndim == 1 else u
         out = np.zeros_like(utmp)
         for j in range(nSlab - 1):
-            blk = j * nif
-            out[blk:blk + nif] = (LinOp_ll @ utmp[blk:blk + nif]
-                                  + LinOp_rr @ utmp[blk:blk + nif])
+            b = j * nif
+            blk = LinOp_ll @ utmp[b:b + nif] + LinOp_rr @ utmp[b:b + nif]
             if j > 0:
-                out[blk:blk + nif] += LinOp_rl @ utmp[blk - nif:blk]
+                blk = blk + LinOp_rl @ utmp[b - nif:b]
             if j < nSlab - 2:
-                out[blk:blk + nif] += LinOp_lr @ utmp[blk + nif:blk + 2 * nif]
+                blk = blk + LinOp_lr @ utmp[b + nif:b + 2 * nif]
+            blk[ring] = utmp[b:b + nif][ring]        # identity-pin the ring rows
+            out[b:b + nif] = blk
         return out.ravel() if u.ndim == 1 else out
 
     A_balance = LinearOperator(shape=((nSlab - 1) * nif, (nSlab - 1) * nif),
@@ -714,6 +747,10 @@ elif solve_method == 'stencil':
             u_if[j * nif:(j + 1) * nif]  = bc_helmholtz(XXbloc[Jr], kh)
             XXif[j * nif:(j + 1) * nif, :] = XXbloc[Jr]
 
+    # ring rows are identity-pinned: set their rhs to the known Dirichlet trace
+    for j in range(nSlab - 1):
+        rhs[j * nif + ring] = u_if[j * nif + ring]
+
     print("res = ", np.linalg.norm(rhs - A_balance @ u_if))
 
     gInfo = gmres_info()
@@ -738,7 +775,7 @@ elif solve_method == 'stencil':
     else:
         device = 'cpu'
 
-    tree_leaf = 64
+    tree_leaf = nleaf
     if admissibility == 'weak':
         tree = slabTree.slabTree(XXl, False, tree_leaf)
         TTrr = HBStorch.HBSMAT(device=device, tree=tree)
@@ -763,8 +800,10 @@ elif solve_method == 'stencil':
             "splitting assumes |Jl| == |Jr| so D_ll and D_rr act on the same block"
         # exact local in-face blocks (NOT Schur complements): the singular/
         # differential part of the self maps, kept exact and added at apply time.
-        D_rr = Abb[Jr][:, Jr].tocsr()
-        D_ll = Abb[Jl][:, Jl].tocsr()
+        # Ring rows are zeroed to match the thrown-away ring conormal (the ring is
+        # identity-pinned in apply_balance_HBS, not flux-balanced).
+        D_rr = Abb[Jr][:, Jr].tolil(); D_rr[ring, :] = 0.0; D_rr = D_rr.tocsr()
+        D_ll = Abb[Jl][:, Jl].tolil(); D_ll[ring, :] = 0.0; D_ll = D_ll.tocsr()
         src_rr, src_ll = LinOp_rr_rem, LinOp_ll_rem
     else:
         src_rr, src_ll = LinOp_rr, LinOp_ll
@@ -788,17 +827,17 @@ elif solve_method == 'stencil':
         tSample += ts; tHBS += th
 
     if splitting:
-        def selfmat_rr(x): return np.asarray(D_rr @ x) + _np(TTrr @ x)
-        def selfmat_ll(x): return np.asarray(D_ll @ x) + _np(TTll @ x)
+        def selfmat_rr(x): return np.asarray(D_rr @ x) + _np(TTrr @ _t(x))
+        def selfmat_ll(x): return np.asarray(D_ll @ x) + _np(TTll @ _t(x))
     else:
-        def selfmat_rr(x): return _np(TTrr @ x)
-        def selfmat_ll(x): return _np(TTll @ x)
+        def selfmat_rr(x): return _np(TTrr @ _t(x))
+        def selfmat_ll(x): return _np(TTll @ _t(x))
 
     v = np.random.standard_normal((N, 10))
     err_rr = np.linalg.norm(selfmat_rr(v) - _np(LinOp_rr @ v)) / np.linalg.norm(v)
     err_ll = np.linalg.norm(selfmat_ll(v) - _np(LinOp_ll @ v)) / np.linalg.norm(v)
-    err_lr = np.linalg.norm(_np(TTlr @ v) - _np(LinOp_lr @ v)) / np.linalg.norm(v)
-    err_rl = np.linalg.norm(_np(TTrl @ v) - _np(LinOp_rl @ v)) / np.linalg.norm(v)
+    err_lr = np.linalg.norm(_np(TTlr @ _t(v)) - _np(LinOp_lr @ v)) / np.linalg.norm(v)
+    err_rl = np.linalg.norm(_np(TTrl @ _t(v)) - _np(LinOp_rl @ v)) / np.linalg.norm(v)
     print("err_rr = ", err_rr)
     print("err_ll = ", err_ll)
     print("err_lr = ", err_lr)
@@ -808,13 +847,14 @@ elif solve_method == 'stencil':
         utmp = u[:, None] if u.ndim == 1 else u
         out = np.zeros_like(utmp)
         for j in range(nSlab - 1):
-            blk = j * nif
-            out[blk:blk + nif] = (selfmat_ll(utmp[blk:blk + nif])
-                                  + selfmat_rr(utmp[blk:blk + nif]))
+            b = j * nif
+            blk = (selfmat_ll(utmp[b:b + nif]) + selfmat_rr(utmp[b:b + nif]))
             if j > 0:
-                out[blk:blk + nif] += _np(TTrl @ utmp[blk - nif:blk])
+                blk = blk + _np(TTrl @ _t(utmp[b - nif:b]))
             if j < nSlab - 2:
-                out[blk:blk + nif] += _np(TTlr @ utmp[blk + nif:blk + 2 * nif])
+                blk = blk + _np(TTlr @ _t(utmp[b + nif:b + 2 * nif]))
+            blk[ring] = utmp[b:b + nif][ring]        # identity-pin the ring rows
+            out[b:b + nif] = blk
         return out.ravel() if u.ndim == 1 else out
 
     A_balance_HBS = LinearOperator(shape=((nSlab - 1) * nif, (nSlab - 1) * nif),
