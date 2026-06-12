@@ -433,6 +433,9 @@ if solve_method == 'HPS':
 
     res_LU = np.linalg.norm(A_balance@_np(u)-_np(rhs))
     res_HBS = np.linalg.norm(A_balance_HBS@_np(u)-_np(rhs))
+    v = np.random.standard_normal((A_balance.shape[0],))
+    Av = A_balance@v
+    errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
 
 
     res_LU = np.linalg.norm(A_balance@u-rhs)
@@ -452,6 +455,7 @@ if solve_method == 'HPS':
     print("total HBS time           = ",tHBS*((nSlab-2)),"s")
     print("HBS equilib. matvec time = ",tMV,'s')
     print("LU equilib. matvec time  = ",tLUMV,'s')
+    print("err HBS                  = ",err_HBS)
     print("res HBS                  = ",res_HBS)
     print("res LU                   = ",res_LU)
     print("=============================================")

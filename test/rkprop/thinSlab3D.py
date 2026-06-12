@@ -120,7 +120,7 @@ _parser.add_argument("--order", nargs="+", default=None,
                           "or (px py pz) for SOMS; space- or comma-separated")
 _parser.add_argument("--shape", nargs="+", default=["1/16", "1", "1"],
                      help="domain extents Lx Ly Lz (fractions like 1/16 allowed)")
-_parser.add_argument("--admissibility", choices=["full", "partial"], default="full",
+_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="full",
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
@@ -466,7 +466,7 @@ if solve_method == 'SOMS':
     errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     print("================ SUMMARY ====================")
     print("total LU mem             = ",ndslab*memLU,"GB")
-    print("total LU time             = ",ndslab*tMUMPS,"s")
+    print("total LU time            = ",ndslab*tMUMPS,"s")
     print("total HBS mem            = ",ndslab*2*(SSl.nbytes)/1e9,"GB")
     print("sample time              = ",tSample*ndslab,"s")
     print("HBS compressions time    = ",tHBS*ndslab,"s")
