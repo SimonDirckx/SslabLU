@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import LinearOperator, splu
 import scipy.sparse as sparse
 from scipy.sparse import block_diag
 from solver.pde_solver import AbstractPDESolver
@@ -89,7 +89,7 @@ def _constructPDO2D_csr(op, xpts, ypts, XX,
     row_of[Ji] = np.arange(Ni,     dtype=np.intp)
     col_of_bnd[Jx] = np.arange(Nx_bnd, dtype=np.intp)
 
-    # Pre-allocate COO arrays with an upper bound of 5 entries per interior row
+    # Interior-row COO buffers  (Aii, Aix): <= 5 entries per interior row
     max_nnz = 5 * Ni
     ii_row  = np.empty(max_nnz, dtype=np.intp)
     ii_col  = np.empty(max_nnz, dtype=np.intp)
@@ -100,8 +100,20 @@ def _constructPDO2D_csr(op, xpts, ypts, XX,
     nii = 0
     nix = 0
 
+    # Boundary-row COO buffers  (Axi, Axx): conormal-derivative rows.
+    xi_max = 3 * max(Nx_bnd, 1)
+    xx_max = 20 * max(Nx_bnd, 1)
+    xi_row = np.empty(xi_max, dtype=np.intp)
+    xi_col = np.empty(xi_max, dtype=np.intp)
+    xi_val = np.empty(xi_max, dtype=np.float64)
+    xx_row = np.empty(xx_max, dtype=np.intp)
+    xx_col = np.empty(xx_max, dtype=np.intp)
+    xx_val = np.empty(xx_max, dtype=np.float64)
+    nxi = 0
+    nxx = 0
+
     def _add(flat_row, flat_col, value):
-        """Route (flat_row, flat_col, value) to Aii or Aix."""
+        """Route an interior-row entry to Aii (col interior) or Aix (col bnd)."""
         nonlocal nii, nix
         r = row_of[flat_row]       # compressed row (always valid: flat_row is interior)
         ci = row_of[flat_col]      # is flat_col interior?
@@ -112,45 +124,83 @@ def _constructPDO2D_csr(op, xpts, ypts, XX,
             ix_row[nix] = r;  ix_col[nix] = cx;  ix_val[nix] = value;  nix += 1
         # neighbours that fall completely outside the grid are ignored
 
+    def _add_bnd(flat_brow, flat_col, value):
+        """Route a boundary (conormal) row entry to Axi (col interior) or Axx (col bnd)."""
+        nonlocal nxi, nxx
+        br = col_of_bnd[flat_brow]  # compressed bnd row (always valid: flat_brow is bnd)
+        ci = row_of[flat_col]       # is flat_col interior?
+        cx = col_of_bnd[flat_col]   # is flat_col boundary?
+        if ci >= 0:
+            xi_row[nxi] = br;  xi_col[nxi] = ci;  xi_val[nxi] = value;  nxi += 1
+        elif cx >= 0:
+            xx_row[nxx] = br;  xx_col[nxx] = cx;  xx_val[nxx] = value;  nxx += 1
+        # neighbours that fall completely outside the grid are ignored
+
+    # Per-axis data:  (stride, h, coeff array, length, index-getter)
+    #   axis 0 = x (stride Ny),  axis 1 = y (stride 1)
     for ix in range(Nx):
         for iy in range(Ny):
             k = ix * Ny + iy
-            if row_of[k] < 0:       # boundary point: not a row of Aii/Aix
+
+            if row_of[k] >= 0:
+                # ---------- interior row: full stencil (Aii / Aix) ----------
+                diag_val  = -c11[k] * 2.0 * ax - c22[k] * 2.0 * ay
+                if c0 is not None: diag_val += c0[k]
+                _add(k, k, diag_val)
+
+                if ix > 0:        _add(k, k - Ny, c11[k] * ax)
+                if ix < Nx - 1:   _add(k, k + Ny, c11[k] * ax)
+                if iy > 0:        _add(k, k - 1,  c22[k] * ay)
+                if iy < Ny - 1:   _add(k, k + 1,  c22[k] * ay)
+
+                # first-order y-derivative (c1 u_y) – backward difference
+                if c1 is not None:
+                    if iy > 0:    _add(k, k - 1, -c1[k] / hy)
+                    _add(k, k,                    c1[k] / hy)
                 continue
 
-            # Coefficients are used exactly as supplied (no sign flip):
-            # this assembles  +c11 u_xx + c22 u_yy [+ c1 u_y] [+ c u],
-            # i.e. a Laplacian (Delta), not -Delta.
-            # Standard 2nd difference: diag = -2/h^2,  off-diag = +1/h^2.
-            diag_val  = -c11[k] * 2.0 * ax - c22[k] * 2.0 * ay
-            if c0  is not None: diag_val += c0[k]
-
-            _add(k, k, diag_val)
-
-            # x-neighbours  (stride Ny in flat indexing)
-            if ix > 0:
-                _add(k, k - Ny, c11[k] * ax)
-            if ix < Nx - 1:
-                _add(k, k + Ny, c11[k] * ax)
-
-            # y-neighbours  (stride 1)
-            if iy > 0:
-                _add(k, k - 1, c22[k] * ay)
-            if iy < Ny - 1:
-                _add(k, k + 1, c22[k] * ay)
-
-            # first-order y-derivative  (c1 * u_y)  – backward difference
-            # (u_i - u_{i-1})/h : diag += c1/h, (k-1) += -c1/h
-            if c1 is not None:
-                if iy > 0:
-                    _add(k, k - 1, -c1[k] / hy)
-                _add(k, k,          c1[k] / hy)
+            # ---------- boundary row: O(h^2) conormal derivative ----------
+            # For each face this node lies on (axis a, outward normal), use a
+            # one-sided normal flux plus a half-cell (h_a/2) correction in the
+            # tangential second differences and the zeroth-order term.  The
+            # ghost outside the box is eliminated through the node's own PDE row.
+            # (A first-order term c1, if present, is kept in the interior solve
+            # but its O(h) contribution to the boundary flux is not added here;
+            # for c1 = None the conormal rows are exact to O(h^2).)
+            axes = ((Ny, hx, c11, Nx, ix),
+                    (1,  hy, c22, Ny, iy))
+            for a in range(2):
+                s_a, h_a, c_a, N_a, i_a = axes[a]
+                on_low  = (i_a == 0)
+                on_high = (i_a == N_a - 1)
+                if not (on_low or on_high):
+                    continue
+                k_in = k - s_a if on_high else k + s_a   # interior normal neighbour
+                # one-sided normal flux  (c_a/h_a)(u_b - u_in)
+                _add_bnd(k, k,    c_a[k] / h_a)
+                _add_bnd(k, k_in, -c_a[k] / h_a)
+                # half-cell tangential second differences
+                for t in range(2):
+                    if t == a:
+                        continue
+                    s_t, h_t, c_t, N_t, i_t = axes[t]
+                    coef = 0.5 * h_a * c_t[k] / h_t**2
+                    _add_bnd(k, k, 2.0 * coef)                       # +h_a c_t/h_t^2
+                    if i_t > 0:        _add_bnd(k, k - s_t, -coef)
+                    if i_t < N_t - 1:  _add_bnd(k, k + s_t, -coef)
+                # half-cell zeroth-order term
+                if c0 is not None:
+                    _add_bnd(k, k, -0.5 * h_a * c0[k])
 
     Aii = sparse.csr_matrix(
         (ii_val[:nii], (ii_row[:nii], ii_col[:nii])), shape=(Ni, Ni))
     Aix = sparse.csr_matrix(
         (ix_val[:nix], (ix_row[:nix], ix_col[:nix])), shape=(Ni, Nx_bnd))
-    return Aii, Aix
+    Axi = sparse.csr_matrix(
+        (xi_val[:nxi], (xi_row[:nxi], xi_col[:nxi])), shape=(Nx_bnd, Ni))
+    Axx = sparse.csr_matrix(
+        (xx_val[:nxx], (xx_row[:nxx], xx_col[:nxx])), shape=(Nx_bnd, Nx_bnd))
+    return Aii, Aix, Axi, Axx
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +252,7 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
     row_of[Ji]  = np.arange(Ni,      dtype=np.intp)
     col_of_bnd[Jx] = np.arange(Nx_bnd, dtype=np.intp)
 
-    # Upper bound: 7 entries per interior row
+    # Interior-row COO buffers (Aii, Aix): <= 7 entries per interior row
     max_nnz = 7 * Ni
     ii_row = np.empty(max_nnz, dtype=np.intp)
     ii_col = np.empty(max_nnz, dtype=np.intp)
@@ -213,10 +263,23 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
     nii = 0
     nix = 0
 
+    # Boundary-row COO buffers (Axi, Axx): conormal-derivative rows.
+    xi_max = 4 * max(Nx_bnd, 1)
+    xx_max = 30 * max(Nx_bnd, 1)
+    xi_row = np.empty(xi_max, dtype=np.intp)
+    xi_col = np.empty(xi_max, dtype=np.intp)
+    xi_val = np.empty(xi_max, dtype=np.float64)
+    xx_row = np.empty(xx_max, dtype=np.intp)
+    xx_col = np.empty(xx_max, dtype=np.intp)
+    xx_val = np.empty(xx_max, dtype=np.float64)
+    nxi = 0
+    nxx = 0
+
     sy = Nz        # stride in y-direction
     sx = Ny * Nz   # stride in x-direction
 
     def _add(flat_row, flat_col, value):
+        """Interior-row entry -> Aii (col interior) or Aix (col boundary)."""
         nonlocal nii, nix
         r  = row_of[flat_row]
         ci = row_of[flat_col]
@@ -226,35 +289,78 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
         elif cx >= 0:
             ix_row[nix] = r;  ix_col[nix] = cx;  ix_val[nix] = value;  nix += 1
 
+    def _add_bnd(flat_brow, flat_col, value):
+        """Boundary (conormal) row entry -> Axi (col interior) or Axx (col bnd)."""
+        nonlocal nxi, nxx
+        br = col_of_bnd[flat_brow]
+        ci = row_of[flat_col]
+        cx = col_of_bnd[flat_col]
+        if ci >= 0:
+            xi_row[nxi] = br;  xi_col[nxi] = ci;  xi_val[nxi] = value;  nxi += 1
+        elif cx >= 0:
+            xx_row[nxx] = br;  xx_col[nxx] = cx;  xx_val[nxx] = value;  nxx += 1
+
     for ix in range(Nx):
         for iy in range(Ny):
             for iz in range(Nz):
                 k = ix * sx + iy * sy + iz
-                if row_of[k] < 0:
+
+                if row_of[k] >= 0:
+                    # ---------- interior row: full 7-point stencil ----------
+                    diag_val = -(c11[k] * 2.0 * ax
+                               + c22[k] * 2.0 * ay
+                               + c33[k] * 2.0 * az)
+                    if c0 is not None:
+                        diag_val += c0[k]      # Helmholtz: c0 = -k^2 (as given)
+                    _add(k, k, diag_val)
+
+                    if ix > 0:        _add(k, k - sx, c11[k] * ax)
+                    if ix < Nx - 1:   _add(k, k + sx, c11[k] * ax)
+                    if iy > 0:        _add(k, k - sy, c22[k] * ay)
+                    if iy < Ny - 1:   _add(k, k + sy, c22[k] * ay)
+                    if iz > 0:        _add(k, k - 1,  c33[k] * az)
+                    if iz < Nz - 1:   _add(k, k + 1,  c33[k] * az)
                     continue
 
-                # Coefficients used exactly as supplied (no sign flip):
-                # assembles +c11 u_xx + c22 u_yy + c33 u_zz [+ c u] (Delta).
-                # Standard 2nd difference: diag = -2/h^2, off-diag = +1/h^2.
-                diag_val = -(c11[k] * 2.0 * ax
-                           + c22[k] * 2.0 * ay
-                           + c33[k] * 2.0 * az)
-                if c0 is not None:
-                    diag_val += c0[k]          # Helmholtz: c0 = -k^2 (as given)
-                _add(k, k, diag_val)
-
-                if ix > 0:        _add(k, k - sx, c11[k] * ax)
-                if ix < Nx - 1:   _add(k, k + sx, c11[k] * ax)
-                if iy > 0:        _add(k, k - sy, c22[k] * ay)
-                if iy < Ny - 1:   _add(k, k + sy, c22[k] * ay)
-                if iz > 0:        _add(k, k - 1,  c33[k] * az)
-                if iz < Nz - 1:   _add(k, k + 1,  c33[k] * az)
+                # ---------- boundary row: O(h^2) conormal derivative ----------
+                # For every face the node lies on (axis a, outward normal): a
+                # one-sided normal flux  (c_a/h_a)(u_b - u_in)  plus a half-cell
+                # (h_a/2) correction in the two tangential second differences and
+                # the zeroth-order term.  The exterior ghost is eliminated via the
+                # node's own PDE row -> second-order conormal derivative.  Nodes on
+                # an edge/corner accumulate one such contribution per incident face.
+                axes = ((sx, hx, c11, Nx, ix),
+                        (sy, hy, c22, Ny, iy),
+                        (1,  hz, c33, Nz, iz))
+                for a in range(3):
+                    s_a, h_a, c_a, N_a, i_a = axes[a]
+                    on_low  = (i_a == 0)
+                    on_high = (i_a == N_a - 1)
+                    if not (on_low or on_high):
+                        continue
+                    k_in = k - s_a if on_high else k + s_a   # interior normal nbr
+                    _add_bnd(k, k,    c_a[k] / h_a)
+                    _add_bnd(k, k_in, -c_a[k] / h_a)
+                    for t in range(3):
+                        if t == a:
+                            continue
+                        s_t, h_t, c_t, N_t, i_t = axes[t]
+                        coef = 0.5 * h_a * c_t[k] / h_t**2
+                        _add_bnd(k, k, 2.0 * coef)              # +h_a c_t/h_t^2
+                        if i_t > 0:        _add_bnd(k, k - s_t, -coef)
+                        if i_t < N_t - 1:  _add_bnd(k, k + s_t, -coef)
+                    if c0 is not None:
+                        _add_bnd(k, k, -0.5 * h_a * c0[k])
 
     Aii = sparse.csr_matrix(
         (ii_val[:nii], (ii_row[:nii], ii_col[:nii])), shape=(Ni, Ni))
     Aix = sparse.csr_matrix(
         (ix_val[:nix], (ix_row[:nix], ix_col[:nix])), shape=(Ni, Nx_bnd))
-    return Aii, Aix
+    Axi = sparse.csr_matrix(
+        (xi_val[:nxi], (xi_row[:nxi], xi_col[:nxi])), shape=(Nx_bnd, Ni))
+    Axx = sparse.csr_matrix(
+        (xx_val[:nxx], (xx_row[:nxx], xx_col[:nxx])), shape=(Nx_bnd, Nx_bnd))
+    return Aii, Aix, Axi, Axx
 
 
 # ---------------------------------------------------------------------------
@@ -301,18 +407,9 @@ class stencilSolver(AbstractPDESolver):
             )[0]
 
             Ni, Nx_bnd = len(self._Ji), len(self._Jx)
-            self._Aii, self._Aix = _constructPDO2D_csr(
+            self._Aii, self._Aix, self._Axi, self._Axx = _constructPDO2D_csr(
                 pdo, xpts, ypts, self._XX,
                 self._Ji, self._Jx, Ni, Nx_bnd)
-
-            # Axi / Axx: boundary rows from the full operator are identity,
-            # but callers may need the off-diagonal coupling. Build lazily
-            # from the full matrix only when needed; set to None for now.
-            # (Uncomment the two lines below if Axi/Axx are required.)
-            # self._Axi, self._Axx = _constructPDO2D_csr(
-            #     pdo, xpts, ypts, self._XX, self._Jx, self._Ji, ...)
-            self._Axi = None
-            self._Axx = None
 
         elif ndim == 3:
             Nx, Ny, Nz = ord[0], ord[1], ord[2]
@@ -343,17 +440,16 @@ class stencilSolver(AbstractPDESolver):
             )[0]
 
             Ni, Nx_bnd = len(self._Ji), len(self._Jx)
-            self._Aii, self._Aix = _constructPDO3D_csr(
+            self._Aii, self._Aix, self._Axi, self._Axx = _constructPDO3D_csr(
                 pdo, xpts, ypts, zpts, self._XX,
                 self._Ji, self._Jx, Ni, Nx_bnd)
-            self._Axi = None
-            self._Axx = None
 
         else:
             raise ValueError(f"Unsupported spatial dimension: {ndim}")
 
         self._XXi = self._XX[self._Ji, :]
         self._XXb = self._XX[self._Jx, :]
+        self._solver_Aii = None        # lazily-built Aii^{-1} operator
 
     # ------------------------------------------------------------------
     # Properties
@@ -402,6 +498,40 @@ class stencilSolver(AbstractPDESolver):
     @property
     def Axx(self):
         return self._Axx
+
+    @property
+    def solver_Aii(self):
+        """Aii^{-1} as a LinearOperator (lazy LU).  Supports @, .T and 2-D rhs."""
+        if self._solver_Aii is None:
+            lu = splu(self._Aii.tocsc())
+            N  = self._Aii.shape[0]
+            self._solver_Aii = LinearOperator(
+                (N, N), dtype=np.float64,
+                matvec  = lu.solve,
+                matmat  = lu.solve,
+                rmatvec = lambda b: lu.solve(b, trans='T'),
+                rmatmat = lambda b: lu.solve(b, trans='T'))
+        return self._solver_Aii
+
+    def schur_complement(self):
+        """
+        Local Schur complement  S = Axx - Axi @ Aii^{-1} @ Aix  as a matrix-free
+        LinearOperator (Nx_bnd x Nx_bnd).  Applied to a boundary trace it returns
+        the (homogeneous-interior) O(h^2) conormal derivative on the boundary.
+        Volume-source contributions to the flux are handled separately on the rhs.
+        """
+        Aii_inv = self.solver_Aii
+        Aix, Axi, Axx = self._Aix, self._Axi, self._Axx
+        n = Axx.shape[0]
+
+        def _mv(x):
+            return Axx @ x - Axi @ (Aii_inv @ (Aix @ x))
+
+        def _rmv(x):
+            return Axx.T @ x - Aix.T @ (Aii_inv.T @ (Axi.T @ x))
+
+        return LinearOperator((n, n), matvec=_mv, matmat=_mv,
+                              rmatvec=_rmv, rmatmat=_rmv, dtype=np.float64)
 
     @property
     def p(self):

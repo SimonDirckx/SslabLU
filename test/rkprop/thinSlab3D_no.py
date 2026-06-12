@@ -16,6 +16,7 @@ import scipy.sparse as sparse
 import time
 import os
 from scipy.sparse.linalg import gmres
+from scipy.sparse.linalg import splu
 torch.set_default_dtype(torch.float64)
 def rss_gb():
     with open(f"/proc/{os.getpid()}/status") as f:
@@ -542,6 +543,341 @@ if solve_method == 'HPS':
 
     # ---- append results to resultsTform.csv (create with header if absent) ---
     _csv_path = "resultsTform.csv"
+    _header = ["H", "gmres_err", "niter",
+               "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
+               "HBS_matvec_time_s", "LU_matvec_time_s",
+               "total_LU_mem_GB", "total_HBS_mem_GB",
+               "solve_time_HBS_s", "solve_time_LU_est_s"]
+    _row = [Lx, gmres_err, niter,
+            total_LU_time_s, total_HBS_time_s, sample_time_s,
+            tMV, tLUMV,
+            total_LU_mem_GB, total_HBS_mem_GB,
+            solve_time_HBS, solve_time_LU_est]
+    _need_header = not os.path.exists(_csv_path)
+    with open(_csv_path, "a") as _f:
+        if _need_header:
+            _f.write(",".join(_header) + "\n")
+        _f.write(",".join(repr(x) for x in _row) + "\n")
+    print(f"appended results row to {_csv_path}")
+
+# ###########################################################################
+# ###########################   STENCIL SOLVER   ############################
+# ###########################################################################
+# Non-overlapping stencil path.  The interface is a slab FACE (x = 0 / x = Lx),
+# i.e. a boundary DOF, so the four-block conormal map from stencilSolver
+# (Axx/Axi as the O(h^2) Dirichlet-to-Neumann / conormal derivative) is used
+# directly -- no interior-plane scatter, no Jc_inJc framework.
+#
+# Interface unknowns = the strictly-interior x-face (ring excluded).  The ring
+# (x-face met by a physical y/z boundary) is global Dirichlet data and folds
+# into the known complement (JJ/Jlc/Jrc) exactly like the y/z faces, feeding the
+# rhs only.  This keeps every interface DOF a node where the conormal is the
+# clean O(h^2) map (full tangential stencil present), and keeps |Jl| == |Jr|.
+elif solve_method == 'stencil':
+    nx, ny, nz = order
+    nx = int(ny * Lx) + 1            # single-width slab; nx so x=Lx lands on-grid
+    print("stencil nx (derived from ny, Lx) = ", nx)
+    ord_ = [nx, ny, nz]
+    solver = stencil.stencilSolver(HH, slabGeom, ord_)
+
+    # ---- four blocks (interior solve + conormal boundary rows) ----
+    Aii = solver.Aii.tocsr()
+    Aib = solver.Aix.tocsc()        # column slicing  Aib[:, J0]
+    Abi = solver.Axi.tocsr()        # row    slicing  Abi[J1]
+    Abb = solver.Axx.tocsr()
+    tic = time.time()
+    lu  = splu(Aii.tocsc())
+    tLU = time.time() - tic
+    print("LU (splu) factorization time = ", tLU)
+    Ni  = Aii.shape[0]
+    solver_ii = LinearOperator((Ni, Ni), dtype=np.float64,
+                               matvec  = lu.solve,
+                               matmat  = lu.solve,
+                               rmatvec = lambda b: lu.solve(b, trans='T'),
+                               rmatmat = lambda b: lu.solve(b, trans='T'))
+
+    XYtot = solver.XX
+    Ji = np.asarray(solver.Ji)
+    Jb = np.asarray(solver.Jx)
+    XXi = XYtot[Ji, :]
+    XXb = XYtot[Jb, :]
+
+    # ---- interface unknowns = strictly-interior x-faces (ring -> known) ----
+    tol = 1e-9
+    Jl = np.where((np.abs(XXb[:, 0] - 0.) < tol) &
+                  (XXb[:, 1] > tol) & (XXb[:, 1] < Ly - tol) &
+                  (XXb[:, 2] > tol) & (XXb[:, 2] < Lz - tol))[0]
+    Jr = np.where((np.abs(XXb[:, 0] - Lx) < tol) &
+                  (XXb[:, 1] > tol) & (XXb[:, 1] < Ly - tol) &
+                  (XXb[:, 2] > tol) & (XXb[:, 2] < Lz - tol))[0]
+    _sl, _sr = set(Jl.tolist()), set(Jr.tolist())
+    JJ  = np.array([i for i in range(len(Jb)) if i not in _sl and i not in _sr])
+    Jlc = np.array([i for i in range(len(Jb)) if i not in _sl])
+    Jrc = np.array([i for i in range(len(Jb)) if i not in _sr])
+    ndofs_if = len(Jl)
+    assert len(Jl) == len(Jr), "left/right interface face sizes differ"
+    XXl = XXb[Jl, :]
+    XXr = XXb[Jr, :]
+    print("|Jl| = ", len(Jl), "  |Jr| = ", len(Jr), "  |JJ| = ", len(JJ))
+
+    def _np(x):
+        return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+    # ---- local Schur (conormal) map  T_{J1,J0} = Abb[J1,J0] - Abi[J1] Aii^-1 Aib[:,J0]
+    # Precompute the sliced sub-blocks once; with_local=False gives the smoothing
+    # remainder  -Abi Aii^-1 Aib  used by the --splitting self blocks.
+    def make_T(J1, J0, with_local=True):
+        Bbi = Abi[J1].tocsr()
+        Bib = Aib[:, J0].tocsc()
+        Bbb = Abb[J1][:, J0].tocsr() if with_local else None
+        def fwd(v):
+            v2 = v[:, None] if v.ndim == 1 else v
+            out = -np.asarray(Bbi @ (solver_ii @ np.asarray(Bib @ v2)))
+            if Bbb is not None:
+                out = out + np.asarray(Bbb @ v2)
+            return out.ravel() if v.ndim == 1 else out
+        def adj(v):
+            v2 = v[:, None] if v.ndim == 1 else v
+            out = -np.asarray(Bib.T @ (solver_ii.T @ np.asarray(Bbi.T @ v2)))
+            if Bbb is not None:
+                out = out + np.asarray(Bbb.T @ v2)
+            return out.ravel() if v.ndim == 1 else out
+        return fwd, adj
+
+    def _linop(shape, fa):
+        f, a = fa
+        return LinearOperator(shape, matvec=f, rmatvec=a, matmat=f, rmatmat=a,
+                              dtype=np.float64)
+
+    nif = ndofs_if
+    LinOp_ll = _linop((nif, nif), make_T(Jl, Jl))
+    LinOp_rr = _linop((nif, nif), make_T(Jr, Jr))
+    LinOp_lr = _linop((nif, nif), make_T(Jl, Jr))
+    LinOp_rl = _linop((nif, nif), make_T(Jr, Jl))
+    # smoothing-remainder self maps (sampled by HBS when --splitting is on)
+    LinOp_ll_rem = _linop((nif, nif), make_T(Jl, Jl, with_local=False))
+    LinOp_rr_rem = _linop((nif, nif), make_T(Jr, Jr, with_local=False))
+
+    # ---- rhs maps: interface-from-known-data ----
+    Trb,   _ = make_T(Jr, JJ)       # interior slab: right face from y/z faces
+    Tlb,   _ = make_T(Jl, JJ)       # interior slab: left  face from y/z faces
+    Trb_l, _ = make_T(Jr, Jrc)      # end slab 0:    right face from everything-but-Jr
+    Tlb_r, _ = make_T(Jl, Jlc)      # end slab N-1:  left  face from everything-but-Jl
+
+    # ---- single-interface equilibrium check on the manufactured trace ----
+    shiftL = np.array([Lx, 0., 0.])
+    ur_l = bc_helmholtz(XXb[Jr], kh)
+    ul_r = bc_helmholtz((XXb + shiftL)[Jl], kh)
+    ub_l = bc_helmholtz(XXb[Jrc], kh)
+    ub_r = bc_helmholtz((XXb + shiftL)[Jlc], kh)
+    equilib1 = np.linalg.norm(
+        LinOp_rr @ ur_l + LinOp_ll @ ul_r + Trb_l(ub_l) + Tlb_r(ub_r), ord=np.inf)
+    print("equilib1 = ", equilib1, "  (O(h^2) for stencil, not ~1e-12)")
+
+    nSlab = int(round(1. / Lx))
+    print("nSlab = ", nSlab)
+
+    # ---- block-tridiagonal balance operator (LU/exact maps) ----
+    def apply_balance(u):
+        utmp = u[:, None] if u.ndim == 1 else u
+        out = np.zeros_like(utmp)
+        for j in range(nSlab - 1):
+            blk = j * nif
+            out[blk:blk + nif] = (LinOp_ll @ utmp[blk:blk + nif]
+                                  + LinOp_rr @ utmp[blk:blk + nif])
+            if j > 0:
+                out[blk:blk + nif] += LinOp_rl @ utmp[blk - nif:blk]
+            if j < nSlab - 2:
+                out[blk:blk + nif] += LinOp_lr @ utmp[blk + nif:blk + 2 * nif]
+        return out.ravel() if u.ndim == 1 else out
+
+    A_balance = LinearOperator(shape=((nSlab - 1) * nif, (nSlab - 1) * nif),
+                               matvec=apply_balance, dtype=np.float64)
+
+    # ---- rhs + manufactured interface trace ----
+    rhs   = np.zeros((nSlab - 1) * nif)
+    u_if  = np.zeros((nSlab - 1) * nif)
+    XXif  = np.zeros(((nSlab - 1) * nif, 3))
+    for j in range(nSlab):
+        XXbloc = XXb + j * shiftL
+        if j == 0:
+            ub_loc = bc_helmholtz(XXbloc[Jrc], kh)
+            rhs[0:nif] -= Trb_l(ub_loc)
+        elif j == nSlab - 1:
+            ub_loc = bc_helmholtz(XXbloc[Jlc], kh)
+            rhs[(j - 1) * nif:j * nif] -= Tlb_r(ub_loc)
+        else:
+            ub_loc = bc_helmholtz(XXbloc[JJ], kh)
+            rhs[j * nif:(j + 1) * nif]       -= Trb(ub_loc)
+            rhs[(j - 1) * nif:j * nif]       -= Tlb(ub_loc)
+        if j < nSlab - 1:
+            u_if[j * nif:(j + 1) * nif]  = bc_helmholtz(XXbloc[Jr], kh)
+            XXif[j * nif:(j + 1) * nif, :] = XXbloc[Jr]
+
+    print("res = ", np.linalg.norm(rhs - A_balance @ u_if))
+
+    gInfo = gmres_info()
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat, _ = gmres(A_balance, rhs, rtol=1e-8, callback=gInfo,
+                        maxiter=gmres_iters, restart=gmres_iters)
+        solve_time_LU = time.time() - tic
+        niter = gInfo.niter
+        gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
+        print("time = ", solve_time_LU)
+        print("niter = ", niter)
+        print("u err = ", gmres_err)
+    else:
+        solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
+        print("GMRES solve skipped (gmres_iters = 0)")
+
+    # =====================  HBS-compressed balance  =======================
+    print("===============  HBS version  ===============")
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+
+    tree_leaf = 64
+    if admissibility == 'weak':
+        tree = slabTree.slabTree(XXl, False, tree_leaf)
+        TTrr = HBStorch.HBSMAT(device=device, tree=tree)
+        TTll = HBStorch.HBSMAT(device=device, tree=tree)
+        TTlr = HBStorch.HBSMAT(device=device, tree=tree)
+        TTrl = HBStorch.HBSMAT(device=device, tree=tree)
+        kmax = 1
+    else:
+        tree = slabTree.slabTree(XXl, False, tree_leaf, adjacency=admissibility)
+        TTrr = HBStorch_strong.HBSMAT(device=device, tree=tree)
+        TTll = HBStorch_strong.HBSMAT(device=device, tree=tree)
+        TTlr = HBStorch_strong.HBSMAT(device=device, tree=tree)
+        TTrl = HBStorch_strong.HBSMAT(device=device, tree=tree)
+        kmax = 9 if admissibility == 'strong' else 5
+
+    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+    s  = kmax * max(2 * rk, nl) + rk + 10
+    N  = LinOp_rr.shape[0]
+
+    if splitting:
+        assert len(Jl) == len(Jr), \
+            "splitting assumes |Jl| == |Jr| so D_ll and D_rr act on the same block"
+        # exact local in-face blocks (NOT Schur complements): the singular/
+        # differential part of the self maps, kept exact and added at apply time.
+        D_rr = Abb[Jr][:, Jr].tocsr()
+        D_ll = Abb[Jl][:, Jl].tocsr()
+        src_rr, src_ll = LinOp_rr_rem, LinOp_ll_rem
+    else:
+        src_rr, src_ll = LinOp_rr, LinOp_ll
+
+    # separate sampling per block (no simultaneous left/right sampling)
+    tSample = 0.0
+    tHBS = 0.0
+    def _construct(TT, src):
+        tic = time.time()
+        Om  = np.random.standard_normal((N, s))
+        Psi = np.random.standard_normal((N, s))
+        Y = src @ Om
+        Z = src.T @ Psi
+        ts = time.time() - tic
+        tic = time.time()
+        TT.construct(rk, Om, Psi, Y, Z, fast=True)
+        th = time.time() - tic
+        return ts, th
+    for TT, src in ((TTrr, src_rr), (TTll, src_ll), (TTrl, LinOp_rl), (TTlr, LinOp_lr)):
+        ts, th = _construct(TT, src)
+        tSample += ts; tHBS += th
+
+    if splitting:
+        def selfmat_rr(x): return np.asarray(D_rr @ x) + _np(TTrr @ x)
+        def selfmat_ll(x): return np.asarray(D_ll @ x) + _np(TTll @ x)
+    else:
+        def selfmat_rr(x): return _np(TTrr @ x)
+        def selfmat_ll(x): return _np(TTll @ x)
+
+    v = np.random.standard_normal((N, 10))
+    err_rr = np.linalg.norm(selfmat_rr(v) - _np(LinOp_rr @ v)) / np.linalg.norm(v)
+    err_ll = np.linalg.norm(selfmat_ll(v) - _np(LinOp_ll @ v)) / np.linalg.norm(v)
+    err_lr = np.linalg.norm(_np(TTlr @ v) - _np(LinOp_lr @ v)) / np.linalg.norm(v)
+    err_rl = np.linalg.norm(_np(TTrl @ v) - _np(LinOp_rl @ v)) / np.linalg.norm(v)
+    print("err_rr = ", err_rr)
+    print("err_ll = ", err_ll)
+    print("err_lr = ", err_lr)
+    print("err_rl = ", err_rl)
+
+    def apply_balance_HBS(u):
+        utmp = u[:, None] if u.ndim == 1 else u
+        out = np.zeros_like(utmp)
+        for j in range(nSlab - 1):
+            blk = j * nif
+            out[blk:blk + nif] = (selfmat_ll(utmp[blk:blk + nif])
+                                  + selfmat_rr(utmp[blk:blk + nif]))
+            if j > 0:
+                out[blk:blk + nif] += _np(TTrl @ utmp[blk - nif:blk])
+            if j < nSlab - 2:
+                out[blk:blk + nif] += _np(TTlr @ utmp[blk + nif:blk + 2 * nif])
+        return out.ravel() if u.ndim == 1 else out
+
+    A_balance_HBS = LinearOperator(shape=((nSlab - 1) * nif, (nSlab - 1) * nif),
+                                   matvec=apply_balance_HBS, dtype=np.float64)
+
+    gInfo = gmres_info()
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat, _ = gmres(A_balance_HBS, rhs, rtol=1e-8, callback=gInfo,
+                        maxiter=gmres_iters, restart=gmres_iters)
+        solve_time_HBS = time.time() - tic
+        niter = gInfo.niter
+        gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
+        print("time = ", solve_time_HBS)
+        print("niter = ", niter)
+        print("u err = ", gmres_err)
+    else:
+        solve_time_HBS = float('nan'); niter = float('nan'); gmres_err = float('nan')
+        print("GMRES solve skipped (gmres_iters = 0)")
+
+    # ---- matvec timings + memory ----
+    v = np.random.standard_normal(((nSlab - 1) * nif,))
+    tic = time.time()
+    for _ in range(20):
+        v = A_balance_HBS @ v
+    tMV = (time.time() - tic) / 20
+    v = np.random.standard_normal(((nSlab - 1) * nif,))
+    tic = time.time()
+    for _ in range(3):
+        v = A_balance @ v
+    tLUMV = (time.time() - tic) / 3
+
+    memLU = (lu.L.nnz + lu.U.nnz) * 8 / 1e9
+    res_LU  = np.linalg.norm(_np(A_balance @ u_if)     - _np(rhs))
+    res_HBS = np.linalg.norm(_np(A_balance_HBS @ u_if) - _np(rhs))
+    v  = np.random.standard_normal((A_balance.shape[0],))
+    Av = _np(A_balance @ v)
+    errHBS = np.linalg.norm(_np(A_balance_HBS @ v) - Av) / np.linalg.norm(Av)
+
+    total_LU_mem_GB  = nSlab * memLU
+    total_LU_time_s  = nSlab * tLU
+    total_HBS_mem_GB = ((nSlab - 2) * 4 + 2) * (TTll.nbytes) / 1e9
+    sample_time_s    = tSample * nSlab - tSample / 2
+    total_HBS_time_s = tHBS * nSlab - tHBS / 2
+    solve_time_LU_est = niter * tLUMV
+
+    print("================ SUMMARY ====================")
+    print("splitting                = ", splitting)
+    print("N                        = ", Aii.shape[0])
+    print("ndofs_if                 = ", nif)
+    print("total LU mem             = ", total_LU_mem_GB, "GB")
+    print("total LU time            = ", total_LU_time_s, "s")
+    print("total HBS mem            = ", total_HBS_mem_GB, "GB")
+    print("sample time              = ", sample_time_s, "s")
+    print("total HBS time           = ", total_HBS_time_s, "s")
+    print("HBS equilib. matvec time = ", tMV, "s")
+    print("LU equilib. matvec time  = ", tLUMV, "s")
+    print("err HBS                  = ", errHBS)
+    print("res HBS                  = ", res_HBS)
+    print("res LU                   = ", res_LU)
+    print("=============================================")
+
+    _csv_path = "resultsTform_stencil.csv"
     _header = ["H", "gmres_err", "niter",
                "total_LU_time_s", "total_HBS_time_s", "sample_time_s",
                "HBS_matvec_time_s", "LU_matvec_time_s",
