@@ -401,10 +401,10 @@ if solve_method == 'HPS':
     tic = time.time()
     Om = np.random.standard_normal((N,s))
     Psi = np.random.standard_normal((N,s))
-    tSample+=time.time()-tic
     Y = src_rr@Om
     Z = src_rr.T@Psi
-    
+    tSample+=time.time()-tic
+
     tic=time.time()
     tic = time.time()
     TTrr.construct(rk,Om,Psi,Y,Z,fast=True)
@@ -590,7 +590,7 @@ elif solve_method == 'stencil':
     print("stencil nx (derived from ny, Lx) = ", nx)
     ord_ = [nx, ny, nz]
     solver = stencil.stencilSolver(HH_np, slabGeom, ord_)
-
+    print("solver construction done")
     # ---- four blocks (interior solve + conormal boundary rows) ----
     Aii = solver.Aii
     Aib = solver.Aix.tocsc()        # column slicing  Aib[:, J0]
@@ -778,20 +778,20 @@ elif solve_method == 'stencil':
 
     print("res = ", np.linalg.norm(rhs - A_balance @ u_if))
 
-    #gInfo = gmres_info()
-    #if gmres_iters > 0:
-    #    tic = time.time()
-    #    uhat, _ = gmres(A_balance, rhs, rtol=1e-8, callback=gInfo,
-    #                    maxiter=gmres_iters, restart=gmres_iters)
-    #    solve_time_LU = time.time() - tic
-    #    niter = gInfo.niter
-    #    gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
-    #    print("time = ", solve_time_LU)
-    #    print("niter = ", niter)
-    #    print("u err = ", gmres_err)
-    #else:
-    #    solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
-    #    print("GMRES solve skipped (gmres_iters = 0)")
+    gInfo = gmres_info()
+    if gmres_iters > 0:
+        tic = time.time()
+        uhat, _ = gmres(A_balance, rhs, rtol=1e-8, callback=gInfo,
+                        maxiter=gmres_iters, restart=gmres_iters)
+        solve_time_LU = time.time() - tic
+        niter = gInfo.niter
+        gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
+        print("time = ", solve_time_LU)
+        print("niter = ", niter)
+        print("u err = ", gmres_err)
+    else:
+        solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
+        print("GMRES solve skipped (gmres_iters = 0)")
 
     # =====================  HBS-compressed balance  =======================
     print("===============  HBS version  ===============")

@@ -459,7 +459,7 @@ if solve_method == 'SOMS':
         memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
     else:
         memLU = 2*ctx.mumps_instance.info[3]*8/1e9
-    v = np.random.standard_normal((ndslab*ndofs_if,))
+    v = np.random.standard_normal((ndslab*ndofs_if,10))
     Av = A_balance@v
     errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     # ---- aggregate totals --------------------------------------------------
@@ -699,15 +699,15 @@ elif solve_method == 'stencil':
     u = u_true
     res = A_balance@u-rhs
     print("res = ",np.linalg.norm(res))
-    if gmres_iters > 0:
-        tic = time.time()
-        uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
-        niter = gInfo.niter
-        print("time = ",time.time()-tic)
-        print("niter = ",niter)
-        print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-    else:
-        print("GMRES solve skipped (gmres_iters = 0)")
+    #if gmres_iters > 0:
+    #    tic = time.time()
+    #    uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
+    #    niter = gInfo.niter
+    #    print("time = ",time.time()-tic)
+    #    print("niter = ",niter)
+    #    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
+    #else:
+    #    print("GMRES solve skipped (gmres_iters = 0)")
 
     print("===============  HBS version  ===============")
 
@@ -832,7 +832,7 @@ elif solve_method == 'stencil':
         memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
     else:
         memLU = 2*ctx.mumps_instance.info[3]*8/1e9
-    v = np.random.standard_normal((ndslab*ndofs_if,))
+    v = np.random.standard_normal((ndslab*ndofs_if,10))
     Av = A_balance@v
     errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     # ---- aggregate totals --------------------------------------------------
