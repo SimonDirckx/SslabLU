@@ -18,6 +18,174 @@ import time
 import os
 from scipy.sparse.linalg import gmres
 torch.set_default_dtype(torch.float64)
+
+
+######################################################
+#                   HELPER FUNCTIONS
+######################################################
+
+def compute_Tmaps(slabGeom):
+    solver_S = stencil.stencilSolver(op_pdo, slabGeom, ord_)
+    Aii,Aib,Abi,Abb,Ni,XXi,XXb,Ji,Jb = _solverdata(solver_S)
+    XYtot = solver_S.XX
+    tol = 1e-9
+    xl = slabGeom.bounds[0,0]
+    xr = slabGeom.bounds[1,0]
+    Jl = np.where(np.abs(XXb[:,0]-xl) < tol)[0]               # physical x = 0  face
+    Jr = np.where(np.abs(XXb[:,0]-xr) < tol)[0]               # physical x = Lx face
+    Jb = np.setdiff1d(np.arange(XXb.shape[0]),
+                        np.concatenate([Jl, Jr])).astype(np.int64)   # the four (y,z) faces
+
+    ndofs_if = len(Jl)                                  # size of one interface block
+
+    # ring = interface-face nodes on the (y,z) physical boundary (their conormal
+    # flux is ill-defined and is replaced by the known Dirichlet trace); inn =
+    # the strictly-interior interface nodes that carry the flux balance.
+    XXl = XXb[Jl, :]
+    ring = np.where((XXl[:, 1] < tol) | (XXl[:, 1] > Ly - tol) |
+                    (XXl[:, 2] < tol) | (XXl[:, 2] > Lz - tol))[0]
+    inn  = np.where((XXl[:, 1] > tol) & (XXl[:, 1] < Ly - tol) &
+                    (XXl[:, 2] > tol) & (XXl[:, 2] < Lz - tol))[0]
+
+    tic = time.time()
+    BLK = 32                                   # tune; see note below
+    ctx  = setup_mumps(Aii, blr=False)
+    ctxT = setup_mumps_transpose(Aii, blr=False)
+    tMUMPS = time.time()-tic
+    
+
+    ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
+    ctxT.mumps_instance.icntl[27] = BLK
+
+    def tmatmat(v, J1,J0, transpose=False):
+        v_tmp = v[:, None] if v.ndim == 1 else v
+        k = v_tmp.shape[1]
+
+        if not transpose:
+            Aib_J = Aib[:, J0].tocsc()
+            out = np.zeros((ndofs_if, k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                rhs = (Aib_J @ sparse.csc_matrix(v_tmp[:, c])).tocsc()
+                sol = ctx._solve_sparse(rhs)
+                out[:, c] =  Abb[J1][:,J0]@v_tmp[:, c] - Abi[J1]@sol  # conormal Schur block: +Abb - Abi Aii^{-1} Aib
+                del rhs, sol
+                ctx.mumps_instance.icntl[20] = 0
+        else:
+            Aib_J = Aib[:, J0].tocsc()
+            out = np.zeros((ndofs_if, k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                rhs = (Aib_J @ sparse.csc_matrix(v_tmp[:, c])).tocsc()
+                sol = ctx._solve_sparse(rhs)
+                out[:, c] =  Abb[J1][:,J0]@v_tmp[:, c] - Abi[J1]@sol  # conormal Schur block: +Abb - Abi Aii^{-1} Aib
+                del rhs, sol
+                ctx.mumps_instance.icntl[20] = 0
+        return out.flatten() if v.ndim == 1 else out
+
+    LinOp_rr = LinearOperator(shape=(len(Jr),len(Jr)),\
+        matvec = lambda v:tmatmat(v,Jr,Jr), rmatvec = lambda v:tmatmat(v,Jr,Jr,transpose=True),\
+        matmat = lambda v:tmatmat(v,Jr,Jr), rmatmat = lambda v:tmatmat(v,Jr,Jr,transpose=True))
+    LinOp_rl = LinearOperator(shape=(len(Jr),len(Jl)),\
+        matvec = lambda v:tmatmat(v,Jr,Jl), rmatvec = lambda v:tmatmat(v,Jr,Jl,transpose=True),\
+        matmat = lambda v:tmatmat(v,Jr,Jl), rmatmat = lambda v:tmatmat(v,Jr,Jl,transpose=True))
+    LinOp_lr = LinearOperator(shape=(len(Jl),len(Jr)),\
+        matvec = lambda v:tmatmat(v,Jl,Jr), rmatvec = lambda v:tmatmat(v,Jl,Jr,transpose=True),\
+        matmat = lambda v:tmatmat(v,Jl,Jr), rmatmat = lambda v:tmatmat(v,Jl,Jr,transpose=True))
+    LinOp_ll = LinearOperator(shape=(len(Jl),len(Jl)),\
+        matvec = lambda v:tmatmat(v,Jl,Jl), rmatvec = lambda v:tmatmat(v,Jl,Jl,transpose=True),\
+        matmat = lambda v:tmatmat(v,Jl,Jl), rmatmat = lambda v:tmatmat(v,Jl,Jl,transpose=True))
+    return LinOp_rr,LinOp_rl,LinOp_lr,LinOp_ll,Aib,Abi,Abb,Jl,Jr,Jb,ring,inn,XYtot,XXi,XXb,ctx,ctxT
+
+def compute_Sl_and_Sr(slabGeom):
+    solver_S = stencil.stencilSolver(op_pdo, slabGeom, ord_)
+    Sii,Sib,Abi,Abb,Ni,XXi,XXb,Ji,Jb = _solverdata(solver_S)
+    XYtot = solver_S.XX
+    tol = 1e-9
+    xl = slabGeom.bounds[0,0]
+    xr = slabGeom.bounds[1,0]
+    cx = (xr+xl)/2
+    Jc = np.where(np.abs(XXi[:,0]-cx) < tol)[0]               # interior interface DOFs
+    Jl = np.where(np.abs(XXb[:,0]-xl) < tol)[0]               # physical x = 0  face
+    XXl = XXb[Jl,:]
+    Jr = np.where(np.abs(XXb[:,0]-xr) < tol)[0]               # physical x = Lx face
+    Jb = np.setdiff1d(np.arange(XXb.shape[0]),
+                        np.concatenate([Jl, Jr])).astype(np.int64)   # the four (y,z) faces
+
+    Jc_large = np.where(np.abs(XYtot[:,0]-cx) < tol)[0]       # full interface plane
+    Jc_inJc =  np.where((XYtot[Jc_large,1] > tol) &\
+                    (XYtot[Jc_large,1] < Ly-tol) &\
+                    (XYtot[Jc_large,2] > tol) &\
+                    (XYtot[Jc_large,2] < Lz-tol))[0]   # x = Lx/2
+    ndofs_if = len(Jc_large)                                  # size of one interface block
+
+    assert len(Jl) == ndofs_if and len(Jr) == ndofs_if, "face/plane size mismatch"
+    assert np.allclose(XXb[Jr][:,1:3], XYtot[Jc_large][:,1:3]), "Jr not aligned to Jc_large"
+    assert np.allclose(XXb[Jl][:,1:3], XYtot[Jc_large][:,1:3]), "Jl not aligned to Jc_large"
+
+    def scatter(vec_Jc):
+        """Scatter a length-len(Jc) interior result into a length-ndofs_if block."""
+        out = np.zeros(ndofs_if)
+        out[Jc_inJc] = vec_Jc
+        return out
+
+    tic = time.time()
+    BLK = 32                                   # tune; see note below
+    ctx  = setup_mumps(Sii, blr=False)
+    ctxT = setup_mumps_transpose(Sii, blr=False)
+    tMUMPS = time.time()-tic
+    
+
+    ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
+    ctxT.mumps_instance.icntl[27] = BLK
+
+    def smatmat(v, J, transpose=False):
+        """Apply the interface map  -(Sii^{-1} Sib_J)  (or its transpose).
+
+        Forward : boundary data on face J (Jc_large-ordered)  ->  interface block.
+                    The interior solve fills the Jc_inJc rows; the (y,z)-boundary
+                    rows of the block stay 0.
+        Transpose: interface block -> face J.  Only the Jc_inJc rows of the input
+                    feed the (transposed) interior solve.
+        """
+        v_tmp = v[:, None] if v.ndim == 1 else v
+        k = v_tmp.shape[1]
+
+        if not transpose:
+            Sib_J = Sib[:, J].tocsc()
+            out = np.zeros((ndofs_if, k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                rhs = (Sib_J @ sparse.csc_matrix(v_tmp[:, c])).tocsc()
+                sol = ctx._solve_sparse(rhs)              # dense (len(Ii) x BLK) — bounded
+                out[Jc_inJc, c] = -sol[Jc, :]
+                del rhs, sol
+                ctx.mumps_instance.icntl[20] = 0
+        else:
+            Sib_J_T = Sib[:, J].T.tocsr()
+            out = np.zeros((ndofs_if, k))
+            for s in range(0, k, BLK):
+                c = slice(s, min(s + BLK, k))
+                w  = v_tmp[Jc_inJc, c]; bw = w.shape[1]; m = len(Jc)
+                rhs = sparse.csc_matrix(
+                    (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
+                    shape=(len(Ji), bw))
+                sol = ctxT._solve_sparse(rhs)
+                out[:, c] = -Sib_J_T @ sol
+                del rhs, sol
+                ctx.mumps_instance.icntl[20] = 0
+        return out.flatten() if v.ndim == 1 else out
+
+    LinOp_r = LinearOperator(shape=(ndofs_if,len(Jr)),\
+        matvec = lambda v:smatmat(v,Jr), rmatvec = lambda v:smatmat(v,Jr,transpose=True),\
+        matmat = lambda v:smatmat(v,Jr), rmatmat = lambda v:smatmat(v,Jr,transpose=True))
+    LinOp_l = LinearOperator(shape=(ndofs_if,len(Jl)),\
+        matvec = lambda v:smatmat(v,Jl), rmatvec = lambda v:smatmat(v,Jl,transpose=True),\
+        matmat = lambda v:smatmat(v,Jl), rmatmat = lambda v:smatmat(v,Jl,transpose=True))
+    return LinOp_l,LinOp_r,Sib,scatter,Jc,Jl,Jr,Jb,Jc_large,Jc_inJc,XYtot,XXi,XXb,ctx,ctxT
+
+
+
 def rss_gb():
     with open(f"/proc/{os.getpid()}/status") as f:
         for line in f:
@@ -49,6 +217,12 @@ def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8):
     ctxT.analyze(Sii.T)
     ctxT.factor(Sii.T)
     return ctxT
+
+
+######################################################
+#                   MAIN BODY
+######################################################
+
 
 
 def bc_laplace(p):
@@ -328,188 +502,105 @@ else:
     print("GMRES solve skipped (gmres_iters = 0)")
 print("condition number = ",_cond(Aii,ctx))
 
-
 print(  "============   T SOLVER:   ============" )
 
 nx = int(ny * Lx) + 1            # single-width slab; nx so x=Lx lands on-grid
 print("stencil nx (derived from ny, Lx) = ", nx)
 ord_ = [nx, ny, nz]
 
-slabGeom    = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]))
-solver_T = stencil.stencilSolver(op_pdo, slabGeom, ord_)
-Aii,Aib,Abi,Abb,Ni,XXi,XXb,Ji,Jb = _solverdata(solver_T)
-tol = 1e-9
+nslab = int(round(1./Lx))
+ndofs_if = ny*nz
 
+# Per-slab conormal-Schur maps.  Each slab [j*Lx,(j+1)*Lx] is assembled at its
+# ABSOLUTE location (like the S solver) so variable coefficients are handled;
+# for constant coefficients every slab is a translate of the reference slab.
+Trr_l=[]; Trl_l=[]; Tlr_l=[]; Tll_l=[]
+Aib_l=[]; Abi_l=[]; Abb_l=[]; ctx_l=[]
+Jl_l=[]; Jr_l=[]; JJ_l=[]; XXb_l=[]; XXi_l=[]
+tic = time.time()
+for j in range(nslab):
+    slabGeom = geom.BoxGeometry(np.array([[0,0,0],[Lx,Ly,Lz]]) +
+                                np.array([j*Lx, 0., 0.]))
+    (Trr,Trl,Tlr,Tll, Aib_j,Abi_j,Abb_j, Jl,Jr,JJ, ring,inn,
+     XYtot,XXi,XXb, ctx,ctxT) = compute_Tmaps(slabGeom)
+    Trr_l.append(Trr); Trl_l.append(Trl); Tlr_l.append(Tlr); Tll_l.append(Tll)
+    Aib_l.append(Aib_j); Abi_l.append(Abi_j); Abb_l.append(Abb_j); ctx_l.append(ctx)
+    Jl_l.append(Jl); Jr_l.append(Jr); JJ_l.append(JJ)
+    XXb_l.append(XXb); XXi_l.append(XXi)
+print("MUMPS factorization (all slabs) time = ", time.time()-tic)
 
+nif     = len(Jl_l[0])              # interface block size  (= ny*nz)
+nIF     = nslab - 1                 # number of interior interfaces
+hx_slab = Lx/(nx-1)                 # normal spacing; conormal rows scale as -hx
+ring    = ring                      # interface ring (same y/z order for every slab)
 
-BLK = 32
-tic  = time.time()
-ctx  = setup_mumps(Aii, blr=False)
-ctxT = setup_mumps_transpose(Aii, blr=False)
-tLU  = time.time() - tic
-print("MUMPS factorization time = ", tLU)
-ctx.mumps_instance.icntl[27]  = BLK     # one wide BLAS-3 block per chunk
-ctxT.mumps_instance.icntl[27] = BLK
-
-def _mumps_solve(ctx_, B):
-    """Apply Aii^-1 (ctx) or Aii^-T (ctxT) to a 1-D or 2-D rhs, BLK-chunked."""
-    B = np.asarray(B)
-    one_d = (B.ndim == 1)
-    if one_d:
-        B = B[:, None]
-    out = np.empty((B.shape[0], B.shape[1]), dtype=np.float64)
-    for c0 in range(0, B.shape[1], BLK):
-        c = slice(c0, min(c0 + BLK, B.shape[1]))
-        out[:, c] = ctx_._solve_sparse(sparse.csc_matrix(B[:, c]))
-        ctx_.mumps_instance.icntl[20] = 0
-    return out[:, 0] if one_d else out
-
-solver_ii = LinearOperator((Ni, Ni), dtype=np.float64,
-                            matvec  = lambda b: _mumps_solve(ctx,  b),
-                            matmat  = lambda b: _mumps_solve(ctx,  b),
-                            rmatvec = lambda b: _mumps_solve(ctxT, b),
-                            rmatmat = lambda b: _mumps_solve(ctxT, b))
-
-
-Jl = np.where(np.abs(XXb[:, 0] - 0.) < tol)[0]
-Jr = np.where(np.abs(XXb[:, 0] - Lx) < tol)[0]
-
-JJ  = np.array([i for i in range(len(Jb)) if i not in Jl and i not in Jr])
-Jlc = np.array([i for i in range(len(Jb)) if i not in Jl])
-Jrc = np.array([i for i in range(len(Jb)) if i not in Jr])
-
-ndofs_if = len(Jl)
-assert len(Jl) == len(Jr), "left/right interface face sizes differ"
-XXl = XXb[Jl, :]
-XXr = XXb[Jr, :]
-
-ring = np.where((XXl[:, 1] < tol) | (XXl[:, 1] > Ly - tol) |
-                    (XXl[:, 2] < tol) | (XXl[:, 2] > Lz - tol))[0]
-inn  = np.where((XXl[:, 1] > tol) & (XXl[:, 1] < Ly - tol) &
-                    (XXl[:, 2] > tol) & (XXl[:, 2] < Lz - tol))[0]
-
-
-
-
-def make_T(J1, J0, with_local=True):
-    Bbi = Abi[J1].tocsr()
-    Bib = Aib[:, J0].tocsc()
-    Bbb = Abb[J1][:, J0].tocsr() if with_local else None
-    def fwd(v):
-        v2 = v[:, None] if v.ndim == 1 else v
-        out = -np.asarray(Bbi @ (solver_ii @ np.asarray(Bib @ v2)))
-        if Bbb is not None:
-            out = out + np.asarray(Bbb @ v2)
-        out[ring, :] = 0.0                       # throw away ring conormal rows
-        return out.ravel() if v.ndim == 1 else out
-    def adj(v):
-        v2 = (v[:, None] if v.ndim == 1 else v).copy()
-        v2[ring, :] = 0.0                        # transpose of zeroing output rows
-        out = -np.asarray(Bib.T @ (solver_ii.T @ np.asarray(Bbi.T @ v2)))
-        if Bbb is not None:
-            out = out + np.asarray(Bbb.T @ v2)
-        return out.ravel() if v.ndim == 1 else out
-    return fwd, adj
-
-def _linop(shape, fa):
-    f, a = fa
-    return LinearOperator(shape, matvec=f, rmatvec=a, matmat=f, rmatmat=a,
-                            dtype=np.float64)
-
-nif = ndofs_if
-LinOp_ll = _linop((nif, nif), make_T(Jl, Jl))
-LinOp_rr = _linop((nif, nif), make_T(Jr, Jr))
-LinOp_lr = _linop((nif, nif), make_T(Jl, Jr))
-LinOp_rl = _linop((nif, nif), make_T(Jr, Jl))
-
-nSlab = int(round(1. / Lx))
-print("nSlab = ", nSlab)
-
-# ---- block-tridiagonal balance operator (LU/exact maps) ----
-# Interior-face rows carry the conormal flux balance; ring rows are identity
-# (the discarded conormal is replaced by  u_ring = known trace).
+# ---- block-tridiagonal flux-balance operator (per-slab conormal Schur maps) ----
+# Interface j sits between slab j (right face Jr) and slab j+1 (left face Jl).
+# Diagonal:  Trr[j] + Tll[j+1];  sub-diag: Trl[j] (u_{j-1}); super: Tlr[j+1] (u_{j+1}).
+# Ring rows are identity-pinned (their conormal flux is replaced by the known trace).
 def apply_balance(u):
     utmp = u[:, None] if u.ndim == 1 else u
-    out = np.zeros_like(utmp)
-    for j in range(nSlab - 1):
-        b = j * nif
-        blk = LinOp_ll @ utmp[b:b + nif] + LinOp_rr @ utmp[b:b + nif]
+    out  = np.zeros_like(utmp)
+    for j in range(nIF):
+        b  = j*nif
+        uj = utmp[b:b+nif]
+        blk = Trr_l[j] @ uj + Tll_l[j+1] @ uj
         if j > 0:
-            blk = blk + LinOp_rl @ utmp[b - nif:b]
-        if j < nSlab - 2:
-            blk = blk + LinOp_lr @ utmp[b + nif:b + 2 * nif]
-        blk[ring] = utmp[b:b + nif][ring]        # identity-pin the ring rows
-        out[b:b + nif] = blk
-    return out.ravel() if u.ndim == 1 else out
-def apply_balance_T(u):
-    utmp = u[:, None] if u.ndim == 1 else u
-    out = np.zeros_like(utmp)
-    for j in range(nSlab - 1):
-        b = j * nif
-        blk = LinOp_ll.T @ utmp[b:b + nif] + LinOp_rr.T @ utmp[b:b + nif]
-        if j > 0:
-            blk = blk + LinOp_lr.T @ utmp[b - nif:b]
-        if j < nSlab - 2:
-            blk = blk + LinOp_rl.T @ utmp[b + nif:b + 2 * nif]
-        blk[ring] = utmp[b:b + nif][ring]        # identity-pin the ring rows
-        out[b:b + nif] = blk
+            blk = blk + Trl_l[j]   @ utmp[b-nif:b]
+        if j < nIF-1:
+            blk = blk + Tlr_l[j+1] @ utmp[b+nif:b+2*nif]
+        blk[ring] = uj[ring]
+        out[b:b+nif] = blk
     return out.ravel() if u.ndim == 1 else out
 
-A_balance = LinearOperator(shape=((nSlab - 1) * nif, (nSlab - 1) * nif),
-                            matvec=apply_balance,rmatvec=apply_balance_T, dtype=np.float64)
+A_balance = LinearOperator(shape=(nIF*nif, nIF*nif),
+                           matvec=apply_balance, dtype=np.float64)
 
+# ---- rhs: known-data flux + particular flux (interior body force) +
+#           interface-node body force (-hx*f), ring identity-pinned. ----
+def data_flux(j, J1, knownfaces, data):
+    """Conormal flux on face J1 of slab j from known Dirichlet data on knownfaces:
+       (Abb - Abi Aii^{-1} Aib)[J1, knownfaces] @ data."""
+    Abi=Abi_l[j]; Aib=Aib_l[j]; Abb=Abb_l[j]; ctx=ctx_l[j]
+    return Abb[J1][:,knownfaces]@data - Abi[J1]@ctx.solve(Aib[:,knownfaces]@data)
 
-def make_T(J1, J0, with_local=True):
-    Bbi = Abi[J1].tocsr()
-    Bib = Aib[:, J0].tocsc()
-    Bbb = Abb[J1][:, J0].tocsr() if with_local else None
-    def fwd(v):
-        v2 = v[:, None] if v.ndim == 1 else v
-        out = -np.asarray(Bbi @ (solver_ii @ np.asarray(Bib @ v2)))
-        if Bbb is not None:
-            out = out + np.asarray(Bbb @ v2)
-        out[ring, :] = 0.0                       # throw away ring conormal rows
-        return out.ravel() if v.ndim == 1 else out
-    def adj(v):
-        v2 = (v[:, None] if v.ndim == 1 else v).copy()
-        v2[ring, :] = 0.0                        # transpose of zeroing output rows
-        out = -np.asarray(Bib.T @ (solver_ii.T @ np.asarray(Bbi.T @ v2)))
-        if Bbb is not None:
-            out = out + np.asarray(Bbb.T @ v2)
-        return out.ravel() if v.ndim == 1 else out
-    return fwd, adj
+def part_flux(j, J1, f_int):
+    """Particular conormal flux on face J1 of slab j from interior body force:
+       Abi[J1] Aii^{-1} f_int   (zero for the homogeneous Green's-function case)."""
+    return Abi_l[j][J1] @ ctx_l[j].solve(f_int)
 
+rhs  = np.zeros(nIF*nif)
+u_if = np.zeros(nIF*nif)
+XXif = np.zeros((nIF*nif, 3))
+for j in range(nIF):
+    # left slab j -> flux on its Jr face (= interface j)
+    JlL, JrL, JJL = Jl_l[j], Jr_l[j], JJ_l[j]
+    knownL = np.concatenate([JJL, JlL]) if j == 0 else JJL
+    dataL  = u_exact_fn(XXb_l[j][knownL])
+    fL = (data_flux(j, JrL, knownL, dataL)
+          + part_flux(j, JrL, forcing_fn(XXi_l[j])))
 
-# ---- rhs maps: interface-from-known-data ----
-Trb,   _ = make_T(Jr, JJ)       # interior slab: right face from y/z faces
-Tlb,   _ = make_T(Jl, JJ)       # interior slab: left  face from y/z faces
-Trb_l, _ = make_T(Jr, Jrc)      # end slab 0:    right face from everything-but-Jr
-Tlb_r, _ = make_T(Jl, Jlc)      # end slab N-1:  left  face from everything-but-Jl
+    # right slab j+1 -> flux on its Jl face (= interface j)
+    JlR, JrR, JJR = Jl_l[j+1], Jr_l[j+1], JJ_l[j+1]
+    knownR = np.concatenate([JJR, JrR]) if (j+1) == nslab-1 else JJR
+    dataR  = u_exact_fn(XXb_l[j+1][knownR])
+    fR = (data_flux(j+1, JlR, knownR, dataR)
+          + part_flux(j+1, JlR, forcing_fn(XXi_l[j+1])))
 
-# ---- rhs + manufactured interface trace ----
-rhs   = np.zeros((nSlab - 1) * nif)
-u_if  = np.zeros((nSlab - 1) * nif)
-XXif  = np.zeros(((nSlab - 1) * nif, 3))
-shiftL = np.array([Lx, 0., 0.])
-for j in range(nSlab):
-    XXbloc = XXb + j * shiftL
-    if j == 0:
-        ub_loc = bc_helmholtz(XXbloc[Jrc], kh)
-        rhs[0:nif] -= Trb_l(ub_loc)
-    elif j == nSlab - 1:
-        ub_loc = bc_helmholtz(XXbloc[Jlc], kh)
-        rhs[(j - 1) * nif:j * nif] -= Tlb_r(ub_loc)
-    else:
-        ub_loc = bc_helmholtz(XXbloc[JJ], kh)
-        rhs[j * nif:(j + 1) * nif]       -= Trb(ub_loc)
-        rhs[(j - 1) * nif:j * nif]       -= Tlb(ub_loc)
-    if j < nSlab - 1:
-        u_if[j * nif:(j + 1) * nif]  = bc_helmholtz(XXbloc[Jr], kh)
-        XXif[j * nif:(j + 1) * nif, :] = XXbloc[Jr]
+    b = -(fL + fR)
+    # interface nodes are BOUNDARY nodes of the non-overlapping slabs, so their
+    # own body force is not contained in any slab interior -> add it explicitly.
+    coords_if = XXb_l[j][JrL]
+    b = b - hx_slab * forcing_fn(coords_if)
 
-# ring rows are identity-pinned: set their rhs to the known Dirichlet trace
-for j in range(nSlab - 1):
-    rhs[j * nif + ring] = u_if[j * nif + ring]
+    uif = u_exact_fn(coords_if)
+    b[ring] = uif[ring]
+    rhs[j*nif:(j+1)*nif]      = b
+    u_if[j*nif:(j+1)*nif]     = uif
+    XXif[j*nif:(j+1)*nif, :]  = coords_if
+
+# sanity: the exact interface trace should nearly satisfy the balance system
+print("res (||A u_if - rhs||) = ", np.linalg.norm(A_balance@u_if - rhs))
 
 gInfo = gmres_info()
 if gmres_iters > 0:
@@ -519,15 +610,13 @@ if gmres_iters > 0:
     solve_time_LU = time.time() - tic
     niter = gInfo.niter
     gmres_err = np.linalg.norm(uhat - u_if) / np.linalg.norm(u_if)
+    gmres_res = np.linalg.norm(rhs - A_balance @ uhat) / np.linalg.norm(rhs)
     print("time = ", solve_time_LU)
     print("niter = ", niter)
+    print("gmres rel residual = ", gmres_res)
     print("u err = ", gmres_err)
 else:
-    solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
     print("GMRES solve skipped (gmres_iters = 0)")
-#Tdense = A_balance@np.identity(A_balance.shape[0])
-#print("condition number = ",np.linalg.cond(Tdense))
-
 
 print(  "============   S SOLVER:   ============" )
 cx = Lx
@@ -535,96 +624,9 @@ nx = int(2 * ny * Lx) + 1            # single-width slab; nx so x=Lx lands on-gr
 print("stencil nx (derived from ny, Lx) = ", nx)
 ord_ = [nx , ny, nz]
 
-def compute_Sl_and_Sr(slabGeom):
-    solver_S = stencil.stencilSolver(op_pdo, slabGeom, ord_)
-    Sii,Sib,Abi,Abb,Ni,XXi,XXb,Ji,Jb = _solverdata(solver_S)
-    XYtot = solver_S.XX
-    tol = 1e-9
-    xl = slabGeom.bounds[0,0]
-    xr = slabGeom.bounds[1,0]
-    cx = (xr+xl)/2
-    Jc = np.where(np.abs(XXi[:,0]-cx) < tol)[0]               # interior interface DOFs
-    Jl = np.where(np.abs(XXb[:,0]-xl) < tol)[0]               # physical x = 0  face
-    XXl = XXb[Jl,:]
-    Jr = np.where(np.abs(XXb[:,0]-xr) < tol)[0]               # physical x = Lx face
-    Jb = np.setdiff1d(np.arange(XXb.shape[0]),
-                        np.concatenate([Jl, Jr])).astype(np.int64)   # the four (y,z) faces
-
-    Jc_large = np.where(np.abs(XYtot[:,0]-cx) < tol)[0]       # full interface plane
-    Jc_inJc =  np.where((XYtot[Jc_large,1] > tol) &\
-                    (XYtot[Jc_large,1] < Ly-tol) &\
-                    (XYtot[Jc_large,2] > tol) &\
-                    (XYtot[Jc_large,2] < Lz-tol))[0]   # x = Lx/2
-    ndofs_if = len(Jc_large)                                  # size of one interface block
-
-    assert len(Jl) == ndofs_if and len(Jr) == ndofs_if, "face/plane size mismatch"
-    assert np.allclose(XXb[Jr][:,1:3], XYtot[Jc_large][:,1:3]), "Jr not aligned to Jc_large"
-    assert np.allclose(XXb[Jl][:,1:3], XYtot[Jc_large][:,1:3]), "Jl not aligned to Jc_large"
-
-    def scatter(vec_Jc):
-        """Scatter a length-len(Jc) interior result into a length-ndofs_if block."""
-        out = np.zeros(ndofs_if)
-        out[Jc_inJc] = vec_Jc
-        return out
-
-    tic = time.time()
-    BLK = 32                                   # tune; see note below
-    ctx  = setup_mumps(Sii, blr=False)
-    ctxT = setup_mumps_transpose(Sii, blr=False)
-    tMUMPS = time.time()-tic
-    
-
-    ctx.mumps_instance.icntl[27]  = BLK        # one wide BLAS-3 block per chunk
-    ctxT.mumps_instance.icntl[27] = BLK
-
-    def smatmat(v, J, transpose=False):
-        """Apply the interface map  -(Sii^{-1} Sib_J)  (or its transpose).
-
-        Forward : boundary data on face J (Jc_large-ordered)  ->  interface block.
-                    The interior solve fills the Jc_inJc rows; the (y,z)-boundary
-                    rows of the block stay 0.
-        Transpose: interface block -> face J.  Only the Jc_inJc rows of the input
-                    feed the (transposed) interior solve.
-        """
-        v_tmp = v[:, None] if v.ndim == 1 else v
-        k = v_tmp.shape[1]
-
-        if not transpose:
-            Sib_J = Sib[:, J].tocsc()
-            out = np.zeros((ndofs_if, k))
-            for s in range(0, k, BLK):
-                c = slice(s, min(s + BLK, k))
-                rhs = (Sib_J @ sparse.csc_matrix(v_tmp[:, c])).tocsc()
-                sol = ctx._solve_sparse(rhs)              # dense (len(Ii) x BLK) — bounded
-                out[Jc_inJc, c] = -sol[Jc, :]
-                del rhs, sol
-                ctx.mumps_instance.icntl[20] = 0
-        else:
-            Sib_J_T = Sib[:, J].T.tocsr()
-            out = np.zeros((ndofs_if, k))
-            for s in range(0, k, BLK):
-                c = slice(s, min(s + BLK, k))
-                w  = v_tmp[Jc_inJc, c]; bw = w.shape[1]; m = len(Jc)
-                rhs = sparse.csc_matrix(
-                    (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
-                    shape=(len(Ji), bw))
-                sol = ctxT._solve_sparse(rhs)
-                out[:, c] = -Sib_J_T @ sol
-                del rhs, sol
-                ctx.mumps_instance.icntl[20] = 0
-        return out.flatten() if v.ndim == 1 else out
-
-    LinOp_r = LinearOperator(shape=(ndofs_if,len(Jr)),\
-        matvec = lambda v:smatmat(v,Jr), rmatvec = lambda v:smatmat(v,Jr,transpose=True),\
-        matmat = lambda v:smatmat(v,Jr), rmatmat = lambda v:smatmat(v,Jr,transpose=True))
-    LinOp_l = LinearOperator(shape=(ndofs_if,len(Jl)),\
-        matvec = lambda v:smatmat(v,Jl), rmatvec = lambda v:smatmat(v,Jl,transpose=True),\
-        matmat = lambda v:smatmat(v,Jl), rmatmat = lambda v:smatmat(v,Jl,transpose=True))
-    return LinOp_l,LinOp_r,Sib,scatter,Jc,Jl,Jr,Jb,Jc_large,Jc_inJc,XYtot,XXi,XXb,ctx,ctxT
-
-
 
 ndslab = int(round(1./cx)) - 1
+ndofs_if = ny*nz
 XXif = np.zeros((ndslab*ndofs_if,3))
 rhs  = np.zeros((ndslab*ndofs_if,))
 u_true = np.zeros((ndslab*ndofs_if,))
@@ -638,25 +640,17 @@ for i in range(ndslab):
     Llist+=[LinOp_l]
     Rlist+=[LinOp_r]
 
-    # check local disc:
-
     XXif[i*ndofs_if:(i+1)*ndofs_if, :] = XYtot[Jc_large]
     trace_full = u_exact_fn(XYtot[Jc_large])           # interior AND ring
     u_true[i*ndofs_if:(i+1)*ndofs_if]  = trace_full
-
     uj   = u_exact_fn(XXb)                              # Dirichlet trace on slab faces
     f_int = forcing_fn(XXi)                            # body force at slab interior pts
 
-    # The centerline trace produced by the slab is (Sii^{-1}(f - Sib u_b))[Jc].
-    # The body force must therefore be propagated THROUGH the interior solve,
-    # exactly like the boundary data -- not added as raw point values.
     if i == 0:                        # physical x=0 face known -> keep Jl, drop Jr
         Jb0 = np.setdiff1d(np.arange(XXb.shape[0]), Jr).astype(np.int64)
         br = u_exact_fn(XXb[Jr])
         ub_loc_rc = u_exact_fn(XXb)[Jb0]
-        blk = ctx.solve(f_int - Sib[:, Jb0] @ ub_loc_rc)[Jc]
-        
-
+        blk = ctx.solve(f_int - Sib[:, Jb0] @ ub_loc_rc)[Jc]        
 
     elif i == ndslab - 1:             # physical far face known -> keep Jr, drop Jl
         Jb0 = np.setdiff1d(np.arange(XXb.shape[0]), Jl).astype(np.int64)
