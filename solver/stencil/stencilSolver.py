@@ -206,7 +206,8 @@ def _constructPDO2D_csr(op, xpts, ypts, XX,
 # ---------------------------------------------------------------------------
 # Direct CSR assembly – 7-point stencil (3-D)
 # ---------------------------------------------------------------------------
-# Operator:  L u = c11 u_xx + c22 u_yy + c33 u_zz [+ c u]   (coeffs as given)
+# Operator:  L u = c11 u_xx + c22 u_yy + c33 u_zz
+#                  [+ c1 u_x + c2 u_y + c3 u_z] [+ c u]   (coeffs as given)
 #
 # Flat index:  k = ix * Ny*Nz + iy * Nz + iz
 #
@@ -245,6 +246,19 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
     # Omitting it silently reduces the operator to Poisson (-lap u = f) and the
     # solve converges to the wrong PDE (the residual stalls under refinement).
     c0  = op.c(XX)  if op.c  else None
+    # First-order (convection) terms  c1 u_x + c2 u_y + c3 u_z, discretised with
+    # the same backward difference the 2-D path uses for c1 u_y.  Read defensively
+    # via getattr so operators that predate convection support (no c2/c3) still
+    # work.  As in 2-D, these are added to the INTERIOR rows only; the conormal
+    # boundary rows omit them (so the Schur/interface machinery stays O(h^2) for
+    # the diffusion part).  Backward differencing makes the interior operator
+    # O(h)-accurate in the convection term (upwind-style).
+    c1f = getattr(op, "c1", None)
+    c2f = getattr(op, "c2", None)
+    c3f = getattr(op, "c3", None)
+    c1  = c1f(XX) if c1f else None
+    c2  = c2f(XX) if c2f else None
+    c3  = c3f(XX) if c3f else None
 
     # Compressed index maps
     row_of     = np.full(Nx * Ny * Nz, -1, dtype=np.intp)
@@ -252,8 +266,11 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
     row_of[Ji]  = np.arange(Ni,      dtype=np.intp)
     col_of_bnd[Jx] = np.arange(Nx_bnd, dtype=np.intp)
 
-    # Interior-row COO buffers (Aii, Aix): <= 7 entries per interior row
-    max_nnz = 7 * Ni
+    # Interior-row COO buffers (Aii, Aix): <= 7 diffusion entries per interior
+    # row, plus up to 6 more from the three backward-difference convection terms
+    # (one off-diagonal + one diagonal hit each).  Duplicate (row,col) entries
+    # are summed by csr_matrix; we only need the buffer length to be safe.
+    max_nnz = 13 * Ni
     ii_row = np.empty(max_nnz, dtype=np.intp)
     ii_col = np.empty(max_nnz, dtype=np.intp)
     ii_val = np.empty(max_nnz, dtype=np.float64)
@@ -320,6 +337,18 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
                     if iy < Ny - 1:   _add(k, k + sy, c22[k] * ay)
                     if iz > 0:        _add(k, k - 1,  c33[k] * az)
                     if iz < Nz - 1:   _add(k, k + 1,  c33[k] * az)
+
+                    # first-order terms (backward differences), mirror of 2-D:
+                    #   c1 u_x ~ c1 (u_k - u_{k-sx}) / hx,  etc.
+                    if c1 is not None:
+                        if ix > 0:    _add(k, k - sx, -c1[k] / hx)
+                        _add(k, k,                     c1[k] / hx)
+                    if c2 is not None:
+                        if iy > 0:    _add(k, k - sy, -c2[k] / hy)
+                        _add(k, k,                     c2[k] / hy)
+                    if c3 is not None:
+                        if iz > 0:    _add(k, k - 1,  -c3[k] / hz)
+                        _add(k, k,                     c3[k] / hz)
                     continue
 
                 # ---------- boundary row: O(h^2) conormal derivative ----------

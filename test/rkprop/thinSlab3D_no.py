@@ -157,6 +157,7 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb = args.nb
+nleaf = args.nleaf
 splitting = args.splitting
 if splitting and admissibility != 'weak':
     raise SystemExit(
@@ -795,7 +796,7 @@ elif solve_method == 'stencil':
 
     # =====================  HBS-compressed balance  =======================
     print("===============  HBS version  ===============")
-    tree_leaf = 64
+    tree_leaf = nleaf
     if admissibility == 'weak':
         tree = slabTree.slabTree(XXl, False, tree_leaf)
         TTrr = HBStorch.HBSMAT(device=device, tree=tree)
