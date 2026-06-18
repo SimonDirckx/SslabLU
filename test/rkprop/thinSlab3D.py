@@ -132,6 +132,12 @@ _parser.add_argument("--nb", dest="nb", type=int, default=8,
                      help="SOMS number of blocks")
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
+_parser.add_argument("--nleaf", dest="nleaf", type=int, default=64,
+                     help="number of DOFs per leaf")
+_parser.add_argument("--weighted", dest="weighted", action="store_true",
+                     default=False,
+                     help="use the approximately L^2-weighted SOMS operator "
+                          "(SOMS path only; no effect on stencil)")
 args = _parser.parse_args()
 
 solve_method = args.type
@@ -145,7 +151,9 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb= args.nb
+weighted = args.weighted
 blr_tol = args.blr
+nleaf = args.nleaf
 blr = False
 
 if blr_tol > 0:
@@ -183,7 +191,7 @@ if solve_method == 'SOMS':
     nbz = nb
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
          px, py, pz, nbx, nby, nbz, 2*Lx, Ly, Lz,
-         coeffs, True, None, weighted=False)
+         coeffs, True, None, weighted=weighted)
 
     XXi = XYtot[Ii,:]
     XXb = XYtot[Ib,:]
@@ -201,10 +209,28 @@ if solve_method == 'SOMS':
     XXr = XXb[Jr,:]
     Jb = np.array([i for i in range(XXb.shape[0]) if i not in Jl and i not in Jr],dtype=np.int64)
 
-    uc = bc_helmholtz(XXc,kh)
-    ul = bc_helmholtz(XXl,kh)
-    ur = bc_helmholtz(XXr,kh)
-    ub = bc_helmholtz(XXb[Jb,:],kh)
+    # ------------------------------------------------------------------
+    # Per-face sqrt-quadrature weights, ordered to match XXi / XXb.
+    # wi, wb come back from the solver as sqrt(GL face weights) when
+    # weighted=True, and as all-ones when weighted=False. We move every
+    # analytic trace that serves as boundary input to a map, as input to a
+    # direct solve, or as an interface reference/RHS into weighted space by
+    # an elementwise product with the matching vector below. Because these
+    # are exactly 1.0 in the unweighted case, this is behaviour-preserving
+    # for --weighted off (single code path, no branching on the numerics).
+    #   w_if : centerline interface block, w_if = wi[Jc]  (tiled across slabs)
+    #   w_l/w_r : physical x=0 / x=2*Lx faces
+    #   w_b : full Ib-ordered vector (indexed later by Jb / Jb0)
+    # ------------------------------------------------------------------
+    w_if = wi[Jc]
+    w_l  = wb[Jl]
+    w_r  = wb[Jr]
+    w_b  = wb
+
+    uc = w_if * bc_helmholtz(XXc,kh)
+    ul = w_l  * bc_helmholtz(XXl,kh)
+    ur = w_r  * bc_helmholtz(XXr,kh)
+    ub = w_b[Jb] * bc_helmholtz(XXb[Jb,:],kh)
 
     tic_lu = time.time()
     BLK = 32                                   # tune; see note below
@@ -269,13 +295,13 @@ if solve_method == 'SOMS':
         XXl = XXb[Jl] + np.array([i*cx, 0., 0.])
 
         XXr = XXb[Jr] + np.array([i*cx, 0., 0.])
-        uj = bc_helmholtz(XXb_loc, kh)
+        uj = w_b * bc_helmholtz(XXb_loc, kh)
         if i == 0:
             XXr = XXb[Jr]
             XXc = XXi[Jc]
 
-            br = bc_helmholtz(XXr,kh)
-            uc = bc_helmholtz(XXc,kh)
+            br = w_r * bc_helmholtz(XXr,kh)
+            uc = w_if * bc_helmholtz(XXc,kh)
             ur = LinOp_r@br
             Jb0 = np.array([k for k in range(XXb.shape[0]) if k not in Jr])
             blk = -ctx.solve(Sib[:, Jb0] @ uj[Jb0])[Jc]
@@ -285,21 +311,21 @@ if solve_method == 'SOMS':
             blk = -ctx.solve(Sib[:, Jb0] @ uj[Jb0])[Jc]
             XXl = XXb[Jl] + np.array([i*cx, 0., 0.])
             XXc = XXi[Jc] + np.array([i*cx, 0., 0.])
-            bl = bc_helmholtz(XXl,kh)
-            uc = bc_helmholtz(XXc,kh)
+            bl = w_l * bc_helmholtz(XXl,kh)
+            uc = w_if * bc_helmholtz(XXc,kh)
             ul = LinOp_l@bl
             print("err slab ",i," = ",np.linalg.norm(uc-blk-ul))
         else:                             # interior slab: only the (y,z) faces are known
             blk = -ctx.solve(Sib[:, Jb] @ uj[Jb])[Jc]
-            bl = bc_helmholtz(XXl,kh)
-            br = bc_helmholtz(XXr,kh)
-            uc = bc_helmholtz(XXc,kh)
+            bl = w_l * bc_helmholtz(XXl,kh)
+            br = w_r * bc_helmholtz(XXr,kh)
+            uc = w_if * bc_helmholtz(XXc,kh)
             ul = LinOp_l@bl
             ur = LinOp_r@br
             print("err slab ",i," = ",np.linalg.norm(uc-blk-ul-ur))
         rhs[i*ndofs_if:(i+1)*ndofs_if] = blk
 
-    ui = bc_helmholtz(XXif,kh)
+    ui = np.tile(w_if, ndslab) * bc_helmholtz(XXif,kh)
 
     def apply_balance(u):
         if u.ndim == 1:
@@ -323,11 +349,9 @@ if solve_method == 'SOMS':
     bb = A_balance@v
     print("matvec time = ",time.time()-tic)
     gInfo = gmres_info()
-    u = bc_helmholtz(XXif,kh)
+    u = np.tile(w_if, ndslab) * bc_helmholtz(XXif,kh)
     res = A_balance@u-rhs
     print("res = ",np.linalg.norm(res))
-    # LU GMRES solve disabled: only the HBS system is solved. The LU solve time is
-    # estimated as niter * tLUMV (same iteration count, LU matvec cost) in the CSV.
 
     print("===============  HBS version  ===============")
 
@@ -335,14 +359,14 @@ if solve_method == 'SOMS':
         device = 'cuda'          # or 'cuda:0' to pin a specific GPU
     else:
         device = 'cpu'
-
+    tree_leaf = nleaf
     if admissibility=='weak':
-        tree = slabTree.slabTree(XXl,False,py*pz)
+        tree = slabTree.slabTree(XXl,False,nleaf)
         SSl = HBStorch.HBSMAT(device=device,tree=tree)
         SSr = HBStorch.HBSMAT(device=device,tree=tree)
         kmax = 1
     else:
-        tree = slabTree.slabTree(XXl,False,py*pz,adjacency=admissibility)
+        tree = slabTree.slabTree(XXl,False,nleaf,adjacency=admissibility)
         SSl = HBStorch_strong.HBSMAT(device=device,tree=tree)
         SSr = HBStorch_strong.HBSMAT(device=device,tree=tree)
         if admissibility == 'strong': 
@@ -350,7 +374,7 @@ if solve_method == 'SOMS':
         else: 
             kmax = 5
     
-    nl = len(tree.get_box_inds(tree.get_leaves()[0]))
+    nl = nleaf
     s = kmax*max(2*rk,nl)+rk+10
     tHBS = 0
     tSample = 0
@@ -423,7 +447,7 @@ if solve_method == 'SOMS':
     bb = A_balance_HBS@v
     print("matvec time = ",time.time()-tic)
     gInfo = gmres_info()
-    u = bc_helmholtz(XXif,kh)
+    u = np.tile(w_if, ndslab) * bc_helmholtz(XXif,kh)
     res = A_balance_HBS@u-rhs
     print("res = ",np.linalg.norm(res))
     if gmres_iters > 0:
@@ -432,9 +456,11 @@ if solve_method == 'SOMS':
         solve_time_HBS = time.time()-tic
         niter = gInfo.niter
         gmres_err = np.linalg.norm(uhat-u)/np.linalg.norm(u)
+        gmres_err_max = np.linalg.norm(uhat-u,ord=np.inf)/np.linalg.norm(u,ord=np.inf)
         print("time = ",solve_time_HBS)
         print("niter = ",niter)
         print("u err = ",gmres_err)
+        print("u err max = ",gmres_err_max)
     else:
         solve_time_HBS = float('nan')
         niter = float('nan')
@@ -477,6 +503,7 @@ if solve_method == 'SOMS':
     solve_time_LU_est = niter*tLUMV       # estimate: same iter count, LU matvec cost
 
     print("================ SUMMARY ====================")
+    print("weighted operator        = ",weighted)
     print("total LU mem             = ",total_LU_mem_GB,"GB")
     print("total LU time            = ",total_LU_time_s,"s")
     print("total HBS mem            = ",total_HBS_mem_GB,"GB")

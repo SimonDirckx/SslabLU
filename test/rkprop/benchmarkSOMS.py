@@ -23,10 +23,17 @@ import tracemalloc
 import numpy as np
 import matplotlib.pyplot as plt
 import mumps
-sys.path.insert(0, '/home/claude/soms')
 from SOMS3D_csr import SOMS_solver_sparse
 
-
+import argparse
+import re
+_parser = argparse.ArgumentParser(
+    description="Test SOMS performance")
+_parser.add_argument("--vc", dest="vc", action="store_true",
+                     default=False,
+                     help="variable coeff")
+args = _parser.parse_args()
+vc = args.vc
 # Constant-coefficient Helmholtz (just a pre-defined problem to call the solver on).
 K = 1.0
 COEFFS = {'c11': 1.0, 'c22': 1.0, 'c33': 1.0, 'c': K ** 2}
@@ -46,9 +53,9 @@ def run_one(p, nb):
     """
     tracemalloc.start()
     t0 = time.perf_counter()
-    Sii, Sib, ftild, XYtot, Ii, Ib = SOMS_solver_sparse(
+    Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS_solver_sparse(
         p, p, p, nb, nb, nb,
-        coeffs=COEFFS, ct_pde=True, forcing=None,
+        coeffs=COEFFS, ct_pde=(not vc), forcing=None,
     )
     
     elapsed = time.perf_counter() - t0
@@ -85,8 +92,8 @@ def add_reference_lines(ax, Ns, ys, exponents, labels):
 
 def main():
     # --- h-refinement: vary nb, p fixed ---
-    p_fixed = 8
-    nb_list = [2,3,4,5,6]                       # two small sizes
+    p_fixed = 6
+    nb_list = [2,3,4]                       # two small sizes
     h_results = []
     print(f"h-refinement (p = {p_fixed}):")
     for nb in nb_list:
@@ -100,7 +107,7 @@ def main():
 
     # --- p-refinement: vary p, nb fixed ---
     nb_fixed = 4
-    p_list = [6,8,10]                        # two small sizes
+    p_list = [4,6,8]                        # two small sizes
     p_results = []
     print(f"\np-refinement (nb = {nb_fixed}):")
     for p in p_list:
@@ -150,10 +157,10 @@ def main():
     plot_panel(axes[2, 1], p_results, f'p-refinement (nb={nb_fixed}): factorization time',
                'factorization time (s)', kk=2)
 
-    fig.suptitle('SOMS3D v6 — build cost scaling (smoke test, 2 points per series)',
+    fig.suptitle('SOMS3D v6 — cost scaling',
                  fontsize=11)
     fig.tight_layout()
-    out = '/home/simond/SslabLU/scaling.png'
+    out = 'scaling_vc.png'
     fig.savefig(out, dpi=120)
     #plt.show()
     print(f"\nWrote {out}")

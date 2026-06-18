@@ -361,7 +361,7 @@ _parser.add_argument("--pde", choices=["greens", "convdiff", "vardiff"],
                           "c11(x)u_xx+c22(x)u_yy+c33(x)u_zz with a manufactured "
                           "solution. The manufactured PDEs carry a nonzero body "
                           "force and are exercised on the global solver only.")
-_parser.add_argument("--epsilon", dest="epsilon", type=float, default=0.1,
+_parser.add_argument("--epsilon", dest="epsilon", type=float, default=1.,
                      help="diffusion coefficient eps for --pde convdiff")
 _parser.add_argument("--beta", dest="beta", nargs="+", default=["1", "0.5", "0.25"],
                      help="convection vector b1 b2 b3 for --pde convdiff "
@@ -477,7 +477,6 @@ print("solver construction done")
 
 Aii,Aib,Abi,Abb,Ni,XXi,XXb,Ji,Jb = _solverdata(solver_glob)
 ctx = setup_mumps(Aii)
-
 ui  = u_exact_fn(solver_glob.XXi)
 ub  = u_exact_fn(solver_glob.XXb)
 fi  = forcing_fn(solver_glob.XXi)        # interior body force (0 for greens)
@@ -500,7 +499,6 @@ if gmres_iters > 0:
 else:
     solve_time_LU = float('nan'); niter = float('nan'); gmres_err = float('nan')
     print("GMRES solve skipped (gmres_iters = 0)")
-print("condition number = ",_cond(Aii,ctx))
 
 print(  "============   T SOLVER:   ============" )
 

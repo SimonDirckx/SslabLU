@@ -281,8 +281,10 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
     nix = 0
 
     # Boundary-row COO buffers (Axi, Axx): conormal-derivative rows.
-    xi_max = 4 * max(Nx_bnd, 1)
-    xx_max = 30 * max(Nx_bnd, 1)
+    # Sized to also hold the optional conormal convection entries (one extra
+    # interior coupling per on_high face + tangential half-cell couplings).
+    xi_max = 8 * max(Nx_bnd, 1)
+    xx_max = 60 * max(Nx_bnd, 1)
     xi_row = np.empty(xi_max, dtype=np.intp)
     xi_col = np.empty(xi_max, dtype=np.intp)
     xi_val = np.empty(xi_max, dtype=np.float64)
@@ -361,6 +363,7 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
                 axes = ((sx, hx, c11, Nx, ix),
                         (sy, hy, c22, Ny, iy),
                         (1,  hz, c33, Nz, iz))
+                cconv = (c1, c2, c3)        # convection coeffs per axis (None if absent)
                 for a in range(3):
                     s_a, h_a, c_a, N_a, i_a = axes[a]
                     on_low  = (i_a == 0)
@@ -380,6 +383,26 @@ def _constructPDO3D_csr(op, xpts, ypts, zpts, XX,
                         if i_t < N_t - 1:  _add_bnd(k, k + s_t, -coef)
                     if c0 is not None:
                         _add_bnd(k, k, -0.5 * h_a * c0[k])
+                    # ---- conormal convection (only when op has c1/c2/c3) ----
+                    # The DD flux balance must reconstruct -h_a*(global stencil) at an
+                    # interface node.  The normal backward-difference convection term
+                    # references the upwind interior node, which lives in the on_high
+                    # slab only, so the full term is carried by the on_high (right-face)
+                    # conormal row; the tangential convection shares the interface-plane
+                    # neighbours and so splits half-and-half between the two slabs.
+                    cca = cconv[a]
+                    if cca is not None and on_high:
+                        _add_bnd(k, k,    -cca[k])        # -c_a (u_b - u_in), backward
+                        _add_bnd(k, k_in,  cca[k])
+                    for t in range(3):
+                        if t == a:
+                            continue
+                        s_t, h_t, c_t, N_t, i_t = axes[t]
+                        cct = cconv[t]
+                        if cct is not None and i_t > 0:
+                            coefc = 0.5 * h_a * cct[k] / h_t
+                            _add_bnd(k, k,        -coefc)  # -0.5 h_a c_t (u_b-u_{t-})/h_t
+                            _add_bnd(k, k - s_t,   coefc)
 
     Aii = sparse.csr_matrix(
         (ii_val[:nii], (ii_row[:nii], ii_col[:nii])), shape=(Ni, Ni))
