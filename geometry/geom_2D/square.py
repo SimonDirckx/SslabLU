@@ -1,5 +1,4 @@
 import numpy as np
-import jax.numpy as jnp
 
 
 bnds = [[0,0],[1,1]]
@@ -8,6 +7,7 @@ def gb_np(p):
     return ((np.abs(p[:,0]-bnds[0][0]))<1e-14) | ((np.abs(p[:,0]-bnds[1][0]))<1e-14) | ((np.abs(p[:,1]-bnds[0][1]))<1e-14) | ((np.abs(p[:,1]-bnds[1][1]))<1e-14)
 
 def gb_jnp(p):
+    import jax.numpy as jnp
     return ((jnp.abs(p[...,0]-bnds[0][0]))<1e-14) | ((jnp.abs(p[...,0]-bnds[1][0]))<1e-14) | ((jnp.abs(p[...,1]-bnds[0][1]))<1e-14) | ((jnp.abs(p[...,1]-bnds[1][1]))<1e-14) 
 
 def gb(p,jax_avail = True,torch_avail=False):
@@ -20,6 +20,7 @@ def gb(p,jax_avail = True,torch_avail=False):
 
 def box_geom(jax_avail=True,torch_avail=True):
     if jax_avail:
+        import jax.numpy as jnp
         return jnp.array(bnds)
     elif torch_avail:
         return np.array(bnds)

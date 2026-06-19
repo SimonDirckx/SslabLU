@@ -9,7 +9,6 @@ from scipy.linalg   import lu_factor, lu_solve
 from solver.solver import stMap
 import time
 import sys
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 #import gc
 
