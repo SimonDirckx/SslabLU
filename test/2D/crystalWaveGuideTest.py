@@ -1,6 +1,7 @@
 # basic packages
 import numpy as np
 import jax.numpy as jnp
+import scipy.linalg
 import torch
 import scipy
 from packaging.version import Version
@@ -12,6 +13,7 @@ import matAssembly.matAssembler as mA
 import multislab.oms as oms
 import solver.hpsmultidomain.hpsmultidomain.pdo as pdo
 import multislab.omsdirectsolve as omsdirect
+import multislab.omsdirectsolveHBS as omsdirectHBS
 
 # validation&testing
 import time
@@ -31,10 +33,22 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
+def convert_to_dense(Srk_list):
+    Sdense = []
+    for i in range(len(Srk_list)):
+        local = []
+        print("len Srk_list[i] = ",len(Srk_list[i]))
+        for j in range(len(Srk_list[i])):
+            local+=[Srk_list[i][j]@np.identity(Srk_list[i][j].shape[0])]
+        Sdense+=[local]
+    return Sdense
+
 
 #nwaves = 24.623521102434587
 nwaves = 24.673521102434584
+#nwaves = 50.
 kh = (nwaves+0.03)*2*np.pi+1.8
+
 
 jax_avail=False
 torch_avail=True
@@ -169,14 +183,16 @@ def bc(p):
     return np.ones_like(p[:,0])
 
 
-solve_method = 'iterative'
-#solve_method = 'direct'
+#solve_method = 'iterative'
+solve_method = 'direct'
+#compression = 'dense'
+compression = 'rk'
 hpsalt=True
 
 N = 8
 dSlabs,connectivity,H = square.dSlabs(N)
 print(connectivity)
-pvec = np.array([30],dtype = np.int64)
+pvec = np.array([25],dtype = np.int64)
 #pvec = np.array([8,10,12,14,16,18,20],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
@@ -188,23 +204,24 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/8,1/32])
-    if solve_method=='direct':
+    a = np.array([H/16,1/64])
+    if compression == 'dense':
+        print("DENSE ASSEMBLER USED")
         assembler = mA.denseMatAssembler()
-    elif solve_method=='iterative':
-        assembler = mA.rkHMatAssembler(p,32,ndim=2)
+    else:
+        assembler = mA.rkHMatAssembler(p,40,ndim=2)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc],a)
     OMS = oms.oms(dSlabs,Lapl,lambda p :square.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    
     print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=1)
     print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=1)
     niter = 0
+    pniter = 0
     if solve_method == 'iterative':
-        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
         gInfo = gmres_info()
         stol = 1e-11*H*H
-
         if Version(scipy.__version__)>=Version("1.14"):
             uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
         else:
@@ -214,11 +231,32 @@ for indp in range(len(pvec)):
         rhstot = np.zeros(shape = (Ntot,))
         for i in range(len(rhs_list)):
             rhstot[i*nc:(i+1)*nc] = rhs_list[i]
-        T = omsdirect.build_block_tridiagonal_solver(S_rk_list)
-        uhat  = omsdirect.block_tridiagonal_solve(OMS, T, rhstot)
-        #Sdense = Stot@np.identity(Stot.shape[0])
-        #uhat = np.linalg.solve(Sdense,rhstot)
-    
+        rhstot_copy = rhstot.copy()
+        tic = time.time()
+        T = omsdirectHBS.build_block_tridiagonal_solver(S_rk_list,assembler.matOpts.tree,False,assembler.matOpts.maxRank)
+        print("time to construct direct solver = ",time.time()-tic)
+        def matvec(v):
+            return omsdirectHBS.block_tridiagonal_solve(OMS, T, v)
+        Sinv_HBS  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec)
+        gInfo = gmres_info()
+        pgInfo = gmres_info()
+        stol = 1e-11*H*H
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
+        else:
+            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        
+        if Version(scipy.__version__)>=Version("1.14"):
+            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
+        else:
+            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=pgInfo,maxiter=500,restart=500,M=Sinv_HBS)
+        niter = gInfo.niter
+        pniter = pgInfo.niter
+
+    #Stot_dense = Stot@np.identity(Stot.shape[0])
+    #print("inv err = ",np.linalg.norm(Sinv_HBS-Sinv_dense,ord=2)/np.linalg.norm(Sinv_dense,ord=2))
+    #SS = Sinv_HBS@Stot_dense
+    #[e,_]=np.linalg.eig(SS)
     res = Stot@uhat-rhstot
 
     
@@ -229,13 +267,19 @@ for indp in range(len(pvec)):
     print("nc                       = ",OMS.nc)
     print("L2 rel. res              = ", np.linalg.norm(res)/np.linalg.norm(rhstot))
     print("GMRES iters              = ", niter)
+    print("pGMRES iters              = ", pniter)
     print("==================================")
+    #plt.figure(1)
+    #plt.scatter(np.real(e),np.imag(e))
+    #plt.figure(2)
+    #plt.semilogy(gInfo.resList)
+    #plt.semilogy(pgInfo.resList)
+    #plt.show()
     #np.save('ref_sol_waveguide.npy',uhat)
-    gref = np.load('ref_sol_waveguide.npy')
-    print("err wrt gref = ",np.linalg.norm(gref-uhat)/np.linalg.norm(gref))
-"""
-    nc = OMS.nc
+    #gref = np.load('ref_sol_waveguide.npy')
+    #print("err wrt gref = ",np.linalg.norm(gref-uhat)/np.linalg.norm(gref))
 
+    nc = OMS.nc
 
     nx=200
     ny=200
@@ -273,22 +317,27 @@ for indp in range(len(pvec)):
         uu=uu.numpy().flatten()
         ghat = solver.interp(YY0,uu)
         gYY[I0] = ghat
-
+    plt.figure(1)
+    plt.imshow(np.reshape(gYY,[nx,ny]),cmap='jet')
+    plt.colorbar()
+    plt.show()
     #triang = tri.Triangulation(YY[:,0],YY[:,1])
     #tri0 = triang.triangles
-"""   
-    
-    
-"""
+    #np.save('ref_sol_waveguide_full.npy',gYY)
+    gref = np.load('ref_sol_waveguide_full.npy')
+    plt.figure(1)
+    plt.imshow(np.log10(np.abs(np.reshape(gYY,[nx,ny])-np.reshape(gref,[nx,ny]))),cmap='jet')
+    plt.colorbar()
+    plt.show()
     print("===================REF SUP ERR===================")
     print("err ref = ",np.linalg.norm(gref-gYY,ord = 2)/np.linalg.norm(gref,ord = 2))
     print("=================================================")
-    err[indp] = np.linalg.norm(gref-gYY,ord=2)/np.linalg.norm(gref,ord = 2)
-    sampl_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
+    #err[indp] = np.linalg.norm(gref-gYY,ord=2)/np.linalg.norm(gref,ord = 2)
+    #sampl_time[indp] = OMS.stats.sampl_timing
+    #compr_time[indp] = OMS.stats.compr_timing
+    #discr_time[indp] = OMS.stats.discr_timing
 
-
+"""
 fileName = 'crystal_waveguide.csv'
 errMat = np.zeros(shape=(len(pvec),5))
 errMat[:,0] = pvec

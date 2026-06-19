@@ -277,7 +277,7 @@ def my_solve_test(dense, hbs, Stot, rhs_phys, m, nSlabs):
     
     
     print("=======================================")
-    print("mod rb solver error = (random rhs) ",np.linalg.norm(x-xhat_rk)/np.linalg.norm(x))
+    print("HBS rb solver error = (random rhs) ",np.linalg.norm(x-xhat_rk)/np.linalg.norm(x))
     print("=======================================")
 
 
@@ -289,10 +289,9 @@ def my_solve_test(dense, hbs, Stot, rhs_phys, m, nSlabs):
 
     
     xhat_rk = hbs.solve(rhs_phys)
-    res = Stot@xhat-rhs_phys
     
     print("=======================================")
-    print("HBS rb solver res = (phys rhs) ",np.linalg.norm(res)/np.linalg.norm(rhs_phys))
+    print("HBS rb solver err = (phys rhs) ",np.linalg.norm(xhat_rk-xhat)/np.linalg.norm(rhs_phys))
     print("=======================================")
 
 

@@ -66,7 +66,7 @@ def _joined_cheb_1d(p, scl):
     """
     # Want pj = 3p/2 made odd. Equivalently pj-1 = 3p/2 - 1 made even,
     # so use the existing formula pj-1 = (3p//2) made even, pj = that+1.
-    pjm1 = (3 * p) // 2
+    pjm1 = 2*p#(3 * p) // 2
     pjm1 -= pjm1 % 2                # ensure pjm1 is even -> pj is odd
     pj = pjm1 + 1
     D, pts = _cheb_diff(pjm1)

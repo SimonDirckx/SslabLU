@@ -102,14 +102,19 @@ class matAssembler:
             return TypeError('epsHBS currently not implemented')
         if self.matOpts.method == 'rkHBS':
             start = time.time()
-            quad = False
+            quad = False # currently only binary trees supported
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
             if  torch.cuda.is_available():
                 device = torch.cuda.get_device_name()
             else:
                 device = 'cpu'
-            HBSmat = HBStorch.HBSMAT(linOp,device,self.matOpts.tree,quad)
-            HBSmat.construct(self.matOpts.maxRank,quad)
+            HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
+            s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            Om = np.random.standard_normal((linOp.shape[0],s))
+            Psi = np.random.standard_normal((linOp.shape[1],s))
+            Y = linOp@Om
+            Z = linOp.T@Psi
+            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z)
             self.stats.timeSample=0
             s = HBSmat.nSamples
             self.stats.timeSample=HBSmat.tSample

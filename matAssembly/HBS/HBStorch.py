@@ -108,6 +108,7 @@ class HBSMAT:
         self.Wlist  =   []
         self.Uulist =   []
         torch.set_default_dtype(torch.float64)
+        self.dtype = np.float64
 
         self.mode   =   'N'
         self._tree  =   None

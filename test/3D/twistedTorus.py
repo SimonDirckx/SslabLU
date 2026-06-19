@@ -84,10 +84,10 @@ dSlabs,connectivity,H = twisted.dSlabs(N)
 formulation = "hps"
 #solve_method = 'iterative'
 solve_method = 'direct'
-HBS = False
+HBS = True
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
-pvec = np.array([4],dtype = np.int64)
+pvec = np.array([6],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
