@@ -8,7 +8,8 @@
 #   SSLABLU_RUN_GMRES=1: run GMRES diagnostics on the meaningful direct-solve RHS.
 #   SSLABLU_COND_NIT=20: use 20 randomized power iterations in condition estimates.
 #   SSLABLU_NPAN_X=<nx>, SSLABLU_NPAN_Y=<ny>: refine the local panel grid with fixed subdomains.
-#   SSLABLU_CHECK_ITI_CAYLEY=1: verify local ItI maps against DtN maps by Cayley transform.
+#   SSLABLU_CHECK_ITI_CAYLEY=1: opt in to local ItI/DtN Cayley probes.
+#   SSLABLU_CHECK_ITI_INTERFACE_MERGE=0: disable the default per-interface ItI merge check.
 #   SSLABLU_REF_PATH=/path/ref.npy: compare variable-coefficient runs to a refined reference.
 #   SSLABLU_SAVE_REF_PATH=/path/ref.npy: save the current variable-coefficient S solution as reference.
 #   SSLABLU_SHARED_POINT_VALIDATION=1: compare S interface traces to a saved refined trace.
@@ -171,11 +172,11 @@ def condition_t_system(system, seed):
 def condition_t_formulation(diff_op, kh, N, H, opts, formulation, bc_func, s_coords, seed):
     builders = {
         'dtn': build_macro_t_dtn_system,
-        'iti_schur': build_macro_t_iti_schur_system,
+        'iti': build_macro_t_iti_system,
     }
     labels = {
         'dtn': 'T-DtN',
-        'iti_schur': 'T-ItI-SC',
+        'iti': 'T-ItI',
     }
     label = labels[formulation]
     system_builder = builders[formulation]
@@ -347,22 +348,86 @@ def check_iti_cayley_transform(Tcc, Tcx, Rloc, bloc, bdry_vals, eta, seed):
     return np.linalg.norm(outgoing_from_iti - outgoing) / denom
 
 
-def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta):
+def check_iti_interface_merge_formula(slab_data, seed, tol):
+    rng = np.random.default_rng(seed)
+    errs = []
+    for slab_ind in range(len(slab_data) - 1):
+        left = slab_data[slab_ind]
+        right = slab_data[slab_ind + 1]
+        left_shared = left['face_slices']['right']
+        right_shared = right['face_slices']['left']
+        left_external = left['face_slices'].get('left', slice(0, 0))
+        right_external = right['face_slices'].get('right', slice(0, 0))
+
+        Rleft = left['Rloc']
+        Rright = right['Rloc']
+        Rleft_ext = Rleft[left_shared, left_external]
+        Rleft_shared = Rleft[left_shared, left_shared]
+        Rright_ext = Rright[right_shared, right_external]
+        Rright_shared = Rright[right_shared, right_shared]
+
+        left_in = rng.standard_normal(Rleft_ext.shape[1]) + 1j * rng.standard_normal(Rleft_ext.shape[1])
+        right_in = rng.standard_normal(Rright_ext.shape[1]) + 1j * rng.standard_normal(Rright_ext.shape[1])
+        rhs_left = Rleft_ext @ left_in
+        rhs_right = Rright_ext @ right_in
+        eye = np.eye(Rleft_shared.shape[0], dtype=np.complex128)
+
+        left_shared_in = np.linalg.solve(
+            eye - Rright_shared @ Rleft_shared,
+            rhs_right + Rright_shared @ rhs_left,
+        )
+        right_shared_in = rhs_left + Rleft_shared @ left_shared_in
+
+        residual = np.concatenate(
+            [
+                right_shared_in - rhs_left - Rleft_shared @ left_shared_in,
+                left_shared_in - rhs_right - Rright_shared @ right_shared_in,
+            ]
+        )
+        denom = max(np.linalg.norm(np.concatenate([left_shared_in, right_shared_in])), 1.0)
+        errs.append(np.linalg.norm(residual) / denom)
+
+    max_err = max(errs) if errs else 0.0
+    print("SANITY per-interface ItI merge max relerr = %5.5e" % max_err)
+    if max_err > tol:
+        raise AssertionError(
+            "per-interface ItI merge check failed: relerr=%5.5e > tol=%5.5e" % (max_err, tol)
+        )
+
+
+def add_local_iti_contribution(blocks, rhs_blocks, dir_inds, Rloc, bloc, ndofs):
+    masks = [dir_inds < ndofs, dir_inds >= ndofs]
+    positions = [np.where(mask)[0] for mask in masks]
+    global_inds = [dir_inds[masks[0]], dir_inds[masks[1]] - ndofs]
+
+    for row_side in range(2):
+        row_pos = positions[row_side]
+        row_inds = global_inds[row_side]
+        if row_inds.size == 0:
+            continue
+        rhs_blocks[row_side][row_inds] += bloc[row_pos]
+        for col_side in range(2):
+            col_pos = positions[col_side]
+            col_inds = global_inds[col_side]
+            if col_inds.size == 0:
+                continue
+            blocks[row_side][col_side][np.ix_(row_inds, col_inds)] += Rloc[np.ix_(row_pos, col_pos)]
+
+
+def build_macro_t_iti_system(N, H, opts, diff_op, bc_func, s_coords, eta):
     if eta == 0:
         raise ValueError("T-ItI is Helmholtz-only and needs nonzero impedance eta.")
 
     check_cayley = os.environ.get("SSLABLU_CHECK_ITI_CAYLEY", "0") != "0"
     cayley_tol = float(os.environ.get("SSLABLU_CHECK_ITI_CAYLEY_TOL", "1e-8"))
+    check_interface_merge = os.environ.get("SSLABLU_CHECK_ITI_INTERFACE_MERGE", "1") != "0"
+    interface_merge_tol = float(os.environ.get("SSLABLU_CHECK_ITI_INTERFACE_MERGE_TOL", "1e-8"))
     cayley_errs = []
     coord_to_ind = {coord_key(x): i for i, x in enumerate(s_coords)}
     ndofs = s_coords.shape[0]
-    ndirected = 2 * ndofs
-    copy1 = np.arange(ndofs)
-    copy2 = ndofs + np.arange(ndofs)
-    bdir = np.zeros((ndirected,), dtype=np.complex128)
+    Rblocks = [[np.zeros((ndofs, ndofs), dtype=np.complex128) for _ in range(2)] for _ in range(2)]
+    rhs_blocks = [np.zeros((ndofs,), dtype=np.complex128) for _ in range(2)]
     slab_data = []
-    blocks = []
-    nnz = 0
 
     for slab_ind in range(N):
         data = build_unit_slab_solver(slab_ind, H, opts, diff_op)
@@ -370,13 +435,19 @@ def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
         Igb = data['Igb']
         active_faces = []
         active_dir_inds = []
+        face_slices = {}
+        active_offset = 0
 
         if slab_ind > 0:
             face = data['Il']
+            face_slices['left'] = slice(active_offset, active_offset + len(face))
+            active_offset += len(face)
             active_faces.append(face)
             active_dir_inds.append(ndofs + face_global_indices(XXb, face, coord_to_ind))
         if slab_ind < N - 1:
             face = data['Ir']
+            face_slices['right'] = slice(active_offset, active_offset + len(face))
+            active_offset += len(face)
             active_faces.append(face)
             active_dir_inds.append(face_global_indices(XXb, face, coord_to_ind))
 
@@ -403,23 +474,19 @@ def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
                 )
             )
 
-        blocks.append((dir_inds, dir_inds, Rloc))
-        nnz += Rloc.size
-        bdir[dir_inds] += bloc
+        add_local_iti_contribution(Rblocks, rhs_blocks, dir_inds, Rloc, bloc, ndofs)
         data.update(
             {
                 'active_face': active_face,
                 'dir_inds': dir_inds,
                 'M_inv': M_inv,
                 'Tcx': Tcx,
+                'Rloc': Rloc,
+                'face_slices': face_slices,
             }
         )
         slab_data.append(data)
 
-    builder = sparse_utils.CSRBuilder(ndirected, ndirected, max(nnz, 1), dtype=np.complex128)
-    for row_inds, col_inds, block in blocks:
-        add_dense_block(builder, row_inds, col_inds, block, (ndirected, ndirected))
-    Rdir = builder.tocsr()
     if check_cayley:
         max_err = max(cayley_errs) if cayley_errs else 0.0
         print("SANITY local ItI Cayley-vs-DtN max relerr = %5.5e" % max_err)
@@ -427,34 +494,12 @@ def build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
             raise AssertionError(
                 "local ItI Cayley transform check failed: relerr=%5.5e > tol=%5.5e" % (max_err, cayley_tol)
             )
+    if check_interface_merge:
+        check_iti_interface_merge_formula(slab_data, seed=3571, tol=interface_merge_tol)
 
-    return {
-        'Rdir': Rdir,
-        'bdir': bdir,
-        'ndofs': ndofs,
-        'ndirected': ndirected,
-        'copy1': copy1,
-        'copy2': copy2,
-        's_coords': s_coords,
-        'slab_data': slab_data,
-        'eta': eta,
-    }
-
-
-def build_macro_t_iti_schur_system(N, H, opts, diff_op, bc_func, s_coords, eta):
-    data = build_macro_t_iti_directed_data(N, H, opts, diff_op, bc_func, s_coords, eta)
-    Rdir = data['Rdir'].toarray()
-    bdir = data['bdir']
-    ndofs = data['ndofs']
-    copy1 = data['copy1']
-    copy2 = data['copy2']
-
-    R11 = Rdir[np.ix_(copy1, copy1)]
-    R12 = Rdir[np.ix_(copy1, copy2)]
-    R21 = Rdir[np.ix_(copy2, copy1)]
-    R22 = Rdir[np.ix_(copy2, copy2)]
-    b1 = bdir[copy1]
-    b2 = bdir[copy2]
+    R11, R12 = Rblocks[0]
+    R21, R22 = Rblocks[1]
+    b1, b2 = rhs_blocks
 
     # The local ItI maps are side-local.  The interface merge is the Schur
     # complement that enforces incoming data on one side to equal outgoing
@@ -465,18 +510,19 @@ def build_macro_t_iti_schur_system(N, H, opts, diff_op, bc_func, s_coords, eta):
     Amacro = np.eye(ndofs, dtype=np.complex128) - R21 - R22 @ Kinv_R11
     rhs = b2 + R22 @ Kinv_b1
 
-    data.update(
-        {
-            'label': 'T-ItI-SC',
-            'kind': 'iti_schur',
-            'A': Amacro,
-            'rhs': rhs,
-            'R11': R11,
-            'K': K,
-            'b1': b1,
-        }
-    )
-    return data
+    return {
+        'label': 'T-ItI',
+        'kind': 'iti',
+        'A': Amacro,
+        'rhs': rhs,
+        's_coords': s_coords,
+        'slab_data': slab_data,
+        'eta': eta,
+        'ndofs': ndofs,
+        'R11': R11,
+        'K': K,
+        'b1': b1,
+    }
 
 
 def apply_block_left_precondition_to_vector(Tmacro, s_coords, rhs):
@@ -511,10 +557,7 @@ def check_preconditioned_t_matches_s(Sop, dslabs, N, H, opts, diff_op, tol=1e-8)
 
 def expand_macro_t_iti_solution(system, sol):
     g2 = np.linalg.solve(system['K'], system['R11'] @ sol + system['b1'])
-    gdir = np.zeros((2 * sol.shape[0],), dtype=np.complex128)
-    gdir[system['copy1']] = sol
-    gdir[system['copy2']] = g2
-    return gdir
+    return np.concatenate([sol, g2])
 
 
 def macro_t_slab_boundary(system, data, sol, bc_func):
@@ -919,14 +962,14 @@ for indp in range(len(pvec)):
     stats_t_dtn = condition_t_formulation(Lapl, kh, N, H, opts, formulation='dtn', bc_func=bc, s_coords=s_coords, seed=202)
 
     if kh != 0:
-        stats_t_iti_sc = condition_t_formulation(Lapl, kh, N, H, opts, formulation='iti_schur', bc_func=bc, s_coords=s_coords, seed=303)
+        stats_t_iti = condition_t_formulation(Lapl, kh, N, H, opts, formulation='iti', bc_func=bc, s_coords=s_coords, seed=303)
     else:
-        stats_t_iti_sc = None
+        stats_t_iti = None
 
     if stats_t_dtn['shape'] != Ssparse.shape:
         raise AssertionError("macro T-DtN size %s does not match S size %s" % (stats_t_dtn['shape'], Ssparse.shape))
-    if stats_t_iti_sc is not None and stats_t_iti_sc['shape'] != Ssparse.shape:
-        raise AssertionError("macro T-ItI-SC size %s does not match S size %s" % (stats_t_iti_sc['shape'], Ssparse.shape))
+    if stats_t_iti is not None and stats_t_iti['shape'] != Ssparse.shape:
+        raise AssertionError("macro T-ItI size %s does not match S size %s" % (stats_t_iti['shape'], Ssparse.shape))
 
     print("=============REDUCED SYSTEM CONDITIONING==============")
     print("kh              = %5.12e" % kh)
@@ -937,8 +980,8 @@ for indp in range(len(pvec)):
     print("GMRES probes    = S:%s T:%s" % (run_s_gmres_probe, run_t_gmres_probe))
     print("condest(S)      = %5.5e   effcond=%5.5e   gmres=(%d,%d,%5.2e)   [||S||=%5.5e, ||S^-1||=%5.5e, backend=%s, size=%s]" % (s_cond, s_eff_cond, s_gmres_niter, s_gmres_info, s_gmres_relres, s_norm, s_inv_norm, s_solver_backend, Ssparse.shape))
     print_t_conditioning("T-DtN", stats_t_dtn)
-    if stats_t_iti_sc is not None:
-        print_t_conditioning("T-ItI-SC", stats_t_iti_sc)
+    if stats_t_iti is not None:
+        print_t_conditioning("T-ItI", stats_t_iti)
     else:
         print("condest(T-ItI)  = skipped for kh=0 because ItI maps are Helmholtz-only in Domain_Driver")
     print("======================================================")
@@ -995,7 +1038,7 @@ for indp in range(len(pvec)):
         print("err known = ", ref_err)
         known_solution_error_from_t_system(stats_t_dtn['system'], constant_helmholtz_exact, "T-DtN")
         if kh != 0:
-            known_solution_error_from_t_system(stats_t_iti_sc['system'], constant_helmholtz_exact, "T-ItI-SC")
+            known_solution_error_from_t_system(stats_t_iti['system'], constant_helmholtz_exact, "T-ItI")
         print("========================================================")
         err[indp] = ref_err
         sampl_time[indp] = OMS.stats.sampl_timing
@@ -1053,7 +1096,7 @@ for indp in range(len(pvec)):
         maybe_shared_interface_validation(dSlabs, opts, Lapl, uhat)
         t_dtn_ref_err = reference_grid_error_from_t_system(stats_t_dtn['system'], bc, YY, gref, "T-DtN")
         if kh != 0:
-            t_iti_sc_ref_err = reference_grid_error_from_t_system(stats_t_iti_sc['system'], bc, YY, gref, "T-ItI-SC")
+            t_iti_ref_err = reference_grid_error_from_t_system(stats_t_iti['system'], bc, YY, gref, "T-ItI")
         print("=================================================")
         err[indp] = s_ref_err
     except (FileNotFoundError, ModuleNotFoundError) as exc:
