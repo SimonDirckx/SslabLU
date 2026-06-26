@@ -1,25 +1,3 @@
-"""
-SOMS3D_legendre_v2.py
-
-Option B implementation: every face of the merged box-pair is covered by a
-single physical Legendre face (one per face of the merged-pair surface).
-Lifting maps p Legendre nodes -> p Cheb-with-endpoints nodes per single
-sub-box axis, and 2p Legendre nodes -> (p_joined+1) Cheb-with-endpoints
-nodes per joined axis.
-
-Pipeline per box-pair, direction `dir`:
-  1. Leg face data (p x p per single, 2p x p on side faces of merged pair)
-  2. Lift Leg -> Cheb-with-endpoints on each of 6 surrounding faces; each
-     boundary node of the merged-box-pair is owned by exactly one Legendre
-     face by deterministic partition (no averaging).
-  3. Cheb merged-box solve via static condensation.
-  4. Extract the FULL centerline-face trace (p x p Cheb-with-endpoints,
-     including its edges/corners which sit on Ib_dir). Project to p x p
-     Legendre on the centerline face.
-
-Convention: `p` = number of points (Legendre OR Chebyshev). Polynomial
-order is p-1, basis dim is p.
-"""
 
 import numpy as np
 import scipy.sparse as sp
@@ -1779,3 +1757,268 @@ def setup_mumps_transpose(Sii):
     ctx.analyze(Sii.T)
     ctx.factor(Sii.T)
     return ctx
+
+# ===========================================================================
+#  NEUMANN BOUNDARY CLOSURE  (folded-in Poincare-Steklov / HPS leaf DtN)
+# ---------------------------------------------------------------------------
+#  Solve   L u = f  in Omega,   d u / dn = g_N  on dOmega,
+#  with  L = c11 u_xx + c22 u_yy + c33 u_zz  (constant coeffs here).
+#
+#  Sii, Sib (interior value-consistency) and the forcing trace ftild are taken
+#  unchanged from SOMS_solver_sparse.  Only the boundary rows Sbb, Sbi are built
+#  here, from a local DtN computed on each boundary cube following the HPS leaf
+#  recipe:  6 (or 10) p-Legendre faces -> p'-Chebyshev faces -> volume Chebyshev
+#  solve -> normal derivative -> p-Legendre.  The Chebyshev (leaf) order exceeds
+#  the Legendre (interface) order so the lift is injective and the local DtN
+#  kernel is just the constant.
+#
+#  Pure Neumann => the global operator is singular with a 1-D null space (the
+#  constant).  The discrete solvability condition is
+#        oint_{dOmega} g_N dS  =  int_Omega f dV          (since L = +Delta),
+#  i.e. WITHOUT forcing it reduces to  oint g_N = 0, and WITH forcing it becomes
+#  oint g_N = int f.  This is handled automatically: the boundary RHS carries the
+#  particular-solution flux  (g_N - d u_p/dn)  and the interior RHS carries ftild,
+#  so the least-squares (min-norm) solve projects onto the compatible subspace
+#  with the correct, forcing-dependent normalization, and returns the mean-zero
+#  representative of the solution.
+# ===========================================================================
+
+def _nm_interp(src, tgt, nb):
+    """Polynomial interpolation matrix (Chebyshev basis) from values at `src`
+    nodes to values at `tgt` nodes; exact for degree nb-1."""
+    a, b = src.min(), src.max()
+    f = lambda v: 2.0 * (v - a) / (b - a) - 1.0
+    Vs = chebpoly.chebvander(f(src), nb - 1)
+    Vt = chebpoly.chebvander(f(tgt), nb - 1)
+    return Vt @ np.linalg.inv(Vs)
+
+
+def _nm_forcing_vals(forcing, X):
+    if forcing is None:
+        return None
+    if callable(forcing):
+        v = np.asarray(forcing(X[:, 0], X[:, 1], X[:, 2]), dtype=float)
+        if v.ndim == 0:
+            v = np.full(X.shape[0], float(v))
+        return v
+    if float(forcing) == 0.0:
+        return None
+    return np.full(X.shape[0], float(forcing))
+
+
+_NM_FACES = ['xL', 'xR', 'yF', 'yB', 'zD', 'zU']
+_NM_FNORM = {'xL': 0, 'xR': 0, 'yF': 1, 'yB': 1, 'zD': 2, 'zU': 2}
+_NM_FEND = {'xL': 0, 'xR': 1, 'yF': 0, 'yB': 1, 'zD': 0, 'zU': 1}
+
+
+def _nm_box_dtn(p, pv, sx, sy, sz, coeffs):
+    """Non-overlapping single-cube DtN.  Leaf Chebyshev order pv > interface
+    Legendre order p.  Returns SF[fk] (p^2 x 6 p^2) outward-normal-derivative
+    operators, Legendre face coordinate layout, the forcing->boundary-flux
+    operators Mforce[fk] (p^2 x n_int), Lii_lu, and interior node coords Xi."""
+    s = [sx, sy, sz]
+    D1 = [None] * 3; xc = [None] * 3; lp = [None] * 3
+    for a in range(3):
+        D1[a], xc[a] = _cheb_1d(pv, s[a]); lp[a] = _legendre_1d(p, s[a])[0]
+    I = [np.eye(pv)] * 3; D2 = [D1[a] @ D1[a] for a in range(3)]; c = coeffs
+    L = (c['c11'] * np.kron(np.kron(D2[0], I[1]), I[2])
+         + c['c22'] * np.kron(np.kron(I[0], D2[1]), I[2])
+         + c['c33'] * np.kron(np.kron(I[0], I[1]), D2[2]))
+    XX, YY, ZZ = np.meshgrid(xc[0], xc[1], xc[2], indexing='ij')
+    X = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], 1); N = pv ** 3
+    lo = [xc[a][0] for a in range(3)]; hi = [xc[a][-1] for a in range(3)]
+    bmask = np.zeros(N, bool)
+    for a in range(3):
+        bmask |= (np.abs(X[:, a] - lo[a]) < 1e-12) | (np.abs(X[:, a] - hi[a]) < 1e-12)
+    Ib = np.where(bmask)[0]; Ii = np.where(~bmask)[0]
+    L2C = [_nm_interp(lp[a], xc[a], p) for a in range(3)]
+    C2L = [_nm_interp(xc[a], lp[a], pv) for a in range(3)]
+
+    def fn(fk):
+        nax = _NM_FNORM[fk]; lim = lo[nax] if _NM_FEND[fk] == 0 else hi[nax]
+        idx = np.where(np.abs(X[:, nax] - lim) < 1e-12)[0]
+        t = [a for a in (0, 1, 2) if a != nax]
+        return idx[np.lexsort((X[idx, t[1]], X[idx, t[0]]))], t
+
+    Lift = np.zeros((N, 6 * p * p)); cnt = np.zeros(N); legc = {}
+    for fi, fk in enumerate(_NM_FACES):
+        idx, t = fn(fk); blk = np.kron(L2C[t[0]], L2C[t[1]])
+        cols = np.arange(fi * p * p, (fi + 1) * p * p)
+        for r, nn in enumerate(idx):
+            Lift[nn, cols] += blk[r]; cnt[nn] += 1
+        nax = _NM_FNORM[fk]; lim = 0.0 if _NM_FEND[fk] == 0 else s[nax]
+        T0, T1 = np.meshgrid(lp[t[0]], lp[t[1]], indexing='ij')
+        fc = np.zeros((p * p, 3)); fc[:, t[0]] = T0.ravel(); fc[:, t[1]] = T1.ravel(); fc[:, nax] = lim
+        legc[fk] = fc
+    bm = cnt > 0; Lift[bm] /= cnt[bm, None]; LiftB = Lift[Ib]
+    Lii_lu = sla.lu_factor(L[np.ix_(Ii, Ii)])
+    G = -sla.lu_solve(Lii_lu, L[np.ix_(Ii, Ib)] @ LiftB)
+    Dn3 = [np.kron(np.kron(D1[0], I[1]), I[2]), np.kron(np.kron(I[0], D1[1]), I[2]),
+           np.kron(np.kron(I[0], I[1]), D1[2])]
+    SF = {}; Mforce = {}
+    for fk in _NM_FACES:
+        nax = _NM_FNORM[fk]; sgn = -1.0 if _NM_FEND[fk] == 0 else 1.0
+        idx, t = fn(fk); Dn = Dn3[nax]; proj = np.kron(C2L[t[0]], C2L[t[1]])
+        SF[fk] = sgn * (proj @ (Dn[np.ix_(idx, Ii)] @ G + Dn[np.ix_(idx, Ib)] @ LiftB))
+        Mforce[fk] = sgn * (proj @ Dn[np.ix_(idx, Ii)])    # @ (Lii^{-1} f_i)
+    return dict(SF=SF, legcoords=legc, Mforce=Mforce, Lii_lu=Lii_lu, Xi=X[Ii])
+
+
+def _nm_domino_dtn(d, p, pl, pt, s, coeffs):
+    """Overlapping 2x1 domino DtN (merged along axis d).  Long axis pl Cheb over
+    [0,2s]; square axes pt Cheb over [0,s].  Returns SF_lo/SF_hi (p^2 x 10 p^2),
+    Legendre layout, forcing ops Mforce_lo/Mforce_hi, Lii_lu, Xi."""
+    t = [a for a in (0, 1, 2) if a != d]; t0, t1 = t
+    Ln = [0., 0., 0.]; Ln[d] = 2 * s; Ln[t0] = s; Ln[t1] = s
+    order = [0, 0, 0]; order[d] = pl; order[t0] = pt; order[t1] = pt
+    xc = [None] * 3; D1 = [None] * 3
+    for a in range(3):
+        D1[a], xc[a] = _cheb_1d(order[a], Ln[a])
+    I = [np.eye(order[a]) for a in range(3)]; D2 = [D1[a] @ D1[a] for a in range(3)]; c = coeffs
+    L = (c['c11'] * np.kron(np.kron(D2[0], I[1]), I[2])
+         + c['c22'] * np.kron(np.kron(I[0], D2[1]), I[2])
+         + c['c33'] * np.kron(np.kron(I[0], I[1]), D2[2]))
+    XX, YY, ZZ = np.meshgrid(xc[0], xc[1], xc[2], indexing='ij')
+    X = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], 1)
+    N = order[0] * order[1] * order[2]
+    lo = [xc[a][0] for a in range(3)]; hi = [xc[a][-1] for a in range(3)]
+    bmask = np.zeros(N, bool)
+    for a in range(3):
+        bmask |= (np.abs(X[:, a] - lo[a]) < 1e-12) | (np.abs(X[:, a] - hi[a]) < 1e-12)
+    Ib = np.where(bmask)[0]; Ii = np.where(~bmask)[0]
+    legf = lambda c0: _legendre_1d(p, s)[0] + c0
+    L2Cp = lambda ax: _nm_interp(legf(0.0), xc[ax], p)
+    LS2C = _nm_interp(np.concatenate([legf(0.0), legf(s)]), xc[d], 2 * p)
+    fci = lambda pax, lim, O, Inr: (lambda idx: idx[np.lexsort((X[idx, Inr], X[idx, O]))])(
+        np.where(np.abs(X[:, pax] - lim) < 1e-12)[0])
+    Lift = np.zeros((N, 10 * p * p)); cnt = np.zeros(N); legc = []; col = 0
+    for lim in (lo[d], hi[d]):
+        idx = fci(d, lim, t0, t1); blk = np.kron(L2Cp(t0), L2Cp(t1)); cols = np.arange(col, col + p * p)
+        for r, nn in enumerate(idx):
+            Lift[nn, cols] += blk[r]; cnt[nn] += 1
+        T0, T1 = np.meshgrid(legf(0.0), legf(0.0), indexing='ij')
+        fc = np.zeros((p * p, 3)); fc[:, t0] = T0.ravel(); fc[:, t1] = T1.ravel()
+        fc[:, d] = 0.0 if lim == lo[d] else 2 * s
+        legc.append(fc); col += p * p
+    for pax in (t0, t1):
+        oth = t1 if pax == t0 else t0
+        for lim in (lo[pax], hi[pax]):
+            idx = fci(pax, lim, d, oth); blk = np.kron(LS2C, L2Cp(oth)); cols = np.arange(col, col + 2 * p * p)
+            for r, nn in enumerate(idx):
+                Lift[nn, cols] += blk[r]; cnt[nn] += 1
+            for sub in (0, 1):
+                D0, OO = np.meshgrid(legf(sub * s), legf(0.0), indexing='ij')
+                fc = np.zeros((p * p, 3)); fc[:, d] = D0.ravel(); fc[:, oth] = OO.ravel()
+                fc[:, pax] = 0.0 if lim == lo[pax] else s
+                legc.append(fc)
+            col += 2 * p * p
+    bm = cnt > 0; Lift[bm] /= cnt[bm, None]; LiftB = Lift[Ib]
+    Lii_lu = sla.lu_factor(L[np.ix_(Ii, Ii)])
+    G = -sla.lu_solve(Lii_lu, L[np.ix_(Ii, Ib)] @ LiftB)
+    Dn = [np.kron(np.kron(D1[0], I[1]), I[2]), np.kron(np.kron(I[0], D1[1]), I[2]),
+          np.kron(np.kron(I[0], I[1]), D1[2])][d]
+    C2Lp = lambda ax: _nm_interp(xc[ax], legf(0.0), order[ax])
+
+    def ops(lim, sgn):
+        idx = fci(d, lim, t0, t1); proj = np.kron(C2Lp(t0), C2Lp(t1))
+        SF = sgn * (proj @ (Dn[np.ix_(idx, Ii)] @ G + Dn[np.ix_(idx, Ib)] @ LiftB))
+        Mf = sgn * (proj @ Dn[np.ix_(idx, Ii)])
+        return SF, Mf
+    SF_lo, Mf_lo = ops(lo[d], -1.0); SF_hi, Mf_hi = ops(hi[d], 1.0)
+    return dict(SF_lo=SF_lo, SF_hi=SF_hi, legcoords=legc,
+                Mforce_lo=Mf_lo, Mforce_hi=Mf_hi, Lii_lu=Lii_lu, Xi=X[Ii])
+
+
+def SOMS_neumann_solver(px, py, pz, nbx, nby, nbz, gN, Lx=1., Ly=1., Lz=1.,
+                        coeffs=None, forcing=None, DtN_type='non-overlapping',
+                        pv=None, pl=None, pt=None, return_system=False):
+    """
+    Solve the pure-Neumann problem  L u = f,  du/dn = g_N  on the tiled cuboid.
+
+    Sii, Sib and the forcing trace ftild are reused unchanged from
+    SOMS_solver_sparse; only the boundary rows are built here from a local DtN.
+
+    Parameters
+    ----------
+    gN : callable  gN(x, y, z, axis, sign) -> outward normal derivative value.
+         axis in {0,1,2} is the face-normal direction; sign = -1 (lo face) /
+         +1 (hi face) is the outward orientation.
+    forcing : callable f(x,y,z), scalar, or None.  Volume source of L u = f.
+              When present, the boundary RHS is corrected by the particular
+              solution's normal derivative, and the solvability/normalization
+              shifts from  oint g_N = 0  to  oint g_N = int f  (handled
+              automatically by the min-norm solve).
+    DtN_type : 'non-overlapping' (default; single cube per patch, pv = p+2)
+               or 'overlapping' (2x1 dominoes; pt = p+2 square, pl = 2p+3 long).
+
+    Returns
+    -------
+    u : (n_dofs,) solution, normalized to zero mean (solution is unique up to a
+        constant).  If return_system: also (A, rhs, XYtot, Ii, Ib, info).
+    """
+    if coeffs is None:
+        coeffs = {'c11': 1., 'c22': 1., 'c33': 1.}
+    p = px
+    if pv is None: pv = p + 2
+    if pt is None: pt = p + 2
+    if pl is None: pl = 2 * p + 3
+    sx, sy, sz = Lx / nbx, Ly / nby, Lz / nbz; s = [sx, sy, sz]; nb = [nbx, nby, nbz]
+
+    Sii, Sib, ftild, XY, Ii, Ib, _, _ = SOMS_solver_sparse(
+        px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
+        coeffs=coeffs, ct_pde=True, forcing=forcing, weighted=False)
+    n = XY.shape[0]
+    A = np.zeros((n, n)); rhs = np.zeros(n)
+    A[np.ix_(Ii, Ii)] = Sii.toarray(); A[np.ix_(Ii, Ib)] = Sib.toarray(); rhs[Ii] = ftild[Ii]
+
+    key = lambda P: (round(float(P[0]), 9), round(float(P[1]), 9), round(float(P[2]), 9))
+    c2i = {key(XY[i]): i for i in range(n)}
+
+    if DtN_type == 'non-overlapping':
+        bd = _nm_box_dtn(p, pv, sx, sy, sz, coeffs)
+        fk_of = lambda d, lo: {0: ('xL', 'xR'), 1: ('yF', 'yB'), 2: ('zD', 'zU')}[d][0 if lo else 1]
+    elif DtN_type == 'overlapping':
+        dom = {dd: _nm_domino_dtn(dd, p, pl, pt, s[dd], coeffs) for dd in (0, 1, 2)}
+    else:
+        raise ValueError("DtN_type must be 'non-overlapping' or 'overlapping'")
+
+    XYt, md, bv, nxy, nyz, nxz, ixv, iyv, izv = global_dofs([nbx, nby, nbz], px, py, pz, Lx, Ly, Lz)
+    fsz = {0: nyz, 1: nxz, 2: nxy}; off = 0
+    for f in range(len(md)):
+        sz_ = fsz[int(md[f])]; rng = np.arange(off, off + sz_); off += sz_
+        if not bv[f]:
+            continue
+        d = int(md[f]); fc = XY[rng]; lo = abs(fc[0, d]) < 1e-9; origin = np.zeros(3)
+        if DtN_type == 'non-overlapping':
+            for a in range(3):
+                origin[a] = (0.0 if lo else (nb[a] - 1) * s[a]) if a == d else np.floor(fc[:, a].mean() / s[a]) * s[a]
+            layout = [bd['legcoords'][fk2] for fk2 in _NM_FACES]
+            SFm = bd['SF'][fk_of(d, lo)]; Mf = bd['Mforce'][fk_of(d, lo)]
+            Lii_lu = bd['Lii_lu']; Xi = bd['Xi']
+        else:
+            for a in range(3):
+                origin[a] = (0.0 if lo else (nb[a] - 2) * s[a]) if a == d else np.floor(fc[:, a].mean() / s[a]) * s[a]
+            bdd = dom[d]; layout = bdd['legcoords']
+            SFm = bdd['SF_lo'] if lo else bdd['SF_hi']
+            Mf = bdd['Mforce_lo'] if lo else bdd['Mforce_hi']
+            Lii_lu = bdd['Lii_lu']; Xi = bdd['Xi']
+        cols = []
+        for lc in layout:
+            cols.extend(c2i[key(lc[r] + origin)] for r in range(lc.shape[0]))
+        A[np.ix_(rng, np.array(cols))] = SFm
+        rb = gN(fc[:, 0], fc[:, 1], fc[:, 2], d, -1.0 if lo else 1.0)
+        fvals = _nm_forcing_vals(forcing, Xi + origin)        # particular-solution flux correction
+        if fvals is not None:
+            rb = rb - Mf @ sla.lu_solve(Lii_lu, fvals)
+        rhs[rng] = rb
+
+    # Singular (null space = constant). Min-norm least squares projects the RHS
+    # onto the compatible subspace (correct normalization, forcing-aware) and
+    # returns the zero-mean representative.
+    u, _res, rank, sv = np.linalg.lstsq(A, rhs, rcond=None)
+    u = u - u.mean()
+    if return_system:
+        info = dict(nulldim=n - rank, sv_min=sv[-1], sv_max=sv[0],
+                    compat_residual=float(np.linalg.norm(A @ u - rhs)))
+        return u, A, rhs, XY, Ii, Ib, info
+    return u

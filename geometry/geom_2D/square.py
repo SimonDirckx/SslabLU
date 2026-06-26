@@ -29,18 +29,29 @@ def bounds():
     return bnds
 
 
-def dSlabs(N):
-    dSlabs = []
-    H = (bnds[1][0]-bnds[0][0])/N
-    connectivity=[]
-    for n in range(N-1):
-        c = bnds[0][0]+(n+1)*H
-        bnds_n = [[c-H,bnds[0][1]],[c+H,bnds[1][1]]]
-        if n == 0:
-            connectivity+=[[-1,1]]
-        elif n == N-2:
-            connectivity+=[[n-1,-1]]
-        else:
-            connectivity+=[[n-1,n+1]]
-        dSlabs+=[bnds_n]
+def dSlabs(N,periodic=False):
+    if periodic:
+        dSlabs = []
+        H = (bnds[1][0]-bnds[0][0])/N
+        connectivity=[]
+        for n in range(N):
+            c = bnds[0][0]+n*H
+            bnds_n = [[c-H,bnds[0][1]],[c+H,bnds[1][1]]]
+            connectivity+=[[(n-1)%N,(n+1)%N]]
+            dSlabs+=[bnds_n]
+    else:
+        dSlabs = []
+        H = (bnds[1][0]-bnds[0][0])/N
+        connectivity=[]
+        for n in range(N-1):
+            c = bnds[0][0]+(n+1)*H
+            bnds_n = [[c-H,bnds[0][1]],[c+H,bnds[1][1]]]
+            if n == 0:
+                connectivity+=[[-1,1]]
+            elif n == N-2:
+                connectivity+=[[n-1,-1]]
+            else:
+                connectivity+=[[n-1,n+1]]
+            dSlabs+=[bnds_n]
     return dSlabs,connectivity,H
+

@@ -1,5 +1,6 @@
 
 import numpy as np
+import scipy.sparse as sp
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
@@ -9,6 +10,7 @@ import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
 import jax.numpy as jnp
 import solver.HPSInterp as interp
+import mumps
 
 # Things we need to add:
 from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
@@ -16,6 +18,33 @@ import solver.hpsmultidomain.hpsmultidomain.geom as hpsaltGeom
 
 
 from time import time
+
+
+def setup_mumps(A):
+    ctx = mumps.Context()
+    ctx.analyze(A)
+    ctx.analyze(A)
+    ctx.factor(A)
+    return ctx
+
+
+def setup_mumps_transpose(A):
+    ctxT = mumps.Context()
+    ctxT.analyze(A.T)
+    ctxT.factor(A.T)
+    return ctxT
+
+
+def setup_solver_Aii_local(ctx,ctxT,N,dtype):
+    
+        return LinearOperator(
+            shape=(N, N),
+            dtype=dtype,
+            matvec=lambda x: ctx.solve(x),
+            rmatvec=lambda x: ctxT.solve(x),
+            matmat=lambda X: ctx.solve(X),
+            rmatmat=lambda X: ctxT.solve(X),
+        )
 
 """
     This header takes care of the Solver Wrapper class
@@ -46,11 +75,14 @@ class solverOptions:
     type:       type of discretization (HPS/cheb/stencil/HPSalt)
     ordx,ordy:  order in x and y directions
     a:          characteristic scale in case of HPS
+    problem_type: 'Dirichlet' or 'mixed'
+                    for mixed, the assumption (for now) is  that we have Dirichlet on vertical bdry sections, Neumann on rest
     """
-    def __init__(self,type:str,ord,a=None):
+    def __init__(self,type:str,ord,a=None,problem_type='Dirichlet'):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
+        self.problem_type = problem_type
 
 def convertGeom(opts,geom):
     if opts.type=='hpsalt':
@@ -134,14 +166,32 @@ class solverWrapper:
             self.Aib = solver.Aix
             self.Abi = solver.Axi
             self.Abb = solver.Axx
+            self.Aii = solver.Aii
             if compute_inverse:
-                tic      = time()
-                print("start solver")
-                solver.setup_solver_Aii()
-                self.solver_ii = solver.solver_Aii
-                print("solver done")
-                toc      = time() - tic
-                print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+                if self.opts.problem_type == 'Dirichlet':
+                    tic      = time()
+                    solver.setup_solver_Aii()
+                    self.solver_ii = solver.solver_Aii
+                    toc      = time() - tic
+                    print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+                elif self.opts.problem_type == 'mixed':
+                    tic      = time()
+                    tol = 1e-10
+                    JD = np.where((np.abs(self.XX[self.Ib,0]-geomHPS.bounds[0][0])<tol) | (np.abs(self.XX[self.Ib,0]-geomHPS.bounds[1][0])<tol))[0]
+                    JN = np.array( [i for i in range(len(self.Ib)) if not i in JD] , dtype = np.int64)
+
+                    M = sp.block_array([[self.Aii,self.Aib[:,JN]],[self.Abi[JN,:],self.Abb[JN,:][:,JN]]]).tocsc()
+                    E = sp.vstack([self.Aib[:,JD],self.Abb[JN,:][:,JD]]).tocsr()
+                    self.M = M
+                    self.E = E
+                    self.JD = JD
+                    self.JN = JN
+                    ctx = setup_mumps(M)
+                    ctxT = setup_mumps_transpose(M)
+                    self.solver_ii = setup_solver_Aii_local(ctx,ctxT,M.shape[0],M.dtype)
+                    toc      = time() - tic
+                    print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+
         if self.type=='spectral':
             geomSpectral = convertGeom(self.opts,geom)
             solver = spectral(PDE, geomSpectral, self.ord)

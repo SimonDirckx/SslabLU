@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 #import gc
-    
+ 
 
 
 class slab:
@@ -341,6 +341,8 @@ class oms_lu:
         self.nbytes = 0
         self.densebytes = 0 
         self.stats = omsStats()
+        self.solvers = []
+        self.idx = []
 
     def compute_global_dofs(self):
         # bookkeeping: keep track of how local double slab dofs relate to the 'global' dofs of reduced S-system
@@ -361,23 +363,44 @@ class oms_lu:
     def compute_stmaps(self,Il,Ic,Ir,XXi,XXb,solver):
         # compute the source-target maps, in linear operator form
         A_solver = solver.solver_ii
-        def smatmat(v,I,J,transpose=False):
+        if solver.opts.problem_type=='Dirichlet':
+            def smatmat(v,I,J,transpose=False):
             
-            if (v.ndim == 1):
-            
-                v_tmp = v[:,np.newaxis]
-            else:
-                v_tmp = v
+                if (v.ndim == 1):
+                
+                    v_tmp = v[:,np.newaxis]
+                else:
+                    v_tmp = v
 
-            if (not transpose):
-                result = (A_solver@(solver.Aib[:,J]@v_tmp))[I,:]
-            else:
-                result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
-                result[I,:] = v_tmp
-                result      = solver.Aib[:,J].T @ (A_solver.T@(result))
-            if (v.ndim == 1):
-                result = result.flatten()
-            return result
+                if (not transpose):
+                    result = (A_solver@(solver.Aib[:,J]@v_tmp))[I,:]
+                else:
+                    result      = np.zeros(shape=(len(solver.Ii),v.shape[1]))
+                    result[I,:] = v_tmp
+                    result      = solver.Aib[:,J].T @ (A_solver.T@(result))
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
+        elif solver.opts.problem_type=='mixed':
+            def smatmat(v,I,J,transpose=False):
+                if (v.ndim == 1):
+                
+                    v_tmp = v[:,np.newaxis]
+                else:
+                    v_tmp = v
+
+                if (not transpose):
+                    result = (A_solver@(solver.E[:,J]@v_tmp))[I,:]
+                else:
+                    result      = np.zeros(shape=(len(solver.Ii)+len(solver.JN),v.shape[1]))
+                    result[I,:] = v_tmp
+                    result      = solver.E[:,J].T @ (A_solver.T@(result))
+                if (v.ndim == 1):
+                    result = result.flatten()
+                return result
+        else:
+            raise NameError("solver problem type not recognized: must be 'Dirichlet' or 'mixed'.")
+        
 
         Linop_r = LinearOperator(shape=(len(Ic),len(Ir)),\
             matvec = lambda v:smatmat(v,Ic,Ir), rmatvec = lambda v:smatmat(v,Ic,Ir,transpose=True),\
@@ -390,7 +413,7 @@ class oms_lu:
         st_l = stMap(Linop_l,XXb[Il,:],XXi[Ic,:],solver.solver_ii.shape[0],solver.solver_ii.shape[1])
         return st_l,st_r
 
-    def construct_Stot_helper(self, bc, dbg=0):
+    def construct_Stot_helper(self, bc, reduced_load = lambda x: 0,dbg=0):
         """
         construct S_rk_list and other helpers needed for S operator, whether iterative or direct
 
@@ -405,9 +428,7 @@ class oms_lu:
         slabs           = self.slabList
         Ntot = 0
         S_lu_list = []
-        
         rhs_list = []
-
         glob_target_dofs=[]
         startCentral = 0
         opts = self.opts
@@ -427,10 +448,20 @@ class oms_lu:
             solver.construct(geom,pdo,verbose=dbg)
             tDisc = time.time()-start
             discrTime += tDisc
+            self.solvers+=[solver]
             if dbg>1:
                 print("SLAB %2.0d discretization time = %5.2f s" % (slabInd,tDisc))
                 
             Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+
+            if solver.opts.problem_type == 'mixed':
+                xl = slab_i.geom[0][0]
+                xr = slab_i.geom[1][0]
+                Il = np.where((np.abs(XXb[solver.JD, 0] - xl) < 1e-14) )[0]
+                Ir = np.where((np.abs(XXb[solver.JD, 0] - xr) < 1e-14) )[0]
+                
+            self.idx +=[(Il,Ir,Ic,Igb,XXi,XXb)]
+
             nc = len(Ic)
             if dbg>1:
                 print("SLAB %2.0d size = %2.0d" % (slabInd,nc))
@@ -439,15 +470,20 @@ class oms_lu:
             glob_target_dofs+=[range(startCentral,startCentral+nc)]
             startCentral += nc
             
-            fgb = bc(XXb[Igb,:])
             
             st_l,st_r = self.compute_stmaps(Il,Ic,Ir,XXi,XXb,solver)
-
-            rhs = solver.solver_ii@(solver.Aib[:,Igb]@fgb)
-            rhs = -rhs[Ic]
+            if solver.opts.problem_type =='Dirichlet':
+                fgb = bc(XXb[Igb,:])
+                rhs = -(solver.solver_ii@(solver.Aib[:,Igb]@fgb))[Ic]
+            elif solver.opts.problem_type =='mixed':
+                b_C, b_X = reduced_load(solver.solver)        # composition returns (b_C on C-space, b_X on X-space)
+                b_N      = b_X[solver.JN]                      # restrict X-space load to the Neumann (wall) rows
+                fgb      = bc(XXb[solver.JN, :])              # g_N (homogeneous Neumann data)
+                rhs      = solver.solver_ii @ np.concatenate([b_C, fgb + b_N])
+                rhs      = rhs[Ic]
+            else:
+                raise NameError("solver problem type not recognized, must be 'Dirichlet' or 'mixed' ")
             rhs_list+=[rhs]
-            bool_r = len(Ir)>0
-            bool_l = len(Il)>0
             
             if self.connectivity[slabInd][0]<0:
                 S_lu_list += [[st_r.A]]
@@ -519,8 +555,68 @@ class oms_lu:
     
 
     
-    def construct_rhstot(self,bc):
-        '''
-        TODO IMPLEMENT RHS
-        '''
-        return 0
+    def construct_rhstot(self,bc,reduced_load = lambda x: 0,dbg = 0):
+
+        slabs           = self.slabList
+        Ntot = 0
+        S_lu_list = []
+        rhs_list = []
+        glob_target_dofs=[]
+        startCentral = 0
+        opts = self.opts
+        pdo = self.pdo
+        for slabInd in range(len(slabs)):
+            geom = np.array(slabs[slabInd])
+            slab_i = slab(geom,self.gb)
+            solver = self.solvers[slabInd]
+            
+                
+            Il,Ir,Ic,Igb,XXi,XXb = self.idx[slabInd]
+                
+            nc = self.nc
+            Ntot += nc
+            glob_target_dofs+=[range(startCentral,startCentral+nc)]
+            startCentral += nc
+            
+            if solver.opts.problem_type =='Dirichlet':
+                fgb = bc(XXb[Igb,:])
+                rhs = -(solver.solver_ii@(solver.Aib[:,Igb]@fgb))[Ic]
+            elif solver.opts.problem_type =='mixed':
+                b_C, b_X = reduced_load[slabInd]        # composition returns (b_C on C-space, b_X on X-space)
+                b_N      = b_X[solver.JN]                      # restrict X-space load to the Neumann (wall) rows
+                fgb      = bc(XXb[solver.JN, :])              # g_N (homogeneous Neumann data)
+                rhs      = solver.solver_ii @ np.concatenate([b_C, fgb + b_N])
+                rhs      = rhs[Ic]
+            else:
+                raise NameError("solver problem type not recognized, must be 'Dirichlet' or 'mixed' ")
+            rhs_list+=[rhs]
+        rhstot = np.zeros(shape = (Ntot,))        
+        for rhsInd in range(len(rhs_list)):
+            rhstot[rhsInd*nc:(rhsInd+1)*nc]=rhs_list[rhsInd]
+        return rhstot
+    
+    def uX_full(self, uhat, i, b_C, b_X):
+        slabs           = self.slabList
+        solver = self.solvers[i]          # cached wrapper for slab i (build once, reuse)
+        Il,Ir,Ic,_,_,_ = self.idx[i]
+        nc = len(Ic)
+
+        # ---- exterior trace, length nX, in I_Xtot ordering ----
+        uX = np.zeros(len(solver.Ib))
+
+        # Source 1: artificial faces <- neighbour central traces (connectivity, periodic wrap)
+        iL, iR = self.connectivity[i]     # neighbour slab indices, -1 if none
+        if iL != -1:
+            uX[solver.JD[Il]] = uhat[iL*nc:(iL+1)*nc]
+        if iR != -1:
+            uX[solver.JD[Ir]] = uhat[iR*nc:(iR+1)*nc]
+
+        # Source 2: physical walls <- solved Neumann values from the local mixed solve
+        b_N = b_X[solver.JN]
+        g_N = np.zeros(len(solver.JN))               # homogeneous Neumann data
+        u_D = uX[solver.JD]                           # artificial-face data, in JD order
+        rhs = np.concatenate([b_C, g_N + b_N]) - solver.E @ u_D
+        w   = solver.solver_ii @ rhs                  # = M^{-1} rhs, length nC + nJN
+        uX[solver.JN] = w[len(b_C):]                  # lower block = u_N (wall values)
+
+        return uX
