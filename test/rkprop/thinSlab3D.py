@@ -120,15 +120,15 @@ _parser.add_argument("--order", nargs="+", default=None,
                           "or (px py pz) for SOMS; space- or comma-separated")
 _parser.add_argument("--shape", nargs="+", default=["1/16", "1", "1"],
                      help="domain extents Lx Ly Lz (fractions like 1/16 allowed)")
-_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="full",
+_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="weak",
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
-_parser.add_argument("--rank", dest="rk", type=int, default=50,
+_parser.add_argument("--rank", dest="rk", type=int, default=100,
                      help="HBS compression rank")
 _parser.add_argument("--blr", dest="blr", type=float, default=0,
                      help="HBS compression rank")
-_parser.add_argument("--nb", dest="nb", type=int, default=8,
+_parser.add_argument("--nb", dest="nb", type=int, default=16,
                      help="SOMS number of blocks")
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
@@ -143,7 +143,7 @@ args = _parser.parse_args()
 solve_method = args.type
 # type-appropriate default order if none supplied
 if args.order is None:
-    order = [9, 128, 128] if solve_method == "stencil" else [6, 6, 6]
+    order = [9, 128, 128] if solve_method == "stencil" else [8, 8, 8]
 else:
     order = _ints3(args.order)
 Lx, Ly, Lz = _nums3(args.shape)
@@ -151,6 +151,7 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb= args.nb
+print("nb = ",nb)
 weighted = args.weighted
 blr_tol = args.blr
 nleaf = args.nleaf
@@ -192,7 +193,9 @@ if solve_method == 'SOMS':
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
          px, py, pz, nbx, nby, nbz, 2*Lx, Ly, Lz,
          coeffs, True, None, weighted=weighted)
-
+    print("Lx = ",Lx)
+    print("cx = ",cx)
+    print("nbx = ",nbx)
     XXi = XYtot[Ii,:]
     XXb = XYtot[Ib,:]
     Jc = np.where(XXi[:,0]==cx)[0]
@@ -233,7 +236,7 @@ if solve_method == 'SOMS':
     ub = w_b[Jb] * bc_helmholtz(XXb[Jb,:],kh)
 
     tic_lu = time.time()
-    BLK = 32                                   # tune; see note below
+    BLK = 64                                   # tune; see note below
     ctx  = setup_mumps(Sii, blr=blr,blr_tol = blr_tol)
     ctxT = setup_mumps_transpose(Sii, blr=blr,blr_tol = blr_tol)
     tMUMPS = time.time()-tic_lu
@@ -375,7 +378,7 @@ if solve_method == 'SOMS':
             kmax = 5
     
     nl = nleaf
-    s = kmax*max(2*rk,nl)+rk+10
+    s = kmax*max(2*rk,nl)+rk+20
     tHBS = 0
     tSample = 0
 
