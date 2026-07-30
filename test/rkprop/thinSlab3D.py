@@ -14,6 +14,8 @@ import mumps
 import scipy.sparse as sparse
 import time
 import os
+import gc
+import weakref
 from scipy.sparse.linalg import gmres
 
 def rss_gb():
@@ -388,11 +390,11 @@ if solve_method == 'SOMS':
     def _sample_lr(Om_l, Om_r):
         Som = sparse.csc_matrix(np.hstack((Sib[:,Jl]@Om_l,Sib[:,Jr]@Om_r)))
         s = Om_l.shape[1]+Om_r.shape[1]
-        out = np.zeros((len(Jc), s))
+        out = np.zeros((ndofs_if, s))
         for l in range(0, s, BLK):
             c = slice(l, min(l + BLK, s))
             sol = ctx._solve_sparse(Som[:,c])              # dense (len(Ii) x BLK) — bounded
-            out[:, c] = -sol[Jc, :]
+            out[Jc_inJc, c] = -sol[Jc, :]
             del sol
             ctx.mumps_instance.icntl[20]=0
         return out[:,:Om_l.shape[1]],out[:,Om_l.shape[1]:]
@@ -404,7 +406,7 @@ if solve_method == 'SOMS':
         SiblT = Sib[:, Jl].T.tocsr(); SibrT = Sib[:, Jr].T.tocsr()
         for a in range(0, s, BLK):
             c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
-            w = Psi[:, c]
+            w = Psi[Jc_inJc, c]
             rhs = sparse.csc_matrix(
                 (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
                 shape=(len(Ii), bw))
@@ -418,7 +420,7 @@ if solve_method == 'SOMS':
     tic = time.time()
     Om_r = np.random.standard_normal((len(Jr), s))
     Om_l = np.random.standard_normal((len(Jl), s))
-    Psi  = np.random.standard_normal((len(Jc), s))   # shared corange test matrix
+    Psi  = np.random.standard_normal((ndofs_if, s))   # shared corange test matrix
     Y_l, Y_r = _sample_lr(Om_l, Om_r)          # forward: one stacked solve
     Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
     tSample += time.time()-tic
@@ -720,25 +722,22 @@ elif solve_method == 'stencil':
     A_balance = LinearOperator(shape=(ndslab*ndofs_if, ndslab*ndofs_if),
                                matvec=apply_balance, dtype=float)
 
-    N = A_balance.shape[0]
-    v = np.random.standard_normal((N,))
-    tic =time.time()
+    # LU balance-operator sanity check (factors alive)
+    v = np.random.standard_normal((A_balance.shape[0],))
+    tic = time.time()
     bb = A_balance@v
-    print("matvec time = ",time.time()-tic)
-    gInfo = gmres_info()
-    u = u_true
-    res = A_balance@u-rhs
-    print("res = ",np.linalg.norm(res))
-    #if gmres_iters > 0:
-    #    tic = time.time()
-    #    uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
-    #    niter = gInfo.niter
-    #    print("time = ",time.time()-tic)
-    #    print("niter = ",niter)
-    #    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-    #else:
-    #    print("GMRES solve skipped (gmres_iters = 0)")
+    print("matvec time = ", time.time()-tic)
+    res = A_balance@u_true - rhs
+    print("res = ", np.linalg.norm(res))
 
+    # =======================================================================
+    #  PHASE A -- everything that needs the LU factors, done up front:
+    #    (1) HBS sampling (interior solves through ctx / ctxT),
+    #    (2) LU matvec timing, LU residual, LU factor memory,
+    #    (3) the LU reference block for the HBS accuracy check.
+    #  Only after all of this do we release + destroy the factors (below),
+    #  so their memory is gone before the HBS maps are built.
+    # =======================================================================
     print("===============  HBS version  ===============")
 
     if torch.cuda.is_available():
@@ -755,11 +754,11 @@ elif solve_method == 'stencil':
         tree = slabTree.slabTree(XXl,False,tree_leaf,adjacency=admissibility)
         SSl = HBStorch_strong.HBSMAT(device=device,tree=tree)
         SSr = HBStorch_strong.HBSMAT(device=device,tree=tree)
-        if admissibility == 'strong': 
-            kmax = 9 
-        else: 
+        if admissibility == 'strong':
+            kmax = 9
+        else:
             kmax = 5
-    
+
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
     s = kmax*max(2*rk,nl)+rk+10
 
@@ -783,17 +782,17 @@ elif solve_method == 'stencil':
         for a in range(0, s, BLK):
             c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
             w = Psi[Jc_inJc, c]
-            rhs = sparse.csc_matrix(
+            rhs_a = sparse.csc_matrix(
                 (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
                 shape=(len(Ii), bw))
-            sol = ctxT._solve_sparse(rhs)                   # (len(Ii) x bw) — bounded
+            sol = ctxT._solve_sparse(rhs_a)                 # (len(Ii) x bw) — bounded
             Z_l[:, c] = -(SiblT @ sol)
             Z_r[:, c] = -(SibrT @ sol)
             del sol
             ctxT.mumps_instance.icntl[20] = 0
         return Z_l, Z_r
 
-
+    # (1) HBS sampling -- the last thing that uses the LU factors
     tSample = 0
     tHBS = 0
     tic = time.time()
@@ -804,11 +803,88 @@ elif solve_method == 'stencil':
     Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
     tSample += time.time()-tic
 
+    # (2) LU matvec time, LU residual, LU factor memory (factors alive)
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(3):
+        v = A_balance@v
+    tLUMV = (time.time()-tic)/3
+
+    res_LU = np.linalg.norm(A_balance@u_true - rhs)
+
+    if ctx.mumps_instance.info[3] < 0:
+        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
+    else:
+        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
+
+    # (3) LU reference block for the HBS accuracy check -- apply the LU operator
+    #     now, compare against the HBS operator after the factors are gone.
+    v_err  = np.random.standard_normal((ndslab*ndofs_if, 10))
+    Av_ref = A_balance@v_err
+
+    # =======================================================================
+    #  RELEASE + FULLY DESTROY the LU factors (after sampling).
+    #  The interface maps, the balance operator, and the samplers all close
+    #  over ctx / ctxT, so every one of those references must be dropped or
+    #  the native MUMPS memory stays pinned.
+    # =======================================================================
+    def _release_mumps(c):
+        # explicit teardown if the wrapper exposes one ("fully destroy");
+        # otherwise drop the native handle so its finalizer frees the memory.
+        fin = getattr(c, "destroy", None) or getattr(c, "finalize", None)
+        if callable(fin):
+            try:
+                fin()
+            except Exception:
+                pass
+        else:
+            try:
+                c.mumps_instance = None
+            except Exception:
+                pass
+
+    # Capture weak references BEFORE dropping the strong ones, so we can verify
+    # the objects were actually collected (i.e. nothing still pins them).  We
+    # track the MUMPS instances themselves plus their Context wrappers; a live
+    # weakref afterwards means a reference survived and the native memory is
+    # still held.  Strong handles used to build the probes are cleared at once.
+    _probes = []
+    for _c in (ctx, ctxT):
+        try:
+            _probes.append(weakref.ref(_c))
+        except TypeError:
+            pass
+        _inst = getattr(_c, "mumps_instance", None)
+        if _inst is not None:
+            try:
+                _probes.append(weakref.ref(_inst))
+            except TypeError:
+                pass          # Cython instance may not support weakref
+        _inst = None
+    _c = None
+
+    rss_before = rss_gb()
+    _release_mumps(ctx)
+    _release_mumps(ctxT)
+    del A_balance, apply_balance, LinOp_l, LinOp_r, smatmat
+    del _sample_lr, _adjoint_sample_lr, ctx, ctxT
+    gc.collect()
+
+    _alive = [r() is not None for r in _probes]
+    if _probes and not any(_alive):
+        print("MUMPS inst. successfully released")
+    else:
+        print("MUMPS inst not released")
+    print("LU factors destroyed after sampling: RSS %.3f -> %.3f GB"
+          % (rss_before, rss_gb()))
+
+    # =======================================================================
+    #  PHASE B -- HBS build and HBS-only measurements (no LU factors needed).
+    # =======================================================================
     tic = time.time()
     SSr.construct(rk, Om_r, Psi, Y_r, Z_r, fast=True)
     SSl.construct(rk, Om_l, Psi, Y_l, Z_l, fast=True)
     tHBS += time.time()-tic
-
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -825,46 +901,33 @@ elif solve_method == 'stencil':
 
     A_balance_HBS = LinearOperator(shape=(ndslab*ndofs_if, ndslab*ndofs_if),
                                matvec=apply_balance_HBS, dtype=float)
-    N = A_balance.shape[0]
-    v = np.random.standard_normal((N,))
-    tic =time.time()
-    bb = A_balance_HBS@v
+
+    bb = A_balance_HBS@np.random.standard_normal((ndslab*ndofs_if,))   # warm-up
     gInfo = gmres_info()
-    u = u_true
-    res = A_balance_HBS@u-rhs
     if gmres_iters > 0:
         tic = time.time()
         uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
         solve_time_HBS = time.time()-tic
         niter = gInfo.niter
-        print("time = ",time.time()-tic)
+        print("time = ",solve_time_HBS)
         print("niter = ",niter)
-        gmres_err = np.linalg.norm(uhat-u)/np.linalg.norm(u)
+        gmres_err = np.linalg.norm(uhat-u_true)/np.linalg.norm(u_true)
         print("u err = ",gmres_err)
     else:
+        solve_time_HBS = float('nan')
+        niter = float('nan')
+        gmres_err = float('nan')
         print("GMRES solve skipped (gmres_iters = 0)")
-    
+
     v = np.random.standard_normal((ndslab*ndofs_if,))
     tic = time.time()
     for i in range(20):
         v = A_balance_HBS@v
     tMV = (time.time()-tic)/20
 
-    v = np.random.standard_normal((ndslab*ndofs_if,))
-    tic = time.time()
-    for i in range(3):
-        v = A_balance@v
-    tLUMV = (time.time()-tic)/3
+    res_HBS = np.linalg.norm(A_balance_HBS@u_true - rhs)
+    errHBS  = np.linalg.norm(A_balance_HBS@v_err - Av_ref)/np.linalg.norm(Av_ref)
 
-    res_LU = np.linalg.norm(A_balance@u-rhs)
-    res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
-    if ctx.mumps_instance.info[3]<0:
-        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
-    else:
-        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
-    v = np.random.standard_normal((ndslab*ndofs_if,10))
-    Av = A_balance@v
-    errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     # ---- aggregate totals --------------------------------------------------
     # The balance operator drops one off-diagonal map at each of the two end
     # interfaces (interface 0 has no SSl term, interface ndslab-1 has no SSr
