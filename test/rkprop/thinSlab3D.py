@@ -31,22 +31,42 @@ def _enable_blr(ctx, blr_tol):
     # inst.icntl[36] = 0      # BLR variant (UFSC); leave default unless tuning
 
 
-def setup_mumps(Sii, blr=False, blr_tol=1e-8):
+# INFOG(7) ordering codes reported by MUMPS after analysis.
+_MUMPS_ORDERINGS = {0: "AMD", 1: "user", 2: "AMF", 3: "SCOTCH",
+                    4: "PORD", 5: "METIS", 6: "QAMD"}
+
+def _report_ordering(ctx, tag=""):
+    """Print the ordering MUMPS ACTUALLY used (INFOG(7)); 5 == METIS.
+    If METIS is not in the build, a requested METIS is silently replaced,
+    and this is the only place that shows it."""
+    inst = ctx.mumps_instance
+    arr  = getattr(inst, "infog", None)        # INFOG(7) is authoritative
+    if arr is None:
+        arr = inst.info                        # fall back to INFO(7)
+    used = int(arr[7])
+    print(f"MUMPS ordering used{tag}: INFOG(7)={used} "
+          f"({_MUMPS_ORDERINGS.get(used, '?')})")
+    return used
+
+
+def setup_mumps(Sii, blr=False, blr_tol=1e-8, ordering="metis"):
     ctx = mumps.Context()
-    ctx.analyze(Sii)
+    # pass ordering to analyze -> sets ICNTL(7) (metis=5) for the actual analysis
+    ctx.analyze(Sii, ordering=ordering)
     if blr:
         _enable_blr(ctx, blr_tol)   # set BEFORE analyze so estimates account for BLR
-    ctx.analyze(Sii)                # symbolic factorization (sparsity pattern only)
-    ctx.factor(Sii)                 # numeric factorization (BLR-compressed if enabled)
+    ctx.analyze(Sii, ordering=ordering)   # symbolic factorization (sparsity pattern only)
+    ctx.factor(Sii)                       # numeric factorization (BLR-compressed if enabled)
+    _report_ordering(ctx)                 # confirm METIS was really used (else it fell back)
     return ctx
 
 
-def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8):
+def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8, ordering="metis"):
     ctxT = mumps.Context()
-    ctxT.analyze(Sii.T)
+    ctxT.analyze(Sii.T, ordering=ordering)
     if blr:
         _enable_blr(ctxT, blr_tol)
-    ctxT.analyze(Sii.T)
+    ctxT.analyze(Sii.T, ordering=ordering)
     ctxT.factor(Sii.T)
     return ctxT
 
