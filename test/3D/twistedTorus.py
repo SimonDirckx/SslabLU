@@ -52,7 +52,7 @@ bnds = twisted.bnds
 nwaves = 2.24
 wavelength = 4/nwaves
 kh = (nwaves/4)*2.*np.pi
-kh = 1.6
+kh = 5.66
 # What to modify to use the Jax-based hps ("hps") or Torch-based ("hpsalt")
 jax_avail   = False
 torch_avail = not jax_avail
@@ -79,15 +79,15 @@ def bc(p):
     return np.sin(kh*rr)/(rr)
 
 
-N = 5
+N = 16
 dSlabs,connectivity,H = twisted.dSlabs(N)
-formulation = "hps"
-#solve_method = 'iterative'
-solve_method = 'direct'
+formulation = "hpsalt"
+solve_method = 'iterative'
+#solve_method = 'direct'
 HBS = True
 
 #pvec = np.array([4,6,8,10],dtype = np.int32)
-pvec = np.array([6],dtype = np.int64)
+pvec = np.array([6,8,10,12],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -99,9 +99,9 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
 
-    a = np.array([H/8.,1./8,1./8])
+    a = np.array([H/8.,1./32,1./32])
     if HBS:
-        assembler = mA.rkHMatAssembler(p*p,100)
+        assembler = mA.rkHMatAssembler(p*p,150)
     else:
         assembler = mA.denseMatAssembler()
     # CHANGE [p_disc,p_disc,p_disc] to no longer be uniform:

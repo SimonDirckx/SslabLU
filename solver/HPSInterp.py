@@ -1,5 +1,4 @@
 import numpy as np
-import jax.numpy as jnp
 import tensorly as tl
 import tensorly.tenalg as tenalg
 import solver.spectralmultidomain.hps.cheb_utils as cheb
@@ -161,7 +160,7 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
         raise ValueError("solver type not recognized")
     _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
     f0    = f[I0]
-    F = np.reshape(f0,shape=(ord[0],ord[1],ord[2]))
+    F = np.reshape(f0,(ord[0],ord[1],ord[2]))
     
     core,U0,U1,U2 = tucker_tol(F,1e-12)
     F_approx = np.zeros(shape =(pts.shape[0],))
@@ -184,7 +183,7 @@ def local_interp_2d(pts,f,XX,box,ord0,typestr):
     ord = [ord0[0],ord0[1]]
     _,I0  = np.unique(XX,axis=0,return_index=True)
     f0      = f[I0]
-    F = np.reshape(f0,shape=(ord[0],ord[1]))
+    F = np.reshape(f0,(ord[0],ord[1]))
     [U,s,Vh]=np.linalg.svd(F)
     F_approx = np.zeros(shape =(pts.shape[0],))
     

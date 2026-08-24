@@ -4,11 +4,8 @@ import scipy.sparse as sp
 from scipy.sparse.linalg   import LinearOperator
 from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
-from solver.spectralmultidomain.hps import hps_multidomain as hps
-import solver.spectralmultidomain.hps.geom as hpsGeom
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
-import jax.numpy as jnp
 import solver.HPSInterp as interp
 import mumps
 
@@ -88,6 +85,8 @@ def convertGeom(opts,geom):
     if opts.type=='hpsalt':
         return hpsaltGeom.BoxGeometry(np.array(geom))
     if opts.type=='hps':
+        from solver.spectralmultidomain.hps import geom as hpsGeom
+        import jax.numpy as jnp
         return hpsGeom.BoxGeometry(jnp.array(geom))
     if opts.type=='stencil':
         return stencilGeom.BoxGeometry(np.array(geom))
@@ -130,6 +129,7 @@ class solverWrapper:
             self.Abb = solver.Axx
             self.solver_ii = solver.solver_Aii
         if self.type=='hps':
+            from solver.spectralmultidomain.hps import hps_multidomain as hps
             geomHPS = convertGeom(self.opts,geom)
             solver = hps.HPSMultidomain(PDE, geomHPS,self.a, self.ord[0],verbose=verbose)
             self.solver=solver
@@ -220,4 +220,3 @@ class solverWrapper:
             return interp.interp(self.solver,pts,f,'hpsalt')
         else:
             raise ValueError("interp not implemented yet")
-

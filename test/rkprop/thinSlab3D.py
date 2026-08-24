@@ -14,6 +14,8 @@ import mumps
 import scipy.sparse as sparse
 import time
 import os
+import gc
+import weakref
 from scipy.sparse.linalg import gmres
 
 def rss_gb():
@@ -29,22 +31,42 @@ def _enable_blr(ctx, blr_tol):
     # inst.icntl[36] = 0      # BLR variant (UFSC); leave default unless tuning
 
 
-def setup_mumps(Sii, blr=False, blr_tol=1e-8):
+# INFOG(7) ordering codes reported by MUMPS after analysis.
+_MUMPS_ORDERINGS = {0: "AMD", 1: "user", 2: "AMF", 3: "SCOTCH",
+                    4: "PORD", 5: "METIS", 6: "QAMD"}
+
+def _report_ordering(ctx, tag=""):
+    """Print the ordering MUMPS ACTUALLY used (INFOG(7)); 5 == METIS.
+    If METIS is not in the build, a requested METIS is silently replaced,
+    and this is the only place that shows it."""
+    inst = ctx.mumps_instance
+    arr  = getattr(inst, "infog", None)        # INFOG(7) is authoritative
+    if arr is None:
+        arr = inst.info                        # fall back to INFO(7)
+    used = int(arr[7])
+    print(f"MUMPS ordering used{tag}: INFOG(7)={used} "
+          f"({_MUMPS_ORDERINGS.get(used, '?')})")
+    return used
+
+
+def setup_mumps(Sii, blr=False, blr_tol=1e-8, ordering="metis"):
     ctx = mumps.Context()
-    ctx.analyze(Sii)
+    # pass ordering to analyze -> sets ICNTL(7) (metis=5) for the actual analysis
+    ctx.analyze(Sii, ordering=ordering)
     if blr:
         _enable_blr(ctx, blr_tol)   # set BEFORE analyze so estimates account for BLR
-    ctx.analyze(Sii)                # symbolic factorization (sparsity pattern only)
-    ctx.factor(Sii)                 # numeric factorization (BLR-compressed if enabled)
+    ctx.analyze(Sii, ordering=ordering)   # symbolic factorization (sparsity pattern only)
+    ctx.factor(Sii)                       # numeric factorization (BLR-compressed if enabled)
+    _report_ordering(ctx)                 # confirm METIS was really used (else it fell back)
     return ctx
 
 
-def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8):
+def setup_mumps_transpose(Sii, ctx=None, sym=False, blr=False, blr_tol=1e-8, ordering="metis"):
     ctxT = mumps.Context()
-    ctxT.analyze(Sii.T)
+    ctxT.analyze(Sii.T, ordering=ordering)
     if blr:
         _enable_blr(ctxT, blr_tol)
-    ctxT.analyze(Sii.T)
+    ctxT.analyze(Sii.T, ordering=ordering)
     ctxT.factor(Sii.T)
     return ctxT
 
@@ -120,15 +142,15 @@ _parser.add_argument("--order", nargs="+", default=None,
                           "or (px py pz) for SOMS; space- or comma-separated")
 _parser.add_argument("--shape", nargs="+", default=["1/16", "1", "1"],
                      help="domain extents Lx Ly Lz (fractions like 1/16 allowed)")
-_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="full",
+_parser.add_argument("--admissibility", choices=["full", "partial","weak"], default="weak",
                      help="HBS tree adjacency / admissibility")
 _parser.add_argument("--gmres-iters", dest="gmres_iters", type=int, default=100,
                      help="max GMRES iterations (sets maxiter & restart); 0 skips the GMRES solve")
-_parser.add_argument("--rank", dest="rk", type=int, default=50,
+_parser.add_argument("--rank", dest="rk", type=int, default=100,
                      help="HBS compression rank")
 _parser.add_argument("--blr", dest="blr", type=float, default=0,
                      help="HBS compression rank")
-_parser.add_argument("--nb", dest="nb", type=int, default=8,
+_parser.add_argument("--nb", dest="nb", type=int, default=16,
                      help="SOMS number of blocks")
 _parser.add_argument("--kh", dest="kh", type=float, default=0.,
                      help="wavenumber")
@@ -143,7 +165,7 @@ args = _parser.parse_args()
 solve_method = args.type
 # type-appropriate default order if none supplied
 if args.order is None:
-    order = [9, 128, 128] if solve_method == "stencil" else [6, 6, 6]
+    order = [9, 128, 128] if solve_method == "stencil" else [8, 8, 8]
 else:
     order = _ints3(args.order)
 Lx, Ly, Lz = _nums3(args.shape)
@@ -151,6 +173,7 @@ admissibility = args.admissibility
 gmres_iters = args.gmres_iters
 rk = args.rk
 nb= args.nb
+print("nb = ",nb)
 weighted = args.weighted
 blr_tol = args.blr
 nleaf = args.nleaf
@@ -192,7 +215,9 @@ if solve_method == 'SOMS':
     Sii, Sib, ftild, XYtot, Ii, Ib, wi,wb = SOMS3D_csr.SOMS_solver_sparse(
          px, py, pz, nbx, nby, nbz, 2*Lx, Ly, Lz,
          coeffs, True, None, weighted=weighted)
-
+    print("Lx = ",Lx)
+    print("cx = ",cx)
+    print("nbx = ",nbx)
     XXi = XYtot[Ii,:]
     XXb = XYtot[Ib,:]
     Jc = np.where(XXi[:,0]==cx)[0]
@@ -233,7 +258,7 @@ if solve_method == 'SOMS':
     ub = w_b[Jb] * bc_helmholtz(XXb[Jb,:],kh)
 
     tic_lu = time.time()
-    BLK = 32                                   # tune; see note below
+    BLK = 64                                   # tune; see note below
     ctx  = setup_mumps(Sii, blr=blr,blr_tol = blr_tol)
     ctxT = setup_mumps_transpose(Sii, blr=blr,blr_tol = blr_tol)
     tMUMPS = time.time()-tic_lu
@@ -375,7 +400,7 @@ if solve_method == 'SOMS':
             kmax = 5
     
     nl = nleaf
-    s = kmax*max(2*rk,nl)+rk+10
+    s = kmax*max(2*rk,nl)+rk+20
     tHBS = 0
     tSample = 0
 
@@ -385,11 +410,11 @@ if solve_method == 'SOMS':
     def _sample_lr(Om_l, Om_r):
         Som = sparse.csc_matrix(np.hstack((Sib[:,Jl]@Om_l,Sib[:,Jr]@Om_r)))
         s = Om_l.shape[1]+Om_r.shape[1]
-        out = np.zeros((len(Jc), s))
+        out = np.zeros((ndofs_if, s))
         for l in range(0, s, BLK):
             c = slice(l, min(l + BLK, s))
             sol = ctx._solve_sparse(Som[:,c])              # dense (len(Ii) x BLK) — bounded
-            out[:, c] = -sol[Jc, :]
+            out[Jc_inJc, c] = -sol[Jc, :]
             del sol
             ctx.mumps_instance.icntl[20]=0
         return out[:,:Om_l.shape[1]],out[:,Om_l.shape[1]:]
@@ -401,7 +426,7 @@ if solve_method == 'SOMS':
         SiblT = Sib[:, Jl].T.tocsr(); SibrT = Sib[:, Jr].T.tocsr()
         for a in range(0, s, BLK):
             c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
-            w = Psi[:, c]
+            w = Psi[Jc_inJc, c]
             rhs = sparse.csc_matrix(
                 (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
                 shape=(len(Ii), bw))
@@ -415,7 +440,7 @@ if solve_method == 'SOMS':
     tic = time.time()
     Om_r = np.random.standard_normal((len(Jr), s))
     Om_l = np.random.standard_normal((len(Jl), s))
-    Psi  = np.random.standard_normal((len(Jc), s))   # shared corange test matrix
+    Psi  = np.random.standard_normal((ndofs_if, s))   # shared corange test matrix
     Y_l, Y_r = _sample_lr(Om_l, Om_r)          # forward: one stacked solve
     Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
     tSample += time.time()-tic
@@ -717,25 +742,22 @@ elif solve_method == 'stencil':
     A_balance = LinearOperator(shape=(ndslab*ndofs_if, ndslab*ndofs_if),
                                matvec=apply_balance, dtype=float)
 
-    N = A_balance.shape[0]
-    v = np.random.standard_normal((N,))
-    tic =time.time()
+    # LU balance-operator sanity check (factors alive)
+    v = np.random.standard_normal((A_balance.shape[0],))
+    tic = time.time()
     bb = A_balance@v
-    print("matvec time = ",time.time()-tic)
-    gInfo = gmres_info()
-    u = u_true
-    res = A_balance@u-rhs
-    print("res = ",np.linalg.norm(res))
-    #if gmres_iters > 0:
-    #    tic = time.time()
-    #    uhat,_   = gmres(A_balance,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
-    #    niter = gInfo.niter
-    #    print("time = ",time.time()-tic)
-    #    print("niter = ",niter)
-    #    print("u err = ",np.linalg.norm(uhat-u)/np.linalg.norm(u))
-    #else:
-    #    print("GMRES solve skipped (gmres_iters = 0)")
+    print("matvec time = ", time.time()-tic)
+    res = A_balance@u_true - rhs
+    print("res = ", np.linalg.norm(res))
 
+    # =======================================================================
+    #  PHASE A -- everything that needs the LU factors, done up front:
+    #    (1) HBS sampling (interior solves through ctx / ctxT),
+    #    (2) LU matvec timing, LU residual, LU factor memory,
+    #    (3) the LU reference block for the HBS accuracy check.
+    #  Only after all of this do we release + destroy the factors (below),
+    #  so their memory is gone before the HBS maps are built.
+    # =======================================================================
     print("===============  HBS version  ===============")
 
     if torch.cuda.is_available():
@@ -752,11 +774,11 @@ elif solve_method == 'stencil':
         tree = slabTree.slabTree(XXl,False,tree_leaf,adjacency=admissibility)
         SSl = HBStorch_strong.HBSMAT(device=device,tree=tree)
         SSr = HBStorch_strong.HBSMAT(device=device,tree=tree)
-        if admissibility == 'strong': 
-            kmax = 9 
-        else: 
+        if admissibility == 'strong':
+            kmax = 9
+        else:
             kmax = 5
-    
+
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
     s = kmax*max(2*rk,nl)+rk+10
 
@@ -780,17 +802,17 @@ elif solve_method == 'stencil':
         for a in range(0, s, BLK):
             c = slice(a, min(a + BLK, s)); bw = c.stop - c.start
             w = Psi[Jc_inJc, c]
-            rhs = sparse.csc_matrix(
+            rhs_a = sparse.csc_matrix(
                 (w.ravel(order="F"), np.tile(Jc, bw), np.arange(0, m*bw+1, m)),
                 shape=(len(Ii), bw))
-            sol = ctxT._solve_sparse(rhs)                   # (len(Ii) x bw) — bounded
+            sol = ctxT._solve_sparse(rhs_a)                 # (len(Ii) x bw) — bounded
             Z_l[:, c] = -(SiblT @ sol)
             Z_r[:, c] = -(SibrT @ sol)
             del sol
             ctxT.mumps_instance.icntl[20] = 0
         return Z_l, Z_r
 
-
+    # (1) HBS sampling -- the last thing that uses the LU factors
     tSample = 0
     tHBS = 0
     tic = time.time()
@@ -801,11 +823,88 @@ elif solve_method == 'stencil':
     Z_l, Z_r = _adjoint_sample_lr(Psi)                  # adjoint: one shared solve
     tSample += time.time()-tic
 
+    # (2) LU matvec time, LU residual, LU factor memory (factors alive)
+    v = np.random.standard_normal((ndslab*ndofs_if,))
+    tic = time.time()
+    for i in range(3):
+        v = A_balance@v
+    tLUMV = (time.time()-tic)/3
+
+    res_LU = np.linalg.norm(A_balance@u_true - rhs)
+
+    if ctx.mumps_instance.info[3] < 0:
+        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
+    else:
+        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
+
+    # (3) LU reference block for the HBS accuracy check -- apply the LU operator
+    #     now, compare against the HBS operator after the factors are gone.
+    v_err  = np.random.standard_normal((ndslab*ndofs_if, 10))
+    Av_ref = A_balance@v_err
+
+    # =======================================================================
+    #  RELEASE + FULLY DESTROY the LU factors (after sampling).
+    #  The interface maps, the balance operator, and the samplers all close
+    #  over ctx / ctxT, so every one of those references must be dropped or
+    #  the native MUMPS memory stays pinned.
+    # =======================================================================
+    def _release_mumps(c):
+        # explicit teardown if the wrapper exposes one ("fully destroy");
+        # otherwise drop the native handle so its finalizer frees the memory.
+        fin = getattr(c, "destroy", None) or getattr(c, "finalize", None)
+        if callable(fin):
+            try:
+                fin()
+            except Exception:
+                pass
+        else:
+            try:
+                c.mumps_instance = None
+            except Exception:
+                pass
+
+    # Capture weak references BEFORE dropping the strong ones, so we can verify
+    # the objects were actually collected (i.e. nothing still pins them).  We
+    # track the MUMPS instances themselves plus their Context wrappers; a live
+    # weakref afterwards means a reference survived and the native memory is
+    # still held.  Strong handles used to build the probes are cleared at once.
+    _probes = []
+    for _c in (ctx, ctxT):
+        try:
+            _probes.append(weakref.ref(_c))
+        except TypeError:
+            pass
+        _inst = getattr(_c, "mumps_instance", None)
+        if _inst is not None:
+            try:
+                _probes.append(weakref.ref(_inst))
+            except TypeError:
+                pass          # Cython instance may not support weakref
+        _inst = None
+    _c = None
+
+    rss_before = rss_gb()
+    _release_mumps(ctx)
+    _release_mumps(ctxT)
+    del A_balance, apply_balance, LinOp_l, LinOp_r, smatmat
+    del _sample_lr, _adjoint_sample_lr, ctx, ctxT
+    gc.collect()
+
+    _alive = [r() is not None for r in _probes]
+    if _probes and not any(_alive):
+        print("MUMPS inst. successfully released")
+    else:
+        print("MUMPS inst not released")
+    print("LU factors destroyed after sampling: RSS %.3f -> %.3f GB"
+          % (rss_before, rss_gb()))
+
+    # =======================================================================
+    #  PHASE B -- HBS build and HBS-only measurements (no LU factors needed).
+    # =======================================================================
     tic = time.time()
     SSr.construct(rk, Om_r, Psi, Y_r, Z_r, fast=True)
     SSl.construct(rk, Om_l, Psi, Y_l, Z_l, fast=True)
     tHBS += time.time()-tic
-
 
     def apply_balance_HBS(u):
         if u.ndim == 1:
@@ -822,46 +921,33 @@ elif solve_method == 'stencil':
 
     A_balance_HBS = LinearOperator(shape=(ndslab*ndofs_if, ndslab*ndofs_if),
                                matvec=apply_balance_HBS, dtype=float)
-    N = A_balance.shape[0]
-    v = np.random.standard_normal((N,))
-    tic =time.time()
-    bb = A_balance_HBS@v
+
+    bb = A_balance_HBS@np.random.standard_normal((ndslab*ndofs_if,))   # warm-up
     gInfo = gmres_info()
-    u = u_true
-    res = A_balance_HBS@u-rhs
     if gmres_iters > 0:
         tic = time.time()
         uhat,_   = gmres(A_balance_HBS,rhs,rtol=1e-8,callback=gInfo,maxiter=gmres_iters,restart=gmres_iters)
         solve_time_HBS = time.time()-tic
         niter = gInfo.niter
-        print("time = ",time.time()-tic)
+        print("time = ",solve_time_HBS)
         print("niter = ",niter)
-        gmres_err = np.linalg.norm(uhat-u)/np.linalg.norm(u)
+        gmres_err = np.linalg.norm(uhat-u_true)/np.linalg.norm(u_true)
         print("u err = ",gmres_err)
     else:
+        solve_time_HBS = float('nan')
+        niter = float('nan')
+        gmres_err = float('nan')
         print("GMRES solve skipped (gmres_iters = 0)")
-    
+
     v = np.random.standard_normal((ndslab*ndofs_if,))
     tic = time.time()
     for i in range(20):
         v = A_balance_HBS@v
     tMV = (time.time()-tic)/20
 
-    v = np.random.standard_normal((ndslab*ndofs_if,))
-    tic = time.time()
-    for i in range(3):
-        v = A_balance@v
-    tLUMV = (time.time()-tic)/3
+    res_HBS = np.linalg.norm(A_balance_HBS@u_true - rhs)
+    errHBS  = np.linalg.norm(A_balance_HBS@v_err - Av_ref)/np.linalg.norm(Av_ref)
 
-    res_LU = np.linalg.norm(A_balance@u-rhs)
-    res_HBS = np.linalg.norm(A_balance_HBS@u-rhs)
-    if ctx.mumps_instance.info[3]<0:
-        memLU = 2*abs(ctx.mumps_instance.info[3])*(1e6)*8/1e9
-    else:
-        memLU = 2*ctx.mumps_instance.info[3]*8/1e9
-    v = np.random.standard_normal((ndslab*ndofs_if,10))
-    Av = A_balance@v
-    errHBS = np.linalg.norm(A_balance_HBS@v-Av)/np.linalg.norm(Av)
     # ---- aggregate totals --------------------------------------------------
     # The balance operator drops one off-diagonal map at each of the two end
     # interfaces (interface 0 has no SSl term, interface ndslab-1 has no SSr
