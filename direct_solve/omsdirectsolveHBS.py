@@ -158,7 +158,7 @@ def Dprime_Linop(D,A,B,Dprev):
         matvec = lambda v:dmatmat(v), rmatvec = lambda v:dmatmat(v,transpose=True),\
         matmat = lambda v:dmatmat(v), rmatmat = lambda v:dmatmat(v,transpose=True))
     return Dprime
-# returns -Sl@T\Sr
+#STS
 def STS_linop(Sl,T,Sr):
     def sts_matmat(v,transpose=False):        
         if (v.ndim == 1):
