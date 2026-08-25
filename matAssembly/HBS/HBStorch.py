@@ -14,13 +14,32 @@ def to_block_tensor(M, n, b):
     s = M.shape[1]
     return M.reshape(n, b, s)
 
-def _rsolve(P, B, fast=False):
-    # batched min-residual solution of  X @ B = P  (i.e. X = P @ pinv(B)).
-    # fast=False: SVD-based pseudoinverse (handles rank deficiency via rcond).
-    # fast=True : QR-based batched least squares; assumes full column rank.
+def _rsolve(P, B, fast=False, rtol=None, QR=None):
+    """
+    Batched min-residual solution of  X @ B = P   (X = P B^+).
+    B: (Nb, n, s) with s >= n.  P: (Nb, ny, s).  Returns (Nb, ny, n).
+    Solves the transposed system B^T X^T = P^T, which is tall/overdetermined.
+    fast=True : QR + triangular solve (assumes full column rank of B^T).
+    fast=False: SVD applied factor-by-factor with an explicit relative cutoff.
+    QR        : optional precomputed (Q, R) of B.mT, see note below.
+    """
+    assert B.shape[-1] >= B.shape[-2], "undersampled: s < n, this is a different problem"
+
     if fast:
-        return tla.lstsq(B.mT, P.mT).solution.mT
-    return torch.bmm(P, tla.pinv(B))
+        if QR is None:
+            Q, R = tla.qr(B.mT, mode='reduced')      # Q:(Nb,s,n)  R:(Nb,n,n)
+        else:
+            Q, R = QR
+        PQ = torch.bmm(P, Q)                          # (Nb, ny, n)
+        # X R^T = PQ ;  R^T is lower triangular, solve from the right
+        return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
+
+    U, S, Vh = tla.svd(B, full_matrices=False)        # U:(Nb,n,n) S:(Nb,n) Vh:(Nb,n,s)
+    if rtol is None:
+        rtol = max(B.shape[-1], B.shape[-2]) * torch.finfo(B.dtype).eps
+    Sinv = torch.where(S > rtol * S[..., :1], 1.0 / S, torch.zeros_like(S))
+    # X = P V S^+ U^T, applied right-to-left; the (s,n) pinv is never built
+    return torch.bmm(torch.bmm(P, Vh.mT) * Sinv.unsqueeze(-2), U.mT)
 
 def block_solve_r(A,B,device,fast=False):
     # batched: solves X[i] = A[i] @ pinv(B[i]) over the block dim
@@ -70,16 +89,15 @@ def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,device,fast=False):
     term2 = torch.bmm(U_ell, torch.bmm(U_ell.mT, inner))
     return term1 + term2
 
-def compute_UV(Om,Y,rk,device):
-    # batched over the block dim; same complete QR + SVD per block as before
-    n = Om.shape[1]
-    Q = tla.qr(Om.mT, mode='complete').Q          # (Nb, s, s)
-    # Null space of Om_i = trailing s-n columns of Q (indices n..s-1).
-    # Projecting Y onto these annihilates the diagonal-block term D@Om.
-    # NB: must use Q[:,:,n:], NOT Q[:,:,-n:]; the two coincide only when
-    # s >= 2n, which fails once the per-level block size n grows past s/2.
-    M = torch.bmm(Y, Q[:,:,n:])                    # (Nb, ny, s-n)
-    return tla.svd(M, full_matrices=False).U[:,:,:rk]
+def compute_UV(Om, Y, rk, device,fast=False):
+    ny = Y.shape[1]
+    Qhead = tla.qr(Om.mT, mode='reduced').Q          # (Nb, s, n)
+    M = Y - torch.bmm(torch.bmm(Y, Qhead), Qhead.mT)  # (Nb, ny, s)  no (s,s) Q ever formed
+    if fast:
+        G = torch.bmm(M, M.mT); G = 0.5*(G + G.mT)
+        return tla.eigh(G).eigenvectors[:, :, -min(rk,ny):].flip(-1)
+    Us, S, _ = tla.svd(M, full_matrices=False)
+    return Us[:, :, :min(rk, ny)]
 
 
 class HBSMAT:
@@ -160,9 +178,20 @@ class HBSMAT:
         ctr+=sum([V.nbytes for V in self.Vmats])
         ctr+=sum([D.nbytes for D in self.Dmats])
         return ctr
-    def construct(self,rk,Om,Psi,Y,Z,compute_ULV=False,fast=False):
+    def construct(self,rk,Om=None,Psi=None,Y=None,Z=None,compute_ULV=False,fast=False):
+        if Om is None:
+            if self.A is None:
+                raise ValueError("Samples and LinOP cannot both be None")
+            else:
+                s = 2*max(rk,self.tree._min_leaf_size)+rk+10
+
+                Om = np.random.standard_normal(size = (self.A.shape[1],s))
+                Psi= np.random.standard_normal(size = (self.A.shape[0],s))
+                Y = self.A@Om
+                Z = self.A.T@Psi
+
         if compute_ULV:
-            self.constructHBS_ULV(rk,fast=fast)
+            self.constructHBS_ULV(rk,Om,Psi,Y,Z,fast=fast)
         else: 
             self.constructHBS(rk,Om,Psi,Y,Z,fast=fast)
 
@@ -215,7 +244,6 @@ class HBSMAT:
                 
                 Nb = Nb//self.fac
                 rkm = min(rk,nl*((self.fac)**(self.L-1-lvl)))
-            print("lvl//Nb = ",lvl,"//",Nb)
             
             if lvl>0:
                 tic = time.time()
@@ -239,30 +267,23 @@ class HBSMAT:
                     self.Dmats+=[D_ell.cpu().pin_memory()]
             self.Nbvec+=[Nb]
         self.tCompress = time.time()-tic_compress
-    def constructHBS_ULV(self,rk,fast=False):
-        torch.set_default_dtype(torch.float64)
-        if self.fac == 4:
-            s = 6*rk+4*self.nl+5
-        else:
-            s = 4*rk+2*self.nl+5
+    def constructHBS_ULV(self,rk,Om0,Psi0,Y0,Z0,fast=True):
+        s = Om0.shape[1]
+        Nb = self.Nb
+        self.Nbvec = [Nb]
+        nl = self.nl
         self.nSamples = s
         tic = time.time()
-        print("self.fac = ",self.fac)
-        # generate Om/Psi directly as torch on device
-        Om_flat  = torch.randn(self.shape[1], s, dtype=torch.float64, device=self.device)
-        Psi_flat = torch.randn(self.shape[0], s, dtype=torch.float64, device=self.device)
-        Omprime  = torch.zeros_like(Om_flat);  Omprime[self.perm,:]  = Om_flat
-        Psiprime = torch.zeros_like(Psi_flat); Psiprime[self.perm,:] = Psi_flat
-        Omprime_np  = Omprime.cpu().numpy()
-        Psiprime_np = Psiprime.cpu().numpy()
-        Y = self.A.matvec(Omprime_np)
-        Z = self.A.matvec(Psiprime_np,mode='T')
-        Y = torch.from_numpy(Y[self.perm,:]).to(self.device)
-        Z = torch.from_numpy(Z[self.perm,:]).to(self.device)
-        Y = ULVsparse.convert_to_torch_tens(Y,self.Nb,self.device)
-        Z = ULVsparse.convert_to_torch_tens(Z,self.Nb,self.device)
-        Om  = ULVsparse.convert_to_torch_tens(Om_flat, self.Nb, self.device)
-        Psi = ULVsparse.convert_to_torch_tens(Psi_flat,self.Nb, self.device)
+        
+        Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
+        Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
+        Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
+        Zpr   = torch.from_numpy(Z0  ).to(device=self.device)[self.perm, :]
+
+        Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
+        Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
+        Om  = ULVsparse.convert_to_torch_tens(Ompr, self.Nb, device=self.device)
+        Psi = ULVsparse.convert_to_torch_tens(Psipr,self.Nb, device=self.device)
         
         Nb = self.Nb
         nl = self.nl
@@ -292,7 +313,7 @@ class HBSMAT:
                 
                 Nb = Nb//self.fac
                 rkm = min(rk,nl*(self.fac**(self.L-1-lvl)))
-            print("lvl//Nb = ",lvl,"//",Nb)
+            #print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
                 U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
@@ -467,27 +488,99 @@ class HBSMAT:
     def compute_ULV(self):
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
-    def solve(self,b,device,mode='N'):
-        if mode =='N':
-            if b.ndim==1:
-                bperm = b[self.perm,None]    
-            else:
-                bperm= b[self.perm,:]
-            rhs = bperm.detach().clone()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs,device=device)
-            u = torch.zeros(size = uhat.shape)
-            u[self.perm,:] = uhat
-        elif mode=='T':
-            rhs = torch.zeros(size = b.shape)
-            if b.ndim==1:
-                rhs = rhs[:,None]
-                rhs[self.perm,:] = b[:,None].detach().clone()
-            else:
-                rhs[self.perm,:] = b.detach().clone()
-            uhat = ULVsparse.solve(self.Umats,self.Dmats,self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec,self.Nbvec,rhs,device=device,mode='T')
-            u = uhat[self.perm,:]
+    def solve(self, b, mode='N'):
+
+        # ------------------------------------------------------------
+        # Input handling
+        # ------------------------------------------------------------
+        input_is_numpy = isinstance(b, np.ndarray)
+        input_is_torch = torch.is_tensor(b)
+
+        if not (input_is_numpy or input_is_torch):
+            raise TypeError(
+                "b must be either a numpy.ndarray or a torch.Tensor"
+            )
+
+        # Convert NumPy input to torch. Keep torch input unchanged.
+        if input_is_numpy:
+            b_torch = torch.as_tensor(
+                b,
+                dtype=self.Umats[0].dtype,
+                device=self.device
+            )
         else:
-            raise NotImplementedError("mode not recognized")
-        if b.ndim==1:
-            u = u.flatten()
+            b_torch = b.to(device=self.device)
+
+        was_vector = (b_torch.ndim == 1)
+
+        if b_torch.ndim not in (1, 2):
+            raise ValueError(
+                f"b must have ndim 1 or 2, got ndim={b_torch.ndim}"
+            )
+
+        # Always work internally with a 2D RHS
+        if was_vector:
+            b_torch = b_torch[:, None]
+
+        # ------------------------------------------------------------
+        # Normal solve
+        # ------------------------------------------------------------
+        if mode == 'N':
+
+            # Apply permutation
+            bperm = b_torch[self.perm, :].clone()
+
+            uhat = ULVsparse.solve(
+                self.Umats,
+                self.Dmats,
+                self.Qlist,
+                self.Wlist,
+                self.Uulist,
+                self.Rlist,
+                self.NNvec,
+                bperm,
+                device=self.device
+            )
+
+            # Undo permutation
+            u = torch.empty_like(uhat)
+            u[self.perm, :] = uhat
+
+        # ------------------------------------------------------------
+        # Transpose solve
+        # ------------------------------------------------------------
+        elif mode == 'T':
+
+            # Here the permutation is applied in the opposite direction
+            rhs = torch.empty_like(b_torch)
+            rhs[self.perm, :] = b_torch
+
+            uhat = ULVsparse.solve(
+                self.Umats,
+                self.Dmats,
+                self.Qlist,
+                self.Wlist,
+                self.Uulist,
+                self.Rlist,
+                self.NNvec,
+                rhs,
+                device=self.device,
+                mode='T'
+            )
+
+            u = uhat[self.perm, :]
+
+        else:
+            raise NotImplementedError(
+                f"mode '{mode}' not recognized. Use 'N' or 'T'."
+            )
+
+        # Restore vector shape
+        if was_vector:
+            u = u[:, 0]
+
+        # Return in the same array type as the input
+        if input_is_numpy:
+            return u.detach().cpu().numpy()
+
         return u

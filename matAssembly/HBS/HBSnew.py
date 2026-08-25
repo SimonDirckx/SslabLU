@@ -92,7 +92,6 @@ class HBSMAT:
         self.mode   =   'N'
         if A is not None:
             self.A      =   A
-            print("A shape = ",A.shape)
             self.shape  =   self.A.shape
             self.shape = A.shape
             self.dtype = A.dtype

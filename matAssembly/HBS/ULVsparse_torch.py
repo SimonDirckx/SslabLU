@@ -121,7 +121,7 @@ def compute_QRW_sparse(Dtot,Vtot,Nb,device):
         Ru = R[:,:n-k,:]
         R22 = R[:,n-k:,n-k:]
         tmv += time.time()-tic
-    print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
+    #print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
     return Q,W12,Ru,R22,NN
 def sparse_block_mult_tens(A,B,device,mode='N'):
     

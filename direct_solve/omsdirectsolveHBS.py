@@ -1,42 +1,72 @@
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 import jax.numpy as jnp
-import matAssembly.HBS.HBSnew as HBSnew
+import matAssembly.HBS.HBStorch as HBSnew
 from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
+import torch
 
 # ---------------------------------------------------------------------------
 # Linear operator helpers
 # ---------------------------------------------------------------------------
 
+def _rdtype(*ops):
+    """Promoted dtype of a set of operators; float64 if none carry one."""
+    dts = [getattr(o, "dtype", None) for o in ops]
+    dts = [d for d in dts if d is not None]
+    return np.result_type(*dts) if dts else np.float64
+
+
 class id_op(LinearOperator):
     """Identity operator."""
     def __init__(self, n,dtype=np.float64):
         super().__init__(shape=(n, n), dtype=dtype)
+        self.tree = None
+        self.quad = None
     def _matvec(self, v):         return v.copy()
     def _matmat(self, v):         return v.copy()
     def _rmatvec(self, v):        return v.copy()
     def _rmatmat(self, v):        return v.copy()
     def solve(self, v, mode='N'): return v.copy()
 
-def dense_to_linop(A):
-    A = np.array(A)
-    n = A.shape[0]
-    lo = LinearOperator(
-        shape=(n, n), dtype=A.dtype,
-        matvec  = lambda v: A @ v,
-        rmatvec = lambda v: A.T @ v,
-        matmat  = lambda V: A @ V,
-        rmatmat = lambda V: A.T @ V,
-    )
-    lo.solve = lambda v, mode='N': (
-        np.linalg.solve(A, v) if mode == 'N' else np.linalg.solve(A.T, v)
-    )
-    lo.tree = lo.quad = None
-    return lo
+
+class zero_op(LinearOperator):
+    """Zero operator; replaces a materialized dense zero block."""
+    def __init__(self, n, dtype=np.float64, m=None):
+        m = n if m is None else m
+        super().__init__(shape=(m, n), dtype=dtype)
+        self.tree = None
+        self.quad = None
+    def _matvec(self, v):
+        return np.zeros(self.shape[0], dtype=self.dtype)
+    def _matmat(self, V):
+        return np.zeros((self.shape[0], V.shape[1]), dtype=self.dtype)
+    def _rmatvec(self, v):
+        return np.zeros(self.shape[1], dtype=self.dtype)
+    def _rmatmat(self, V):
+        return np.zeros((self.shape[1], V.shape[1]), dtype=self.dtype)
+    def solve(self, v, mode='N'):
+        raise NotImplementedError(
+            "zero_op is singular: a boundary off-diagonal block was solved "
+            "with, which means a boundary guard is missing upstream."
+        )
+
+
+def _is_id(op):
+    """True if `op` is a structural identity, i.e. an id_op instance.
+
+    Detection is deliberately structural rather than semantic: the fast paths
+    below skip work only when the object is known to be the identity, so a
+    dense np.eye wrapped in a LinearOperator would take the slow path.
+    RedBlackSolverHBS._normalize_diag exists to convert such diagonals up
+    front.
+    """
+    return isinstance(op, id_op)
+
 
 def _linop_from_mat(A):
     """Wrap a dense numpy matrix as a LinearOperator with .solve and .tree/.quad."""
+    A  = np.asarray(A)
     n  = A.shape[0]
     lo = LinearOperator(
         shape   = (n, n),
@@ -54,6 +84,9 @@ def _linop_from_mat(A):
     return lo
 
 
+dense_to_linop = _linop_from_mat
+
+
 def STS_linop(Sl, T, Sr):
     """Returns the LinearOperator  -Sl @ T^{-1} @ Sr."""
     def sts_matmat(v, transpose=False):
@@ -65,8 +98,8 @@ def STS_linop(Sl, T, Sr):
         return result.flatten() if v.ndim == 1 else result
 
     return LinearOperator(
-        shape   = (T.shape[0], T.shape[1]),
-        dtype   = np.float64,
+        shape   = (Sl.shape[0], Sr.shape[1]),
+        dtype   = _rdtype(Sl, T, Sr),
         matvec  = lambda v: sts_matmat(v),
         rmatvec = lambda v: sts_matmat(v, transpose=True),
         matmat  = lambda v: sts_matmat(v),
@@ -85,29 +118,30 @@ def RB_linop(Ti, tm, tp, SiPi, SiMi, smp, spm):
         if not transpose:
             result = Ti.matmat(v_tmp)
             if tp is not None:
-                result -= SiPi.matmat(tp.solve(smp.matmat(v_tmp)))
+                result = result - SiPi.matmat(tp.solve(smp.matmat(v_tmp)))
             if tm is not None:
-                result -= SiMi.matmat(tm.solve(spm.matmat(v_tmp)))
+                result = result - SiMi.matmat(tm.solve(spm.matmat(v_tmp)))
         else:
             result = Ti.rmatmat(v_tmp)
             if tp is not None:
-                result -= smp.rmatmat(tp.solve(SiPi.rmatmat(v_tmp), mode='T'))
+                result = result - smp.rmatmat(tp.solve(SiPi.rmatmat(v_tmp), mode='T'))
             if tm is not None:
-                result -= spm.rmatmat(tm.solve(SiMi.rmatmat(v_tmp), mode='T'))
+                result = result - spm.rmatmat(tm.solve(SiMi.rmatmat(v_tmp), mode='T'))
         return result.flatten() if v.ndim == 1 else result
 
     return LinearOperator(
         shape   = (Ti.shape[0], Ti.shape[1]),
-        dtype   = np.float64,
+        dtype   = _rdtype(Ti, tm, tp, SiPi, SiMi, smp, spm),
         matvec  = lambda v: smatmat(v),
         rmatvec = lambda v: smatmat(v, transpose=True),
         matmat  = lambda v: smatmat(v),
         rmatmat = lambda v: smatmat(v, transpose=True),
     )
 
+
 def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
     if id:
-        def smatmat(v,transpose=False):        
+        def smatmat(v,transpose=False):
             if (v.ndim == 1):
                 v_tmp = v[:,np.newaxis]
             else:
@@ -122,7 +156,7 @@ def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
             return result
 
     else:
-        def smatmat(v,transpose=False):        
+        def smatmat(v,transpose=False):
             if (v.ndim == 1):
                 v_tmp = v[:,np.newaxis]
             else:
@@ -135,13 +169,14 @@ def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
             if (v.ndim == 1):
                 result = result.flatten()
             return result
-    Sprime = LinearOperator(shape=(Sl.shape[0],Sr.shape[1]),\
-        matvec = lambda v:smatmat(v), rmatvec = lambda v:smatmat(v,transpose=True),\
+    Sprime = LinearOperator(shape=(Sl.shape[0],Sr.shape[1]),
+        dtype  = _rdtype(Sl, Sprime_prev, Sr),
+        matvec = lambda v:smatmat(v), rmatvec = lambda v:smatmat(v,transpose=True),
         matmat = lambda v:smatmat(v), rmatmat = lambda v:smatmat(v,transpose=True))
     return Sprime
 
 def Dprime_Linop(D,A,B,Dprev):
-    def dmatmat(v,transpose=False):        
+    def dmatmat(v,transpose=False):
         if (v.ndim == 1):
             v_tmp = v[:,np.newaxis]
         else:
@@ -154,29 +189,11 @@ def Dprime_Linop(D,A,B,Dprev):
         if (v.ndim == 1):
             result = result.flatten()
         return result
-    Dprime = LinearOperator(shape=(D.shape[0],D.shape[1]),\
-        matvec = lambda v:dmatmat(v), rmatvec = lambda v:dmatmat(v,transpose=True),\
+    Dprime = LinearOperator(shape=(D.shape[0],D.shape[1]),
+        dtype  = _rdtype(D, A, B, Dprev),
+        matvec = lambda v:dmatmat(v), rmatvec = lambda v:dmatmat(v,transpose=True),
         matmat = lambda v:dmatmat(v), rmatmat = lambda v:dmatmat(v,transpose=True))
     return Dprime
-#STS
-def STS_linop(Sl,T,Sr):
-    def sts_matmat(v,transpose=False):        
-        if (v.ndim == 1):
-            v_tmp = v[:,np.newaxis]
-        else:
-            v_tmp = v
-
-        if (not transpose):
-            result = -Sl.matmat(T.solve(Sr.matmat(v_tmp)))
-        else:
-            result = -Sr.rmatmat(T.solve(Sl.rmatmat(v_tmp),mode='T'))
-        if (v.ndim == 1):
-            result = result.flatten()
-        return result
-    STS = LinearOperator(shape=(T.shape[0],T.shape[1]),\
-        matvec = lambda v:sts_matmat(v), rmatvec = lambda v:sts_matmat(v,transpose=True),\
-        matmat = lambda v:sts_matmat(v), rmatmat = lambda v:sts_matmat(v,transpose=True))
-    return STS
 
 
 '''
@@ -200,6 +217,10 @@ class ThomasSolverHBS(DirectSolver):
             self.factorize_with_diag(S_rk_list, diagList)
             self.solve_method = 'diag'
     def factorize_id_diag(self, S_rk_list):
+        if  torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
         """
     
         [ I ] [S12] [ 0 ] [ 0 ]
@@ -227,17 +248,17 @@ class ThomasSolverHBS(DirectSolver):
         rk = self.rk
         m = S_rk_list[0][0].shape[0]
         n = len(S_rk_list) - 1
-        I = id_op(m)
+        I = id_op(m, S_rk_list[0][0].dtype)
         Sl = [S_rk_list[_][0] for _ in range(1,n+1)]
         Sprime = [I]
         Sr = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
         for i in range(1, n+1):
             if i==1:
-                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True),Sl[0].tree,Sl[0].quad)
+                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True),device=device,tree = Sl[0].tree,quad = Sl[0].quad)
                 Sprime_i.construct(rk,compute_ULV=True)
                 
             else:
-                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),Sl[i-1].tree,Sl[i-1].quad)
+                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),device=device,tree = Sl[i-1].tree,quad = Sl[i-1].quad)
                 Sprime_i.construct(rk,compute_ULV=True)
             Sprime.append(Sprime_i)
         self.A = Sl
@@ -264,7 +285,8 @@ class ThomasSolverHBS(DirectSolver):
         C = [AB_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
 
         for i in range(1, n+1):
-            B_i = HBSnew.HBSMAT(Dprime_Linop(D_list[i],A[i-1],C[i-1],B[-1],D_list[i].tree,D_list[i-1].quad))
+            B_i = HBSnew.HBSMAT(Dprime_Linop(D_list[i], A[i-1], C[i-1], B[-1]),
+                                tree=D_list[i].tree, quad=D_list[i].quad)
             B_i.construct(self.rk,compute_ULV=True)    
             B.append(B_i)
         
@@ -303,7 +325,7 @@ class ThomasSolverHBS(DirectSolver):
             else:
                 d[indices[i],:] = d[indices[i],:] - Sl[i-1]@(Sprime[i-1].solve(d[indices[i-1],:]))
 
-        x             = np.zeros(d.shape)
+        x             = np.zeros(d.shape, dtype=d.dtype)
         x[indices[n],:] = Sprime[n].solve(d[indices[n],:] )
         for i in range(n-1, 0, -1):
             x[indices[i],:] = Sprime[i].solve(d[indices[i],:] - Sr[i] @ x[indices[i+1],:] )
@@ -328,9 +350,9 @@ class ThomasSolverHBS(DirectSolver):
             indices = glob_target_dofs
         
         for i in range(1, n+1):
-            d[indices[i]] = d[indices[i]] - A[i-1] @ B[i].solve( d[indices[i-1]])
+            d[indices[i]] = d[indices[i]] - A[i-1] @ B[i-1].solve( d[indices[i-1]])
 
-        x             = np.zeros(d.shape)
+        x             = np.zeros(d.shape, dtype=d.dtype)
         x[indices[n]] = B[n].solve( d[indices[n]])
 
         for i in range(n-1, 0, -1):
@@ -368,30 +390,172 @@ class RedBlackSolverHBS(DirectSolver):
       T_hbs[i] : HBS factorization of T[i]  (replaces lu_factor)
       SiP[i]   : right off-diagonal at node i
 
-    lu_solve(T_inv[k], v)  -->  T_hbs[k].solve(v)
-    lu_factor(T[i])        -->  HBSnew.HBSMAT(...).construct(rk, compute_ULV=True)
+    ---------------------------------------------------------------------
+    FUSED CONSTRUCTION (fused=True, default)
+    ---------------------------------------------------------------------
+    The three operators produced at each retained node,
+
+        B_i = T_i - S^+_i T_{i+1}^{-1} S^-_{i+1} - S^-_i T_{i-1}^{-1} S^+_{i-1}
+        A_i =     - S^-_i T_{i-1}^{-1} S^-_{i-1}
+        C_i =     - S^+_i T_{i+1}^{-1} S^+_{i+1}
+
+    (S^- = SiM, S^+ = SiP) are compressed by black-box sampling.  Driving
+    each one through its own `construct` re-solves the same eliminated
+    diagonals against the same right-hand sides.  Writing out which
+    constructions consume the eliminated node k:
+
+        B_{k-1} : T_k^{-1} S^-_k Om        A_{k+1} : T_k^{-1} S^-_k Om
+        C_{k-1} : T_k^{-1} S^+_k Om        B_{k+1} : T_k^{-1} S^+_k Om
+
+    -- four solves, two distinct right-hand sides.  This class instead shares
+    one Omega / Psi pair across the whole level, caches
+
+        Xm_k = T_k^{-1} S^-_k Om,     Xp_k = T_k^{-1} S^+_k Om
+
+    once per eliminated node (a single fused solve with 2s columns), and then
+    forms all three sample blocks at each retained node from them.  The
+    adjoint side shares differently but just as well: B_i^T and C_i^T both
+    need t^+_i = T_{i+1}^{-T} (S^+_i)^T Psi, and B_i^T and A_i^T both need
+    t^-_i = T_{i-1}^{-T} (S^-_i)^T Psi.
+
+    Per (retained, eliminated) pair this takes the forward+adjoint sampling
+    from 13 elementary applies/solves to 9, and the call count from 13 to 6.
+    The compressions themselves are unchanged in number and rank.
+
+    Requires HBSMAT.construct(rk, Om, Psi, Y, Z, ...), i.e. the
+    externally-sampled path.  Set fused=False for the original one-operator-
+    at-a-time construction.
+
+    ---------------------------------------------------------------------
+    IDENTITY DIAGONAL
+    ---------------------------------------------------------------------
+    When T_i = I the level-0 work collapses: T_k^{-1} is a no-op, so pass 1
+    needs no solve and no fused right-hand side, and T_i Om / T_i^T Psi are
+    Om / Psi themselves.  Level 0 holds half of all eliminated nodes, so this
+    is the bulk of the identity saving.  The structure does not survive the
+    reduction -- B_i = I - E_i is not the identity -- so there is nothing
+    further to exploit from level 1 on.
+
+    These fast paths key off `isinstance(op, id_op)`.  A caller supplying
+    T = [dense_to_linop(np.eye(m))] * nSlabs would silently take the slow
+    path, so `factorize` routes any supplied T through `_normalize_diag`
+    first; see `identity_diag`.
     """
 
-    def __init__(self, m, rk, tree, quad, cyclic=False):
+    def __init__(self, m, rk, tree, quad, cyclic=False,
+                 compress_diag=True, fused=True, device='cpu', fast=False,
+                 seed=0, identity_diag=None):
         super().__init__(m, cyclic)
         self.rk   = rk
         self.tree = tree
         self.quad = quad
+        # carry the *compressed* Schur diagonal down to the next level
+        self.compress_diag = compress_diag
+        self.fused  = fused
+        self.device = device
+        self.fast   = fast
+        # How to treat a user-supplied diagonal list T:
+        #   None  -- probe each entry and swap exact identities for id_op
+        #   True  -- assert every entry is the identity and swap unconditionally
+        #   False -- leave T exactly as given
+        self.identity_diag = identity_diag
+        self._dtype = np.float64
+        self._rng   = np.random.default_rng(seed)
+        # bookkeeping so the saving can be checked directly
+        self.nConstruct = 0
+        self.nSolve     = 0     # calls to T^{-1} (any number of columns)
+        self.nApply     = 0     # calls to an off-diagonal / diagonal apply
+        self.nIdSkipped = 0     # applies/solves elided because T was identity
 
     # ------------------------------------------------------------------
 
-    def _hbs(self, linop,rk = None):
-        if rk is None:
-            rkloc = self.rk
-        else:
-            rkloc = rk
+    def _nsamples(self, rk):
+        """Sample count, matching HBSMAT.construct's internal choice.
+
+        Every operator sharing an Omega must use the same s.  All nodes share
+        self.tree, so one value per level is consistent by construction.
+        """
+        mls = getattr(self.tree, "_min_leaf_size", rk)
+        return 2 * max(rk, mls) + rk + 10
+
+    def _hbs(self, linop, rk=None, device=None):
         """Compress a LinearOperator into an HBS matrix and factorize it."""
-        h = HBSnew.HBSMAT(linop, self.tree, self.quad)
-        h.construct(rkloc, compute_ULV=True)
+        rkloc  = self.rk if rk is None else rk
+        dev    = self.device if device is None else device
+        h = HBSnew.HBSMAT(linop, device=dev, tree=self.tree, quad=self.quad)
+        h.construct(rkloc, compute_ULV=True, fast=self.fast)
+        self.nConstruct += 1
         return h
 
+    def _hbs_from_samples(self, rk, Om, Psi, Y, Z):
+        """Compress from externally supplied samples Y = M Om, Z = M^T Psi.
+
+        Om/Psi/Y/Z must be numpy: constructHBS calls torch.from_numpy on all
+        four.
+        """
+        h = HBSnew.HBSMAT(device=self.device, tree=self.tree, quad=self.quad)
+        h.construct(rk, Om=np.ascontiguousarray(Om), Psi=np.ascontiguousarray(Psi),
+                    Y=np.ascontiguousarray(Y), Z=np.ascontiguousarray(Z),
+                    compute_ULV=True, fast=self.fast)
+        self.nConstruct += 1
+        return h
+
+    # -- small counted wrappers ---------------------------------------- #
+
+    def _ap(self, op, X):
+        self.nApply += 1
+        return np.asarray(op.matmat(X))
+
+    def _apT(self, op, X):
+        self.nApply += 1
+        return np.asarray(op.rmatmat(X))
+
+    def _sv(self, op, X, mode='N'):
+        self.nSolve += 1
+        return np.asarray(op.solve(X, mode=mode))
+
+    def _normalize_diag(self, T, m):
+        """Swap identity diagonals for id_op so the fast paths engage.
+
+        The level-0 savings below are triggered by `isinstance(op, id_op)`, not
+        by the operator being mathematically the identity.  A caller passing
+        `[dense_to_linop(np.eye(m))] * nSlabs` would otherwise run a real m x m
+        GEMM per apply and np.linalg.solve on a dense identity per eliminated
+        node -- same answer, far more expensive, no warning.
+
+        The probe is exact-arithmetic reliable: if T - I is nonzero then
+        (T - I) X = 0 for a Gaussian X has probability zero, so two columns
+        suffice.
+        """
+        if self.identity_diag is False:
+            return T
+
+        out, replaced = [], 0
+        for op in T:
+            if _is_id(op):
+                out.append(op)
+                continue
+            if self.identity_diag is True:
+                out.append(id_op(m, self._dtype))
+                replaced += 1
+                continue
+            X = self._rng.standard_normal(size=(m, 2))
+            try:
+                Y = np.asarray(op.matmat(X))
+            except Exception:
+                out.append(op)
+                continue
+            nrm = np.linalg.norm(X)
+            if nrm > 0 and np.linalg.norm(Y - X) <= 1e-12 * nrm:
+                out.append(id_op(m, self._dtype))
+                replaced += 1
+            else:
+                out.append(op)
+        self.nIdNormalized = replaced
+        return out
+
     # ------------------------------------------------------------------
-    # factorize  -- mirrors RedBlackSolver.factorize
+    # factorize
     # ------------------------------------------------------------------
 
     def factorize(self, S_rk_list, T=None):
@@ -401,20 +565,21 @@ class RedBlackSolverHBS(DirectSolver):
         if not ((nSlabs & (nSlabs - 1) == 0) and nSlabs != 0):
             raise ValueError("Number of slabs must be a power of 2.")
 
+        self._dtype = S_rk_list[0][0].dtype
+
         SiM = [_[0]  for _ in S_rk_list]
         SiP = [_[-1] for _ in S_rk_list]
 
-        # Boundary zeros -- kept as zero LinearOperators (like np.zeros in dense version)
-        # so that indexing is uniform throughout.
+        # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
-            SiM[0]  = _linop_from_mat(np.zeros((m, m)))
-            SiP[-1] = _linop_from_mat(np.zeros((m, m)))
+            SiM[0]  = zero_op(m, self._dtype)
+            SiP[-1] = zero_op(m, self._dtype)
 
         if T is None:
-            #T = [dense_to_linop(np.eye(m)) for _ in range(nSlabs)]
-            T = [id_op(m,S_rk_list[0][0].dtype) for _ in range(nSlabs)]
+            T = [id_op(m, self._dtype) for _ in range(nSlabs)]
+        else:
+            T = self._normalize_diag(list(T), m)
         # At level 0, T operators are used directly without HBS compression.
-        # Deeper levels produce HBS objects via _build_level.
         T_hbs = T
 
         RB = [(SiM, T, T_hbs, SiP)]
@@ -422,38 +587,173 @@ class RedBlackSolverHBS(DirectSolver):
         l = nSlabs
         rk = self.rk
         while l > 1:
-            RB.append(self._build_level(m, l, RB[-1],rk))
-            rk = rk #+ 20
+            builder = self._build_level_fused if self.fused else self._build_level
+            RB.append(builder(m, l, RB[-1], rk))
+            rk = rk  # + 20
             l //= 2
 
         self.nSlabs = nSlabs
         self.RB     = RB
 
     # ------------------------------------------------------------------
-    # _build_level  -- mirrors build_block_RB_solver_level
+    # _build_level_fused  -- tier-2 shared solves
     # ------------------------------------------------------------------
 
-    def _build_level(self, m, nSlabs, RB_level,rk):
-        """
-        Eliminate all odd-indexed nodes and return a reduced level of length nSlabs//2.
-
-        Dense counterpart formulas:
-          B_i  = T[i] - SiM[i] @ T[i-1]^{-1} @ SiP[i-1]
-                       - SiP[i] @ T[i+1]^{-1} @ SiM[i+1]   (new diagonal, factorized)
-          A_i  = -SiM[i] @ T[i-1]^{-1} @ SiM[i-1]          (new left  off-diag)
-          C_i  = -SiP[i] @ T[i+1]^{-1} @ SiP[i+1]          (new right off-diag)
-        for even i = 0, 2, ..., nSlabs-2.
-
-        Returns (A_i, B_i, T_hbs_new, C_i) matching the dense (A_i, B_i, T_inv, C_i) layout.
-        """
+    def _build_level_fused(self, m, nSlabs, RB_level, rk):
         SiM   = RB_level[0]
         T     = RB_level[1]
         T_hbs = RB_level[2]
         SiP   = RB_level[3]
 
         cyclic = self.cyclic
+        dtype  = self._dtype
 
-        B_i      = []
+        s   = self._nsamples(rk)
+        Om  = self._rng.standard_normal(size=(m, s))
+        Psi = self._rng.standard_normal(size=(m, s))
+
+        # ---------------------------------------------------------------
+        # pass 1 -- eliminated (odd) nodes: one fused solve each
+        #
+        #   Xm_k = T_k^{-1} S^-_k Om   feeds B_{k-1} and A_{k+1}
+        #   Xp_k = T_k^{-1} S^+_k Om   feeds C_{k-1} and B_{k+1}
+        #
+        # Xp is skipped for the final odd node in the non-cyclic case: its two
+        # consumers are C_{nSlabs-2} (structurally zero, since S^+_{nSlabs-1}
+        # = 0) and B_{nSlabs}, which does not exist.
+        # ---------------------------------------------------------------
+        Xm, Xp = {}, {}
+        for k in range(1, nSlabs, 2):
+            need_p = cyclic or (k != nSlabs - 1)
+
+            if _is_id(T_hbs[k]):
+                # T_k^{-1} is a no-op, so there is no solve to fuse.  Going
+                # through the general path would allocate an m x 2s block,
+                # copy it inside id_op.solve, and slice it straight back
+                # apart -- pure overhead at level 0, which holds half of all
+                # eliminated nodes.
+                Xm[k] = self._ap(SiM[k], Om)
+                if need_p:
+                    Xp[k] = self._ap(SiP[k], Om)
+                self.nIdSkipped += 1
+                continue
+
+            cols = [self._ap(SiM[k], Om)]
+            if need_p:
+                cols.append(self._ap(SiP[k], Om))
+            RHS = cols[0] if len(cols) == 1 else np.concatenate(cols, axis=1)
+
+            X = self._sv(T_hbs[k], RHS)        # one solve, up to 2s columns
+            Xm[k] = X[:, :s]
+            if need_p:
+                Xp[k] = X[:, s:]
+
+        # ---------------------------------------------------------------
+        # pass 2 -- retained (even) nodes
+        # ---------------------------------------------------------------
+        B_i, T_hbs_new, A_i, C_i = [], [], [], []
+
+        for i in range(0, nSlabs, 2):
+            has_left  = cyclic or i > 0
+            has_right = cyclic or i < nSlabs - 1
+            kL = (i - 1) % nSlabs
+            kR = (i + 1) % nSlabs
+
+            # A_0 is zero exactly when there is no left neighbour.
+            # C_{nSlabs-2} is zero because S^+_{nSlabs-1} = 0, even though the
+            # right neighbour exists -- the asymmetry is because the zeroed
+            # SiM sits at an even index and the zeroed SiP at an odd one.
+            A_is_zero = (not cyclic) and i == 0
+            C_is_zero = (not cyclic) and i == nSlabs - 2
+
+            # T_i Om and T_i^T Psi are Om and Psi themselves when T_i = I.
+            # The updates below are out-of-place, so no copy is needed here.
+            if _is_id(T[i]):
+                Y_B, Z_B = Om, Psi
+                self.nIdSkipped += 1
+            else:
+                Y_B = self._ap(T[i], Om)
+                Z_B = self._apT(T[i], Psi)
+            Y_A = Y_C = Z_A = Z_C = None
+
+            if has_right:
+                # forward: one apply of S^+_i covering both B and C
+                cols = [Xm[kR]] if C_is_zero else [Xm[kR], Xp[kR]]
+                W = self._ap(SiP[i], cols[0] if len(cols) == 1
+                             else np.concatenate(cols, axis=1))
+                Y_B = Y_B - W[:, :s]
+                if not C_is_zero:
+                    Y_C = -W[:, s:]
+
+                # adjoint: t^+ = T_{i+1}^{-T} (S^+_i)^T Psi serves B and C
+                rhs_p = self._apT(SiP[i], Psi)
+                if _is_id(T_hbs[kR]):
+                    tp = rhs_p
+                    self.nIdSkipped += 1
+                else:
+                    tp = self._sv(T_hbs[kR], rhs_p, mode='T')
+                Z_B = Z_B - self._apT(SiM[kR], tp)
+                if not C_is_zero:
+                    Z_C = -self._apT(SiP[kR], tp)
+
+            if has_left:
+                # Xp first (B term), Xm second (A term)
+                W = self._ap(SiM[i], np.concatenate([Xp[kL], Xm[kL]], axis=1))
+                Y_B = Y_B - W[:, :s]
+                Y_A = -W[:, s:]
+
+                # adjoint: t^- = T_{i-1}^{-T} (S^-_i)^T Psi serves B and A
+                rhs_m = self._apT(SiM[i], Psi)
+                if _is_id(T_hbs[kL]):
+                    tm = rhs_m
+                    self.nIdSkipped += 1
+                else:
+                    tm = self._sv(T_hbs[kL], rhs_m, mode='T')
+                Z_B = Z_B - self._apT(SiP[kL], tm)
+                Z_A = -self._apT(SiM[kL], tm)
+
+            # Guard the degenerate case where neither branch ran: Y_B/Z_B
+            # would still alias Om/Psi, which construct would then receive as
+            # both the test matrix and its own samples.
+            if Y_B is Om:
+                Y_B = Om.copy()
+            if Z_B is Psi:
+                Z_B = Psi.copy()
+
+            # ---- compress from the shared samples ----------------------
+            B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_B, Z_B)
+            T_hbs_new.append(B_hbs)
+
+            if self.compress_diag:
+                B_i.append(B_hbs)
+            else:
+                spm = SiP[kL] if has_left  else None
+                smp = SiM[kR] if has_right else None
+                tmo = T_hbs[kL] if has_left  else None
+                tpo = T_hbs[kR] if has_right else None
+                B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
+
+            A_i.append(zero_op(m, dtype) if A_is_zero
+                       else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A))
+            C_i.append(zero_op(m, dtype) if C_is_zero
+                       else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C))
+
+        return (A_i, B_i, T_hbs_new, C_i)
+
+    # ------------------------------------------------------------------
+    # _build_level  -- original one-operator-at-a-time path (fused=False)
+    # ------------------------------------------------------------------
+
+    def _build_level(self, m, nSlabs, RB_level, rk):
+        SiM   = RB_level[0]
+        T     = RB_level[1]
+        T_hbs = RB_level[2]
+        SiP   = RB_level[3]
+
+        cyclic = self.cyclic
+        dtype  = self._dtype
+
+        B_i       = []
         T_hbs_new = []
 
         for i in range(0, nSlabs, 2):
@@ -462,28 +762,33 @@ class RedBlackSolverHBS(DirectSolver):
             tm  = T_hbs[(i - 1) % nSlabs] if spm is not None else None
             tp  = T_hbs[(i + 1) % nSlabs] if smp is not None else None
 
-            # B_i linop = T[i] - SiM[i]@T[i-1]^{-1}@SiP[i-1] - SiP[i]@T[i+1]^{-1}@SiM[i+1]
             B_linop = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
-            B_hbs   = self._hbs(B_linop,rk)
-            B_i.append(B_linop)       # keep as LinearOperator (mirrors dense T list)
-            T_hbs_new.append(B_hbs)   # factorized (mirrors lu_factor)
+            B_hbs   = self._hbs(B_linop, rk)
+            B_i.append(B_hbs if self.compress_diag else B_linop)
+            T_hbs_new.append(B_hbs)
 
-        # A_i = -SiM[i] @ T[i-1]^{-1} @ SiM[i-1]  for even i = 0,2,...
-        A_i = [
-            self._hbs(STS_linop(SiM[i], T_hbs[(i - 1) % nSlabs], SiM[(i - 1) % nSlabs]),rk)
-            for i in range(0, nSlabs, 2)
-        ]
+        A_i = []
+        for i in range(0, nSlabs, 2):
+            if (not cyclic) and i == 0:
+                A_i.append(zero_op(m, dtype))
+            else:
+                A_i.append(self._hbs(
+                    STS_linop(SiM[i], T_hbs[(i - 1) % nSlabs],
+                              SiM[(i - 1) % nSlabs]), rk))
 
-        # C_i = -SiP[i] @ T[i+1]^{-1} @ SiP[i+1]  for even i = 0,2,...
-        C_i = [
-            self._hbs(STS_linop(SiP[i], T_hbs[(i + 1) % nSlabs], SiP[(i + 1) % nSlabs]),rk)
-            for i in range(0, nSlabs, 2)
-        ]
+        C_i = []
+        for i in range(0, nSlabs, 2):
+            if (not cyclic) and i == nSlabs - 2:
+                C_i.append(zero_op(m, dtype))
+            else:
+                C_i.append(self._hbs(
+                    STS_linop(SiP[i], T_hbs[(i + 1) % nSlabs],
+                              SiP[(i + 1) % nSlabs]), rk))
 
         return (A_i, B_i, T_hbs_new, C_i)
 
     # ------------------------------------------------------------------
-    # solve  -- mirrors RedBlackSolver.solve
+    # solve
     # ------------------------------------------------------------------
 
     def solve(self, rhs):
@@ -491,8 +796,8 @@ class RedBlackSolverHBS(DirectSolver):
         RB = self.RB
 
         # ---- forward reduction ----------------------------------------
-        # Mirrors dense forward loop exactly; lu_solve(T_inv[k], v) -> T_hbs[k].solve(v)
         vPrimes = [rhs.copy()]
+        dtype   = np.result_type(np.asarray(rhs).dtype, self._dtype)
 
         for l in range(len(RB) - 1):
             SiM, _, T_hbs, SiP = RB[l]
@@ -500,7 +805,7 @@ class RedBlackSolverHBS(DirectSolver):
             nSlabs   = len(SiM)
             nReduced = nSlabs // 2
             vPrev    = vPrimes[-1]
-            vPrime   = np.zeros(m * nReduced)
+            vPrime   = np.zeros(m * nReduced, dtype=dtype)
 
             for j in range(nReduced):
                 i = 2 * j
@@ -523,11 +828,9 @@ class RedBlackSolverHBS(DirectSolver):
             vPrimes.append(vPrime)
 
         # ---- coarsest solve -------------------------------------------
-        # Mirrors:  vPrimes[-1] = lu_solve(RB[-1][2][0], vPrimes[-1])
         vPrimes[-1] = RB[-1][2][0].solve(vPrimes[-1])
 
         # ---- back substitution ----------------------------------------
-        # Mirrors dense back-sub exactly; lu_solve(Tinv[i+1], v) -> T_hbs[i+1].solve(v)
         for l in range(len(RB) - 1, 0, -1):
             SiM, _, T_hbs, SiP = RB[l - 1]
 
@@ -537,10 +840,8 @@ class RedBlackSolverHBS(DirectSolver):
             for j in range(nReduced):
                 i = 2 * j
 
-                # Copy even node solution down from coarser level
                 vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
 
-                # Recover odd node i+1
                 next_j = (j + 1) % nReduced
                 contrib = SiM[i+1].matmat(
                     vPrimes[l][j*m:(j+1)*m, np.newaxis]
