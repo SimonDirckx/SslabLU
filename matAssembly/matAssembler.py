@@ -88,13 +88,14 @@ class matAssembler:
     def assemble(self,stMap:solver.stMap,dbg=0):
         reduced = self.matOpts.reduced
         linOp = stMap.A
-
+        self.XXI = stMap.XXI
         print("MAT ASSEMBLER METHOD=%s" % self.matOpts.method) if dbg > 0 else None
         if self.matOpts.method == 'dense':
             tic = time.time()
             M=linOp@np.identity(linOp.shape[1])
             self.stats.timeSample = time.time()-tic
             self.stats.nbytes = M.nbytes
+            
             return M #linOp
         
         if self.matOpts.method == 'epsHBS':
