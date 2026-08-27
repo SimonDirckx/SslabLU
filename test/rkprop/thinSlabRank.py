@@ -425,7 +425,7 @@ for Lx in widths:
     tree = slabTree.slabTree(XXb[Jl], False, nleaf) if admissibility == 'weak' \
         else slabTree.slabTree(XXb[Jl], False, nleaf, adjacency=admissibility)
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    s = kmax*max(2*max(ranks), nl) + max(ranks) + 20      # samples for the largest rank
+    s = kmax*max(2*max(ranks), nl) + max(ranks) + max(20,max(ranks)//2)      # samples for the largest rank
 
     def sample_lr(Om_l, Om_r):
         """One stacked forward solve -> (Y_l, Y_r)."""
