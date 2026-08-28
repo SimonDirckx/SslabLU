@@ -67,12 +67,14 @@ that width -- so every rank is measured with exactly the oversampling a
 standalone compression at that rank would have given it, and no rank is
 flattered by a budget sized for a larger one.
 
-Device.  Om, Psi and the products Y, Z are built as torch tensors on
-cfg.device, because HBSMAT allocates its internals there and the construction
-mixes the two.  Their dtype follows torch.get_default_dtype(), which is what
-the untyped torch.zeros calls inside ULVsparse_torch allocate -- so if the
-process default is float32, every error here floors around 1e-7 regardless of
-rank.  Set torch.set_default_dtype(torch.float64) before running.
+Device.  Om, Psi, Y and Z are passed to construct as numpy arrays:
+constructHBS_ULV does its own torch.from_numpy(...).to(self.device), so it
+requires numpy and moves the samples itself.  Their dtype should match
+torch.get_default_dtype(), because the untyped torch.zeros calls inside
+ULVsparse_torch allocate at the process default and a float32 factor against a
+float64 sample raises rather than casts.  Set
+torch.set_default_dtype(torch.float64) before running; the header line prints
+the default so a mismatch is visible.
 """
 
 import csv
@@ -177,11 +179,6 @@ class ProbeConfig:
     def n_samples(self, rk):
         return n_samples(rk, self.nl, self.fac,
                          self.oversample, self.oversample_min)
-
-    def tensor(self, X):
-        """numpy -> torch, on the device and in the dtype HBSMAT expects."""
-        return torch.as_tensor(np.ascontiguousarray(X),
-                               dtype=self.torch_dtype, device=self.device)
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +322,12 @@ def sweep_solver(solver, cfg, label=None):
     # Construction samples: one draw at the widest budget any usable rank in the
     # grid asks for, shared by every block and every level.  Each rank slices the
     # leading cfg.n_samples(rk) columns out of it.  Drawn from the seeded rng, so
-    # unlike HBSMAT's internal path the whole study is reproducible.  Built on
-    # cfg.device: HBSMAT allocates its internals there and multiplies the two.
+    # unlike HBSMAT's internal path the whole study is reproducible.  Kept as
+    # numpy: constructHBS_ULV converts and moves them to self.device itself.
     usable = [rk for rk in cfg.rk_grid if rk < m]
     smax   = max((cfg.n_samples(rk) for rk in usable), default=0)
-    Om     = cfg.tensor(rng.standard_normal((m, smax))) if smax else None
-    Psi    = cfg.tensor(rng.standard_normal((m, smax))) if smax else None
+    Om     = rng.standard_normal((m, smax)) if smax else None
+    Psi    = rng.standard_normal((m, smax)) if smax else None
     if cfg.verbose and smax:
         print(f"    [{label}] samples: nl={cfg.nl} fac={cfg.fac}  "
               f"s = {cfg.n_samples(min(usable))} .. {smax}  "
@@ -350,8 +347,7 @@ def sweep_solver(solver, cfg, label=None):
         YZ = {}
         if cfg.cache_samples and smax:
             for b in lvl:
-                A_t     = cfg.tensor(b.dense)
-                YZ[b.key] = (A_t @ Om, A_t.T @ Psi)
+                YZ[b.key] = (b.dense @ Om, b.dense.T @ Psi)
 
         for rk in cfg.rk_grid:
             if rk >= m:
@@ -369,8 +365,7 @@ def sweep_solver(solver, cfg, label=None):
                     Y, Z = YZ[b.key]
                     Y, Z = Y[:, :s], Z[:, :s]
                 else:
-                    A_t  = cfg.tensor(b.dense)
-                    Y, Z = A_t @ Om[:, :s], A_t.T @ Psi[:, :s]
+                    Y, Z = b.dense @ Om[:, :s], b.dense.T @ Psi[:, :s]
 
                 H = HBSnew.HBSMAT(dense_to_linop(b.dense),
                                   device=cfg.device, tree=cfg.tree, quad=cfg.quad)
