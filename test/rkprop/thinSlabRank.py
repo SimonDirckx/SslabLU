@@ -425,7 +425,21 @@ for Lx in widths:
     tree = slabTree.slabTree(XXb[Jl], False, nleaf) if admissibility == 'weak' \
         else slabTree.slabTree(XXb[Jl], False, nleaf, adjacency=admissibility)
     nl = len(tree.get_box_inds(tree.get_leaves()[0]))
-    s = kmax*max(2*max(ranks), nl) + max(ranks) + max(20,max(ranks)//2)      # samples for the largest rank
+
+    def s_of(rk):
+        """Number of samples a standalone compression at rank `rk` would use.
+
+        kmax*max(2*rk, nl) covers the largest block a level can present (2*rk at
+        the coarse levels, nl at the leaves); +rk is the basis itself; the last
+        term is the oversampling, kept proportional to rk so that the ratio s/rk
+        does not collapse as the rank grows."""
+        return kmax*max(2*rk, nl) + rk + max(20, rk//2)
+
+    # One sampling round at the widest budget in the sweep.  Each rank then uses
+    # the leading s_of(rk) columns of it: the columns are i.i.d. Gaussian, so a
+    # prefix is a valid, independent sample set of that width, and every rank is
+    # measured with exactly the oversampling it would get on its own.
+    smax = s_of(max(ranks))
 
     def sample_lr(Om_l, Om_r):
         """One stacked forward solve -> (Y_l, Y_r)."""
@@ -462,13 +476,13 @@ for Lx in widths:
         return Z_l, Z_r
 
     tic = time.time()
-    Om_l = np.random.standard_normal((len(Jl), s))
-    Om_r = np.random.standard_normal((len(Jr), s))
-    Psi = np.random.standard_normal((ndofs_if, s))      # shared corange test matrix
+    Om_l = np.random.standard_normal((len(Jl), smax))
+    Om_r = np.random.standard_normal((len(Jr), smax))
+    Psi = np.random.standard_normal((ndofs_if, smax))   # shared corange test matrix
     Y_l, Y_r = sample_lr(Om_l, Om_r)
     Z_l, Z_r = adjoint_sample_lr(Psi)
     tSample = time.time()-tic
-    print("sampling time (", s, " samples) = ", tSample)
+    print("sampling time (", smax, " samples) = ", tSample)
 
     # reference blocks for the error study, computed while the factors are alive
     V = np.random.standard_normal((ndofs_if, ntest))
@@ -490,18 +504,19 @@ for Lx in widths:
             SSl = HBStorch_strong.HBSMAT(device=device, tree=tree)
             SSr = HBStorch_strong.HBSMAT(device=device, tree=tree)
 
+        s = min(s_of(rk), smax)          # this rank's own sample budget
         tic = time.time()
-        SSl.construct(rk, Om_l, Psi, Y_l, Z_l, fast=True)
-        SSr.construct(rk, Om_r, Psi, Y_r, Z_r, fast=True)
+        SSl.construct(rk, Om_l[:, :s], Psi[:, :s], Y_l[:, :s], Z_l[:, :s], fast=True)
+        SSr.construct(rk, Om_r[:, :s], Psi[:, :s], Y_r[:, :s], Z_r[:, :s], fast=True)
         tHBS = time.time()-tic
 
         err_l = np.linalg.norm(SSl@V - ref_l)/np.linalg.norm(ref_l)
         err_r = np.linalg.norm(SSr@V - ref_r)/np.linalg.norm(ref_r)
         mem_MB = (SSl.nbytes + SSr.nbytes)/1e6
 
-        print("Lx = %g  rank = %3d   err_l = %.3e   err_r = %.3e   "
+        print("Lx = %g  rank = %3d  s = %4d   err_l = %.3e   err_r = %.3e   "
               "mem = %.1f MB   t_HBS = %.2f s"
-              % (Lx, rk, err_l, err_r, mem_MB, tHBS))
+              % (Lx, rk, s, err_l, err_r, mem_MB, tHBS))
 
         header = ["type", "Lx", "ndofs_if", "nleaf", "admissibility", "kh",
                   "rank", "nsamples", "err_l", "err_r", "mem_MB",
