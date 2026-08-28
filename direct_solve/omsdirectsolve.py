@@ -5,6 +5,7 @@ import time
 import pickle
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import os
 np.set_printoptions(linewidth=200)
@@ -287,6 +288,26 @@ def Dprime_Linop(D, A, B, Dprev):
 # Base class
 # ---------------------------------------------------------------------------
 
+@dataclass
+class Block:
+    """One intermediate block of a factorization, kept for offline study.
+
+    kind separates blocks worth compressing ('general') from the structural
+    identities and zeros, which are recorded without a dense copy.
+    """
+    level: int
+    node:  int
+    role:  str            # 'sub' | 'diag' | 'super'
+    kind:  str            # 'general' | 'identity' | 'zero'
+    shape: tuple
+    dense: object = None
+
+    @property
+    def key(self):
+        """Identity of the slot this block occupies."""
+        return (self.level, self.node, self.role)
+
+
 class DirectSolver(ABC):
 
     def __init__(self, m, cyclic=False, save_levels=False):
@@ -342,9 +363,7 @@ class DirectSolver(ABC):
     def _log_block(self, level, node, role, op):
         """Record one intermediate block.
 
-        role is 'sub' | 'diag' | 'super'.  kind separates blocks worth studying
-        ('general') from the structural identities and zeros, which are stored
-        without a dense copy.
+        role is 'sub' | 'diag' | 'super'.
         """
         if not self.save_levels or op is None:
             return
@@ -354,7 +373,7 @@ class DirectSolver(ABC):
             kind = 'identity'
         else:
             kind = 'general'
-        self._blocks.append(dict(
+        self._blocks.append(Block(
             level = level,
             node  = node,
             role  = role,
@@ -374,13 +393,13 @@ class DirectSolver(ABC):
                 "No block log: construct the solver with save_levels=True.")
         out = self._blocks
         if level is not None:
-            out = [b for b in out if b['level'] == level]
+            out = [b for b in out if b.level == level]
         if node is not None:
-            out = [b for b in out if b['node'] == node]
+            out = [b for b in out if b.node == node]
         if role is not None:
-            out = [b for b in out if b['role'] == role]
+            out = [b for b in out if b.role == role]
         if kind is not None:
-            out = [b for b in out if b['kind'] == kind]
+            out = [b for b in out if b.kind == kind]
         return out
 
     @property
@@ -388,7 +407,7 @@ class DirectSolver(ABC):
         if self._blocks is None:
             raise RuntimeError(
                 "No block log: construct the solver with save_levels=True.")
-        return 1 + max(b['level'] for b in self._blocks)
+        return 1 + max(b.level for b in self._blocks)
 
     def get_block_op(self, level, node, role):
         """Live operator currently occupying a slot (see set_block_op)."""

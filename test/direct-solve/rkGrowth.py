@@ -66,13 +66,21 @@ A @ Om[:, :s] columnwise, and a prefix of an i.i.d. Gaussian is a valid draw of
 that width -- so every rank is measured with exactly the oversampling a
 standalone compression at that rank would have given it, and no rank is
 flattered by a budget sized for a larger one.
+
+Device.  Om, Psi and the products Y, Z are built as torch tensors on
+cfg.device, because HBSMAT allocates its internals there and the construction
+mixes the two.  Their dtype follows torch.get_default_dtype(), which is what
+the untyped torch.zeros calls inside ULVsparse_torch allocate -- so if the
+process default is float32, every error here floors around 1e-7 regardless of
+rank.  Set torch.set_default_dtype(torch.float64) before running.
 """
 
 import csv
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, astuple
 
 import numpy as np
+import torch
 
 import matAssembly.HBS.HBStorch as HBSnew
 import gen_HH_op_cube as HHcube
@@ -101,10 +109,10 @@ def nleaf_from_tree(tree):
 
 
 def make_rank_grid(nleaf, step=10):
-    """nleaf .. 2*nleaf inclusive, in steps of `step`."""
-    nleaf = int(nleaf)
+    """nleaf/2 .. 4*nleaf inclusive, in steps of `step`."""
+    nleaf    = int(nleaf)
     grid_max = 4 * nleaf
-    grid  = list(range(nleaf//2, grid_max + 1, step))
+    grid     = list(range(nleaf // 2, grid_max + 1, step))
     if grid[-1] != grid_max:
         grid.append(grid_max)
     return grid
@@ -124,11 +132,7 @@ def n_samples(rk, nl, fac, oversample=0.5, oversample_min=20):
 
 
 def default_device():
-    try:
-        import torch
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
-    except Exception:
-        return 'cpu'
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 @dataclass
@@ -138,22 +142,23 @@ class ProbeConfig:
     One tree/quad pair is reused for every block at every level, which is valid
     because the reduction keeps every block m x m.
     """
-    tree:          object
-    quad:          object
-    rk_grid:       list  = None      # defaults to nleaf .. 2*nleaf, step 5
-    step:          int   = 10
-    device:        str   = None
-    fast:          bool  = False
-    nprobe:        int   = 50        # columns for err_apply / err_solve
-    nrhs:          int   = 4         # right-hand sides for err_global
-    seed:          int   = 0
-    oversample:     float = 0.5      # p = max(oversample_min, oversample*rk)
+    tree:           object
+    quad:           object
+    rk_grid:        list  = None      # defaults to nleaf/2 .. 4*nleaf
+    step:           int   = 10
+    device:         str   = None      # 'cuda' when available
+    torch_dtype:    object = None     # defaults to torch.get_default_dtype()
+    fast:           bool  = False
+    nprobe:         int   = 50        # columns for err_apply / err_solve
+    nrhs:           int   = 4         # right-hand sides for err_global
+    seed:           int   = 0
+    oversample:     float = 0.5       # p = max(oversample_min, oversample*rk)
     oversample_min: int   = 20
-    cache_samples:  bool  = True     # keep A@Om per block for a level's rank loop
-    eps_list:      list  = field(default_factory=lambda: [1e-3,1e-4,1e-5,1e-6])
-    per_block_e2e: bool  = True
-    per_level_e2e: bool  = True
-    verbose:       bool  = True
+    cache_samples:  bool  = True      # keep A@Om per block for a level's rank loop
+    eps_list:       list  = field(default_factory=lambda: [1e-3, 1e-4, 1e-5, 1e-6])
+    per_block_e2e:  bool  = True
+    per_level_e2e:  bool  = True
+    verbose:        bool  = True
 
     def __post_init__(self):
         self.nl  = nleaf_from_tree(self.tree)
@@ -163,10 +168,62 @@ class ProbeConfig:
             self.rk_grid = make_rank_grid(self.nl, self.step)
         if self.device is None:
             self.device = default_device()
+        if self.torch_dtype is None:
+            # Match what HBSMAT allocates internally: the untyped torch.zeros
+            # calls in ULVsparse_torch follow the process default, and a
+            # float32 factor against a float64 sample raises rather than casts.
+            self.torch_dtype = torch.get_default_dtype()
 
     def n_samples(self, rk):
         return n_samples(rk, self.nl, self.fac,
                          self.oversample, self.oversample_min)
+
+    def tensor(self, X):
+        """numpy -> torch, on the device and in the dtype HBSMAT expects."""
+        return torch.as_tensor(np.ascontiguousarray(X),
+                               dtype=self.torch_dtype, device=self.device)
+
+
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Record:
+    """One (block, rank) measurement.  Field order is the CSV column order."""
+    solver:           str
+    level:            int
+    node:             int
+    role:             str
+    rk:               int
+    m:                int
+    nsamples:         int
+    block_norm:       float
+    err_apply:        float
+    err_solve:        float = None    # diagonal blocks only
+    err_global_block: float = None    # filled by the per-block substitution
+    err_global_level: float = None    # filled by the whole-level substitution
+    read_by_solve:    bool  = None
+
+    @property
+    def key(self):
+        return (self.solver, self.level, self.node, self.role)
+
+
+@dataclass
+class RankResult:
+    """Smallest rank clearing a tolerance, and whether it holds above it."""
+    rank:   int   = None      # None: the grid never cleared eps
+    stable: bool  = None      # do all larger ranks in the grid clear it too
+    best:   float = None      # smallest error seen anywhere on the grid
+
+
+@dataclass
+class BlockRef:
+    """Exact quantities for one block, computed once and reused every rank."""
+    apply: object              # A @ G
+    lu:    object = None       # diagonal blocks only
+    solve: object = None       # A^-1 R, diagonal blocks only
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +268,14 @@ def _detect_read_slots(solver, RHS, x_ref, blocks, rng):
     """
     read = {}
     for b in blocks:
-        key  = (b['level'], b['node'], b['role'])
-        m    = b['shape'][0]
-        junk = dense_to_linop(3.0 * np.eye(m) + rng.standard_normal((m, m)))
-        prev = solver.set_block_op(*key, junk)
+        junk = dense_to_linop(3.0 * np.eye(b.shape[0])
+                              + rng.standard_normal(b.shape))
+        prev = solver.set_block_op(*b.key, junk)
         try:
             e = _relerr(x_ref, solver.solve(RHS))
         finally:
-            solver.set_block_op(*key, prev)
-        read[key] = bool(e > 1e-12)
+            solver.set_block_op(*b.key, prev)
+        read[b.key] = bool(e > 1e-12)
     return read
 
 
@@ -236,7 +292,7 @@ def _system_size(solver):
 def sweep_solver(solver, cfg, label=None):
     """Compress every logged block at every rank in the grid and measure.
 
-    Returns a flat list of records, one per (level, node, role, rk).
+    Returns a flat list of Records, one per (level, node, role, rk).
     """
     from scipy.linalg import lu_factor, lu_solve
 
@@ -249,7 +305,7 @@ def sweep_solver(solver, cfg, label=None):
     R = rng.standard_normal((m, cfg.nprobe))
 
     blocks = solver.get_blocks()                    # 'general' only
-    levels = sorted({b['level'] for b in blocks})
+    levels = sorted({b.level for b in blocks})
 
     N        = _system_size(solver)
     RHS      = rng.standard_normal((N, cfg.nrhs))
@@ -261,26 +317,24 @@ def sweep_solver(solver, cfg, label=None):
     # Exact references per block, computed once.
     ref = {}
     for b in blocks:
-        key = (b['level'], b['node'], b['role'])
-        A   = b['dense']
-        r   = {'apply': A @ G, 'lu': None, 'solve': None}
-        if b['role'] == 'diag':
-            r['lu']    = lu_factor(A)
-            r['solve'] = lu_solve(r['lu'], R)
-        ref[key] = r
+        ref[b.key] = BlockRef(apply=b.dense @ G)
+        if b.role == 'diag':
+            ref[b.key].lu    = lu_factor(b.dense)
+            ref[b.key].solve = lu_solve(ref[b.key].lu, R)
 
     # Construction samples: one draw at the widest budget any usable rank in the
     # grid asks for, shared by every block and every level.  Each rank slices the
     # leading cfg.n_samples(rk) columns out of it.  Drawn from the seeded rng, so
-    # unlike HBSMAT's internal path the whole study is reproducible.
+    # unlike HBSMAT's internal path the whole study is reproducible.  Built on
+    # cfg.device: HBSMAT allocates its internals there and multiplies the two.
     usable = [rk for rk in cfg.rk_grid if rk < m]
     smax   = max((cfg.n_samples(rk) for rk in usable), default=0)
-    Om     = rng.standard_normal((m, smax)) if smax else None
-    Psi    = rng.standard_normal((m, smax)) if smax else None
+    Om     = cfg.tensor(rng.standard_normal((m, smax))) if smax else None
+    Psi    = cfg.tensor(rng.standard_normal((m, smax))) if smax else None
     if cfg.verbose and smax:
         print(f"    [{label}] samples: nl={cfg.nl} fac={cfg.fac}  "
               f"s = {cfg.n_samples(min(usable))} .. {smax}  "
-              f"(block size m = {m})")
+              f"(block size m = {m}, {cfg.device}, {cfg.torch_dtype})")
         if smax >= m:
             print(f"    [{label}] NOTE: s reaches {smax} >= m = {m} at the top "
                   f"of the grid; those ranks see the whole block.")
@@ -288,7 +342,7 @@ def sweep_solver(solver, cfg, label=None):
     records = []
 
     for level in levels:
-        lvl = [b for b in blocks if b['level'] == level]
+        lvl = [b for b in blocks if b.level == level]
 
         # Exact samples per block, once for this level's whole rank loop.
         # Y[:, :s] == A @ Om[:, :s] columnwise, so slicing these is the same as
@@ -296,8 +350,8 @@ def sweep_solver(solver, cfg, label=None):
         YZ = {}
         if cfg.cache_samples and smax:
             for b in lvl:
-                key     = (b['level'], b['node'], b['role'])
-                YZ[key] = (b['dense'] @ Om, b['dense'].T @ Psi)
+                A_t     = cfg.tensor(b.dense)
+                YZ[b.key] = (A_t @ Om, A_t.T @ Psi)
 
         for rk in cfg.rk_grid:
             if rk >= m:
@@ -306,63 +360,54 @@ def sweep_solver(solver, cfg, label=None):
                           f">= block size {m}")
                 continue
 
-            t0         = time.time()
-            compressed = {}
-            s          = min(cfg.n_samples(rk), smax)
+            t0   = time.time()
+            s    = min(cfg.n_samples(rk), smax)
+            rows = []          # (block, record, compressed) for this rank
 
             for b in lvl:
-                key = (b['level'], b['node'], b['role'])
-
-                if key in YZ:
-                    Y, Z = YZ[key]
+                if b.key in YZ:
+                    Y, Z = YZ[b.key]
                     Y, Z = Y[:, :s], Z[:, :s]
                 else:
-                    Y = b['dense'] @ Om[:, :s]
-                    Z = b['dense'].T @ Psi[:, :s]
+                    A_t  = cfg.tensor(b.dense)
+                    Y, Z = A_t @ Om[:, :s], A_t.T @ Psi[:, :s]
 
-                H = HBSnew.HBSMAT(dense_to_linop(b['dense']),
+                H = HBSnew.HBSMAT(dense_to_linop(b.dense),
                                   device=cfg.device, tree=cfg.tree, quad=cfg.quad)
                 H.construct(rk, Om[:, :s], Psi[:, :s], Y, Z,
                             compute_ULV=True, fast=cfg.fast)
-                compressed[key] = H
 
-                records.append(dict(
-                    solver=label, level=level, node=b['node'], role=b['role'],
+                rec = Record(
+                    solver=label, level=level, node=b.node, role=b.role,
                     rk=rk, m=m, nsamples=s,
-                    block_norm=float(np.linalg.norm(b['dense'])),
-                    err_apply=err_apply(b['dense'], H, G, ref[key]['apply']),
-                    err_solve=(err_solve(ref[key]['lu'], H, R, ref[key]['solve'])
-                               if b['role'] == 'diag' else None),
-                    err_global_block=None,
-                    err_global_level=None,
-                    read_by_solve=read.get(key)))
+                    block_norm=float(np.linalg.norm(b.dense)),
+                    err_apply=err_apply(b.dense, H, G, ref[b.key].apply),
+                    err_solve=(err_solve(ref[b.key].lu, H, R, ref[b.key].solve)
+                               if b.role == 'diag' else None),
+                    read_by_solve=read.get(b.key))
+
+                records.append(rec)
+                rows.append((b, rec, H))
 
             # ---- per-block substitution --------------------------------
             if cfg.per_block_e2e:
-                for b in lvl:
-                    key  = (b['level'], b['node'], b['role'])
-                    prev = solver.set_block_op(*key, compressed[key])
+                for b, rec, H in rows:
+                    prev = solver.set_block_op(*b.key, H)
                     try:
-                        e = _relerr(x_ref, solver.solve(RHS))
+                        rec.err_global_block = _relerr(x_ref, solver.solve(RHS))
                     finally:
-                        solver.set_block_op(*key, prev)
-                    for rec in records[-len(lvl):]:
-                        if (rec['node'], rec['role']) == (b['node'], b['role']):
-                            rec['err_global_block'] = e
+                        solver.set_block_op(*b.key, prev)
 
             # ---- whole-level substitution ------------------------------
             if cfg.per_level_e2e:
-                saved = []
-                for b in lvl:
-                    key = (b['level'], b['node'], b['role'])
-                    saved.append((key, solver.set_block_op(*key, compressed[key])))
+                saved = [(b, solver.set_block_op(*b.key, H)) for b, _, H in rows]
                 try:
                     e_lvl = _relerr(x_ref, solver.solve(RHS))
                 finally:
-                    for key, prev in saved:
-                        solver.set_block_op(*key, prev)
-                for rec in records[-len(lvl):]:
-                    rec['err_global_level'] = e_lvl
+                    for b, prev in saved:
+                        solver.set_block_op(*b.key, prev)
+                for _, rec, _ in rows:
+                    rec.err_global_level = e_lvl
 
             if cfg.verbose:
                 print(f"    [{label}] level {level:>2}  rk={rk:>4}  s={s:>5}  "
@@ -377,51 +422,45 @@ def sweep_solver(solver, cfg, label=None):
 # Summary
 # ---------------------------------------------------------------------------
 
-def minimal_ranks(records, metric, eps):
-    """Smallest rank in the grid whose error clears eps, per block.
+def _first_clearing(pairs, eps):
+    """(rank, error) pairs -> RankResult.
 
-    Also flags whether every larger rank in the grid clears it too: the
-    construction is randomized, so a lone passing rank below a run of failures
-    is luck, not a sufficient rank.
+    The construction is randomized, so a lone passing rank below a run of
+    failures is luck; `stable` records whether every larger rank clears eps too.
     """
-    out  = {}
-    keyf = lambda r: (r['solver'], r['level'], r['node'], r['role'])
-    for key in {keyf(r) for r in records}:
-        rows = sorted([r for r in records if keyf(r) == key], key=lambda r: r['rk'])
-        vals = [(r['rk'], r[metric]) for r in rows
-                if r[metric] is not None and not np.isnan(r[metric])]
-        if not vals:
-            out[key] = dict(rank=None, stable=None, best=None)
-            continue
-        passing = [rk for rk, e in vals if e <= eps]
-        best    = min(e for _, e in vals)
-        if not passing:
-            out[key] = dict(rank=None, stable=False, best=best)
-        else:
-            rk0    = min(passing)
-            stable = all(e <= eps for rk, e in vals if rk >= rk0)
-            out[key] = dict(rank=rk0, stable=stable, best=best)
+    pairs = sorted(p for p in pairs if p[1] is not None and not np.isnan(p[1]))
+    if not pairs:
+        return RankResult()
+    best    = min(e for _, e in pairs)
+    passing = [rk for rk, e in pairs if e <= eps]
+    if not passing:
+        return RankResult(rank=None, stable=False, best=best)
+    rk0 = min(passing)
+    return RankResult(rank=rk0, best=best,
+                      stable=all(e <= eps for rk, e in pairs if rk >= rk0))
+
+
+def minimal_ranks(records, metric, eps):
+    """Smallest rank clearing eps, per block."""
+    out = {}
+    for key in {r.key for r in records}:
+        out[key] = _first_clearing(
+            [(r.rk, getattr(r, metric)) for r in records if r.key == key], eps)
     return out
 
 
 def level_ranks(records, eps, metric='err_global_level'):
     """Smallest rank at which a whole level clears eps."""
     out = {}
-    for solver in {r['solver'] for r in records}:
-        for level in sorted({r['level'] for r in records if r['solver'] == solver}):
-            rows = sorted({(r['rk'], r[metric]) for r in records
-                           if r['solver'] == solver and r['level'] == level
-                           and r[metric] is not None})
-            passing = [rk for rk, e in rows if e <= eps]
-            best    = min([e for _, e in rows], default=None)
-            out[(solver, level)] = dict(
-                rank=min(passing) if passing else None,
-                best=best)
+    for key in {(r.solver, r.level) for r in records}:
+        out[key] = _first_clearing(
+            {(r.rk, getattr(r, metric)) for r in records
+             if (r.solver, r.level) == key}, eps)
     return out
 
 
 def print_summary(records, cfg):
-    solvers = sorted({r['solver'] for r in records})
+    solvers = sorted({r.solver for r in records})
     for eps in cfg.eps_list:
         print(f"\n=== sufficient rank at eps = {eps:g} " + "=" * 40)
 
@@ -433,24 +472,22 @@ def print_summary(records, cfg):
             print(f"\n  {s}")
             print(f"    {'level':>5} {'blocks':>7} {'apply':>14} "
                   f"{'solve(diag)':>14} {'whole level':>12}")
-            levels = sorted({r['level'] for r in records if r['solver'] == s})
-            for l in levels:
-                keys = [k for k in per_block if k[0] == s and k[1] == l]
-                ap   = [per_block[k]['rank'] for k in keys]
-                sv   = [per_solve[k]['rank'] for k in keys
-                        if k[3] == 'diag' and per_solve[k]['rank'] is not None]
+            for l in sorted({r.level for r in records if r.solver == s}):
+                keys  = [k for k in per_block if k[0] == s and k[1] == l]
+                ap    = [per_block[k].rank for k in keys]
+                sv    = [per_solve[k].rank for k in keys
+                         if k[3] == 'diag' and per_solve[k].rank is not None]
                 nfail = sum(1 for v in ap if v is None)
-                ap_s = ('-' if all(v is None for v in ap)
-                        else f"{max(v for v in ap if v is not None)}"
-                             + (f" (+{nfail} fail)" if nfail else ""))
-                sv_s = f"{max(sv)}" if sv else '-'
-                lv   = per_level.get((s, l), {}).get('rank')
+                ap_s  = ('-' if all(v is None for v in ap)
+                         else f"{max(v for v in ap if v is not None)}"
+                              + (f" (+{nfail} fail)" if nfail else ""))
+                sv_s  = f"{max(sv)}" if sv else '-'
+                lv    = per_level[(s, l)].rank if (s, l) in per_level else None
                 print(f"    {l:>5} {len(keys):>7} {ap_s:>14} {sv_s:>14} "
                       f"{(lv if lv is not None else '-'):>12}")
 
     # blocks the solve never reads, worth stating once
-    unread = sorted({(r['solver'], r['level'], r['node'], r['role'])
-                     for r in records if r['read_by_solve'] is False})
+    unread = sorted({r.key for r in records if r.read_by_solve is False})
     if unread:
         print(f"\n  {len(unread)} block(s) are never read by the solve, so their "
               f"per-block err_global is 0 by construction.")
@@ -458,14 +495,11 @@ def print_summary(records, cfg):
 
 
 def write_csv(records, path):
-    cols = ['solver', 'level', 'node', 'role', 'rk', 'm', 'nsamples',
-            'block_norm', 'err_apply', 'err_solve', 'err_global_block',
-            'err_global_level', 'read_by_solve']
     with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
+        w = csv.writer(f)
+        w.writerow([fl.name for fl in fields(Record)])
         for r in records:
-            w.writerow({c: r.get(c) for c in cols})
+            w.writerow(astuple(r))
     return path
 
 
@@ -478,16 +512,15 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
     """Factorize densely, then sweep HBS ranks over every intermediate block.
 
     S_rk_list : list of (S^-_i, S^+_i) pairs, dense arrays or LinearOperators.
-    m         : block size.
     cfg       : ProbeConfig, carrying the tree/quad the compressions use.
     T         : optional diagonal list; None means the identity diagonal.
     """
     m = S_rk_list[0][0].shape[0]
     print(f"rank grid: {cfg.rk_grid}   (block size m = {m}, "
-          f"device = {cfg.device})")
+          f"device = {cfg.device}, dtype = {cfg.torch_dtype})")
     print(f"sampling: s(rk) = max({cfg.fac}*rk, {cfg.nl}) + rk + "
           f"max({cfg.oversample_min}, {cfg.oversample:g}*rk)")
-    
+
     records = []
     for which in solvers:
         if which == 'redblack':
@@ -508,12 +541,15 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
         write_csv(records, csv_path)
         print(f"\nwrote {csv_path} ({len(records)} rows)")
     return records
+
+
 def main():
     N = 17
     H = 1/N
-    S_rk_list,tree = HHcube.get_HH_op_cube(25.,N,8,np.array([H/4,1./16,1./16]))
-    cfg  = ProbeConfig(tree,quad=False)
-    run_study(S_rk_list,cfg=cfg,csv_path="rank_growth.csv")
+    S_rk_list, tree = HHcube.get_HH_op_cube(25., N, 8, np.array([H/4, 1./16, 1./16]))
+    cfg = ProbeConfig(tree, quad=False)
+    run_study(S_rk_list, cfg=cfg, csv_path="rank_growth.csv")
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
