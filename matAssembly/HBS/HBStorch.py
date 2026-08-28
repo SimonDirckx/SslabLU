@@ -333,8 +333,7 @@ class HBSMAT:
                     self.Dmats+=[D_ell]                  
                 else:
                     self.Dmats+=[D_ell.cpu().pin_memory()]
-                U_ell = torch.eye(D_ell.shape[1])
-                U_ell = U_ell[None,:,:]
+                U_ell = torch.eye(D_ell.shape[1], dtype=D_ell.dtype,device=self.device)[None, :, :]
             
             if lvl==self.L-1:
                     Rhat = D_ell
