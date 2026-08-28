@@ -50,6 +50,22 @@ rank each exact block needs to be representable, not the rank a fully
 compressed solver would need to stay stable.  That is the ladder experiment.
 
 Non-cyclic only.
+
+Sampling.  The HBS construction is randomized, so the samples it is built from
+are drawn HERE rather than left to HBSMAT's internal default.  Two reasons.
+First, the internal path re-draws for every rank, so consecutive points on a
+rank curve would differ by the realization of Om as well as by the rank -- the
+very noise the `stable` flag in minimal_ranks exists to detect.  Second, its
+oversampling is a constant +10 regardless of rank, so the ratio s/rk collapses
+as the rank grows and the high-rank end of every curve is sample-starved.
+
+Instead: one Gaussian pair (Om, Psi) is drawn per solver at the widest budget
+the rank grid needs, shared by every block at every level, and each rank uses
+the leading n_samples(rk) columns of it.  Slicing is exact -- Y[:, :s] is
+A @ Om[:, :s] columnwise, and a prefix of an i.i.d. Gaussian is a valid draw of
+that width -- so every rank is measured with exactly the oversampling a
+standalone compression at that rank would have given it, and no rank is
+flattered by a budget sized for a larger one.
 """
 
 import csv
@@ -68,7 +84,16 @@ from direct_solve.omsdirectsolve import ThomasSolver, RedBlackSolver, dense_to_l
 # ---------------------------------------------------------------------------
 
 def nleaf_from_tree(tree):
-    """DOFs per leaf, the same attribute HBSMAT's own sample count keys off."""
+    """DOFs per leaf.
+
+    Prefer the actual size of a leaf box, which is what HBSMAT itself uses
+    (self.nl = len(perm)//Nb); _min_leaf_size is only the threshold that
+    stopped the splitting and can be larger than any leaf really is.
+    """
+    try:
+        return int(len(tree.get_box_inds(tree.get_leaves()[0])))
+    except Exception:
+        pass
     n = getattr(tree, '_min_leaf_size', None)
     if n is None:
         raise ValueError("tree has no _min_leaf_size; pass rk_grid explicitly.")
@@ -83,6 +108,19 @@ def make_rank_grid(nleaf, step=10):
     if grid[-1] != grid_max:
         grid.append(grid_max)
     return grid
+
+
+def n_samples(rk, nl, fac, oversample=0.5, oversample_min=20):
+    """Samples a standalone HBS compression at rank `rk` would use.
+
+    max(fac*rk, nl) is the largest block a level presents: fac*rk at the coarse
+    levels (fac = 2 for a binary tree, 4 for a quad tree, since that is how many
+    children the reduction stacks), nl at the leaves.  +rk is the basis itself.
+    The last term is the oversampling, held proportional to rk so that s/rk does
+    not collapse as the rank grows.
+    """
+    return (max(int(fac)*int(rk), int(nl)) + int(rk)
+            + max(int(oversample_min), int(oversample*rk)))
 
 
 def default_device():
@@ -106,19 +144,29 @@ class ProbeConfig:
     step:          int   = 10
     device:        str   = None
     fast:          bool  = False
-    nprobe:        int   = 20        # columns for err_apply / err_solve
+    nprobe:        int   = 50        # columns for err_apply / err_solve
     nrhs:          int   = 4         # right-hand sides for err_global
     seed:          int   = 0
+    oversample:     float = 0.5      # p = max(oversample_min, oversample*rk)
+    oversample_min: int   = 20
+    cache_samples:  bool  = True     # keep A@Om per block for a level's rank loop
     eps_list:      list  = field(default_factory=lambda: [1e-3,1e-4,1e-5,1e-6])
     per_block_e2e: bool  = True
     per_level_e2e: bool  = True
     verbose:       bool  = True
 
     def __post_init__(self):
+        self.nl  = nleaf_from_tree(self.tree)
+        # how many children the HBS reduction stacks per level
+        self.fac = 4 if self.quad else 2
         if self.rk_grid is None:
-            self.rk_grid = make_rank_grid(nleaf_from_tree(self.tree), self.step)
+            self.rk_grid = make_rank_grid(self.nl, self.step)
         if self.device is None:
             self.device = default_device()
+
+    def n_samples(self, rk):
+        return n_samples(rk, self.nl, self.fac,
+                         self.oversample, self.oversample_min)
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +269,36 @@ def sweep_solver(solver, cfg, label=None):
             r['solve'] = lu_solve(r['lu'], R)
         ref[key] = r
 
+    # Construction samples: one draw at the widest budget any usable rank in the
+    # grid asks for, shared by every block and every level.  Each rank slices the
+    # leading cfg.n_samples(rk) columns out of it.  Drawn from the seeded rng, so
+    # unlike HBSMAT's internal path the whole study is reproducible.
+    usable = [rk for rk in cfg.rk_grid if rk < m]
+    smax   = max((cfg.n_samples(rk) for rk in usable), default=0)
+    Om     = rng.standard_normal((m, smax)) if smax else None
+    Psi    = rng.standard_normal((m, smax)) if smax else None
+    if cfg.verbose and smax:
+        print(f"    [{label}] samples: nl={cfg.nl} fac={cfg.fac}  "
+              f"s = {cfg.n_samples(min(usable))} .. {smax}  "
+              f"(block size m = {m})")
+        if smax >= m:
+            print(f"    [{label}] NOTE: s reaches {smax} >= m = {m} at the top "
+                  f"of the grid; those ranks see the whole block.")
+
     records = []
 
     for level in levels:
         lvl = [b for b in blocks if b['level'] == level]
+
+        # Exact samples per block, once for this level's whole rank loop.
+        # Y[:, :s] == A @ Om[:, :s] columnwise, so slicing these is the same as
+        # sampling at width s.
+        YZ = {}
+        if cfg.cache_samples and smax:
+            for b in lvl:
+                key     = (b['level'], b['node'], b['role'])
+                YZ[key] = (b['dense'] @ Om, b['dense'].T @ Psi)
+
         for rk in cfg.rk_grid:
             if rk >= m:
                 if cfg.verbose:
@@ -234,18 +308,27 @@ def sweep_solver(solver, cfg, label=None):
 
             t0         = time.time()
             compressed = {}
+            s          = min(cfg.n_samples(rk), smax)
 
             for b in lvl:
                 key = (b['level'], b['node'], b['role'])
 
+                if key in YZ:
+                    Y, Z = YZ[key]
+                    Y, Z = Y[:, :s], Z[:, :s]
+                else:
+                    Y = b['dense'] @ Om[:, :s]
+                    Z = b['dense'].T @ Psi[:, :s]
+
                 H = HBSnew.HBSMAT(dense_to_linop(b['dense']),
                                   device=cfg.device, tree=cfg.tree, quad=cfg.quad)
-                H.construct(rk, compute_ULV=True, fast=cfg.fast)
+                H.construct(rk, Om[:, :s], Psi[:, :s], Y, Z,
+                            compute_ULV=True, fast=cfg.fast)
                 compressed[key] = H
 
                 records.append(dict(
                     solver=label, level=level, node=b['node'], role=b['role'],
-                    rk=rk, m=m,
+                    rk=rk, m=m, nsamples=s,
                     block_norm=float(np.linalg.norm(b['dense'])),
                     err_apply=err_apply(b['dense'], H, G, ref[key]['apply']),
                     err_solve=(err_solve(ref[key]['lu'], H, R, ref[key]['solve'])
@@ -282,8 +365,10 @@ def sweep_solver(solver, cfg, label=None):
                     rec['err_global_level'] = e_lvl
 
             if cfg.verbose:
-                print(f"    [{label}] level {level:>2}  rk={rk:>4}  "
+                print(f"    [{label}] level {level:>2}  rk={rk:>4}  s={s:>5}  "
                       f"{len(lvl)} blocks  {time.time()-t0:6.2f}s")
+
+        YZ.clear()
 
     return records
 
@@ -373,9 +458,9 @@ def print_summary(records, cfg):
 
 
 def write_csv(records, path):
-    cols = ['solver', 'level', 'node', 'role', 'rk', 'm', 'block_norm',
-            'err_apply', 'err_solve', 'err_global_block', 'err_global_level',
-            'read_by_solve']
+    cols = ['solver', 'level', 'node', 'role', 'rk', 'm', 'nsamples',
+            'block_norm', 'err_apply', 'err_solve', 'err_global_block',
+            'err_global_level', 'read_by_solve']
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -400,6 +485,8 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
     m = S_rk_list[0][0].shape[0]
     print(f"rank grid: {cfg.rk_grid}   (block size m = {m}, "
           f"device = {cfg.device})")
+    print(f"sampling: s(rk) = max({cfg.fac}*rk, {cfg.nl}) + rk + "
+          f"max({cfg.oversample_min}, {cfg.oversample:g}*rk)")
     
     records = []
     for which in solvers:
