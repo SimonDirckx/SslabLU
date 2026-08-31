@@ -247,8 +247,8 @@ class HBSMAT:
             
             if lvl>0:
                 tic = time.time()
-                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
-                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
                 self.nullTime+=time.time()-tic
                 tic = time.time()
                 D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
@@ -316,8 +316,8 @@ class HBSMAT:
             #print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
-                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device)
-                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device)
+                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
+                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
                 tic = time.time()
                 D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
                 self.DTime+= time.time()-tic
@@ -353,8 +353,8 @@ class HBSMAT:
             else:
                 Uhat = ULVsparse.sparse_block_mult_tens(Uhat,U_ell,device=self.device)
             
-            Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:-rk],Uhat,device=self.device,mode='T')
-            Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rk:],Uhat,device=self.device,mode='T')
+            Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:-rkm],Uhat,device=self.device,mode='T')
+            Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rkm:],Uhat,device=self.device,mode='T')
             self.Uulist+=[Uu]
             Uhat=Ud
         self.tCompress = time.time()-tic

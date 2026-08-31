@@ -150,7 +150,7 @@ class ProbeConfig:
     step:           int   = 10
     device:         str   = None      # 'cuda' when available
     torch_dtype:    object = None     # defaults to torch.get_default_dtype()
-    fast:           bool  = False
+    fast:           bool  = True
     nprobe:         int   = 50        # columns for err_apply / err_solve
     nrhs:           int   = 4         # right-hand sides for err_global
     seed:           int   = 0
