@@ -112,9 +112,23 @@ class lu_op(LinearOperator):
     applies the old `lu_solve(B[-1], I)` / `reconstruct_from_lu_factor` path
     cost.  `solve` carries the mode='N' | 'T' convention used by HBSMAT.solve,
     so call sites here and in the HBS module are textually the same.
+
+
+    Materializing the block and factorizing it are separate costs, and most
+    blocks in both solvers here need only the first: every off-diagonal is
+    applied but never inverted, and under cyclic reduction so is half of every
+    level's diagonals.  `factor=False` therefore builds the operator without an
+    LU.  The LU is still computed on demand if `solve` is called anyway, so a
+    mis-set flag costs a factorization at solve time rather than correctness;
+    `n_lazy` counting up is the signal that a `factor=False` was wrong.
     """
 
-    def __init__(self, op, dtype=None):
+    # class-level tallies so a driver can check the factorization count
+    n_eager   = 0    # LUs built at construction
+    n_lazy    = 0    # LUs forced later by an unexpected solve
+    n_deferred = 0   # operators built with factor=False
+
+    def __init__(self, op, dtype=None, factor=True):
         if isinstance(op, np.ndarray):
             A = np.array(op, copy=True)
         else:
@@ -126,7 +140,12 @@ class lu_op(LinearOperator):
 
         super().__init__(shape=A.shape, dtype=A.dtype)
         self._A   = A
-        self._lu  = lu_factor(A, overwrite_a=False)
+        if factor:
+            self._lu = lu_factor(A, overwrite_a=False)
+            lu_op.n_eager += 1
+        else:
+            self._lu = None
+            lu_op.n_deferred += 1
         self.tree = getattr(op, "tree", None)
         self.quad = getattr(op, "quad", None)
 
@@ -135,8 +154,27 @@ class lu_op(LinearOperator):
     def _rmatvec(self, v): return self._A.T @ v
     def _rmatmat(self, V): return self._A.T @ V
 
+    @property
+    def is_factored(self):
+        return self._lu is not None
+
+    def ensure_factored(self, _lazy=True):
+        """Build the LU if it is not there yet; returns self."""
+        if self._lu is None:
+            self._lu = lu_factor(self._A, overwrite_a=False)
+            if _lazy:
+                lu_op.n_lazy += 1
+            else:
+                lu_op.n_eager += 1
+            lu_op.n_deferred -= 1
+        return self
+
+    @property
+    def lu(self):
+        return self.ensure_factored()._lu
+
     def solve(self, v, mode='N'):
-        return lu_solve(self._lu, v, trans=0 if mode == 'N' else 1)
+        return lu_solve(self.lu, v, trans=0 if mode == 'N' else 1)
 
     def construct(self, *args, **kwargs):
         """No-op, for API parity with HBSMAT.construct; the LU is already built."""
@@ -165,13 +203,24 @@ def _as_op(x):
     Existing dense call sites hand these routines plain m x m arrays while the
     HBS call sites hand them HBS operators; ingesting through this keeps both
     working without branching further down.
+
+    Wrapped with factor=False: these are off-diagonal blocks, which every
+    solver in this module applies and none inverts.  Factorizing them here cost
+    2*nSlabs LUs per factorize() that were never used.  lu_op still builds one
+    on demand should anything actually call .solve.
     """
-    return lu_op(x) if isinstance(x, np.ndarray) else x
+    return lu_op(x, factor=False) if isinstance(x, np.ndarray) else x
 
 
-def _as_solvable(op):
-    """Return something exposing .solve, factorizing densely if it does not."""
-    return op if hasattr(op, "solve") else lu_op(op)
+def _as_solvable(op, factor=True):
+    """Return something exposing .solve, factorizing densely if it does not.
+
+    factor=False defers the LU; the caller is then responsible for calling
+    ensure_factored() on the entries it knows will be inverted.
+    """
+    if hasattr(op, "solve"):
+        return op
+    return lu_op(op, factor=factor)
 
 
 def STS_linop(Sl, T, Sr):
@@ -804,13 +853,43 @@ class RedBlackSolver(DirectSolver):
         self.nSolve     = 0
         self.nApply     = 0
         self.nIdSkipped = 0
+        # factorization bookkeeping; see _needs_factor
+        self.nLU        = 0     # blocks materialized *and* LU-factorized
+        self.nLUSkipped = 0     # blocks materialized, apply-only
 
     # ------------------------------------------------------------------
 
-    def _factor(self, A):
-        """Dense LU of a materialized block; the counterpart of _hbs."""
+    @staticmethod
+    def _needs_factor(i, nSlabs):
+        """Does retained node `i` of a level of size `nSlabs` need an LU?
+
+        Only eliminated diagonals are ever inverted.  Retained node i becomes
+        child j = i // 2 one level down, and only odd j are eliminated there,
+        so an LU is needed iff j is odd, i.e. i % 4 == 2.  The exception is the
+        coarsest level: when nSlabs == 2 the single surviving child j = 0 is
+        inverted directly by `solve`.
+
+        Everything else is materialized for its applies only.  With an identity
+        level-0 diagonal this brings the count to
+
+            sum_{l=1}^{L-1} N/2^(l+1)  +  1  =  N/2
+
+        against N-1 unconditional LUs on the Schur diagonals, plus the 2N that
+        _as_op used to spend on off-diagonals.
+        """
+        return (i % 4 == 2) or (nSlabs == 2)
+
+    def _factor(self, A, factor=True):
+        """Dense LU of a materialized block; the counterpart of _hbs.
+
+        factor=False materializes without factorizing; see _needs_factor.
+        """
         self.nConstruct += 1
-        return lu_op(A)
+        if factor:
+            self.nLU += 1
+        else:
+            self.nLUSkipped += 1
+        return lu_op(A, factor=factor)
 
     def _densify(self, op):
         """Materialize an operator against the identity."""
@@ -888,7 +967,16 @@ class RedBlackSolver(DirectSolver):
             T = self._normalize_diag([_as_op(_) for _ in T], m)
         # At level 0 the diagonals are used as given; _as_solvable only has work
         # to do if a caller passed a bare LinearOperator with no .solve.
-        T_fac = [_as_solvable(_) for _ in T]
+        # Deferred: at level 0 only the odd (eliminated) diagonals are ever
+        # inverted, so the even ones are left unfactorized.  When T is None
+        # they are id_op and none of this costs anything either way.
+        T_fac = [_as_solvable(_, factor=False) for _ in T]
+        for k in range(1, nSlabs, 2):
+            if isinstance(T_fac[k], lu_op):
+                T_fac[k].ensure_factored(_lazy=False)
+                self.nLU += 1
+        self.nLUSkipped += sum(1 for k in range(0, nSlabs, 2)
+                               if isinstance(T_fac[k], lu_op))
 
         RB = [(SiM, T, T_fac, SiP)]
 
@@ -991,7 +1079,10 @@ class RedBlackSolver(DirectSolver):
         if len(B_dense) == 1 and cyclic:
             B_dense[0] = B_dense[0] + A_dense[0] + C_dense[0]
 
-        T_fac_new = [self._factor(_) for _ in B_dense]
+        # Only the diagonals that get eliminated at the next level -- plus the
+        # coarsest survivor -- are ever inverted; see _needs_factor.
+        T_fac_new = [self._factor(Bd, factor=self._needs_factor(2 * j, nSlabs))
+                     for j, Bd in enumerate(B_dense)]
         B_i       = T_fac_new if self.compress_diag else B_linops
 
         A_i = [zero_op(m, dtype) if _ is None else dense_to_linop(_) for _ in A_dense]
