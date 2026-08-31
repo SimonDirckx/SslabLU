@@ -105,10 +105,7 @@ class matAssembler:
             start = time.time()
             quad = False # currently only binary trees supported
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
-            if  torch.cuda.is_available():
-                device = torch.cuda.get_device_name()
-            else:
-                device = 'cpu'
+            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
             s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
             Om = np.random.standard_normal((linOp.shape[0],s))
