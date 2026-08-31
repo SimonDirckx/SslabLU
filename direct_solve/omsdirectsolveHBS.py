@@ -52,6 +52,28 @@ class zero_op(LinearOperator):
         )
 
 
+class dead_op:
+    """Placeholder for a diagonal slot that provably has no consumer.
+
+    Occupies its position in T_hbs so that indexing stays uniform, and raises
+    on every operation so that a consumer missed by the analysis in
+    RedBlackSolverHBS surfaces as an exception rather than as a wrong answer.
+    """
+    def __init__(self, why=""):
+        self.why  = why
+        self.tree = None
+        self.quad = None
+
+    def _die(self, *args, **kwargs):
+        raise RuntimeError(
+            f"dead_op used ({self.why}): this diagonal block was never built "
+            "because RedBlackSolverHBS determined that nothing reads it. "
+            "Pass skip_unused_ulv=False to restore unconditional construction."
+        )
+
+    matmat = rmatmat = matvec = rmatvec = solve = _die
+
+
 def _is_id(op):
     """True if `op` is a structural identity, i.e. an id_op instance.
 
@@ -440,11 +462,44 @@ class RedBlackSolverHBS(DirectSolver):
     T = [dense_to_linop(np.eye(m))] * nSlabs would silently take the slow
     path, so `factorize` routes any supplied T through `_normalize_diag`
     first; see `identity_diag`.
+
+    ---------------------------------------------------------------------
+    ULV FACTORIZATION COUNT  (skip_unused_ulv=True, default)
+    ---------------------------------------------------------------------
+    Compressing an operator and factorizing it are separate costs.  Only a
+    diagonal that is *eliminated* is ever inverted, so most of the operators
+    built here need the compressed form for applies but no ULV at all:
+
+      * A_i and C_i become SiM / SiP one level down and are only ever fed to
+        matmat / rmatmat -- never solved.  `zero_op.solve` raising is the
+        same invariant stated defensively.  Their ULV is pure waste.
+
+      * A retained node i becomes child j = i // 2 at the next level, where
+        only odd j are eliminated.  So B_i needs a ULV iff j is odd, i.e.
+        i % 4 == 2, plus the coarsest node (nSlabs == 2, where `solve`
+        inverts the single survivor directly).
+
+      * When compress_diag=False the next level's T[i] is the uncompressed
+        RB_linop, so an even B_hbs has no consumer at all -- neither its ULV
+        nor its compression.  Those slots get a `dead_op`.
+
+    With an identity level-0 diagonal (no factorizations there at all) the
+    resulting count is
+
+        sum_{l=1}^{L-1} N/2^(l+1)  +  1  =  N/2
+
+    against the 3(N-1) - 2*log2(N) unconditional ULVs of the previous
+    version, and against 2N-1 for a textbook cyclic reduction that also
+    factorizes the N identity diagonals at level 0.  `nULV`, `nULVSkipped`
+    and `nDeadSkipped` record this directly.
+
+    Operators built without a ULV get their `solve` replaced by a raising
+    stub, so a consumer missed by the analysis above fails loudly.
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False,
                  compress_diag=True, fused=True, device='cpu', fast=False,
-                 seed=0, identity_diag=None):
+                 seed=0, identity_diag=None, skip_unused_ulv=True):
         super().__init__(m, cyclic)
         self.rk   = rk
         self.tree = tree
@@ -459,6 +514,11 @@ class RedBlackSolverHBS(DirectSolver):
         #   True  -- assert every entry is the identity and swap unconditionally
         #   False -- leave T exactly as given
         self.identity_diag = identity_diag
+        # Factorize only the diagonals that are actually inverted; see the
+        # ULV FACTORIZATION COUNT section above.  False restores the previous
+        # unconditional compute_ULV=True on every construct, which is the
+        # fallback if HBSMAT.construct turns out not to honour compute_ULV.
+        self.skip_unused_ulv = skip_unused_ulv
         self._dtype = np.float64
         self._rng   = np.random.default_rng(seed)
         # bookkeeping so the saving can be checked directly
@@ -466,6 +526,9 @@ class RedBlackSolverHBS(DirectSolver):
         self.nSolve     = 0     # calls to T^{-1} (any number of columns)
         self.nApply     = 0     # calls to an off-diagonal / diagonal apply
         self.nIdSkipped = 0     # applies/solves elided because T was identity
+        self.nULV         = 0   # constructs that did build a ULV factorization
+        self.nULVSkipped  = 0   # constructs that skipped it (apply-only)
+        self.nDeadSkipped = 0   # diagonals not built at all (no consumer)
 
     # ------------------------------------------------------------------
 
@@ -478,27 +541,92 @@ class RedBlackSolverHBS(DirectSolver):
         mls = getattr(self.tree, "_min_leaf_size", rk)
         return 2 * max(rk, mls) + rk + 10
 
-    def _hbs(self, linop, rk=None, device=None):
-        """Compress a LinearOperator into an HBS matrix and factorize it."""
-        rkloc  = self.rk if rk is None else rk
-        dev    = self.device if device is None else device
-        h = HBSnew.HBSMAT(linop, device=dev, tree=self.tree, quad=self.quad)
-        h.construct(rkloc, compute_ULV=True, fast=self.fast)
-        self.nConstruct += 1
+    def _want_ulv(self, compute_ULV):
+        """Resolve a requested compute_ULV against the opt-out flag."""
+        return True if not self.skip_unused_ulv else bool(compute_ULV)
+
+    def _guard_no_ulv(self, h, label):
+        """Replace `solve` on an unfactorized operator with a raising stub.
+
+        The savings here rest on an analysis of which diagonals are inverted.
+        If that analysis is wrong somewhere, the failure mode without this
+        guard depends entirely on what HBSMAT does when asked to solve
+        without a ULV factorization -- possibly a wrong answer with no
+        warning.  With it, the mistake is an exception naming the block.
+        """
+        def _no_ulv_solve(*args, **kwargs):
+            raise RuntimeError(
+                f"solve() called on {label}, which was built with "
+                "compute_ULV=False because RedBlackSolverHBS determined it "
+                "is only ever applied, never inverted. Pass "
+                "skip_unused_ulv=False to restore unconditional "
+                "factorization."
+            )
+        try:
+            h.solve = _no_ulv_solve
+        except Exception:
+            # Attribute is not settable on this HBSMAT build; the operator is
+            # still correct for applies, we just lose the tripwire.
+            pass
         return h
 
-    def _hbs_from_samples(self, rk, Om, Psi, Y, Z):
+    def _dead_diag(self, label):
+        """Placeholder for a diagonal with no consumer at all."""
+        if not self.skip_unused_ulv:
+            raise AssertionError("_dead_diag reached with skip_unused_ulv=False")
+        self.nDeadSkipped += 1
+        return dead_op(label)
+
+    def _hbs(self, linop, rk=None, device=None, compute_ULV=True, label=None):
+        """Compress a LinearOperator into an HBS matrix.
+
+        compute_ULV=False compresses for applies only and skips the
+        factorization; the result is fitted with a raising `solve`.
+        """
+        rkloc  = self.rk if rk is None else rk
+        dev    = self.device if device is None else device
+        ulv    = self._want_ulv(compute_ULV)
+        h = HBSnew.HBSMAT(linop, device=dev, tree=self.tree, quad=self.quad)
+        h.construct(rkloc, compute_ULV=ulv, fast=self.fast)
+        self.nConstruct += 1
+        if ulv:
+            self.nULV += 1
+        else:
+            self.nULVSkipped += 1
+            h = self._guard_no_ulv(h, label or "an HBS block")
+        return h
+
+    def _hbs_from_samples(self, rk, Om, Psi, Y, Z, compute_ULV=True, label=None):
         """Compress from externally supplied samples Y = M Om, Z = M^T Psi.
 
         Om/Psi/Y/Z must be numpy: constructHBS calls torch.from_numpy on all
-        four.
+        four.  compute_ULV=False skips the factorization; see `_hbs`.
         """
+        ulv = self._want_ulv(compute_ULV)
         h = HBSnew.HBSMAT(device=self.device, tree=self.tree, quad=self.quad)
         h.construct(rk, Om=np.ascontiguousarray(Om), Psi=np.ascontiguousarray(Psi),
                     Y=np.ascontiguousarray(Y), Z=np.ascontiguousarray(Z),
-                    compute_ULV=True, fast=self.fast)
+                    compute_ULV=ulv, fast=self.fast)
         self.nConstruct += 1
+        if ulv:
+            self.nULV += 1
+        else:
+            self.nULVSkipped += 1
+            h = self._guard_no_ulv(h, label or "an HBS block")
         return h
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _needs_ulv(i, nSlabs):
+        """Does retained node `i` of a level of size `nSlabs` need a ULV?
+
+        Node i becomes child j = i // 2 one level down, and only the odd
+        children are eliminated there, so a ULV is needed iff j is odd, i.e.
+        i % 4 == 2.  The exception is the coarsest level: when nSlabs == 2
+        the single child j = 0 is inverted directly by `solve`.
+        """
+        return (i % 4 == 2) or (nSlabs == 2)
 
     # -- small counted wrappers ---------------------------------------- #
 
@@ -721,7 +849,17 @@ class RedBlackSolverHBS(DirectSolver):
                 Z_B = Psi.copy()
 
             # ---- compress from the shared samples ----------------------
-            B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_B, Z_B)
+            need_ULV = self._needs_ulv(i, nSlabs)
+
+            if need_ULV or self.compress_diag or not self.skip_unused_ulv:
+                B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_B, Z_B,
+                                               compute_ULV=need_ULV,
+                                               label=f"B[{i}] (nSlabs={nSlabs})")
+            else:
+                # compress_diag=False hands the uncompressed RB_linop to the
+                # next level as T[i], so this slot is read by nobody: skip
+                # the compression itself, not just the factorization.
+                B_hbs = self._dead_diag(f"B[{i}] (nSlabs={nSlabs})")
             T_hbs_new.append(B_hbs)
 
             if self.compress_diag:
@@ -733,10 +871,16 @@ class RedBlackSolverHBS(DirectSolver):
                 tpo = T_hbs[kR] if has_right else None
                 B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
 
+            # A_i and C_i become SiM / SiP one level down and are only ever
+            # applied, never solved with -- no ULV, unconditionally.
             A_i.append(zero_op(m, dtype) if A_is_zero
-                       else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A))
+                       else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
+                                                   compute_ULV=False,
+                                                   label=f"A[{i}] (nSlabs={nSlabs})"))
             C_i.append(zero_op(m, dtype) if C_is_zero
-                       else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C))
+                       else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
+                                                   compute_ULV=False,
+                                                   label=f"C[{i}] (nSlabs={nSlabs})"))
 
         return (A_i, B_i, T_hbs_new, C_i)
 
@@ -762,8 +906,15 @@ class RedBlackSolverHBS(DirectSolver):
             tm  = T_hbs[(i - 1) % nSlabs] if spm is not None else None
             tp  = T_hbs[(i + 1) % nSlabs] if smp is not None else None
 
-            B_linop = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
-            B_hbs   = self._hbs(B_linop, rk)
+            need_ULV = self._needs_ulv(i, nSlabs)
+            B_linop  = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
+
+            if need_ULV or self.compress_diag or not self.skip_unused_ulv:
+                B_hbs = self._hbs(B_linop, rk, compute_ULV=need_ULV,
+                                  label=f"B[{i}] (nSlabs={nSlabs})")
+            else:
+                B_hbs = self._dead_diag(f"B[{i}] (nSlabs={nSlabs})")
+
             B_i.append(B_hbs if self.compress_diag else B_linop)
             T_hbs_new.append(B_hbs)
 
@@ -774,7 +925,8 @@ class RedBlackSolverHBS(DirectSolver):
             else:
                 A_i.append(self._hbs(
                     STS_linop(SiM[i], T_hbs[(i - 1) % nSlabs],
-                              SiM[(i - 1) % nSlabs]), rk))
+                              SiM[(i - 1) % nSlabs]), rk,
+                    compute_ULV=False, label=f"A[{i}] (nSlabs={nSlabs})"))
 
         C_i = []
         for i in range(0, nSlabs, 2):
@@ -783,7 +935,8 @@ class RedBlackSolverHBS(DirectSolver):
             else:
                 C_i.append(self._hbs(
                     STS_linop(SiP[i], T_hbs[(i + 1) % nSlabs],
-                              SiP[(i + 1) % nSlabs]), rk))
+                              SiP[(i + 1) % nSlabs]), rk,
+                    compute_ULV=False, label=f"C[{i}] (nSlabs={nSlabs})"))
 
         return (A_i, B_i, T_hbs_new, C_i)
 

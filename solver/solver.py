@@ -297,7 +297,7 @@ class solverWrapper:
         self.time_analysis = 0.0
         self.time_factor   = 0.0
 
-    def construct(self,geom,PDE,verbose=False,compute_inverse=True):
+    def construct(self,geom,PDE,verbose=False,compute_inverse=True,reduced_gpu = False):
         """
         Actual construction of the local solver
         """
@@ -343,7 +343,10 @@ class solverWrapper:
             geomHPS = convertGeom(self.opts,geom)
             solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord)) #verbose=verbose)
             self.solver=solver
-            self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
+            if reduced_gpu:
+                self.solver.build("reduced_gpu", "MUMPS", verbose=verbose)
+            else:
+                self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
             '''
             adapt these to fit the notation of custom solver
