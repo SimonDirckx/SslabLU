@@ -253,7 +253,7 @@ class solverOptions:
     """
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
                  mumps_ordering='metis',blr_tol=0.0,use_ctxT=False,
-                 mumps_block_size=None):
+                 mumps_block_size=None,reduced_gpu=False):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
@@ -262,6 +262,7 @@ class solverOptions:
         self.blr_tol          = blr_tol
         self.use_ctxT         = use_ctxT
         self.mumps_block_size = mumps_block_size
+        self.reduced_gpu        = reduced_gpu
 
 def convertGeom(opts,geom):
     if opts.type=='hpsalt':
@@ -297,7 +298,7 @@ class solverWrapper:
         self.time_analysis = 0.0
         self.time_factor   = 0.0
 
-    def construct(self,geom,PDE,verbose=False,compute_inverse=True,reduced_gpu = False):
+    def construct(self,geom,PDE,verbose=False,compute_inverse=True):
         """
         Actual construction of the local solver
         """
@@ -343,7 +344,7 @@ class solverWrapper:
             geomHPS = convertGeom(self.opts,geom)
             solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord)) #verbose=verbose)
             self.solver=solver
-            if reduced_gpu:
+            if self.opts.reduced_gpu:
                 self.solver.build("reduced_gpu", "MUMPS", verbose=verbose)
             else:
                 self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)

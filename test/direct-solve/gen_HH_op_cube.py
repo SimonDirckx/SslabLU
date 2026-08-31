@@ -115,7 +115,7 @@ def get_HH_op_cube(kh,N,p,a,dense=True,rk=0):
         assembler = mA.denseMatAssembler()
     else:
         assembler = mA.rkHMatAssembler(p*p,rk,ndim=3)
-    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
+    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     S_rk_list, _, _, _ = OMS.construct_Stot_helper(bc, assembler, dbg=2)
     tree = slabTree.slabTree(assembler.XXI,False,p*p)
