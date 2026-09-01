@@ -7,7 +7,12 @@ import torch
 import matAssembly.HBS.HBSnew as HBSnew
 #sparse block matrix operations
 
-
+def _move_list_(lst, device, non_blocking=True):
+    """Move tensors in a list in place; non-tensors pass through."""
+    for i, t in enumerate(lst):
+        if torch.is_tensor(t):
+            lst[i] = t.to(device, non_blocking=non_blocking)
+    return lst
 
 def to_block_tensor(M, n, b):
     """(n*b, s) -> (n, b, s) block tensor (analogue of convert_to_torch_tens)."""
@@ -492,6 +497,11 @@ class HBSMAT:
         # ------------------------------------------------------------
         # Input handling
         # ------------------------------------------------------------
+        
+        if not self.Qlist:
+            raise RuntimeError(
+                "solve() requires the ULV factorization; "
+                "this HBSMAT was built with compute_ULV=False")
         input_is_numpy = isinstance(b, np.ndarray)
         input_is_torch = torch.is_tensor(b)
 
@@ -583,3 +593,53 @@ class HBSMAT:
             return u.detach().cpu().numpy()
 
         return u
+
+
+    # every list on the object that holds tensors; NNvec is numpy and
+    # Nbvec is ints, both stay put
+    _tensor_lists = ('Umats', 'Vmats', 'Dmats',
+                     'Qlist', 'Wlist', 'Rlist', 'Uulist')
+
+    def to(self, device, pin_leaf=None, non_blocking=True):
+        """Move every stored factor to `device`, in place, and return self.
+
+        Entries are rebound rather than collected into a new list, so the old
+        device tensors lose their last reference here and go straight back to
+        the caching allocator.
+
+        Dmats[-1] is the exception.  Both construct paths leave that one in
+        pinned host memory whenever the device is not CPU, and matmat/rmatmat/
+        __matmul__ stream it in per call, so `to` preserves that convention by
+        default.  Pass pin_leaf=False to place it on the device with everything
+        else, which solve() needs: it hands self.Dmats straight to
+        ULVsparse.solve, which has no per-call move of its own.
+
+        (Dmats[-1] is the lvl == 0 block, i.e. the root of the reduction --
+        the construction loop runs L-1 down to 0, so it is appended last.
+        The `D_leaf` name in the matvec paths is a misnomer.)
+        """
+        device = torch.device(device)
+        if pin_leaf is None:
+            pin_leaf = (device.type != 'cpu')
+
+        for name in self._tensor_lists:
+            lst  = getattr(self, name)
+            last = len(lst) - 1
+            for i, t in enumerate(lst):
+                if not torch.is_tensor(t):
+                    continue
+                if name == 'Dmats' and i == last and pin_leaf:
+                    t = t.cpu()
+                    lst[i] = t if t.is_pinned() else t.pin_memory()
+                else:
+                    lst[i] = t.to(device, non_blocking=non_blocking)
+
+        if torch.is_tensor(self.perm):
+            self.perm = self.perm.to(device, non_blocking=non_blocking)
+
+        self.device = str(device)
+        return self
+
+    def cpu(self):
+        """Offload entirely to host, including the pinned leaf."""
+        return self.to('cpu', pin_leaf=False)

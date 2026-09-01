@@ -147,7 +147,7 @@ class ProbeConfig:
     tree:           object
     quad:           object
     rk_grid:        list  = None      # defaults to nleaf/2 .. 4*nleaf
-    step:           int   = 10
+    step:           int   = 20
     device:         str   = None      # 'cuda' when available
     torch_dtype:    object = None     # defaults to torch.get_default_dtype()
     fast:           bool  = True
@@ -281,6 +281,9 @@ def _system_size(solver):
         return solver.m * solver.nSlabs
     return solver.m * len(solver.B)
 
+def _needs_ulv(b):
+    return b.role=='diag'
+
 
 # ---------------------------------------------------------------------------
 # Sweep
@@ -360,6 +363,12 @@ def sweep_solver(solver, cfg, label=None):
             s    = min(cfg.n_samples(rk), smax)
             rows = []          # (block, record, compressed) for this rank
 
+            # A block whose ULV was built hands self.Dmats straight to
+            # ULVsparse.solve, which does no per-call move of its own, so the
+            # level-0 D has to be on the device rather than pinned on the host.
+            def _onto_device(H, b):
+                return H.to(cfg.device, pin_leaf=not _needs_ulv(b))
+
             for b in lvl:
                 if b.key in YZ:
                     Y, Z = YZ[b.key]
@@ -370,7 +379,10 @@ def sweep_solver(solver, cfg, label=None):
                 H = HBSnew.HBSMAT(dense_to_linop(b.dense),
                                   device=cfg.device, tree=cfg.tree, quad=cfg.quad)
                 H.construct(rk, Om[:, :s], Psi[:, :s], Y, Z,
-                            compute_ULV=True, fast=cfg.fast)
+                            compute_ULV=_needs_ulv(b), fast=cfg.fast)
+                # the dense copy dense_to_linop made is never read after
+                # construction, and it is 2.1 GB of host RAM per block
+                H.A = None
 
                 rec = Record(
                     solver=label, level=level, node=b.node, role=b.role,
@@ -382,27 +394,38 @@ def sweep_solver(solver, cfg, label=None):
                     read_by_solve=read.get(b.key))
 
                 records.append(rec)
-                rows.append((b, rec, H))
+                rows.append((b, rec, H.cpu()))     # off the device until needed
 
             # ---- per-block substitution --------------------------------
+            # one operator resident at a time
             if cfg.per_block_e2e:
                 for b, rec, H in rows:
+                    _onto_device(H, b)
                     prev = solver.set_block_op(*b.key, H)
                     try:
                         rec.err_global_block = _relerr(x_ref, solver.solve(RHS))
                     finally:
                         solver.set_block_op(*b.key, prev)
+                        H.cpu()
 
             # ---- whole-level substitution ------------------------------
+            # every block of the level is swapped in at once, so they are all
+            # resident here by construction; this is the peak of the run
             if cfg.per_level_e2e:
+                for b, _, H in rows:
+                    _onto_device(H, b)
                 saved = [(b, solver.set_block_op(*b.key, H)) for b, _, H in rows]
                 try:
                     e_lvl = _relerr(x_ref, solver.solve(RHS))
                 finally:
                     for b, prev in saved:
                         solver.set_block_op(*b.key, prev)
+                    for _, _, H in rows:
+                        H.cpu()
                 for _, rec, _ in rows:
                     rec.err_global_level = e_lvl
+
+            rows.clear()       # drop the operators before the next rank
 
             if cfg.verbose:
                 print(f"    [{label}] level {level:>2}  rk={rk:>4}  s={s:>5}  "
@@ -541,7 +564,7 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
 def main():
     N = 17
     H = 1/N
-    S_rk_list, tree = HHcube.get_HH_op_cube(25., N, 8, np.array([H/4, 1./32, 1./32]),dense=False,rk=128)
+    S_rk_list, tree = HHcube.get_HH_op_cube(100., N, 8, np.array([H/4, 1./32, 1./32]),dense=True)
     cfg = ProbeConfig(tree, quad=False)
     run_study(S_rk_list, cfg=cfg, csv_path="rank_growth.csv")
 
