@@ -7,12 +7,7 @@ import torch
 import matAssembly.HBS.HBSnew as HBSnew
 #sparse block matrix operations
 
-def _move_list_(lst, device, non_blocking=True):
-    """Move tensors in a list in place; non-tensors pass through."""
-    for i, t in enumerate(lst):
-        if torch.is_tensor(t):
-            lst[i] = t.to(device, non_blocking=non_blocking)
-    return lst
+
 
 def to_block_tensor(M, n, b):
     """(n*b, s) -> (n, b, s) block tensor (analogue of convert_to_torch_tens)."""
@@ -107,7 +102,7 @@ def compute_UV(Om, Y, rk, device,fast=False):
 
 class HBSMAT:
     """
-    
+
     HBS mat in new framework
 
     @init:
@@ -120,7 +115,26 @@ class HBSMAT:
     @implements:
             matvec (normal/transpose)
 
+    Device policy
+    -------------
+    Every tensor the object stores lives on self.device.  There is no per-level
+    exception: Dmats is handled exactly like Umats and Vmats, so any consumer
+    that takes the whole list (ULVsparse.solve, ULVsparse.compute_ULV) sees a
+    list on one device.  Use to()/cpu() to relocate the whole object; that is
+    the only supported way to trade VRAM for host memory.
+
+    Note on level ordering: the construction loop runs L-1 down to 0, so
+    Dmats[0] is the leaf level and Dmats[-1] is the ROOT.  Earlier versions
+    parked Dmats[-1] in pinned host memory under the name "leaf D"; that block
+    is in fact the smallest in the list (one block of side ~2*rk), so the
+    saving was negligible while the mixed-device list silently broke solve().
+
     """
+
+    # every attribute holding a list of tensors; to() walks these.
+    # NNvec is numpy and Nbvec is a list of ints, so both stay put.
+    _tensor_lists = ('Umats', 'Vmats', 'Dmats',
+                     'Qlist', 'Wlist', 'Rlist', 'Uulist')
 
     def __init__(self,A=None,device=None,tree=None,quad=False):
         self.Umats  =   []
@@ -265,11 +279,9 @@ class HBSMAT:
                 tic = time.time()
                 D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
                 self.blockSolveTime+=time.time()-tic
-                # pin leaf-level matrices to CPU to save VRAM
-                if self.device == 'cpu':
-                    self.Dmats+=[D_ell]
-                else:
-                    self.Dmats+=[D_ell.cpu().pin_memory()]
+                # stored on self.device like every other level; use to()/cpu()
+                # to relocate the whole object rather than one block of it
+                self.Dmats+=[D_ell]
             self.Nbvec+=[Nb]
         self.tCompress = time.time()-tic_compress
     def constructHBS_ULV(self,rk,Om0,Psi0,Y0,Z0,fast=True):
@@ -296,6 +308,7 @@ class HBSMAT:
         self.tSample+=time.time()-tic
         self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
         self.NNvec = np.append(self.NNvec,0)
+        tic_compress = time.time()
         for lvl in range(self.L-1,-1,-1):
             
             if lvl == self.L-1:
@@ -333,11 +346,9 @@ class HBSMAT:
                 tic = time.time()
                 D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
                 self.blockSolveTime+=time.time()-tic
-                # pin leaf-level matrix to CPU to save VRAM
-                if self.device == 'cpu':
-                    self.Dmats+=[D_ell]                  
-                else:
-                    self.Dmats+=[D_ell.cpu().pin_memory()]
+                # stored on self.device like every other level; use to()/cpu()
+                # to relocate the whole object rather than one block of it
+                self.Dmats+=[D_ell]
                 U_ell = torch.eye(D_ell.shape[1], dtype=D_ell.dtype,device=self.device)[None, :, :]
             
             if lvl==self.L-1:
@@ -362,7 +373,7 @@ class HBSMAT:
             Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rkm:],Uhat,device=self.device,mode='T')
             self.Uulist+=[Uu]
             Uhat=Ud
-        self.tCompress = time.time()-tic
+        self.tCompress = time.time()-tic_compress
 
     @property
     def T(self):
@@ -392,9 +403,7 @@ class HBSMAT:
             v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],self.device,mode='T')
             VV+=[v_lvl]
             Nb=Nb//self.fac
-        # stream pinned leaf D to device non-blocking
-        D_leaf = self.Dmats[-1].to(self.device, non_blocking=True)
-        uperm = block_matvec(D_leaf,VV[-1],self.device)
+        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device)
         for lvl in range(len(self.Umats)-1,-1,-1):
             uperm = block_matvec(self.Umats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device)
             Nb=Nb*self.fac
@@ -422,9 +431,7 @@ class HBSMAT:
             v_lvl = block_matvec(self.Umats[lvl],VV[lvl],self.device,mode='T')
             VV+=[v_lvl]
             Nb=Nb//self.fac
-        # stream pinned leaf D to device non-blocking
-        D_leaf = self.Dmats[-1].to(self.device, non_blocking=True)
-        uperm = block_matvec(D_leaf,VV[-1],self.device,mode='T')
+        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device,mode='T')
         for lvl in range(len(self.Vmats)-1,-1,-1):
             uperm = block_matvec(self.Vmats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device,mode='T')
             Nb=Nb*self.fac
@@ -447,15 +454,13 @@ class HBSMAT:
             vperm= v[self.perm,:]
         VV = []
         Nb = self.Nb
-        # stream pinned leaf D to device once, shared by both branches
-        D_leaf = self.Dmats[-1].to(self.device, non_blocking=True)
         if self.mode=='N':
             VV+=[vperm]
             for lvl in range(len(self.Vmats)):
                 v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],self.device,mode='T')
                 VV+=[v_lvl]
                 Nb=Nb//self.fac
-            uperm = block_matvec(D_leaf,VV[-1],self.device)
+            uperm = block_matvec(self.Dmats[-1],VV[-1],self.device)
             for lvl in range(len(self.Umats)-1,-1,-1):
                 uperm = block_matvec(self.Umats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device)
                 Nb=Nb*self.fac
@@ -467,7 +472,7 @@ class HBSMAT:
                 v_lvl = block_matvec(self.Umats[lvl],VV[lvl],self.device,mode='T')
                 VV+=[v_lvl]
                 Nb=Nb//self.fac
-            uperm = block_matvec(D_leaf,VV[-1],self.device,mode='T')
+            uperm = block_matvec(self.Dmats[-1],VV[-1],self.device,mode='T')
             for lvl in range(len(self.Vmats)-1,-1,-1):
                 uperm = block_matvec(self.Vmats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device,mode='T')
                 Nb=Nb*self.fac
@@ -488,7 +493,48 @@ class HBSMAT:
     @tree.setter
     def tree(self, t):
         self._tree = t
-    
+
+    # ------------------------------------------------------------------
+    # Device placement
+    # ------------------------------------------------------------------
+
+    def to(self, device, non_blocking=True):
+        """Move every stored factor to `device`, in place, and return self.
+
+        Entries are rebound rather than collected into a new list, so the
+        tensors on the old device lose their last reference here and go back
+        to the caching allocator immediately.
+
+        All seven tensor lists are treated identically -- there is no
+        per-level exception -- so after this call self.Dmats, self.Umats and
+        self.Vmats are on one device and consumers that take the whole list
+        (ULVsparse.solve, ULVsparse.compute_ULV) are safe.
+
+        self.A is deliberately untouched: it is the host-side LinearOperator
+        the samples came from and nothing reads it after construction.  Set
+        H.A = None yourself if you want that memory back.
+        """
+        device = torch.device(device)
+        for name in self._tensor_lists:
+            lst = getattr(self, name)
+            for i, t in enumerate(lst):
+                if torch.is_tensor(t):
+                    lst[i] = t.to(device, non_blocking=non_blocking)
+        if torch.is_tensor(self.perm):
+            self.perm = self.perm.to(device, non_blocking=non_blocking)
+        # keep this a string: the constructors and the ULVsparse calls all
+        # pass self.device around, and str(torch.device('cuda')) == 'cuda'
+        self.device = str(device)
+        return self
+
+    def cpu(self):
+        """Offload the whole object to host memory."""
+        return self.to('cpu')
+
+    def cuda(self, index=None):
+        """Move the whole object to a CUDA device."""
+        return self.to('cuda' if index is None else f'cuda:{index}')
+
     def compute_ULV(self):
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
 
@@ -497,11 +543,13 @@ class HBSMAT:
         # ------------------------------------------------------------
         # Input handling
         # ------------------------------------------------------------
-        
         if not self.Qlist:
             raise RuntimeError(
-                "solve() requires the ULV factorization; "
-                "this HBSMAT was built with compute_ULV=False")
+                "solve() requires the ULV factorization, but this HBSMAT has "
+                "an empty Qlist.  Build it with construct(..., compute_ULV=True) "
+                "or call compute_ULV() first."
+            )
+
         input_is_numpy = isinstance(b, np.ndarray)
         input_is_torch = torch.is_tensor(b)
 
@@ -593,53 +641,3 @@ class HBSMAT:
             return u.detach().cpu().numpy()
 
         return u
-
-
-    # every list on the object that holds tensors; NNvec is numpy and
-    # Nbvec is ints, both stay put
-    _tensor_lists = ('Umats', 'Vmats', 'Dmats',
-                     'Qlist', 'Wlist', 'Rlist', 'Uulist')
-
-    def to(self, device, pin_leaf=None, non_blocking=True):
-        """Move every stored factor to `device`, in place, and return self.
-
-        Entries are rebound rather than collected into a new list, so the old
-        device tensors lose their last reference here and go straight back to
-        the caching allocator.
-
-        Dmats[-1] is the exception.  Both construct paths leave that one in
-        pinned host memory whenever the device is not CPU, and matmat/rmatmat/
-        __matmul__ stream it in per call, so `to` preserves that convention by
-        default.  Pass pin_leaf=False to place it on the device with everything
-        else, which solve() needs: it hands self.Dmats straight to
-        ULVsparse.solve, which has no per-call move of its own.
-
-        (Dmats[-1] is the lvl == 0 block, i.e. the root of the reduction --
-        the construction loop runs L-1 down to 0, so it is appended last.
-        The `D_leaf` name in the matvec paths is a misnomer.)
-        """
-        device = torch.device(device)
-        if pin_leaf is None:
-            pin_leaf = (device.type != 'cpu')
-
-        for name in self._tensor_lists:
-            lst  = getattr(self, name)
-            last = len(lst) - 1
-            for i, t in enumerate(lst):
-                if not torch.is_tensor(t):
-                    continue
-                if name == 'Dmats' and i == last and pin_leaf:
-                    t = t.cpu()
-                    lst[i] = t if t.is_pinned() else t.pin_memory()
-                else:
-                    lst[i] = t.to(device, non_blocking=non_blocking)
-
-        if torch.is_tensor(self.perm):
-            self.perm = self.perm.to(device, non_blocking=non_blocking)
-
-        self.device = str(device)
-        return self
-
-    def cpu(self):
-        """Offload entirely to host, including the pinned leaf."""
-        return self.to('cpu', pin_leaf=False)

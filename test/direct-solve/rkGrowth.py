@@ -367,7 +367,7 @@ def sweep_solver(solver, cfg, label=None):
             # ULVsparse.solve, which does no per-call move of its own, so the
             # level-0 D has to be on the device rather than pinned on the host.
             def _onto_device(H, b):
-                return H.to(cfg.device, pin_leaf=not _needs_ulv(b))
+                return H.to(cfg.device)
 
             for b in lvl:
                 if b.key in YZ:
@@ -562,9 +562,9 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
 
 
 def main():
-    N = 17
+    N = 9
     H = 1/N
-    S_rk_list, tree = HHcube.get_HH_op_cube(100., N, 8, np.array([H/4, 1./32, 1./32]),dense=True)
+    S_rk_list, tree = HHcube.get_HH_op_cube(100., N, 6, np.array([H/2, 1./16, 1./16]),dense=True,reduced_gpu=False)
     cfg = ProbeConfig(tree, quad=False)
     run_study(S_rk_list, cfg=cfg, csv_path="rank_growth.csv")
 
