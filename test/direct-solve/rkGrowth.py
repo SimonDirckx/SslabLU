@@ -562,9 +562,9 @@ def run_study(S_rk_list, cfg, T=None, solvers=('redblack', 'thomas'),
 
 
 def main():
-    N = 9
+    N = 17
     H = 1/N
-    S_rk_list, tree = HHcube.get_HH_op_cube(100., N, 6, np.array([H/2, 1./16, 1./16]),dense=True,reduced_gpu=False)
+    S_rk_list, tree = HHcube.get_HH_op_cube(100., N, 8, np.array([H/4, 1./32, 1./32]),dense=True,reduced_gpu=True)
     cfg = ProbeConfig(tree, quad=False)
     run_study(S_rk_list, cfg=cfg, csv_path="rank_growth.csv")
 

@@ -277,11 +277,11 @@ class ThomasSolverHBS(DirectSolver):
         for i in range(1, n+1):
             if i==1:
                 Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True),device=device,tree = Sl[0].tree,quad = Sl[0].quad)
-                Sprime_i.construct(rk,compute_ULV=True)
+                Sprime_i.construct(rk,compute_ULV=True,fast=True)
                 
             else:
                 Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),device=device,tree = Sl[i-1].tree,quad = Sl[i-1].quad)
-                Sprime_i.construct(rk,compute_ULV=True)
+                Sprime_i.construct(rk,compute_ULV=True,fast=True)
             Sprime.append(Sprime_i)
         self.A = Sl
         self.B = Sprime
@@ -309,7 +309,7 @@ class ThomasSolverHBS(DirectSolver):
         for i in range(1, n+1):
             B_i = HBSnew.HBSMAT(Dprime_Linop(D_list[i], A[i-1], C[i-1], B[-1]),
                                 tree=D_list[i].tree, quad=D_list[i].quad)
-            B_i.construct(self.rk,compute_ULV=True)    
+            B_i.construct(self.rk,compute_ULV=True,fast=True)    
             B.append(B_i)
         
         self.A = A
