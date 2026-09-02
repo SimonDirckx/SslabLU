@@ -25,14 +25,14 @@ def _rsolve(P, B, fast=False, rtol=None, QR=None):
     """
     assert B.shape[-1] >= B.shape[-2], "undersampled: s < n, this is a different problem"
 
-    if fast:
-        if QR is None:
-            Q, R = tla.qr(B.mT, mode='reduced')      # Q:(Nb,s,n)  R:(Nb,n,n)
-        else:
-            Q, R = QR
-        PQ = torch.bmm(P, Q)                          # (Nb, ny, n)
-        # X R^T = PQ ;  R^T is lower triangular, solve from the right
-        return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
+    #if fast:
+    #    if QR is None:
+    #        Q, R = tla.qr(B.mT, mode='reduced')      # Q:(Nb,s,n)  R:(Nb,n,n)
+    #    else:
+    #        Q, R = QR
+    #    PQ = torch.bmm(P, Q)                          # (Nb, ny, n)
+    #    # X R^T = PQ ;  R^T is lower triangular, solve from the right
+    #    return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
 
     U, S, Vh = tla.svd(B, full_matrices=False)        # U:(Nb,n,n) S:(Nb,n) Vh:(Nb,n,s)
     if rtol is None:
