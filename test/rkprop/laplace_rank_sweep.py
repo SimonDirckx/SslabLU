@@ -1,4 +1,5 @@
 # basic packages
+import argparse
 import numpy as np
 import torch
 import time
@@ -29,6 +30,35 @@ except ImportError:
 
 ################################################################
 #
+#   COMMAND-LINE ARGUMENTS
+#   p, N, a, kh, leaf_size, target are all overridable from the CLI.
+#   Defaults reproduce the original hard-coded values.  `a` and
+#   `leaf_size` default to expressions that depend on other knobs
+#   (H = 2/(N-1) and p respectively), so they are resolved below once
+#   those knobs are known.
+#
+################################################################
+
+parser = argparse.ArgumentParser(
+    description="Laplace/Helmholtz rank sweep on the unit square (hpsalt)")
+parser.add_argument('--p', type=int, default=16,
+                    help="HPS polynomial order (default 16)")
+parser.add_argument('--N', type=int, default=9,
+                    help="number of slices; N-1 interfaces (default 9)")
+parser.add_argument('--a', type=float, nargs=2, default=None,
+                    metavar=('AX', 'AY'),
+                    help="per-dim panel half-widths [ax, ay] (default [H/4, 1/16])")
+parser.add_argument('--kh', type=float, default=50.0,
+                    help="wavenumber; 0 -> Laplace log kernel (default 50)")
+parser.add_argument('--leaf_size', type=int, default=None,
+                    help="HBS leaf size on the interface (default 2*p)")
+parser.add_argument('--target', type=float, default=1e-13,
+                    help="target relative error (default 1e-13)")
+args = parser.parse_args()
+
+
+################################################################
+#
 #   SET-UP BVP:         Laplace on the unit square
 #   - pdo               (-u_xx - u_yy = 0)
 #   - BC / exact sol.   log|x - x0|, harmonic source x0 OUTSIDE domain
@@ -42,7 +72,7 @@ hpsalt      = not jax_avail
 
 from scipy.special import j0
 
-kh = 50.0
+kh = args.kh
 
 src = np.array([3.0, 2.5])           # source well outside [0,1]^2
 
@@ -76,21 +106,22 @@ gb = lambda p: square.gb(p, jax_avail=jax_avail, torch_avail=torch_avail)
 #
 ################################################################
 
-N = 9                               # slices -> N-1 = 16 interfaces (power of 2, RB-compatible)
+N = args.N                          # slices -> N-1 = 16 interfaces (power of 2, RB-compatible)
 dSlabs, connectivity, H = square.dSlabs(N)
 
 formulation = 'hpsalt'
-p = 16                               # high order so discretization err << 1e-8
+p = args.p                           # high order so discretization err << 1e-8
 p_disc = p + 2                       # hpsalt convention: q = p-2 interface nodes per face,
                                      # so +2 to match the jax-hps convention (cf. twistedTorus.py)
-a = np.array([H / 4., 1. / 16.])      # per-dim panel half-widths (hpsalt wants an array):
-                                     # x: 2H/(2*H/4) = 4 panels across the double slab
-                                     # y: 1/(2*1/8)  = 4 panels across the unit height
+# per-dim panel half-widths (hpsalt wants an array):
+#   x: 2H/(2*H/4) = 4 panels across the double slab
+#   y: 1/(2*1/8)  = 4 panels across the unit height
+a = np.array(args.a) if args.a is not None else np.array([H / 4., 1. / 16.])
 opts = solverWrap.solverOptions(formulation, [p_disc, p_disc], a)
 
-leaf_size = 2 * p                    # HBS leaf size on the (1D line) interface
+leaf_size = args.leaf_size if args.leaf_size is not None else 2 * p  # HBS leaf size on the (1D line) interface
 rkvec = np.arange(10, 90, 10, dtype=np.int64)
-target = 1e-13
+target = args.target
 
 # ---- interface points / exact interface solution (computed once) ----------
 # interface of slab `slabInd` = its center line x=(slabInd+1)H, points XXi[Ic].

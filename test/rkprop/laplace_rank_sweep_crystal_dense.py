@@ -1,4 +1,5 @@
 # basic packages
+import argparse
 import numpy as np
 import torch
 import time
@@ -25,6 +26,33 @@ try:
     import geometry.geom_2D.square as square
 except ImportError:
     import geometry.square as square
+
+
+################################################################
+#
+#   COMMAND-LINE ARGUMENTS
+#   p, N, a, kh, leaf_size, target are all overridable from the CLI.
+#   Defaults reproduce the original hard-coded values.  `a` depends on
+#   H = 2/(N-1), so it is resolved below once N is known.
+#
+################################################################
+
+parser = argparse.ArgumentParser(
+    description="Photonic-crystal Helmholtz rank sweep on the unit square (hpsalt)")
+parser.add_argument('--p', type=int, default=16,
+                    help="HPS polynomial order (default 16)")
+parser.add_argument('--N', type=int, default=33,
+                    help="number of slices; N-1 interfaces (default 33)")
+parser.add_argument('--a', type=float, nargs=2, default=None,
+                    metavar=('AX', 'AY'),
+                    help="per-dim panel half-widths [ax, ay] (default [H/4, 1/64])")
+parser.add_argument('--kh', type=float, default=80.0,
+                    help="background wavenumber (default 80)")
+parser.add_argument('--leaf_size', type=int, default=32,
+                    help="HBS leaf size on the interface (default 32)")
+parser.add_argument('--target', type=float, default=1e-14,
+                    help="target relative error (default 1e-14)")
+args = parser.parse_args()
 
 
 ################################################################
@@ -66,7 +94,7 @@ from scipy.special import j0       # 2D Helmholtz radial solution (Bessel J0)
 # ff_body in solve_dir_full, but oms.construct_Stot_helper would need to
 # aggregate it into the interface RHS.  Ask if you want that variant.
 
-kh           = 80.0                  # background wavenumber (40 is ~6.4 wavelengths across [0,1]);
+kh           = args.kh               # background wavenumber (40 is ~6.4 wavelengths across [0,1]);
                                      # higher kh -> more oscillatory S-maps -> higher off-diagonal
                                      # rank -> the sweep and per-level spectrum become informative.
                                      # (If a run "never converges", nudge kh by +/-2 to dodge a
@@ -126,25 +154,26 @@ gb = lambda p: square.gb(p, jax_avail=jax_avail, torch_avail=torch_avail)
 #
 ################################################################
 
-N = 33                               # slices -> N-1 = 16 interfaces (power of 2, RB-compatible)
+N = args.N                          # slices -> N-1 = 16 interfaces (power of 2, RB-compatible)
 dSlabs, connectivity, H = square.dSlabs(N)
 
 formulation = 'hpsalt'
-p = 16                               # high order so discretization err << 1e-8
+p = args.p                           # high order so discretization err << 1e-8
 p_disc = p + 2                       # hpsalt convention: q = p-2 interface nodes per face,
                                      # so +2 to match the jax-hps convention (cf. twistedTorus.py)
 # DEEP TREE: fine y-mesh so the interface carries ~256 dofs -> HBS tree has
 # ~8 leaves / 4 levels, giving the hierarchy room to show per-level rank growth.
 # (a[1]=1/32 -> 16 y-panels -> nc ~ 256.  Use 1/64 for ~512 dofs / 16 leaves if
 #  the per-slab MUMPS builds are affordable; 1/16 -> nc~128 if too slow.)
-a = np.array([H / 4., 1. / 64.])     # per-dim panel half-widths (hpsalt wants an array):
-                                     # x: 2H/(2*H/4) = 4 panels across the double slab
-                                     # y: 1/(2*1/32) = 16 panels across the unit height
+# per-dim panel half-widths (hpsalt wants an array):
+#   x: 2H/(2*H/4) = 4 panels across the double slab
+#   y: 1/(2*1/32) = 16 panels across the unit height
+a = np.array(args.a) if args.a is not None else np.array([H / 4., 1. / 64.])
 opts = solverWrap.solverOptions(formulation, [p_disc, p_disc], a)
 
-leaf_size = 32 #4*p                       # HBS leaf size on the (1D line) interface (nc/leaf ~ 8 leaves)
+leaf_size = args.leaf_size          # HBS leaf size on the (1D line) interface (nc/leaf ~ 8 leaves)
 rkvec = np.arange(10, 90, 10, dtype=np.int64)
-target = 1e-14
+target = args.target
 
 # ---- interface points / exact interface solution (computed once) ----------
 # interface of slab `slabInd` = its center line x=(slabInd+1)H, points XXi[Ic].

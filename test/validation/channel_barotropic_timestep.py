@@ -130,6 +130,30 @@ LCHAN    =  1.0e6         # channel width Ly [m]; domain nondimensionalized by t
 RIDGE_HR =  0.8           # ridge height as a fraction of H0
 RIDGE_KB =  40.0          # von-Mises concentration: larger = narrower ridge
 FCOR     = -1.0e-4        # Coriolis parameter [1/s] (explicit; needs |FCOR|*dt < 2)
+RHO0     =  1025.0        # reference seawater density [kg/m^3]
+
+# ---- Forced re-entrant-channel scenario (wind + drag + steric buoyancy) -----
+# Uniform SSH at rest, spun up by a steady zonal wind, equilibrated by linear
+# bottom drag, and tilted meridionally by a prescribed steric height. The goal
+# is an emerging north-high / south-low SSH with a "finger" steered through the
+# ridge gap. FORCED = 0 recovers the original geostrophic-adjustment bump.
+FORCED     = os.environ.get("SSLABLU_FORCED", "1") != "0"
+TAU0       = float(os.environ.get("SSLABLU_TAU0",   "0.15"))   # wind stress amp [N/m^2]
+RDRAG      = float(os.environ.get("SSLABLU_RDRAG",  "1.0e-5")) # linear bottom drag [1/s] default was 1e-5, successful (with dirichlet BC) was 5e-5
+STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "0.5"))    # steric SSH half-range [m]
+GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","1.0e-5")) # steric relaxation rate [1/s]
+# y-wall Dirichlet data in FORCED: 1 = hold walls at the steric height eta_s
+# (tilt is BC-driven, establishes fast); 0 = zero walls, so the meridional tilt
+# must emerge purely from the interior GAMMA_S buoyancy relaxation (slower,
+# fully "inductive"). See the wall_eta method.
+WALL_STERIC = os.environ.get("SSLABLU_WALL_STERIC", "1") != "0" # Default 1
+# Closed (no-flux) y-walls, emulated in the Dirichlet oms path: (1) zero-gradient
+# wall data -- feed each wall node the adjacent inward eta so d eta/dn ~ 0; (2)
+# zero the predictor's wall-normal velocity v* before div(H u*). Together these
+# give H u.n ~ 0 (a closed basin) without the mixed-BC solver plumbing. The wall
+# leakage is diagnosed by max|v| at the walls and by the mass residual vs the
+# steric-relaxation source (see the conservation figure). Overrides WALL_STERIC.
+WALL_NOFLUX = os.environ.get("SSLABLU_WALL_NOFLUX", "1") != "0"
 
 # Meridional gap through the ridge (difference-of-tanh notch, cf. the Julia
 # ridge_function). GAP_DEPTH = 0 disables it (y-independent ridge); 1 cuts the
@@ -196,6 +220,23 @@ def ddepth_frac_dx(x, y, lib=np):
 def ddepth_frac_dy(x, y, lib=np):
     """d/dy of depth_frac (analytic; zero when GAP_DEPTH = 0)."""
     return -RIDGE_HR * dgapfac(y, lib) * bump_x(x, lib)
+
+
+def wind_stress(y, lib=np):
+    """Steady zonal (eastward / 'westerly') wind stress tau^x(y) [N/m^2]:
+    a single mid-channel jet, tau0*sin(pi*y), vanishing at both y-walls. Net
+    eastward momentum input -> must be balanced by bottom drag + ridge form
+    drag (the ACC / Southern-Ocean momentum budget). x-independent."""
+    return TAU0 * lib.sin(np.pi * y)
+
+
+def steric_height(y, lib=np):
+    """Prescribed steric SSH target eta_s(y) [m]: linear meridional profile,
+    high to the north (y = 1, +STERIC_AMP), low to the south (y = 0). The
+    sea-surface expression of a meridional temperature/buoyancy gradient (warm
+    equatorward). The free surface is relaxed toward this; the y-walls are held
+    at it. x-independent."""
+    return STERIC_AMP * (2.0 * y - 1.0)
 
 
 def make_pdo(ell2, conservative=True):
@@ -368,6 +409,41 @@ class SlabSolve:
                 fixes.append((corner[0], row, w / w.sum()))
             self.cfix.append(fixes)
 
+        # --- closed-wall (no-flux) support -----------------------------------
+        # leaf points on the y-walls (for zeroing v* and measuring wall flux)
+        yy = self.gx[:, :, 1]
+        self.wall_mask = ((np.abs(yy - BNDS[0][1]) < 1e-12)
+                          | (np.abs(yy - BNDS[1][1]) < 1e-12))
+        own_set = np.zeros(self.nb, dtype=bool)
+        own_set[self.own] = True
+        self.wall_mask_own = self.wall_mask & own_set[:, None]
+
+        # zero-gradient map: each y-wall boundary node (in Igb, indexing XXb) ->
+        # its adjacent inward leaf node (same box + x-node, one y-node inward).
+        # Setting eta_wall = eta there makes the discrete normal gradient ~ 0.
+        coord2leaf = {}
+        for b in range(self.nb):
+            for j in range(self.pp2):
+                coord2leaf[(round(float(self.gx[b, j, 0]), 9),
+                            round(float(self.gx[b, j, 1]), 9))] = (b, j)
+        inb, inj = [], []
+        for idx in self.Igb:
+            key = (round(float(self.XXb[idx, 0]), 9),
+                   round(float(self.XXb[idx, 1]), 9))
+            b, j = coord2leaf[key]
+            uxn, uyn, ix, iy = self.box_meta[b]
+            ix0, iy0 = ix[j], iy[j]
+            iy_in = 1 if iy0 == 0 else (len(uyn) - 2)
+            jin = int(np.where((ix == ix0) & (iy == iy_in))[0][0])
+            inb.append(b); inj.append(jin)
+        self.wall_in_b = np.array(inb, dtype=int)
+        self.wall_in_j = np.array(inj, dtype=int)
+
+    def wall_zero_grad(self, eta_field):
+        """Zero-gradient Dirichlet data on the y-walls: value at the adjacent
+        inward leaf node (eta_wall = eta_first-interior => d eta/dn ~ 0)."""
+        return eta_field[self.wall_in_b, self.wall_in_j]
+
     def gradx(self, F):
         return np.einsum('ij,bj->bi', self.D1, F)
 
@@ -522,27 +598,88 @@ class ChannelModel:
                              own_split=n * H) for n in range(self.N)]
         self.t_keep = time.perf_counter() - tic
 
-        # initial condition: SSH bump at rest
+        # steady forcing fields, precomputed once per slab (leaf grids)
+        self.a_wind = []      # eastward wind acceleration tau^x/(rho0 H)
+        self.eta_s = []       # steric relaxation target eta_s(y)
+        for s in self.sl:
+            xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
+            Hp = H0 * depth_frac(xg, yg)
+            self.a_wind.append(wind_stress(yg) / (RHO0 * Hp))
+            self.eta_s.append(steric_height(yg))
+
+        # initial condition
         self.eta, self.u, self.v = [], [], []
         for s in self.sl:
             xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
-            self.eta.append(ETA0
-                            * np.exp(IC_KB * (np.cos(2.0 * np.pi * (xg - IC_CX)) - 1.0))
-                            * np.exp(-IC_AY * (yg - IC_CY) ** 2))
+            if FORCED:
+                # uniform SSH at rest (the dynamic/mass field starts flat; the
+                # meridional tilt is induced by wind + steric relaxation)
+                self.eta.append(np.zeros_like(xg))
+            else:
+                # geostrophic-adjustment bump (original scenario)
+                self.eta.append(ETA0
+                                * np.exp(IC_KB * (np.cos(2.0 * np.pi * (xg - IC_CX)) - 1.0))
+                                * np.exp(-IC_AY * (yg - IC_CY) ** 2))
             self.u.append(np.zeros_like(xg))
             self.v.append(np.zeros_like(xg))
         self.t = 0.0
 
     def wall_eta(self, pts, t):
-        """Dirichlet SSH on the y-walls: 0 by default (clamped / open walls),
-        or a zonal wavenumber-1 'tidal' driver if WALL_AMP is set."""
+        """Dirichlet SSH on the y-walls. In the FORCED scenario the walls are
+        held at the steric target eta_s(y_wall) (so the interior tilt has
+        consistent boundary data, not a clamped zero it must fight). Otherwise:
+        0 (clamped / open walls), or a zonal wavenumber-1 'tidal' driver."""
+        if FORCED:
+            return steric_height(pts[:, 1]) if WALL_STERIC \
+                else np.zeros(pts.shape[0])
         if WALL_AMP == 0.0:
             return np.zeros(pts.shape[0])
         return (WALL_AMP * np.cos(2.0 * np.pi * pts[:, 0])
                 * np.sin(2.0 * np.pi * t / WALL_PERIOD))
 
+    def band_mean_eta(self, ylo, yhi):
+        """Area-weighted mean SSH over the meridional band ylo <= y < yhi
+        (tiling 'own' boxes), using the leaf quadrature weights."""
+        num = den = 0.0
+        for i, s in enumerate(self.sl):
+            W = s.W[s.own]
+            m = ((s.gx[s.own, :, 1] >= ylo) & (s.gx[s.own, :, 1] < yhi))
+            num += float((W * self.eta[i][s.own] * m).sum())
+            den += float((W * m).sum())
+        return num / den if den > 0 else np.nan
+
+    def mer_tilt(self):
+        """Meridional SSH tilt: mean(north third) - mean(south third) [m]."""
+        return self.band_mean_eta(2.0 / 3.0, 1.0) - self.band_mean_eta(0.0, 1.0 / 3.0)
+
+    def max_speed(self):
+        mu = max(np.abs(u).max() for u in self.u)
+        mv = max(np.abs(v).max() for v in self.v)
+        return mu, mv
+
     def mass(self):
         return sum(s.integrate_own(self.eta[i]) for i, s in enumerate(self.sl))
+
+    def relax_integral(self):
+        """int (eta - eta_s) over the domain: the steric-relaxation mass source
+        is -GAMMA_S times this, the ONLY term that should change total mass once
+        the walls are closed (periodic x carries no net zonal flux)."""
+        return sum(s.integrate_own(self.eta[i] - self.eta_s[i])
+                   for i, s in enumerate(self.sl))
+
+    def wall_vn(self):
+        """Max and area-mean |v| (wall-normal velocity) on the y-walls, over the
+        tiling boxes. The closed-wall target is 0; this is the direct measure of
+        residual transport through the walls."""
+        vmax = num = den = 0.0
+        for i, s in enumerate(self.sl):
+            m = s.wall_mask_own
+            if not m.any():
+                continue
+            av = np.abs(self.v[i][m])
+            vmax = max(vmax, float(av.max()))
+            num += float((s.W[m] * av).sum()); den += float(s.W[m].sum())
+        return vmax, (num / den if den > 0 else 0.0)
 
     def energy(self):
         """Per-unit-density energy: int 1/2 g eta^2 + 1/2 H (u^2+v^2)."""
@@ -559,6 +696,10 @@ class ChannelModel:
         gdtL = GRAV * dt / LCHAN
         tnew = self.t + dt
 
+        # expected mass change from the steric source this step (eta^n), used to
+        # separate the physical relaxation source from spurious wall leakage
+        relax_src = -dt * GAMMA_S * self.relax_integral() if FORCED else 0.0
+
         # ---- explicit predictor + body load R^n, per slab -----------------
         tic = time.perf_counter()
         fgbs, fvecs, ustars, vstars = [], [], [], []
@@ -569,14 +710,37 @@ class ChannelModel:
             Hpx = H0 * ddepth_frac_dx(xg, yg)
             Hpy = H0 * ddepth_frac_dy(xg, yg)   # nonzero across the gap band
 
-            us = self.u[i] + dt * (FCOR * self.v[i])
-            vs = self.v[i] - dt * (FCOR * self.u[i])
+            # explicit momentum predictor: rotation, and (if forced) eastward
+            # wind stress tau/(rho0 H) and linear bottom drag -r u
+            if FORCED:
+                us = self.u[i] + dt * (FCOR * self.v[i]
+                                       + self.a_wind[i] - RDRAG * self.u[i])
+                vs = self.v[i] + dt * (-FCOR * self.u[i] - RDRAG * self.v[i])
+            else:
+                us = self.u[i] + dt * (FCOR * self.v[i])
+                vs = self.v[i] - dt * (FCOR * self.u[i])
+
+            if WALL_NOFLUX:
+                # closed wall: no transport into the y-walls -> zero the
+                # predictor's wall-normal velocity there before div(H u*)
+                vs = np.where(s.wall_mask, 0.0, vs)
 
             # div(H u*) = H (u*_x + v*_y) + H_x u* + H_y v*
             divHu = Hp * (s.gradx(us) + s.grady(vs)) + Hpx * us + Hpy * vs
             R = self.eta[i] - (dt / LCHAN) * divHu
+            if FORCED:
+                # steric buoyancy: explicit Newtonian relaxation of the free
+                # surface toward eta_s(y). Explicit -> screening coefficient (and
+                # the reused factorization / gate) unchanged; stable for
+                # GAMMA_S*dt << 1.
+                R = R - dt * GAMMA_S * (self.eta[i] - self.eta_s[i])
 
-            fgb = self.wall_eta(s.XXb[s.Igb, :], tnew)   # implicit wall data
+            if WALL_NOFLUX:
+                # zero-gradient Dirichlet: eta_wall = adjacent inward eta^n so
+                # d eta/dn ~ 0 (a discrete Neumann / no-flux wall)
+                fgb = s.wall_zero_grad(self.eta[i])
+            else:
+                fgb = self.wall_eta(s.XXb[s.Igb, :], tnew)   # Dirichlet wall data
             fvec = torch.from_numpy(R.reshape(-1, 1).copy())
 
             rhstot[i * self.nc:(i + 1) * self.nc] = s.body_rhs(fvec, fgb)
@@ -604,14 +768,18 @@ class ChannelModel:
 
         self.t = tnew
         maxeta = max(np.abs(e).max() for e in self.eta)
+        mu, mv = self.max_speed()
+        wvmax, wvmean = self.wall_vn()
         return {"mass": self.mass(), "energy": self.energy(),
-                "maxeta": maxeta, "t_rhs": t_rhs, "t_slv": t_slv,
-                "t_rec": t_rec}
+                "maxeta": maxeta, "tilt": self.mer_tilt(),
+                "maxu": mu, "maxv": mv, "relax_src": relax_src,
+                "wall_vn_max": wvmax, "wall_vn_mean": wvmean,
+                "t_rhs": t_rhs, "t_slv": t_slv, "t_rec": t_rec}
 
-    def snapshot(self, nx=8, ny=8):
-        """Global uniform image of eta: per-leaf barycentric resampling of the
-        tiling ('own') boxes (IMEXconvdiv's plot_field pattern; smooth fields,
-        no scatter banding from the Chebyshev point clustering)."""
+    def _resample(self, field, nx=8, ny=8):
+        """Global uniform image of a per-slab leaf field: per-leaf barycentric
+        resampling of the tiling ('own') boxes (IMEXconvdiv's plot_field
+        pattern; smooth, no scatter banding from Chebyshev point clustering)."""
         uxn0, uyn0, _, _ = self.sl[0].box_meta[0]
         bx, by = uxn0[-1] - uxn0[0], uyn0[-1] - uyn0[0]
         ncol, nrow = int(round(1.0 / bx)), int(round(1.0 / by))
@@ -621,13 +789,16 @@ class ChannelModel:
             for b in s.own:
                 uxn, uyn, ix, iy = s.box_meta[b]
                 U2 = np.zeros((len(uxn), len(uyn)))
-                U2[ix, iy] = self.eta[i][b]
+                U2[ix, iy] = field[i][b]
                 c = int(round(np.mod(uxn[0], 1.0) / bx)) % ncol
                 r = int(round(uyn[0] / by))
                 img[c * nx:(c + 1) * nx, r * ny:(r + 1) * ny] = Bx @ U2 @ By.T
         xc = (np.arange(ncol * nx) + 0.5) / (ncol * nx)
         yc = (np.arange(nrow * ny) + 0.5) / (nrow * ny)
         return xc, yc, img
+
+    def snapshot(self, nx=8, ny=8):
+        return self._resample(self.eta, nx, ny)
 
 
 ################################################################
@@ -641,7 +812,7 @@ p        = int(os.environ.get("SSLABLU_P", "12"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
 dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.25"))
-NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "48"))
+NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "19200")) # Default 48
 RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
@@ -675,7 +846,21 @@ print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
 print("f*dt (explicit Coriolis) = ", '%6.3f' % (FCOR * dt))
 print("S-map assembler          = ",
       ("HBS rk = %d" % RK) if RK > 0 else "dense")
-print("wall forcing amplitude   = ", WALL_AMP, "m")
+if FORCED:
+    print("scenario                 =  FORCED (wind + drag + steric)")
+    print("wind stress amp TAU0     = ", '%6.3f N/m^2' % TAU0)
+    print("bottom drag RDRAG        = ", '%8.2E /s  (1/r = %5.1f h)'
+          % (RDRAG, 1.0 / RDRAG / 3600.0))
+    print("steric half-range        = ", '%6.3f m' % STERIC_AMP)
+    print("steric relax GAMMA_S     = ", '%8.2E /s  (1/g = %5.1f h)'
+          % (GAMMA_S, 1.0 / GAMMA_S / 3600.0))
+    wtxt = ("closed / no-flux (zero-grad + v*=0)" if WALL_NOFLUX
+            else ("steric-held Dirichlet" if WALL_STERIC
+                  else "zero Dirichlet (open reservoir)"))
+    print("y-walls                  = ", wtxt)
+else:
+    print("scenario                 =  bump (geostrophic adjustment)")
+    print("wall forcing amplitude   = ", WALL_AMP, "m")
 print("================================================")
 
 # ---- GATE first: nothing runs unless signs and scalings check out ----------
@@ -697,34 +882,58 @@ t_setup = time.perf_counter() - tic
 
 M0C = modC.mass()
 E0 = modC.energy()
+E0safe = E0 if E0 > 0 else 1.0    # FORCED starts at rest (E0 = 0): report abs E
 M0N = modN.mass() if modN is not None else np.nan
 
 snaps = {0: modC.snapshot()}
 rows = []
 hist = {"t": [0.0], "dMC": [0.0], "dMN": [0.0], "E": [E0],
-        "maxeta": [ETA0], "t_slv": [], "t_rhs": [], "t_rec": []}
+        "maxeta": [modC.mer_tilt() * 0.0 + (0.0 if FORCED else ETA0)],
+        "tilt": [modC.mer_tilt()], "maxu": [0.0], "maxv": [0.0],
+        "mass": [M0C], "massexp": [M0C], "massres": [0.0], "wvmax": [0.0],
+        "t_slv": [], "t_rhs": [], "t_rec": []}
+cum_relax = 0.0     # running sum of the steric-relaxation mass source
 
 print("")
-print(" step   t[h]    |M-M0| div-form   |M-M0| non-cons    E/E0     max|eta|"
-      "   t_rhs   t_slv   t_rec")
+if FORCED:
+    print(" step   t[h]    tilt[m]   max|u|   wall|v|    mass_res   E[J/rho0]"
+          "   t_rhs t_slv t_rec")
+else:
+    print(" step   t[h]    |M-M0| div-form   |M-M0| non-cons    E/E0     max|eta|"
+          "   t_rhs   t_slv   t_rec")
 for n in range(1, NSTEPS + 1):
     dC = modC.step()
     dN = modN.step() if modN is not None else None
 
     dMC = abs(dC["mass"] - M0C)
     dMN = abs(dN["mass"] - M0N) if dN is not None else np.nan
-    print(" %4d  %6.2f     %10.3E       %10.3E     %7.4f   %8.4f"
-          "   %5.2f   %5.3f   %5.2f"
-          % (n, n * dt_hours, dMC, dMN, dC["energy"] / E0, dC["maxeta"],
-             dC["t_rhs"], dC["t_slv"], dC["t_rec"]))
+    # mass budget: expected = M0 + cumulative steric source; residual = the part
+    # NOT explained by relaxation = spurious wall-flux leakage
+    cum_relax += dC["relax_src"]
+    mass_exp = M0C + cum_relax
+    mass_res = dC["mass"] - mass_exp
+    if FORCED:
+        print(" %4d  %6.2f  %8.4f  %7.4f  %9.2E  %9.2E   %7.4f"
+              "   %4.2f  %4.3f  %4.2f"
+              % (n, n * dt_hours, dC["tilt"], dC["maxu"], dC["wall_vn_max"],
+                 mass_res, dC["energy"], dC["t_rhs"], dC["t_slv"], dC["t_rec"]))
+    else:
+        print(" %4d  %6.2f     %10.3E       %10.3E     %7.4f   %8.4f"
+              "   %5.2f   %5.3f   %5.2f"
+              % (n, n * dt_hours, dMC, dMN, dC["energy"] / E0safe, dC["maxeta"],
+                 dC["t_rhs"], dC["t_slv"], dC["t_rec"]))
 
-    rows.append([n, n * dt_hours, dC["mass"], dMC,
-                 (dN["mass"] if dN else np.nan), dMN,
+    rows.append([n, n * dt_hours, dC["mass"], dC["tilt"],
+                 dC["maxu"], dC["maxv"], dC["wall_vn_max"], mass_res,
                  dC["energy"], dC["maxeta"],
                  dC["t_rhs"], dC["t_slv"], dC["t_rec"]])
     hist["t"].append(n * dt_hours)
     hist["dMC"].append(dMC); hist["dMN"].append(dMN)
     hist["E"].append(dC["energy"]); hist["maxeta"].append(dC["maxeta"])
+    hist["tilt"].append(dC["tilt"])
+    hist["maxu"].append(dC["maxu"]); hist["maxv"].append(dC["maxv"])
+    hist["mass"].append(dC["mass"]); hist["massexp"].append(mass_exp)
+    hist["massres"].append(mass_res); hist["wvmax"].append(dC["wall_vn_max"])
     hist["t_rhs"].append(dC["t_rhs"]); hist["t_slv"].append(dC["t_slv"])
     hist["t_rec"].append(dC["t_rec"])
 
@@ -732,7 +941,7 @@ for n in range(1, NSTEPS + 1):
         snaps[n] = modC.snapshot()
 
 maxeta_run = max(hist["maxeta"])
-stable = maxeta_run < 50.0 * ETA0
+stable = maxeta_run < 50.0 * max(ETA0, STERIC_AMP)
 
 print("")
 print("=============SUMMARY (%d steps, dt = %.2f h)=============" % (NSTEPS, dt_hours))
@@ -741,20 +950,40 @@ print("avg rhs / solve / recon  =  %6.3f / %6.4f / %6.3f s per step"
       % (np.mean(hist["t_rhs"]), np.mean(hist["t_slv"]), np.mean(hist["t_rec"])))
 print("max|eta| over run        = ", '%8.4f m' % maxeta_run,
       " ->", "stable" if stable else "CHECK STABILITY")
-print("final |M-M0| divergence  = ", '%10.3E' % hist["dMC"][-1])
-if modN is not None:
-    print("final |M-M0| non-cons    = ", '%10.3E' % hist["dMN"][-1])
-    print("  (walls are clamped-SSH, not solid: both forms share the physical")
-    print("   wall flux; the non-conservative excess is the spurious part)")
-print("final E/E0               = ", '%8.4f' % (hist["E"][-1] / E0),
-      " (backward Euler damps the radiated gravity waves)")
+if FORCED:
+    print("final meridional tilt    = ", '%8.4f m  (N third - S third)'
+          % hist["tilt"][-1])
+    print("  target (steric) tilt   = ", '%8.4f m  (2/3 of full range)'
+          % (STERIC_AMP * 4.0 / 3.0))
+    print("final max|u| / max|v|    =  %8.4f / %8.4f m/s  (zonal flow spin-up)"
+          % (hist["maxu"][-1], hist["maxv"][-1]))
+    print("  (not expected to be fully equilibrated: 1/r = %.0f h, run = %.0f h)"
+          % (1.0 / RDRAG / 3600.0, NSTEPS * dt_hours))
+    print("final energy             = ", '%10.3E J/rho0' % hist["E"][-1])
+    # conservation / wall closure
+    Mscale = max(abs(M0C), STERIC_AMP, 1e-30)
+    print("wall closure (y-walls    = ", wtxt, ")")
+    print("  final max|v| at walls  = ", '%10.3E m/s' % hist["wvmax"][-1])
+    print("  total mass drift       = ", '%10.3E  (%.2E rel)'
+          % (hist["mass"][-1] - M0C, (hist["mass"][-1] - M0C) / Mscale))
+    print("  drift from steric src  = ", '%10.3E  (expected, physical)'
+          % (hist["massexp"][-1] - M0C))
+    print("  residual (wall leakage)= ", '%10.3E  (%.2E rel) <- want ~0'
+          % (hist["massres"][-1], hist["massres"][-1] / Mscale))
+else:
+    print("final |M-M0| divergence  = ", '%10.3E' % hist["dMC"][-1])
+    if modN is not None:
+        print("final |M-M0| non-cons    = ", '%10.3E' % hist["dMN"][-1])
+        print("  (walls are clamped-SSH, not solid: both forms share the physical")
+        print("   wall flux; the non-conservative excess is the spurious part)")
+    print("final E/E0               = ", '%8.4f' % (hist["E"][-1] / E0safe))
 print("=========================================================")
 
 # ---- CSV export -------------------------------------------------------------
 rows = np.array(rows)
 csv_name = "channel_timestep_diag.csv"
 with open(csv_name, 'w') as f:
-    f.write("step,t_hours,mass_div,dmass_div,mass_ncons,dmass_ncons,"
+    f.write("step,t_hours,mass,tilt_NmS,max_u,max_v,wall_vn_max,mass_resid,"
             "energy,max_eta,t_rhs,t_solve,t_recon\n")
     np.savetxt(f, rows, fmt='%.16e', delimiter=',')
 print("Wrote %s  (%d rows)" % (csv_name, rows.shape[0]))
@@ -791,51 +1020,85 @@ try:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    # snapshots
+    # ---- SSH snapshots -------------------------------------------------------
+    # FORCED: shared color scale across panels so the tilt GROWING is visible
+    # (t=0 is uniform 0). Bump: per-panel scale (magnitudes span orders).
     keys = sorted(snaps.keys())
     figF, axF = plt.subplots(1, len(keys), figsize=(5.0 * len(keys), 4.4),
                              sharex=True, sharey=True, squeeze=False)
     axF = axF[0]
+    shared_vmax = max(np.nanmax(np.abs(snaps[k][2])) for k in keys) if FORCED \
+        else None
     for k, nstep in enumerate(keys):
         xc, yc, img = snaps[nstep]
-        # per-panel symmetric scale: the late-time geostrophic residual is
-        # orders of magnitude below the initial bump
-        vmax = max(np.nanmax(np.abs(img)), 1e-12)
+        vmax = shared_vmax if FORCED else max(np.nanmax(np.abs(img)), 1e-12)
+        vmax = max(vmax, 1e-12)
         pc = axF[k].pcolormesh(xc, yc, img.T, cmap='RdBu_r',
                                vmin=-vmax, vmax=vmax, shading='auto')
         figF.colorbar(pc, ax=axF[k], shrink=0.85)
-        axF[k].set_title(r'$\eta$ at t = %.2f h  (max %.3g m)'
-                         % (nstep * dt_hours, vmax))
+        ttl = (r'$\eta$ at t = %.1f h' % (nstep * dt_hours)) if FORCED else \
+              (r'$\eta$ at t = %.2f h  (max %.3g m)' % (nstep * dt_hours, vmax))
+        axF[k].set_title(ttl)
         axF[k].set_xlabel('x / L')
         axF[k].set_xlim(0, 1); axF[k].set_ylim(0, 1)
         axF[k].set_aspect('equal')
     axF[0].set_ylabel('y / L')
-    figF.suptitle('geostrophic adjustment over the ridge: one factorization, '
-                  '%d back-substitutions' % NSTEPS, fontsize=11)
+    if FORCED:
+        figF.suptitle('wind + steric forced channel: meridional SSH tilt '
+                      '(N high / S low) + gap finger', fontsize=11)
+    else:
+        figF.suptitle('geostrophic adjustment over the ridge: one factorization, '
+                      '%d back-substitutions' % NSTEPS, fontsize=11)
     figF.tight_layout(rect=[0, 0, 1, 0.93])
     figF.savefig('channel_timestep_fields.png', dpi=200)
 
-    # diagnostics
+    # ---- diagnostics ---------------------------------------------------------
     figD, axD = plt.subplots(2, 2, figsize=(11, 8))
     tt = np.array(hist["t"])
-    axD[0, 0].semilogy(tt, np.maximum(hist["dMC"], 1e-18), 'o-',
-                       label='divergence form')
-    if modN is not None:
-        axD[0, 0].semilogy(tt, np.maximum(hist["dMN"], 1e-18), 's--',
-                           label='non-conservative')
-    axD[0, 0].set_xlabel('t [h]'); axD[0, 0].set_ylabel(r'|M(t) - M$_0$|')
-    axD[0, 0].set_title('mass drift (shared wall flux + spurious part)')
-    axD[0, 0].grid(True, which='both', alpha=0.3); axD[0, 0].legend(fontsize=8)
+    if FORCED:
+        # zonal-mean SSH profiles <eta>_x(y) at the snapshot times
+        for nstep in keys:
+            xc, yc, img = snaps[nstep]
+            axD[0, 0].plot(np.nanmean(img, axis=0), yc,
+                           label='t = %.0f h' % (nstep * dt_hours))
+        axD[0, 0].plot(steric_height(np.linspace(0, 1, 50)),
+                       np.linspace(0, 1, 50), 'k:', label='steric target')
+        axD[0, 0].set_xlabel(r'$\langle\eta\rangle_x$ [m]')
+        axD[0, 0].set_ylabel('y / L')
+        axD[0, 0].set_title('zonal-mean SSH profile: meridional tilt emerging')
+        axD[0, 0].grid(True, alpha=0.3); axD[0, 0].legend(fontsize=8)
 
-    axD[0, 1].plot(tt, np.array(hist["E"]) / E0, 'o-')
-    axD[0, 1].set_xlabel('t [h]'); axD[0, 1].set_ylabel(r'E(t) / E$_0$')
-    axD[0, 1].set_title('energy (backward-Euler wave damping)')
-    axD[0, 1].grid(True, alpha=0.3)
+        axD[0, 1].plot(tt, hist["tilt"], 'o-')
+        axD[0, 1].axhline(STERIC_AMP * 4.0 / 3.0, color='k', ls=':',
+                          label='steric target')
+        axD[0, 1].set_xlabel('t [h]'); axD[0, 1].set_ylabel(r'$\eta$ tilt N-S [m]')
+        axD[0, 1].set_title('meridional tilt vs time (approach to steady state)')
+        axD[0, 1].grid(True, alpha=0.3); axD[0, 1].legend(fontsize=8)
 
-    axD[1, 0].plot(tt, hist["maxeta"], 'o-')
-    axD[1, 0].set_xlabel('t [h]'); axD[1, 0].set_ylabel(r'max |$\eta$| [m]')
-    axD[1, 0].set_title('stability check')
-    axD[1, 0].grid(True, alpha=0.3)
+        axD[1, 0].plot(tt, hist["maxu"], 'o-', label='max|u| (zonal)')
+        axD[1, 0].plot(tt, hist["maxv"], 's--', label='max|v| (meridional)')
+        axD[1, 0].set_xlabel('t [h]'); axD[1, 0].set_ylabel('speed [m/s]')
+        axD[1, 0].set_title('flow spin-up (wind in, bottom + form drag out)')
+        axD[1, 0].grid(True, alpha=0.3); axD[1, 0].legend(fontsize=8)
+    else:
+        axD[0, 0].semilogy(tt, np.maximum(hist["dMC"], 1e-18), 'o-',
+                           label='divergence form')
+        if modN is not None:
+            axD[0, 0].semilogy(tt, np.maximum(hist["dMN"], 1e-18), 's--',
+                               label='non-conservative')
+        axD[0, 0].set_xlabel('t [h]'); axD[0, 0].set_ylabel(r'|M(t) - M$_0$|')
+        axD[0, 0].set_title('mass drift (shared wall flux + spurious part)')
+        axD[0, 0].grid(True, which='both', alpha=0.3); axD[0, 0].legend(fontsize=8)
+
+        axD[0, 1].plot(tt, np.array(hist["E"]) / E0safe, 'o-')
+        axD[0, 1].set_xlabel('t [h]'); axD[0, 1].set_ylabel(r'E(t) / E$_0$')
+        axD[0, 1].set_title('energy (backward-Euler wave damping)')
+        axD[0, 1].grid(True, alpha=0.3)
+
+        axD[1, 0].plot(tt, hist["maxeta"], 'o-')
+        axD[1, 0].set_xlabel('t [h]'); axD[1, 0].set_ylabel(r'max |$\eta$| [m]')
+        axD[1, 0].set_title('stability check')
+        axD[1, 0].grid(True, alpha=0.3)
 
     steps_ax = np.arange(1, NSTEPS + 1)
     axD[1, 1].plot(steps_ax, hist["t_rhs"], 'o-', label='body-load rhs')
@@ -851,6 +1114,70 @@ try:
     figD.tight_layout(rect=[0, 0, 1, 0.96])
     figD.savefig('channel_timestep_diagnostics.png', dpi=200)
 
-    print("wrote channel_timestep_fields.png, channel_timestep_diagnostics.png")
+    outnames = "channel_timestep_fields.png, channel_timestep_diagnostics.png"
+
+    # ---- forcing fields (FORCED only) ---------------------------------------
+    if FORCED:
+        yln = np.linspace(0.0, 1.0, 200)
+        figW, axW = plt.subplots(1, 3, figsize=(15, 4.4))
+
+        axW[0].plot(wind_stress(yln), yln, 'C0')
+        axW[0].set_xlabel(r'$\tau^x(y)$ [N/m$^2$]'); axW[0].set_ylabel('y / L')
+        axW[0].set_title('prescribed zonal wind stress\n(eastward / westerly)')
+        axW[0].axvline(0, color='k', lw=0.6); axW[0].grid(True, alpha=0.3)
+
+        axW[1].plot(steric_height(yln), yln, 'C3')
+        axW[1].set_xlabel(r'$\eta_s(y)$ [m]'); axW[1].set_ylabel('y / L')
+        axW[1].set_title('prescribed steric height target\n(N high / S low)')
+        axW[1].axvline(0, color='k', lw=0.6); axW[1].grid(True, alpha=0.3)
+
+        # bottom drag: the deceleration field -r*u at the final state (shows
+        # x-structure, esp. the throughflow jet at the ridge gap)
+        xc, yc, uimg = modC._resample(modC.u)
+        drag = -RDRAG * uimg
+        dmax = max(np.nanmax(np.abs(drag)), 1e-30)
+        pc = axW[2].pcolormesh(xc, yc, drag.T, cmap='PuOr',
+                               vmin=-dmax, vmax=dmax, shading='auto')
+        figW.colorbar(pc, ax=axW[2], shrink=0.85)
+        axW[2].set_xlabel('x / L'); axW[2].set_ylabel('y / L')
+        axW[2].set_title(r'bottom drag $-r\,u$ [m/s$^2$] (final)'
+                         '\n' r'$r$ = %.1e /s' % RDRAG)
+        axW[2].set_aspect('equal')
+
+        figW.suptitle('Forcing fields: steady wind stress, steric target, '
+                      'and bottom drag', fontsize=12)
+        figW.tight_layout(rect=[0, 0, 1, 0.93])
+        figW.savefig('channel_timestep_forcings.png', dpi=200)
+        outnames += ", channel_timestep_forcings.png"
+
+    # ---- wall closure / mass conservation (FORCED only) ---------------------
+    if FORCED:
+        figC, axC = plt.subplots(1, 2, figsize=(11, 4.4))
+        tt = np.array(hist["t"])
+
+        axC[0].plot(tt, np.array(hist["mass"]) - M0C, 'o-', ms=3,
+                    label='total drift  M(t) - M$_0$')
+        axC[0].plot(tt, np.array(hist["massexp"]) - M0C, 'k--',
+                    label='steric source (expected)')
+        axC[0].plot(tt, hist["massres"], 's-', ms=3,
+                    label='residual = wall leakage')
+        axC[0].set_xlabel('t [h]'); axC[0].set_ylabel(r'mass change [m$\cdot$area]')
+        axC[0].set_title('mass budget: physical source vs spurious wall flux\n'
+                         '(y-walls: %s)' % wtxt)
+        axC[0].grid(True, alpha=0.3); axC[0].legend(fontsize=8)
+
+        axC[1].semilogy(tt, np.maximum(np.abs(hist["wvmax"]), 1e-18), 'o-', ms=3)
+        axC[1].set_xlabel('t [h]')
+        axC[1].set_ylabel(r'max $|v|$ at y-walls [m/s]')
+        axC[1].set_title('wall-normal velocity (closed wall -> 0)')
+        axC[1].grid(True, which='both', alpha=0.3)
+
+        figC.suptitle('Closed-wall diagnostics: is H u·n = 0 at the y-walls?',
+                      fontsize=12)
+        figC.tight_layout(rect=[0, 0, 1, 0.93])
+        figC.savefig('channel_timestep_conservation.png', dpi=200)
+        outnames += ", channel_timestep_conservation.png"
+
+    print("wrote " + outnames)
 except Exception as e:
     print("plotting skipped:", e)
