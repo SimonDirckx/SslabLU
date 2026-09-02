@@ -1,13 +1,30 @@
 import numpy as np
 import direct_solve.omsdirectsolveHBS as omsdirect
-import gen_HH_op_cube as gen_HH
 
-N = 9
-H=1/N
-kh = 50.
-p=4
-a = np.array([H/4,1/32,1/32])
-S_rk_list,tree = gen_HH.get_HH_op_cube(kh,N,p,a,dense=True,reduced_gpu=False)
+import jax.numpy as jnp
+import torch
+import scipy
+from packaging.version import Version
+import matplotlib.tri as tri
+
+# oms packages
+import solver.solver as solverWrap
+import matAssembly.matAssembler as mA
+import multislab.oms as oms
+import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
+import solver.spectralmultidomain.hps.pdo as pdo
+# validation&testing
+import time
+from scipy.sparse.linalg import gmres
+import solver.HPSInterp3D as interp
+import matplotlib.pyplot as plt
+import scipy.sparse.linalg as splinalg
+import multislab.omsdirectsolve as omsdirect
+#import multislab.omsdirectsolveHBS as omsdirectHBS
+import direct_solve.omsdirectsolveHBS as omsdirectHBS
+import direct_solve.omsdirectsolve as omsdirect
+import geometry.geom_3D.cube as cube
+from scipy.sparse.linalg import LinearOperator
 
 
 
