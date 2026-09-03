@@ -108,16 +108,17 @@ class matAssembler:
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
             s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            tic = time.time()
             Om = np.random.standard_normal((linOp.shape[0],s))
             Psi = np.random.standard_normal((linOp.shape[1],s))
             Y = linOp@Om
             Z = linOp.T@Psi
+            self.stats.timeSample=time.time()-tic
+            tic = time.time()
             HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z)
-            self.stats.timeSample=0
-            s = HBSmat.nSamples
-            self.stats.timeSample=HBSmat.tSample
-            self.stats.nbytes = HBSmat.nbytes
             self.stats.timeCompress=HBSmat.tCompress
+            s = HBSmat.nSamples
+            self.stats.nbytes = HBSmat.nbytes
             
             if dbg>0:
                 print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))

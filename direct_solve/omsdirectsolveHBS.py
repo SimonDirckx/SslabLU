@@ -282,7 +282,7 @@ class ThomasSolverHBS(DirectSolver):
             else:
                 Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),device=device,tree = Sl[i-1].tree,quad = Sl[i-1].quad)
                 Sprime_i.construct(rk,compute_ULV=True,fast=True)
-            Sprime.append(Sprime_i)
+            Sprime.append(Sprime_i.to('cpu'))
         self.A = Sl
         self.B = Sprime
         self.C = Sr
@@ -504,31 +504,21 @@ class RedBlackSolverHBS(DirectSolver):
         self.rk   = rk
         self.tree = tree
         self.quad = quad
-        # carry the *compressed* Schur diagonal down to the next level
         self.compress_diag = compress_diag
         self.fused  = fused
         self.device = device
         self.fast   = fast
-        # How to treat a user-supplied diagonal list T:
-        #   None  -- probe each entry and swap exact identities for id_op
-        #   True  -- assert every entry is the identity and swap unconditionally
-        #   False -- leave T exactly as given
         self.identity_diag = identity_diag
-        # Factorize only the diagonals that are actually inverted; see the
-        # ULV FACTORIZATION COUNT section above.  False restores the previous
-        # unconditional compute_ULV=True on every construct, which is the
-        # fallback if HBSMAT.construct turns out not to honour compute_ULV.
         self.skip_unused_ulv = skip_unused_ulv
         self._dtype = np.float64
         self._rng   = np.random.default_rng(seed)
-        # bookkeeping so the saving can be checked directly
         self.nConstruct = 0
-        self.nSolve     = 0     # calls to T^{-1} (any number of columns)
-        self.nApply     = 0     # calls to an off-diagonal / diagonal apply
-        self.nIdSkipped = 0     # applies/solves elided because T was identity
-        self.nULV         = 0   # constructs that did build a ULV factorization
-        self.nULVSkipped  = 0   # constructs that skipped it (apply-only)
-        self.nDeadSkipped = 0   # diagonals not built at all (no consumer)
+        self.nSolve     = 0     
+        self.nApply     = 0     
+        self.nIdSkipped = 0     
+        self.nULV         = 0   
+        self.nULVSkipped  = 0   
+        self.nDeadSkipped = 0   
 
     # ------------------------------------------------------------------
 
@@ -607,6 +597,7 @@ class RedBlackSolverHBS(DirectSolver):
         h.construct(rk, Om=np.ascontiguousarray(Om), Psi=np.ascontiguousarray(Psi),
                     Y=np.ascontiguousarray(Y), Z=np.ascontiguousarray(Z),
                     compute_ULV=ulv, fast=self.fast)
+        h.to('cpu')
         self.nConstruct += 1
         if ulv:
             self.nULV += 1
@@ -695,8 +686,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         self._dtype = S_rk_list[0][0].dtype
 
-        SiM = [_[0]  for _ in S_rk_list]
-        SiP = [_[-1] for _ in S_rk_list]
+        SiM = [_[0].to('cpu')  for _ in S_rk_list]
+        SiP = [_[-1].to('cpu') for _ in S_rk_list]
 
         # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
