@@ -61,7 +61,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 50.
+kh = 75.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -119,7 +119,7 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/32,1/32])
+    a = np.array([H/4,1/64,1/64])
     assembler = mA.rkHMatAssembler(p*p,256,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=False)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
@@ -148,7 +148,7 @@ for indp in range(len(pvec)):
     print("Thomas solver time = ",time.time()-tic)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,256,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cpu')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,256,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=False,device='cpu')
     rb_solver.factorize(S_rk_list)
     print("RB solver factorized in ",time.time()-tic,"s")    
     def matvec_rb(v):
