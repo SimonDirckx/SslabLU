@@ -80,24 +80,100 @@ def block_mult_and_reduce(A,B,fac,device,mode='N'):
     else:
         raise ValueError("mode not recognized")
 
-def construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,device,fast=False):
-    # batched over the block dim; same per-block algebra as before
+
+def _small_pinv_factors(R, s=None, rtol=None):
+    """B = R^T Q^T  =>  pinv(R^T) = Vh^T diag(Sinv) Uc^T, all n x n."""
+    n = R.shape[-1]
+    Uc, S, Vhc = tla.svd(R.mT, full_matrices=False)
+    if rtol is None:
+        rtol = max(s if s is not None else n, n) * torch.finfo(R.dtype).eps
+    Sinv = torch.zeros_like(S)
+    m = S > rtol * S[..., :1]
+    Sinv[m] = S[m].reciprocal()
+    return Uc, Sinv, Vhc
+
+
+def _rsolve_qr(P, QR, s=None, fast=False):
+    """P B^+ where B = R^T Q^T. Replaces _rsolve(P, B)."""
+    Q, R = QR
+    PQ = torch.bmm(P, Q)                                  # (Nb, ny, n)
+    if fast:
+        return torch.linalg.solve_triangular(R, PQ, upper=True, left=False)
+    Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
+    return torch.bmm(torch.bmm(PQ, Vhc.mT) * Sinv.unsqueeze(-2), Uc.mT)
+
+
+def _pinv_apply_left(QR, U, s=None, fast=False):
+    """B^+ U = Q pinv(R^T) U, applied to k columns."""
+    Q, R = QR
+    if fast:
+        T = torch.linalg.solve_triangular(R.mT, U, upper=False, left=True)
+    else:
+        Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
+        T = torch.bmm(Vhc.mT, Sinv.unsqueeze(-1) * torch.bmm(Uc.mT, U))
+    return torch.bmm(Q, T)                                # (Nb, s, k)
+
+def construct_D(U_ell, V_ell, Y_ell, Z_ell, om_qr, psi_qr,
+                device=None, s=None, fast=False):
+    """
+    om_qr  = (Q_om,  R_om)   from compute_UV(Om_ell,  Y_ell, ...)
+    psi_qr = (Q_psi, R_psi)  from compute_UV(Psi_ell, Z_ell, ...)
+    s : column count of the original Om/Psi, needed only to keep the rtol
+        cutoff identical to the old max(s, n) * eps.
+    """
+    # --- term1: (I - U U^T) Y  Om^+ ---------------------------------------
+    # formed explicitly: this term needs all n columns of the result
     Yperp = Y_ell - torch.bmm(U_ell, torch.bmm(U_ell.mT, Y_ell))
-    Zperp = Z_ell - torch.bmm(V_ell, torch.bmm(V_ell.mT, Z_ell))
-    term1 = _rsolve(Yperp, Om_ell, fast=fast)
-    inner = _rsolve(Zperp, Psi_ell, fast=fast).mT
-    term2 = torch.bmm(U_ell, torch.bmm(U_ell.mT, inner))
+    term1 = _rsolve_qr(Yperp, om_qr, s=s, fast=fast)
+
+    # --- term2: U U^T (Zperp Psi^+)^T  ==  U ( Zperp (Psi^+ U) )^T ---------
+    X  = _pinv_apply_left(psi_qr, U_ell, s=s, fast=fast)   # (Nb, s, k) = Psi^+ U
+    ZX = torch.bmm(Z_ell, X)                               # (Nb, n, k)
+    ZX -= torch.bmm(V_ell, torch.bmm(V_ell.mT, ZX))        # = Zperp X, Zperp never formed
+    term2 = torch.bmm(U_ell, ZX.mT)
+
     return term1 + term2
 
-def compute_UV(Om, Y, rk, device,fast=False):
-    ny = Y.shape[1]
-    Qhead = tla.qr(Om.mT, mode='reduced').Q          # (Nb, s, n)
-    M = Y - torch.bmm(torch.bmm(Y, Qhead), Qhead.mT)  # (Nb, ny, s)  no (s,s) Q ever formed
+def compute_UV(Om, Y, rk, device,fast=False,work=None):
+    """
+    Orthonormal basis for the dominant rk-dim left singular subspace of
+    Y projected off the row space of Om.
+
+    Om : (Nb, n,  s)        Y : (Nb, ny, s)        s >= n
+    Returns (U, (Q_om, R_om)) with U : (Nb, ny, k), k = min(rk, ny).
+    The QR pair is the factorization of Om that _rsolve needs in
+    construct_D -- handing it back is what removes the duplicate factor.
+    """
+    Nb, ny, s = Y.shape
+    n = Om.shape[1]
+    k = min(rk, ny)
+    assert s >= n + k, "undersampled: not enough columns left after projecting off Om"
+
+    # ---- one QR does the projection and the Om factorization at once -------
+    if work is None:
+        W = torch.empty((Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
+    else:
+        W = work[:Nb, :s, :n + ny]          # caller-owned arena, see below
+    W[:, :, :n].copy_(Om.mT)
+    W[:, :, n:].copy_(Y.mT)
+
+    Q, R = tla.qr(W, mode='reduced')        # Q:(Nb,s,r) R:(Nb,r,n+ny), r=min(s,n+ny)
+
+    # .contiguous() drops the reference to the full Q so the (Nb,s,ny) tail
+    # is freed here rather than living as long as the returned view.
+    Q_om = Q[:, :, :n]        # == old Qhead
+    R_om = R[:, :n, :n]
+    L    = R[:, n:, n:].mT                  # (Nb, ny, r-n) -- this is the L of M
+
+    # ---- tiny factorization on L instead of a wide one on M ----------------
     if fast:
-        G = torch.bmm(M, M.mT); G = 0.5*(G + G.mT)
-        return tla.eigh(G).eigenvectors[:, :, -min(rk,ny):].flip(-1)
-    Us, S, _ = tla.svd(M, full_matrices=False)
-    return Us[:, :, :min(rk, ny)]
+        G = torch.bmm(L, L.mT)
+        G = 0.5 * (G + G.mT)
+        U = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
+    else:
+        U = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
+
+    return U, (Q_om, R_om)
 
 
 class HBSMAT:
@@ -266,11 +342,15 @@ class HBSMAT:
             
             if lvl>0:
                 tic = time.time()
-                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
-                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
+                V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                if str(self.device).startswith('cuda'):
+                    torch.cuda.synchronize()
                 self.nullTime+=time.time()-tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
+                if str(self.device).startswith('cuda'):
+                    torch.cuda.synchronize()
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -334,10 +414,15 @@ class HBSMAT:
             #print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
-                U_ell = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
-                V_ell = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
+                V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                if str(self.device).startswith('cuda'):
+                    torch.cuda.synchronize()
+                self.nullTime+=time.time()-tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,Om_ell,Psi_ell,self.device,fast=fast)
+                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
+                if str(self.device).startswith('cuda'):
+                    torch.cuda.synchronize()
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
