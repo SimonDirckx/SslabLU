@@ -209,6 +209,10 @@ class HBSMAT:
 
     # every attribute holding a list of tensors; to() walks these.
     # NNvec is numpy and Nbvec is a list of ints, so both stay put.
+    _GROUPS = {
+        'core': ('Umats', 'Vmats', 'Dmats'),
+        'ulv' : ('Qlist', 'Wlist', 'Rlist', 'Uulist'),
+    }
     _tensor_lists = ('Umats', 'Vmats', 'Dmats',
                      'Qlist', 'Wlist', 'Rlist', 'Uulist')
 
@@ -225,7 +229,16 @@ class HBSMAT:
 
         self.mode   =   'N'
         self._tree  =   None
-        self.device = device
+
+        dev = torch.device(device) if device is not None else torch.device('cpu')
+        self.compute_device = dev
+        self.home           = torch.device('cpu')
+        self._resident = {'core': dev, 'ulv': dev}
+        self._dirty    = {'core': dev != self.home, 'ulv': dev != self.home}
+        self.strict    = False
+        self.nFill = self.nSpill = 0
+        self.bytesH2D = self.bytesD2H = 0
+
         if A is not None:
             self.A      =   A
             self.shape  =   self.A.shape
@@ -273,6 +286,9 @@ class HBSMAT:
         ctr+=sum([V.nbytes for V in self.Vmats])
         ctr+=sum([D.nbytes for D in self.Dmats])
         return ctr
+    @property
+    def device(self):
+        return str(self.compute_device)
     def construct(self,rk,Om=None,Psi=None,Y=None,Z=None,compute_ULV=False,fast=False):
         if Om is None:
             if self.A is None:
@@ -297,7 +313,11 @@ class HBSMAT:
         nl = self.nl
         self.nSamples = s
         tic = time.time()
-        
+        if torch.is_tensor(self.perm):
+            self.perm = self.perm.to(self.compute_device)
+        else:
+            self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
+                                        device=self.compute_device)        
         Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
         Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
         Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
@@ -371,7 +391,11 @@ class HBSMAT:
         nl = self.nl
         self.nSamples = s
         tic = time.time()
-        
+        if torch.is_tensor(self.perm):
+            self.perm = self.perm.to(self.compute_device)
+        else:
+            self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
+                                        device=self.compute_device)
         Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
         Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
         Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
@@ -473,6 +497,8 @@ class HBSMAT:
         return self.rmatmat(v)
 
     def matmat(self,v):
+        self._require_resident('matmat')
+        dev = self.compute_device
         numpy_input = isinstance(v, np.ndarray)
         if numpy_input:
             v = torch.from_numpy(v).to(self.device)
@@ -583,45 +609,139 @@ class HBSMAT:
     # Device placement
     # ------------------------------------------------------------------
 
-    def to(self, device, non_blocking=True):
-        """Move every stored factor to `device`, in place, and return self.
+    def _lists(self, groups):
+        for g in groups:
+            for name in self._GROUPS[g]:
+                yield g, getattr(self, name)
 
-        Entries are rebound rather than collected into a new list, so the
-        tensors on the old device lose their last reference here and go back
-        to the caching allocator immediately.
-
-        All seven tensor lists are treated identically -- there is no
-        per-level exception -- so after this call self.Dmats, self.Umats and
-        self.Vmats are on one device and consumers that take the whole list
-        (ULVsparse.solve, ULVsparse.compute_ULV) are safe.
-
-        self.A is deliberately untouched: it is the host-side LinearOperator
-        the samples came from and nothing reads it after construction.  Set
-        H.A = None yourself if you want that memory back.
-        """
-        device = torch.device(device)
-        for name in self._tensor_lists:
-            lst = getattr(self, name)
+    def _move(self, target, groups, non_blocking=False):
+        target = torch.device(target)
+        moved = 0
+        for g, lst in self._lists(groups):
             for i, t in enumerate(lst):
-                if torch.is_tensor(t):
-                    lst[i] = t.to(device, non_blocking=non_blocking)
-        if torch.is_tensor(self.perm):
-            self.perm = self.perm.to(device, non_blocking=non_blocking)
-        # keep this a string: the constructors and the ULVsparse calls all
-        # pass self.device around, and str(torch.device('cuda')) == 'cuda'
-        self.device = str(device)
+                if torch.is_tensor(t) and t.device != target:
+                    moved += t.nbytes
+                    lst[i] = t.to(target, non_blocking=non_blocking)
+        if 'core' in groups and torch.is_tensor(self.perm) \
+                and self.perm.device != target:
+            moved += self.perm.nbytes
+            self.perm = self.perm.to(target, non_blocking=non_blocking)
+        return moved
+
+    def _group_resident(self, g):
+        # A group with no tensors (e.g. ulv on a compute_ULV=False block)
+        # is vacuously resident -- there is nothing to stage.
+        if not any(len(getattr(self, n)) for n in self._GROUPS[g]):
+            return True
+        r = self._resident[g]
+        return r is not None and torch.device(r) == self.compute_device
+
+    def prefetch(self, groups=('core',), non_blocking=True):
+        """Stage a device mirror for the named groups. No-op if resident."""
+        need = [g for g in groups if not self._group_resident(g)]
+        if not need:
+            return self
+        n = self._move(self.compute_device, need, non_blocking=non_blocking)
+        for g in need:
+            self._resident[g] = self.compute_device
+        self.nFill += 1
+        self.bytesH2D += n
+        return self
+
+    def evict(self, groups=('core', 'ulv')):
+        """Drop the device mirror for the named groups.
+
+        A *dirty* group was built on device and has no home copy: it is
+        written back.  A *clean* group already has an identical home copy
+        -- it was staged in for read-only use -- so the tensors are rebound
+        to `home` and the device memory returns to the caching allocator
+        with no copy at all.  That clean path is what makes a
+        consume-before-evict schedule cost one bus crossing per block.
+
+        compute_device is NOT touched.  An evicted block that is applied
+        again must be re-staged, never silently demoted to host arithmetic;
+        that is the whole point of this method existing instead of to('cpu').
+        """
+        if self.compute_device == self.home:
+            return self 
+        for g in groups:
+            if self._resident[g] is None:
+                continue
+            n = self._move(self.home, (g,))
+            if self._dirty[g]:
+                self.bytesD2H += n
+                self._dirty[g] = False
+            self._resident[g] = None
+            self.nSpill += 1
+        return self
+
+    def release_ulv(self):
+        """Send the ULV factors home, keep the apply factors on device."""
+        return self.evict(groups=('ulv',))
+    def to(self, device, non_blocking=False):
+        device = torch.device(device)
+
+        moved = 0
+        for g in self._GROUPS:
+            moved += self._move(device, (g,), non_blocking=non_blocking)
+            self._resident[g] = device
+            self._dirty[g]    = False
+
+        # perm rides with 'core' inside _move, but normalize it here so a
+        # tree-supplied numpy perm becomes a tensor on the target rather
+        # than staying host-side and forcing an implicit H2D on every
+        # fancy-index in matmat/constructHBS.
+        if not torch.is_tensor(self.perm):
+            self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
+                                        device=device)
+
+        self.home           = device
+        self.compute_device = device
+
+        # Counted separately from bytesH2D/bytesD2H so residency_report()
+        # keeps measuring the spill/fill schedule and is not polluted by
+        # one-off relocations.
+        self.bytesRelocated = getattr(self, 'bytesRelocated', 0) + moved
         return self
 
     def cpu(self):
-        """Offload the whole object to host memory."""
+        """Relocate to host: this becomes a host object that computes on the
+        host.  NOT the same as evict(), which keeps compute_device on the
+        accelerator and merely drops the mirror."""
         return self.to('cpu')
 
     def cuda(self, index=None):
-        """Move the whole object to a CUDA device."""
+        """Relocate to a CUDA device."""
         return self.to('cuda' if index is None else f'cuda:{index}')
 
+    def device_nbytes(self, include_ulv=True):
+        groups = ('core', 'ulv') if include_ulv else ('core',)
+        tot = sum(t.nbytes for _, lst in self._lists(groups)
+                  for t in lst if torch.is_tensor(t))
+        if torch.is_tensor(self.perm):
+            tot += self.perm.nbytes
+        return tot
+
+    def _require_resident(self, what, need_ulv=False):
+        groups = ('core', 'ulv') if need_ulv else ('core',)
+        missing = [g for g in groups if not self._group_resident(g)]
+        if not missing:
+            return
+        if self.strict:
+            raise RuntimeError(
+                f"{what}() on an HBS block whose {'+'.join(missing)} factors "
+                f"are not resident on {self.compute_device} (resident="
+                f"{self._resident}). The block was evicted and nothing staged "
+                "it back. Under strict=True this is an error instead of a "
+                "silent fallback to host arithmetic."
+            )
+        self.prefetch(groups=missing)
+
     def compute_ULV(self):
+        self._require_resident('compute_ULV')
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
+        self._resident['ulv'] = self.compute_device
+        self._dirty['ulv']    = (self.compute_device != self.home)
 
     def solve(self, b, mode='N'):
 
