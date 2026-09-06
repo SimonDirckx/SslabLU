@@ -94,8 +94,8 @@ def _rsolve_qr(P, QR, s=None, fast=False):
     """P B^+ where B = R^T Q^T. Replaces _rsolve(P, B)."""
     Q, R = QR
     PQ = torch.bmm(P, Q)                                  # (Nb, ny, n)
-    if fast:
-        return torch.linalg.solve_triangular(R, PQ, upper=True, left=False)
+    #if fast:
+    #    return torch.linalg.solve_triangular(R, PQ, upper=True, left=False)
     Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
     return torch.bmm(torch.bmm(PQ, Vhc.mT) * Sinv.unsqueeze(-2), Uc.mT)
 
@@ -290,7 +290,7 @@ class HBSMAT:
     def _as_local(self,X):
         dev = self.compute_device
         if torch.is_tensor(X):
-            return X.to(device=dev,dtype=self.dtype_t,non_blocking=true)
+            return X.to(device=dev,dtype=self.dtype_t,non_blocking=True)
         return torch.from_numpy(X).to(device=dev,dtype=self.dtype_t)
     def construct(self,rk,Om=None,Psi=None,Y=None,Z=None,compute_ULV=False,fast=False):
         if Om is None:
@@ -395,10 +395,10 @@ class HBSMAT:
         else:
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=self.compute_device)
-        Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
-        Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
-        Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
-        Zpr   = torch.from_numpy(Z0  ).to(device=self.device)[self.perm, :]
+        Ompr  = self._as_local(Om0 )[self.perm, :]
+        Psipr = self._as_local(Psi0)[self.perm, :]
+        Ypr   = self._as_local(Y0  )[self.perm, :]
+        Zpr   = self._as_local(Z0  )[self.perm, :]
 
         Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
         Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
@@ -751,7 +751,6 @@ class HBSMAT:
             )
 
         self._require_resident('solve',need_ulv=True)
-        print('after require:',self._resident,'core:',self.Umats[0].device,'ulv:',self.Qlist[0].device,'compute:',self.compute_device)
         input_is_numpy = isinstance(b, np.ndarray)
         input_is_torch = torch.is_tensor(b)
 

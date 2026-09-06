@@ -28,7 +28,6 @@ from scipy.sparse.linalg import LinearOperator
 
 
 
-
 def dense_to_linop(A):
     A = np.array(A)
     n = A.shape[0]
@@ -119,7 +118,7 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/16,1/16])
+    a = np.array([H/4,1/64,1/64])
     assembler = mA.rkHMatAssembler(p*p,p*p,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
@@ -136,7 +135,7 @@ for indp in range(len(pvec)):
     print("Ntot = ",Ntot)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=False,device='cuda')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
     rb_solver.factorize(S_rk_list)
     print("RB solver factorized in ",time.time()-tic,"s")
     h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))

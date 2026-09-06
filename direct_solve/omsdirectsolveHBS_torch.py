@@ -4,6 +4,7 @@ import matAssembly.HBS.HBStorch as HBSnew
 from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 import torch
+import time
 
 def _resolve_device(spec):
     if spec is None or spec == 'auto':
@@ -42,6 +43,11 @@ def _rdtype(*ops):
 
 class id_op(_NoResidency,LinearOperator):
     """Identity operator."""
+
+    def __init__(self, n, dtype=np.float64):
+        super().__init__(shape=(n, n), dtype=dtype)
+        self.tree = None
+        self.quad = None
     def _matvec(self, v):         return v.clone() if torch.is_tensor(v) else v.copy()
     _matmat = _rmatvec = _rmatmat = _matvec
     def solve(self,v,mode='N'):
@@ -54,6 +60,11 @@ def _zeros_like_input(V,rows,dtype):
 
 class zero_op(_NoResidency,LinearOperator):
     """Zero operator; replaces a materialized dense zero block."""
+    def __init__(self, n, dtype=np.float64, m=None):
+        m = n if m is None else m
+        super().__init__(shape=(m, n), dtype=dtype)
+        self.tree = None
+        self.quad = None
     def _matmat(self, V):   return _zeros_like_input(V,self.shape[0],self.dtype)
     def _rmatmat(self, v):  return _zeros_like_input(V,self.shape[1],self.dtype)
     _matvec, _rmatvec = _matmat, _rmatmat
@@ -740,7 +751,6 @@ class RedBlackSolverHBS(DirectSolver):
 
         # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
-            print(type(S_rk_list[0][0]), repr(S_rk_list[0][0].dtype))
             SiM[0]  = zero_op(m, self._dtype)
             SiP[-1] = zero_op(m, self._dtype)
 
@@ -755,9 +765,18 @@ class RedBlackSolverHBS(DirectSolver):
 
         l = nSlabs
         rk = self.rk
+        self.levelTimes=[]
         while l > 1:
             builder = self._build_level_fused if self.fused else self._build_level
+            if self.compute_device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.time()
             RB.append(builder(m, l, RB[-1], rk))
+            if self.compute_device.type == 'cuda':
+                torch.cuda.synchronize()
+            dt = time.time() - t0
+            self.levelTimes.append((l,dt))
+            print(f" level nSlabs = {l:5d} {dt:7.2f} s " f"({dt/(l//2):.4f}s/node)")
             rk = rk  # + 20
             l //= 2
 
@@ -812,8 +831,6 @@ class RedBlackSolverHBS(DirectSolver):
                 cols.append(self._ap(SiP[k], Om))
             RHS = cols[0] if len(cols) == 1 else torch.cat(cols, dim=1)
             h = T_hbs[k]
-            print(h._resident,h._dirty)
-            print('core:',h.Umats[0].device,'ulv:',h.Qlist[0].device)
 
             X = self._sv(T_hbs[k], RHS)        # one solve, up to 2s columns
             Xm[k] = X[:, :s]
@@ -992,7 +1009,7 @@ class RedBlackSolverHBS(DirectSolver):
         m  = self.m
         RB = self.RB
         dev = self.compute_device
-        input_is_numpy - isinstance(rhs,np.ndarray)
+        input_is_numpy = isinstance(rhs,np.ndarray)
         was_vector = (np.asarray(rhs).ndim == 1 if input_is_numpy else rhs.ndim ==1 )
         # ---- forward reduction ----------------------------------------
         v0 = torch.as_tensor(rhs, dtype=self._tdtype, device=dev)
@@ -1043,7 +1060,7 @@ class RedBlackSolverHBS(DirectSolver):
                 next_j = (j + 1) % nReduced
                 contrib = self._ap(SiM[i+1],vPrimes[l][j*m:(j+1)*m,:])
                 if self.cyclic or j + 1 < nReduced:
-                    contrib = constrib + self._ap(SiP[i+1],vPrimes[l][next_j*m:(next_j+1)*m, :])
+                    contrib = contrib + self._ap(SiP[i+1],vPrimes[l][next_j*m:(next_j+1)*m, :])
 
                 blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
                 vPrimes[l-1][(i+1)*m:(i+2)*m,:] = self._sv(T_hbs[i+1],blk)
