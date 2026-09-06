@@ -121,7 +121,7 @@ for indp in range(len(pvec)):
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/4,1/16,1/16])
     assembler = mA.rkHMatAssembler(p*p,p*p,ndim=3)
-    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=False)
+    opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
     S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=0)
@@ -134,53 +134,46 @@ for indp in range(len(pvec)):
     print("type rhslist  = ",type(rhs_list))
     print("len rhs_list  = ",len(rhs_list))
     print("Ntot = ",Ntot)
-    tic = time.time()
-    thomas_solver = omsdirectHBS.ThomasSolverHBS(nc,p*p)
-    thomas_solver.factorize(S_rk_list)
-    print("THOMAS solver factorized in ",time.time()-tic,"s")
-    tic = time.time()
-    def matvec_thomas(v):
-        return thomas_solver.solve(v)
-    Sinv_HBS_thomas  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_thomas,dtype=np.float64)
-    tic = time.time()
-    v = np.random.standard_normal(size=(Sinv_HBS_thomas.shape[0],))
-    u = Sinv_HBS_thomas@v
-    print("Thomas solver time = ",time.time()-tic)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=False,device='cpu')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=False,device='cuda')
     rb_solver.factorize(S_rk_list)
-    print("RB solver factorized in ",time.time()-tic,"s")    
+    print("RB solver factorized in ",time.time()-tic,"s")
+    h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))
+    assert h.compute_device.type == 'cuda'
+    h.evict()
+    assert h._resident['core'] is None
+    assert h.Dmats[0].device.type == 'cpu'
+    n0 = h.nFill
+    y = h.matmat(np.random.randn(h.shape[1],4))
+    assert h.nFill == n0+1
+    assert h._resident['core'] == h.compute_device
+    r = rb_solver.residency_report()
+    print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
+
     def matvec_rb(v):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
     tic = time.time()
-    v = np.random.standard_normal(size=(Sinv_HBS_thomas.shape[0],))
+    v = np.random.standard_normal(size=(Sinv_HBS_rb.shape[0],))
     u = Sinv_HBS_rb@v
     print("RB solver time = ",time.time()-tic)
 
     ptgInfo = gmres_info()
     prbgInfo = gmres_info()
     
-    stol = 1e-11*H*H
-    if Version(scipy.__version__)>=Version("1.14"):
-        uhat_thomas,_   = gmres(Stot,rhstot,rtol=stol,callback=ptgInfo,maxiter=100,restart=100,M=Sinv_HBS_thomas)
-    else:
-        uhat_thomas,_   = gmres(Stot,rhstot,tol=stol,callback=ptgInfo,maxiter=100,restart=100,M=Sinv_HBS_thomas)
+    stol = 1e-8*H*H
     if Version(scipy.__version__)>=Version("1.14"):
         uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=prbgInfo,maxiter=100,restart=100,M=Sinv_HBS_rb)
     else:
         uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=prbgInfo,maxiter=100,restart=100,M=Sinv_HBS_rb)
-    res_thomas = Stot@uhat_thomas-rhstot
     res_rb = Stot@uhat_rb-rhstot
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
     print("ord                      = ",p)
     print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
     print("nc                       = ",OMS.nc)
-    print("L2 rel. res thomas       = ", np.linalg.norm(res_thomas)/np.linalg.norm(rhstot))
     print("L2 rel. res rb           = ", np.linalg.norm(res_rb)/np.linalg.norm(rhstot))
-    print("pGMRES iters thomas      = ", ptgInfo.niter)
     print("pGMRES iters rb          = ", prbgInfo.niter)
     print("==================================")
     nc = OMS.nc

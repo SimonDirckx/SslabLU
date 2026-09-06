@@ -22,7 +22,15 @@ def _resolve_device(spec):
 # Linear operator helpers
 # ---------------------------------------------------------------------------
 
-
+class _NoResidency:
+    """Residency no-ops for operators that own no device memory."""
+    strict = False
+    def prefetch(self, *a, **kw):  return self
+    def evict(self, *a, **kw):     return self
+    def release_ulv(self):         return self
+    def device_nbytes(self, include_ulv=True): return 0
+    @property
+    def is_resident(self): return True
 
 
 def _rdtype(*ops):
@@ -32,39 +40,23 @@ def _rdtype(*ops):
     return np.result_type(*dts) if dts else np.float64
 
 
-class id_op(LinearOperator):
+class id_op(_NoResidency,LinearOperator):
     """Identity operator."""
-    def __init__(self, n,dtype=np.float64):
-        super().__init__(shape=(n, n), dtype=dtype)
-        self.tree = None
-        self.quad = None
-    def _matvec(self, v):         return v.copy()
-    def _matmat(self, v):         return v.copy()
-    def _rmatvec(self, v):        return v.copy()
-    def _rmatmat(self, v):        return v.copy()
-    def solve(self, v, mode='N'): return v.copy()
+    def _matvec(self, v):         return v.clone() if torch.is_tensor(v) else v.copy()
+    _matmat = _rmatvec = _rmatmat = _matvec
+    def solve(self,v,mode='N'):
+        return v.clone() if torch.is_tensor(v) else v.copy()
+def _zeros_like_input(V,rows,dtype):
+    cols = V.shape[1] if V.ndim == 2 else 1
+    if torch.is_tensor(V):
+        return torch.zeros(rows,cols,dtype=V.dtype,device=V.device)
+    return np.zeros((rows,cols),dtype=dtype)
 
-
-class zero_op(LinearOperator):
+class zero_op(_NoResidency,LinearOperator):
     """Zero operator; replaces a materialized dense zero block."""
-    def __init__(self, n, dtype=np.float64, m=None):
-        m = n if m is None else m
-        super().__init__(shape=(m, n), dtype=dtype)
-        self.tree = None
-        self.quad = None
-    def _matvec(self, v):
-        return np.zeros(self.shape[0], dtype=self.dtype)
-    def _matmat(self, V):
-        return np.zeros((self.shape[0], V.shape[1]), dtype=self.dtype)
-    def _rmatvec(self, v):
-        return np.zeros(self.shape[1], dtype=self.dtype)
-    def _rmatmat(self, V):
-        return np.zeros((self.shape[1], V.shape[1]), dtype=self.dtype)
-    def solve(self, v, mode='N'):
-        raise NotImplementedError(
-            "zero_op is singular: a boundary off-diagonal block was solved "
-            "with, which means a boundary guard is missing upstream."
-        )
+    def _matmat(self, V):   return _zeros_like_input(V,self.shape[0],self.dtype)
+    def _rmatmat(self, v):  return _zeros_like_input(V,self.shape[1],self.dtype)
+    _matvec, _rmatvec = _matmat, _rmatmat
 
 
 class dead_op:
@@ -87,15 +79,6 @@ class dead_op:
         )
 
     matmat = rmatmat = matvec = rmatvec = solve = _die
-class _NoResidency:
-    """Residency no-ops for operators that own no device memory."""
-    strict = False
-    def prefetch(self, *a, **kw):  return self
-    def evict(self, *a, **kw):     return self
-    def release_ulv(self):         return self
-    def device_nbytes(self, include_ulv=True): return 0
-    @property
-    def is_resident(self): return True
 
 def _is_id(op):
     """True if `op` is a structural identity, i.e. an id_op instance.
@@ -109,8 +92,7 @@ def _is_id(op):
     return isinstance(op, id_op)
 
 
-def _linop_from_mat(A):
-    """Wrap a dense numpy matrix as a LinearOperator with .solve and .tree/.quad."""
+def _linop_from_mat(A,device=None):
     A  = np.asarray(A)
     n  = A.shape[0]
     lo = LinearOperator(
@@ -520,9 +502,8 @@ class RedBlackSolverHBS(DirectSolver):
     stub, so a consumer missed by the analysis above fails loudly.
     """
 
-    def __init__(self, m, rk, tree, quad, cyclic=False,
-                 compress_diag=True, fused=True, device='cpu', fast=False,
-                 seed=0, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False):
+    def __init__(self, m, rk, tree, quad, cyclic=False,seed=None,
+                 compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False):
         super().__init__(m, cyclic)
         self.rk   = rk
         self.tree = tree
@@ -546,6 +527,11 @@ class RedBlackSolverHBS(DirectSolver):
             compute_device if compute_device is not None else device)
         self.strict_residency = strict_residency
         self._blocks = []
+        self._tdtype = torch.float64
+        self._tgen   = torch.Generator(device=self.compute_device)
+        if seed is not None:
+            self._tgen.manual_seed(seed)
+
     
     # ------------------------------------------------------------------
 
@@ -636,7 +622,7 @@ class RedBlackSolverHBS(DirectSolver):
 
         return self._finish(h, ulv, label, spill=spill)
 
-    def _hbs_from_samples(self, rk, Om, Psi, Y, Z, compute_ULV=True, label=None):
+    def _hbs_from_samples(self, rk, Om, Psi, Y, Z, compute_ULV=True, label=None,spill=True):
         """Compress from externally supplied samples Y = M Om, Z = M^T Psi.
 
         Om/Psi/Y/Z must be numpy: constructHBS calls torch.from_numpy on all
@@ -658,6 +644,16 @@ class RedBlackSolverHBS(DirectSolver):
                     compute_ULV=ulv, fast=self.fast)
 
         return self._finish(h, ulv, label, spill=spill)
+    def residency_report(self):
+        b = self._blocks
+        return dict(
+                nBlocks = len(b),
+                nFill   = sum(getattr(x,'nFill',0) for x in b),
+                nSpill  = sum(getattr(x,'nSpill',0) for x in b),
+                GB_H2D  = sum(getattr(x,'bytesH2D',0)for x in b)/10**9,
+                GB_D2H  = sum(getattr(x,'bytesD2H',0)for x in b)/10**9,
+                GB_total= sum(x.device_nbytes() for x in b)/10**9
+                )
 
     # ------------------------------------------------------------------
 
@@ -676,15 +672,15 @@ class RedBlackSolverHBS(DirectSolver):
 
     def _ap(self, op, X):
         self.nApply += 1
-        return np.asarray(op.matmat(X))
+        return op.matmat(X)
 
     def _apT(self, op, X):
         self.nApply += 1
-        return np.asarray(op.rmatmat(X))
+        return op.rmatmat(X)
 
     def _sv(self, op, X, mode='N'):
         self.nSolve += 1
-        return np.asarray(op.solve(X, mode=mode))
+        return op.solve(X, mode=mode)
 
     def _normalize_diag(self, T, m):
         """Swap identity diagonals for id_op so the fast paths engage.
@@ -739,11 +735,12 @@ class RedBlackSolverHBS(DirectSolver):
 
         self._dtype = S_rk_list[0][0].dtype
 
-        SiM = [_[0].to('cpu')  for _ in S_rk_list]
-        SiP = [_[-1].to('cpu') for _ in S_rk_list]
+        SiM = [self._adopt(_[0]) for _ in S_rk_list]
+        SiP = [self._adopt(_[-1])for _ in S_rk_list]
 
         # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
+            print(type(S_rk_list[0][0]), repr(S_rk_list[0][0].dtype))
             SiM[0]  = zero_op(m, self._dtype)
             SiP[-1] = zero_op(m, self._dtype)
 
@@ -781,8 +778,8 @@ class RedBlackSolverHBS(DirectSolver):
         dtype  = self._dtype
 
         s   = self._nsamples(rk)
-        Om  = self._rng.standard_normal(size=(m, s))
-        Psi = self._rng.standard_normal(size=(m, s))
+        Om  = torch.randn(m,s,generator=self._tgen,device=self.compute_device,dtype=self._tdtype)
+        Psi = torch.randn(m,s,generator=self._tgen,device=self.compute_device,dtype=self._tdtype)
 
         # ---------------------------------------------------------------
         # pass 1 -- eliminated (odd) nodes: one fused solve each
@@ -813,7 +810,10 @@ class RedBlackSolverHBS(DirectSolver):
             cols = [self._ap(SiM[k], Om)]
             if need_p:
                 cols.append(self._ap(SiP[k], Om))
-            RHS = cols[0] if len(cols) == 1 else np.concatenate(cols, axis=1)
+            RHS = cols[0] if len(cols) == 1 else torch.cat(cols, dim=1)
+            h = T_hbs[k]
+            print(h._resident,h._dirty)
+            print('core:',h.Umats[0].device,'ulv:',h.Qlist[0].device)
 
             X = self._sv(T_hbs[k], RHS)        # one solve, up to 2s columns
             Xm[k] = X[:, :s]
@@ -852,7 +852,7 @@ class RedBlackSolverHBS(DirectSolver):
                 # forward: one apply of S^+_i covering both B and C
                 cols = [Xm[kR]] if C_is_zero else [Xm[kR], Xp[kR]]
                 W = self._ap(SiP[i], cols[0] if len(cols) == 1
-                             else np.concatenate(cols, axis=1))
+                             else torch.cat(cols, dim=1))
                 Y_B = Y_B - W[:, :s]
                 if not C_is_zero:
                     Y_C = -W[:, s:]
@@ -870,7 +870,7 @@ class RedBlackSolverHBS(DirectSolver):
 
             if has_left:
                 # Xp first (B term), Xm second (A term)
-                W = self._ap(SiM[i], np.concatenate([Xp[kL], Xm[kL]], axis=1))
+                W = self._ap(SiM[i], torch.cat([Xp[kL], Xm[kL]], dim=1))
                 Y_B = Y_B - W[:, :s]
                 Y_A = -W[:, s:]
 
@@ -888,9 +888,9 @@ class RedBlackSolverHBS(DirectSolver):
             # would still alias Om/Psi, which construct would then receive as
             # both the test matrix and its own samples.
             if Y_B is Om:
-                Y_B = Om.copy()
+                Y_B = Om.clone()
             if Z_B is Psi:
-                Z_B = Psi.copy()
+                Z_B = Psi.clone()
 
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
@@ -991,10 +991,15 @@ class RedBlackSolverHBS(DirectSolver):
     def solve(self, rhs):
         m  = self.m
         RB = self.RB
-
+        dev = self.compute_device
+        input_is_numpy - isinstance(rhs,np.ndarray)
+        was_vector = (np.asarray(rhs).ndim == 1 if input_is_numpy else rhs.ndim ==1 )
         # ---- forward reduction ----------------------------------------
-        vPrimes = [rhs.copy()]
-        dtype   = np.result_type(np.asarray(rhs).dtype, self._dtype)
+        v0 = torch.as_tensor(rhs, dtype=self._tdtype, device=dev)
+        if was_vector:
+            v0 = v0[:,None]
+        nrhs = v0.shape[1]
+        vPrimes = [v0.clone()]
 
         for l in range(len(RB) - 1):
             SiM, _, T_hbs, SiP = RB[l]
@@ -1002,7 +1007,7 @@ class RedBlackSolverHBS(DirectSolver):
             nSlabs   = len(SiM)
             nReduced = nSlabs // 2
             vPrev    = vPrimes[-1]
-            vPrime   = np.zeros(m * nReduced, dtype=dtype)
+            vPrime   = torch.zeros(m * nReduced, nrhs,dtype=self._tdtype,device=dev)
 
             for j in range(nReduced):
                 i = 2 * j
@@ -1010,22 +1015,18 @@ class RedBlackSolverHBS(DirectSolver):
                 prev = (i - 1) % nSlabs if (self.cyclic or i > 0)          else None
                 next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1) else None
 
-                contrib = vPrev[i*m:(i+1)*m].copy()
+                contrib = vPrev[i*m:(i+1)*m].clone()
                 if prev is not None:
-                    contrib -= SiM[i].matmat(
-                        T_hbs[prev].solve(vPrev[prev*m:(prev+1)*m, np.newaxis])
-                    )[:, 0]
+                    contrib = contrib - self._ap(SiM[i],self._sv(T_hbs[prev], vPrev[prev*m:(prev+1)*m,:]))
                 if next is not None:
-                    contrib -= SiP[i].matmat(
-                        T_hbs[next].solve(vPrev[next*m:(next+1)*m, np.newaxis])
-                    )[:, 0]
+                    contrib = contrib - self._ap(SiP[i],self._sv(T_hbs[next],vPrev[next*m:(next+1)*m,:]))
 
-                vPrime[j*m:(j+1)*m] = contrib
+                vPrime[j*m:(j+1)*m,:] = contrib
 
             vPrimes.append(vPrime)
 
         # ---- coarsest solve -------------------------------------------
-        vPrimes[-1] = RB[-1][2][0].solve(vPrimes[-1])
+        vPrimes[-1] = self._sv(RB[-1][2][0],vPrimes[-1])
 
         # ---- back substitution ----------------------------------------
         for l in range(len(RB) - 1, 0, -1):
@@ -1040,17 +1041,15 @@ class RedBlackSolverHBS(DirectSolver):
                 vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
 
                 next_j = (j + 1) % nReduced
-                contrib = SiM[i+1].matmat(
-                    vPrimes[l][j*m:(j+1)*m, np.newaxis]
-                )[:, 0]
+                contrib = self._ap(SiM[i+1],vPrimes[l][j*m:(j+1)*m,:])
                 if self.cyclic or j + 1 < nReduced:
-                    contrib += SiP[i+1].matmat(
-                        vPrimes[l][next_j*m:(next_j+1)*m, np.newaxis]
-                    )[:, 0]
+                    contrib = constrib + self._ap(SiP[i+1],vPrimes[l][next_j*m:(next_j+1)*m, :])
 
-                vPrimes[l-1][(i+1)*m:(i+2)*m] -= contrib
-                vPrimes[l-1][(i+1)*m:(i+2)*m] = T_hbs[i+1].solve(
-                    vPrimes[l-1][(i+1)*m:(i+2)*m]
-                )
-
-        return vPrimes[0]
+                blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
+                vPrimes[l-1][(i+1)*m:(i+2)*m,:] = self._sv(T_hbs[i+1],blk)
+        out = vPrimes[0]
+        if was_vector:
+            out = out[:,0]
+        if input_is_numpy:
+            return out.detach().cpu().numpy()
+        return out

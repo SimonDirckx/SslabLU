@@ -66,7 +66,6 @@ def block_matvec(A,B,device,mode='N'):
         return torch.bmm(A.mT, Bm).reshape(Nb * A.shape[2], k)
     else:
         raise ValueError("mode not recognized")
-
 def block_mult_and_reduce(A,B,fac,device,mode='N'):
     # A: (Nb, n, rk), B: (Nb, rk, s) or (Nb, n, s)
     # After bmm: (Nb, *, s); reshape to group fac blocks together
@@ -87,9 +86,7 @@ def _small_pinv_factors(R, s=None, rtol=None):
     Uc, S, Vhc = tla.svd(R.mT, full_matrices=False)
     if rtol is None:
         rtol = max(s if s is not None else n, n) * torch.finfo(R.dtype).eps
-    Sinv = torch.zeros_like(S)
-    m = S > rtol * S[..., :1]
-    Sinv[m] = S[m].reciprocal()
+    Sinv = torch.where(S > rtol*S[...,:1], S.reciprocal(), torch.zeros_like(S))
     return Uc, Sinv, Vhc
 
 
@@ -226,6 +223,7 @@ class HBSMAT:
         self.Uulist =   []
         torch.set_default_dtype(torch.float64)
         self.dtype = np.float64
+        self.dtype_t = torch.float64
 
         self.mode   =   'N'
         self._tree  =   None
@@ -289,6 +287,11 @@ class HBSMAT:
     @property
     def device(self):
         return str(self.compute_device)
+    def _as_local(self,X):
+        dev = self.compute_device
+        if torch.is_tensor(X):
+            return X.to(device=dev,dtype=self.dtype_t,non_blocking=true)
+        return torch.from_numpy(X).to(device=dev,dtype=self.dtype_t)
     def construct(self,rk,Om=None,Psi=None,Y=None,Z=None,compute_ULV=False,fast=False):
         if Om is None:
             if self.A is None:
@@ -318,10 +321,10 @@ class HBSMAT:
         else:
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=self.compute_device)        
-        Ompr  = torch.from_numpy(Om0 ).to(device=self.device)[self.perm, :]
-        Psipr = torch.from_numpy(Psi0).to(device=self.device)[self.perm, :]
-        Ypr   = torch.from_numpy(Y0  ).to(device=self.device)[self.perm, :]
-        Zpr   = torch.from_numpy(Z0  ).to(device=self.device)[self.perm, :]
+        Ompr  = self._as_local(Om0 )[self.perm, :]
+        Psipr = self._as_local(Psi0)[self.perm, :]
+        Ypr   = self._as_local(Y0  )[self.perm, :]
+        Zpr   = self._as_local(Z0  )[self.perm, :]
 
         Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
         Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
@@ -364,13 +367,9 @@ class HBSMAT:
                 tic = time.time()
                 U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
                 V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
-                if str(self.device).startswith('cuda'):
-                    torch.cuda.synchronize()
                 self.nullTime+=time.time()-tic
                 tic = time.time()
                 D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
-                if str(self.device).startswith('cuda'):
-                    torch.cuda.synchronize()
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -440,13 +439,9 @@ class HBSMAT:
             if lvl>0:
                 U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
                 V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
-                if str(self.device).startswith('cuda'):
-                    torch.cuda.synchronize()
                 self.nullTime+=time.time()-tic
                 tic = time.time()
                 D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
-                if str(self.device).startswith('cuda'):
-                    torch.cuda.synchronize()
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -755,6 +750,8 @@ class HBSMAT:
                 "or call compute_ULV() first."
             )
 
+        self._require_resident('solve',need_ulv=True)
+        print('after require:',self._resident,'core:',self.Umats[0].device,'ulv:',self.Qlist[0].device,'compute:',self.compute_device)
         input_is_numpy = isinstance(b, np.ndarray)
         input_is_torch = torch.is_tensor(b)
 
@@ -771,7 +768,7 @@ class HBSMAT:
                 device=self.device
             )
         else:
-            b_torch = b.to(device=self.device)
+            b_torch = b.to(device=self.compute_device,dtype=self.Umats[0].dtype)
 
         was_vector = (b_torch.ndim == 1)
 
