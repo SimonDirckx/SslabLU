@@ -137,6 +137,7 @@ for indp in range(len(pvec)):
     tic = time.time()
     rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
     rb_solver.factorize(S_rk_list)
+    rb_solver.print_timing()
     print("RB solver factorized in ",time.time()-tic,"s")
     h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))
     assert h.compute_device.type == 'cuda'

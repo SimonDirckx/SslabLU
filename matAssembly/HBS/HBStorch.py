@@ -258,6 +258,8 @@ class HBSMAT:
         self.tConstruct = 0
         self.Nbvec = []
         self.quad = quad
+        self.tULV = 0
+        self.tCompress = 0
         if quad:
             self.fac = 4
         else:
@@ -437,6 +439,7 @@ class HBSMAT:
             #print("lvl//Nb = ",lvl,"//",Nb)
             self.Nbvec+=[Nb]
             if lvl>0:
+                tic = time.time()
                 U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
                 V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
                 self.nullTime+=time.time()-tic
@@ -455,6 +458,7 @@ class HBSMAT:
                 self.Dmats+=[D_ell]
                 U_ell = torch.eye(D_ell.shape[1], dtype=D_ell.dtype,device=self.device)[None, :, :]
             
+            tic = time.time()
             if lvl==self.L-1:
                     Rhat = D_ell
             else:
@@ -467,7 +471,7 @@ class HBSMAT:
             self.Rlist+=[Ru]
             self.NNvec=np.append(self.NNvec,self.NNvec[-1]+NN)
 
-
+            tic = time.time()
             if lvl == self.L-1:
                 Uhat = U_ell
             else:
@@ -477,6 +481,9 @@ class HBSMAT:
             Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rkm:],Uhat,device=self.device,mode='T')
             self.Uulist+=[Uu]
             Uhat=Ud
+            self.tULV +=time.time()-tic
+        if self.compute_device == 'cuda':
+            torch.cuda.synchronize()
         self.tCompress = time.time()-tic_compress
 
     @property
@@ -734,7 +741,9 @@ class HBSMAT:
 
     def compute_ULV(self):
         self._require_resident('compute_ULV')
+        tic=time.time()
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
+        self.tULV = time.time() - tic
         self._resident['ulv'] = self.compute_device
         self._dirty['ulv']    = (self.compute_device != self.home)
 

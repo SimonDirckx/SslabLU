@@ -786,7 +786,32 @@ class RedBlackSolverHBS(DirectSolver):
     # ------------------------------------------------------------------
     # _build_level_fused  -- tier-2 shared solves
     # ------------------------------------------------------------------
-
+    def _sync(self):
+        if self.compute_device=='cuda':
+            torch.cuda.synchronize()
+    def timing_report(self,per_level=False):
+        blocks = [b for b in self._blocks if hasattr(b,'tCompress')]
+        def tot(attr):
+            return sum(getattr(b,attr,0) for b in blocks)
+        rep = dict(
+                nBlocks     = len(blocks),
+                setup       = tot('setupTime'),
+                null        = tot('nullTime'),
+                D           = tot('Dtime'),
+                ULV         = tot('tULV'),
+                blockSolve  = tot('blockSolveTime'),
+                compress    = tot('tCompress')
+                )
+        rep['residual'] = rep['compress']-(rep['null']+rep['D']+rep['ULV']+rep['blockSolve'])
+        if per_level and hasattr(self, 'levelTimes'):
+            rep['levels'] = list(self.levelTimes)
+        return rep
+    def print_timing(self):
+        r = self.timing_report()
+        tot = r['compress'] or 1.0
+        print(f"  {r['nBlocks']} blocks, {r['compress']:.2f}s in compression")
+        for k in ('null', 'D', 'ULV', 'blockSolve', 'setup', 'residual'):
+            print(f"    {k:<11s} {r[k]:7.2f}s  {100*r[k]/tot:5.1f}%")
     def _build_level_fused(self, m, nSlabs, RB_level, rk):
         SiM   = RB_level[0]
         T     = RB_level[1]
@@ -813,7 +838,7 @@ class RedBlackSolverHBS(DirectSolver):
         Xm, Xp = {}, {}
         for k in range(1, nSlabs, 2):
             need_p = cyclic or (k != nSlabs - 1)
-
+            self._sync(); t0=time.time()
             if _is_id(T_hbs[k]):
                 # T_k^{-1} is a no-op, so there is no solve to fuse.  Going
                 # through the general path would allocate an m x 2s block,
@@ -908,7 +933,7 @@ class RedBlackSolverHBS(DirectSolver):
                 Y_B = Om.clone()
             if Z_B is Psi:
                 Z_B = Psi.clone()
-
+            self._sync(); t1=time.time()
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
 
@@ -942,7 +967,8 @@ class RedBlackSolverHBS(DirectSolver):
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
-
+            self._sync();t2=time.time()
+            print(f"node {i:3d}: sample {t1-t0:6.2f}s" f" construct {t2-t1:6.2f}s (B+A+C)")
         return (A_i, B_i, T_hbs_new, C_i)
 
     # ------------------------------------------------------------------
