@@ -7,7 +7,26 @@ import torch
 import matAssembly.HBS.HBSnew as HBSnew
 #sparse block matrix operations
 
+_UV_TQR    = [0.0]      # the QR of W = [Om^T | Y^T]
+_UV_TBASIS = [0.0]      # eigh/svd extraction of U from L
+_UV_TSETUP = [0.0]      # allocation and the two copies into W
+_UV_NCALL  = [0]
+_UV_SYNC   = [False]
+_UV_QR_MODE = ['chol2']
 
+def uv_timers_reset():
+    _UV_TQR[0] = _UV_TBASIS[0] = _UV_TSETUP[0] = 0.0
+    _UV_NCALL[0] = 0
+
+
+def uv_timers():
+    return dict(qr=_UV_TQR[0], basis=_UV_TBASIS[0],
+                setup=_UV_TSETUP[0], ncall=_UV_NCALL[0])
+
+
+def _uv_sync(device):
+    if _UV_SYNC[0] and torch.device(device).type == 'cuda':
+        torch.cuda.synchronize()
 
 def to_block_tensor(M, n, b):
     """(n*b, s) -> (n, b, s) block tensor (analogue of convert_to_torch_tens)."""
@@ -94,8 +113,8 @@ def _rsolve_qr(P, QR, s=None, fast=False):
     """P B^+ where B = R^T Q^T. Replaces _rsolve(P, B)."""
     Q, R = QR
     PQ = torch.bmm(P, Q)                                  # (Nb, ny, n)
-    #if fast:
-    #    return torch.linalg.solve_triangular(R, PQ, upper=True, left=False)
+    if fast:
+        return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
     Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
     return torch.bmm(torch.bmm(PQ, Vhc.mT) * Sinv.unsqueeze(-2), Uc.mT)
 
@@ -109,68 +128,164 @@ def _pinv_apply_left(QR, U, s=None, fast=False):
         Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
         T = torch.bmm(Vhc.mT, Sinv.unsqueeze(-1) * torch.bmm(Uc.mT, U))
     return torch.bmm(Q, T)                                # (Nb, s, k)
+def _tri_rsolve_T(R, P, rcond):
+    """P (R^T)^+ , R upper triangular n x n.  Triangular solve where R is
+    safely conditioned; SVD pseudo-inverse on the (rare) entries that are not.
 
-def construct_D(U_ell, V_ell, Y_ell, Z_ell, om_qr, psi_qr,
-                device=None, s=None, fast=False):
-    """
-    om_qr  = (Q_om,  R_om)   from compute_UV(Om_ell,  Y_ell, ...)
-    psi_qr = (Q_psi, R_psi)  from compute_UV(Psi_ell, Z_ell, ...)
-    s : column count of the original Om/Psi, needed only to keep the rtol
-        cutoff identical to the old max(s, n) * eps.
-    """
-    # --- term1: (I - U U^T) Y  Om^+ ---------------------------------------
-    # formed explicitly: this term needs all n columns of the result
-    Yperp = Y_ell - torch.bmm(U_ell, torch.bmm(U_ell.mT, Y_ell))
-    term1 = _rsolve_qr(Yperp, om_qr, s=s, fast=fast)
+    Om is Gaussian with s >= n + k, so R_oo is well conditioned with
+    overwhelming probability -- the SVD branch is a guard, not the norm."""
+    d   = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+    bad = (d.amin(-1) <= rcond * d.amax(-1).clamp_min(torch.finfo(R.dtype).tiny))
 
-    # --- term2: U U^T (Zperp Psi^+)^T  ==  U ( Zperp (Psi^+ U) )^T ---------
-    X  = _pinv_apply_left(psi_qr, U_ell, s=s, fast=fast)   # (Nb, s, k) = Psi^+ U
-    ZX = torch.bmm(Z_ell, X)                               # (Nb, n, k)
-    ZX -= torch.bmm(V_ell, torch.bmm(V_ell.mT, ZX))        # = Zperp X, Zperp never formed
-    term2 = torch.bmm(U_ell, ZX.mT)
+    X = torch.linalg.solve_triangular(R.mT, P, upper=False, left=False)
+
+    if bool(bad.any()):                            # one sync, only when needed
+        idx = bad.nonzero(as_tuple=True)[0]
+        Uc, S, Vhc = tla.svd(R[idx].mT, full_matrices=False)
+        Sinv = torch.where(S > rcond * S[..., :1], S.reciprocal(),
+                           torch.zeros_like(S))
+        X[idx] = torch.bmm(torch.bmm(P[idx], Vhc.mT) * Sinv.unsqueeze(-2),
+                           Uc.mT)
+    return X
+def _tri_lsolve_T(R, U, rcond=1e-12):
+    d   = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+    tiny = torch.finfo(R.dtype).tiny
+    bad = d.amin(-1) <= rcond * d.amax(-1).clamp_min(tiny)
+
+    T = torch.linalg.solve_triangular(R.mT, U, upper=False, left=True)
+
+    if bool(bad.any()):                   # one D2H sync, only when it fires
+        idx = bad.nonzero(as_tuple=True)[0]
+        Uc, S, Vhc = tla.svd(R[idx].mT, full_matrices=False)
+        Sinv = torch.where(S > rcond * S[..., :1], S.reciprocal(),
+                           torch.zeros_like(S))
+        # (R^T)^+ U = V S^+ U_c^T U
+        T[idx] = torch.bmm(Vhc.mT, Sinv.unsqueeze(-1) * torch.bmm(Uc.mT, U[idx]))
+    return T
+def construct_D(U, V, om_R, psi_R, fast=True, rcond=1e-12):
+    """D = (I-UU*) Y Om^+  +  U [ (I-VV*) Z Psi^+ ]^* U ... (see derivation)
+
+    Uses  Y Q_om = R_oy^T  and  Z Q_psi = R_pz^T, so neither Q nor any
+    width-s intermediate is ever formed.  All work is n x n and n x k.
+    """
+    R_oo, R_oy = om_R
+    R_pp, R_pz = psi_R
+
+    # ---- term 1:  (I - UU*) R_oy^T R_oo^{-T} --------------------------
+    P = R_oy.mT                                   # (Nb, ny, n) == Y Q_om
+    P = P - torch.bmm(U, torch.bmm(U.mT, P))      # project, width n not s
+    term1 = _tri_rsolve_T(R_oo, P, rcond)         # X R_oo^T = P
+
+    # ---- term 2:  U [ (I - VV*) R_pz^T R_pp^{-T} U ]^* ----------------
+    T  = _tri_lsolve_T(R_pp, U, rcond)            # R_pp^T T = U   -> (Nb,n,k)
+    G  = torch.bmm(R_pz.mT, T)                    # (Nb, ny, k)
+    G  = G - torch.bmm(V, torch.bmm(V.mT, G))
+    term2 = torch.bmm(U, G.mT)
 
     return term1 + term2
+def _qr_R_only(W, mode='house', jitter=1e-12):
+    p = W.shape[-1]
+    A,tau = torch.geqrf(W)
 
-def compute_UV(Om, Y, rk, device,fast=False,work=None):
-    """
-    Orthonormal basis for the dominant rk-dim left singular subspace of
-    Y projected off the row space of Om.
+    return torch.triu(A[...,:p,:])#tla.qr(W, mode='r').R
+def compute_UV(Om, Y, rk, device, fast=False):
+    """Returns (U, R_oo, R_oy) where W = [Om^T | Y^T] = Q R,
+       R_oo = R[:, :n, :n]  (upper triangular, n x n)
+       R_oy = R[:, :n, n:]  (n x ny)   -- note  Y Q_om = R_oy^T  exactly.
+       Q is never formed: nothing downstream needs it."""
+    Nb, ny, s = Y.shape
+    n = Om.shape[1]
+    k = min(rk, ny)
+    print(f"  lvl-shape Nb={Nb:5d} s={s:5d} n={n:4d} ny={ny:5d} k={k:4d}")
+    assert s >= n + k
+    _UV_NCALL[0] += 1
+    _uv_sync(Y.device); _t = time.time()
+    W = torch.empty((Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
+    W[:, :, :n].copy_(Om.mT)
+    W[:, :, n:].copy_(Y.mT)
+    _uv_sync(Y.device); _UV_TSETUP[0] += time.time() - _t
+    _uv_sync(Y.device); _t = time.time()
+    prev = torch.backends.cuda.preferred_linalg_library()
+    torch.backends.cuda.preferred_linalg_library('magma')
+    R = _qr_R_only(W, mode=_UV_QR_MODE[0])
+    torch.backends.cuda.preferred_linalg_library(prev)
+    _uv_sync(Y.device); _UV_TQR[0] += time.time() - _t
+    R_oo = R[:, :n, :n]
+    R_oy = R[:, :n, n:]
+    L    = R[:, n:, n:].mT                    # (Nb, ny, r-n)
+    _uv_sync(Y.device); _t = time.time()
+    if fast:
+        G = torch.bmm(L, L.mT); G = 0.5 * (G + G.mT)
+        U = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
+    else:
+        U = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
+    _uv_sync(Y.device); _UV_TBASIS[0] += time.time() - _t
+    return U, (R_oo.contiguous(), R_oy.contiguous())
+def compute_UV_pair(Om, Y, Psi, Z, rk, device, fast=False):
+    """Both halves of a level's basis computation in one batched call.
 
-    Om : (Nb, n,  s)        Y : (Nb, ny, s)        s >= n
-    Returns (U, (Q_om, R_om)) with U : (Nb, ny, k), k = min(rk, ny).
-    The QR pair is the factorization of Om that _rsolve needs in
-    construct_D -- handing it back is what removes the duplicate factor.
+    compute_UV(Om, Y, ...) and compute_UV(Psi, Z, ...) operate on identically
+    shaped inputs -- Om and Psi are both (Nb, n, s), Y and Z both (Nb, ny, s)
+    -- so the two factorizations can be stacked along the batch dimension and
+    issued as one.  That doubles Nb for the QR and the basis extraction,
+    which together are ~90% of compression time and sit on a scaling curve
+    that is still improving at these batch sizes.
+
+    Returns ((U, om_R), (V, psi_R)), matching two compute_UV calls exactly.
+    The Om/Y result occupies batch entries [:Nb], Psi/Z entries [Nb:].
     """
     Nb, ny, s = Y.shape
     n = Om.shape[1]
     k = min(rk, ny)
-    assert s >= n + k, "undersampled: not enough columns left after projecting off Om"
 
-    # ---- one QR does the projection and the Om factorization at once -------
-    if work is None:
-        W = torch.empty((Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
-    else:
-        W = work[:Nb, :s, :n + ny]          # caller-owned arena, see below
-    W[:, :, :n].copy_(Om.mT)
-    W[:, :, n:].copy_(Y.mT)
+    assert Psi.shape == Om.shape and Z.shape == Y.shape, \
+        "compute_UV_pair needs matching shapes; call compute_UV twice instead"
+    assert s >= n + k, \
+        "undersampled: not enough columns left after projecting off Om"
 
-    Q, R = tla.qr(W, mode='reduced')        # Q:(Nb,s,r) R:(Nb,r,n+ny), r=min(s,n+ny)
+    _UV_NCALL[0] += 2          # counts as two logical compute_UV calls
 
-    # .contiguous() drops the reference to the full Q so the (Nb,s,ny) tail
-    # is freed here rather than living as long as the returned view.
-    Q_om = Q[:, :, :n]        # == old Qhead
-    R_om = R[:, :n, :n]
-    L    = R[:, n:, n:].mT                  # (Nb, ny, r-n) -- this is the L of M
+    # ---- setup: one arena, four copies -----------------------------------
+    _uv_sync(Y.device); _t = time.time()
+    W = torch.empty((2 * Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
+    W[:Nb, :, :n].copy_(Om.mT)
+    W[:Nb, :, n:].copy_(Y.mT)
+    W[Nb:, :, :n].copy_(Psi.mT)
+    W[Nb:, :, n:].copy_(Z.mT)
+    _uv_sync(Y.device); _UV_TSETUP[0] += time.time() - _t
+    print("W shape in UV pair: ",W.shape)
+    # ---- one QR over the doubled batch -----------------------------------
+    _uv_sync(Y.device); _t = time.time()
+    R = tla.qr(W, mode='r').R              # (2Nb, r, n+ny), r = min(s, n+ny)
+    _uv_sync(Y.device); _UV_TQR[0] += time.time() - _t
 
-    # ---- tiny factorization on L instead of a wide one on M ----------------
+    # W is dead here and is the largest tensor in the routine; dropping it
+    # before the basis extraction keeps peak usage close to the unmerged
+    # version rather than holding W and G simultaneously.
+    del W
+
+    L = R[:, n:, n:].mT                    # (2Nb, ny, r-n)
+
+    # ---- basis extraction, also over the doubled batch --------------------
+    _uv_sync(Y.device); _t = time.time()
     if fast:
         G = torch.bmm(L, L.mT)
         G = 0.5 * (G + G.mT)
-        U = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
+        UU = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
+        del G
     else:
-        U = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
+        UU = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
+    _uv_sync(Y.device); _UV_TBASIS[0] += time.time() - _t
 
-    return U, (Q_om, R_om)
+    # .contiguous() on every slice: these are views into the (2Nb, r, n+ny)
+    # R, and holding any one of them alive would keep the whole thing
+    # allocated for as long as the returned tuples live.
+    om_R  = (R[:Nb, :n, :n].contiguous(), R[:Nb, :n, n:].contiguous())
+    psi_R = (R[Nb:, :n, :n].contiguous(), R[Nb:, :n, n:].contiguous())
+    U_out = UU[:Nb].contiguous()
+    V_out = UU[Nb:].contiguous()
+
+    return (U_out, om_R), (V_out, psi_R)
 
 
 class HBSMAT:
@@ -366,12 +481,14 @@ class HBSMAT:
                 rkm = min(rk,nl*((self.fac)**(self.L-1-lvl)))
             
             if lvl>0:
+                
                 tic = time.time()
-                U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
-                V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                
+                (U_ell,om_R),(V_ell,psi_R) = compute_UV_pair(Om_ell,Y_ell,Psi_ell,Z_ell,rkm,self.device,fast=fast)
+                
                 self.nullTime+=time.time()-tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
+                D_ell = construct_D(U_ell,V_ell,om_R,psi_R,fast=fast)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -440,11 +557,11 @@ class HBSMAT:
             self.Nbvec+=[Nb]
             if lvl>0:
                 tic = time.time()
-                U_ell,om_qr = compute_UV(Om_ell,Y_ell,rkm,self.device,fast=fast)
-                V_ell,psi_qr = compute_UV(Psi_ell,Z_ell,rkm,self.device,fast=fast)
-                self.nullTime+=time.time()-tic
+                (U_ell, om_R), (V_ell, psi_R) = compute_UV_pair(
+                    Om_ell, Y_ell, Psi_ell, Z_ell, rkm, self.device, fast=fast)
+                self.nullTime += time.time() - tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,Y_ell,Z_ell,om_qr,psi_qr,self.device,fast=fast)
+                D_ell = construct_D(U_ell,V_ell,om_R,psi_R,fast=fast)
                 self.DTime+= time.time()-tic
                 self.Dmats+=[D_ell]
                 self.Umats+=[U_ell]
@@ -471,7 +588,6 @@ class HBSMAT:
             self.Rlist+=[Ru]
             self.NNvec=np.append(self.NNvec,self.NNvec[-1]+NN)
 
-            tic = time.time()
             if lvl == self.L-1:
                 Uhat = U_ell
             else:
@@ -482,7 +598,7 @@ class HBSMAT:
             self.Uulist+=[Uu]
             Uhat=Ud
             self.tULV +=time.time()-tic
-        if self.compute_device == 'cuda':
+        if self.compute_device.type == 'cuda':
             torch.cuda.synchronize()
         self.tCompress = time.time()-tic_compress
 
@@ -503,8 +619,8 @@ class HBSMAT:
         dev = self.compute_device
         numpy_input = isinstance(v, np.ndarray)
         if numpy_input:
-            v = torch.from_numpy(v).to(self.device)
-        v = v.to(self.Dmats[0].dtype)
+            v = torch.from_numpy(v)
+        v = v.to(device = dev,dtype = self.Dmats[0].dtype)
         if v.ndim==1:
             vperm = v[self.perm,None]
         else:
@@ -529,10 +645,12 @@ class HBSMAT:
         return u
 
     def rmatmat(self,v):
+        self._require_resident('matmat')
+        dev = self.compute_device
         numpy_input = isinstance(v, np.ndarray)
         if numpy_input:
-            v = torch.from_numpy(v).to(self.device)
-        v = v.to(self.Dmats[0].dtype)
+            v = torch.from_numpy(v)
+        v = v.to(dev,dtype = self.Dmats[0].dtype)
         if v.ndim==1:
             vperm = v[self.perm,None]
         else:

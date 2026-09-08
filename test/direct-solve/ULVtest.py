@@ -26,8 +26,6 @@ import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
 from scipy.sparse.linalg import LinearOperator
 
-
-
 def dense_to_linop(A):
     A = np.array(A)
     n = A.shape[0]
@@ -60,7 +58,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 5.
+kh = 15.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -101,7 +99,7 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 9
+N = 17
 dSlabs,connectivity,H = cube.dSlabs(N)
 pvec = np.array([8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
@@ -119,7 +117,7 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(p*p,p*p,ndim=3)
+    assembler = mA.rkHMatAssembler(256,256,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
@@ -135,7 +133,7 @@ for indp in range(len(pvec)):
     print("Ntot = ",Ntot)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,p*p,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,256,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
     rb_solver.factorize(S_rk_list)
     rb_solver.print_timing()
     print("RB solver factorized in ",time.time()-tic,"s")

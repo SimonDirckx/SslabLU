@@ -115,7 +115,7 @@ class matAssembler:
             Z = linOp.T@Psi
             self.stats.timeSample=time.time()-tic
             tic = time.time()
-            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z)
+            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z,fast=True)
             self.stats.timeCompress=HBSmat.tCompress
             s = HBSmat.nSamples
             self.stats.nbytes = HBSmat.nbytes

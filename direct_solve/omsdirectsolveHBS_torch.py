@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 import torch
 import time
+HBSnew._UV_QR_MODE[0] = 'chol'    # or 'chol', or 'chol2'
 
 def _resolve_device(spec):
     if spec is None or spec == 'auto':
@@ -594,6 +595,7 @@ class RedBlackSolverHBS(DirectSolver):
     def _register(self, h):
             h.compute_device = self.compute_device
             h.strict = self.strict_residency
+            h._built_by_rb = True
             self._blocks.append(h)
             return h
     def _adopt(self, op):
@@ -743,7 +745,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         if not ((nSlabs & (nSlabs - 1) == 0) and nSlabs != 0):
             raise ValueError("Number of slabs must be a power of 2.")
-
+        HBSnew.uv_timers_reset()
+        HBSnew._UV_SYNC[0] = (self.compute_device.type == 'cuda')
         self._dtype = S_rk_list[0][0].dtype
 
         SiM = [self._adopt(_[0]) for _ in S_rk_list]
@@ -787,21 +790,26 @@ class RedBlackSolverHBS(DirectSolver):
     # _build_level_fused  -- tier-2 shared solves
     # ------------------------------------------------------------------
     def _sync(self):
-        if self.compute_device=='cuda':
+        if self.compute_device.type=='cuda':
             torch.cuda.synchronize()
     def timing_report(self,per_level=False):
-        blocks = [b for b in self._blocks if hasattr(b,'tCompress')]
+        blocks = [b for b in self._blocks if getattr(b,'_built_by_rb',False)]
         def tot(attr):
             return sum(getattr(b,attr,0) for b in blocks)
         rep = dict(
                 nBlocks     = len(blocks),
                 setup       = tot('setupTime'),
                 null        = tot('nullTime'),
-                D           = tot('Dtime'),
+                D           = tot('DTime'),
                 ULV         = tot('tULV'),
                 blockSolve  = tot('blockSolveTime'),
                 compress    = tot('tCompress')
                 )
+        uv = HBSnew.uv_timers()
+        rep['null_qr']    = uv['qr']
+        rep['null_basis'] = uv['basis']
+        rep['null_setup'] = uv['setup']
+        rep['null_calls'] = uv['ncall']
         rep['residual'] = rep['compress']-(rep['null']+rep['D']+rep['ULV']+rep['blockSolve'])
         if per_level and hasattr(self, 'levelTimes'):
             rep['levels'] = list(self.levelTimes)
@@ -810,8 +818,21 @@ class RedBlackSolverHBS(DirectSolver):
         r = self.timing_report()
         tot = r['compress'] or 1.0
         print(f"  {r['nBlocks']} blocks, {r['compress']:.2f}s in compression")
-        for k in ('null', 'D', 'ULV', 'blockSolve', 'setup', 'residual'):
+        for k in ('null', 'null_qr', 'null_basis', 'null_setup',
+                  'D', 'ULV', 'blockSolve', 'setup', 'residual'):
             print(f"    {k:<11s} {r[k]:7.2f}s  {100*r[k]/tot:5.1f}%")
+        print(f"    ({r['null_calls']} compute_UV calls, "
+              f"{r['null']/max(r['null_calls'],1)*1000:.1f} ms each)")
+    def _retire(self,idx,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs):
+        if idx < 0 or idx>= nSlabs:
+            return
+        for lst in (SiM,SiP,T,T_hbs):
+            op = lst[idx]
+            if hasattr(op,'evict'):
+                op.evict()
+        Xm.pop(idx,None)
+        Xp.pop(idx,None)
+
     def _build_level_fused(self, m, nSlabs, RB_level, rk):
         SiM   = RB_level[0]
         T     = RB_level[1]
@@ -838,7 +859,6 @@ class RedBlackSolverHBS(DirectSolver):
         Xm, Xp = {}, {}
         for k in range(1, nSlabs, 2):
             need_p = cyclic or (k != nSlabs - 1)
-            self._sync(); t0=time.time()
             if _is_id(T_hbs[k]):
                 # T_k^{-1} is a no-op, so there is no solve to fuse.  Going
                 # through the general path would allocate an m x 2s block,
@@ -872,7 +892,7 @@ class RedBlackSolverHBS(DirectSolver):
             has_right = cyclic or i < nSlabs - 1
             kL = (i - 1) % nSlabs
             kR = (i + 1) % nSlabs
-
+            self._sync(); t0 = time.time()
             # A_0 is zero exactly when there is no left neighbour.
             # C_{nSlabs-2} is zero because S^+_{nSlabs-1} = 0, even though the
             # right neighbour exists -- the asymmetry is because the zeroed
@@ -891,6 +911,9 @@ class RedBlackSolverHBS(DirectSolver):
             Y_A = Y_C = Z_A = Z_C = None
 
             if has_right:
+                for op in (SiM[kR], SiP[kR]):
+                    if hasattr(op, 'release_ulv'):
+                        op.release_ulv()
                 # forward: one apply of S^+_i covering both B and C
                 cols = [Xm[kR]] if C_is_zero else [Xm[kR], Xp[kR]]
                 W = self._ap(SiP[i], cols[0] if len(cols) == 1
@@ -911,6 +934,9 @@ class RedBlackSolverHBS(DirectSolver):
                     Z_C = -self._apT(SiP[kR], tp)
 
             if has_left:
+                for op in (SiP[kL], SiM[kL]):
+                    if hasattr(op, 'release_ulv'):
+                        op.release_ulv()
                 # Xp first (B term), Xm second (A term)
                 W = self._ap(SiM[i], torch.cat([Xp[kL], Xm[kL]], dim=1))
                 Y_B = Y_B - W[:, :s]
@@ -967,8 +993,13 @@ class RedBlackSolverHBS(DirectSolver):
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
+            if not cyclic:
+                self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+                self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
             self._sync();t2=time.time()
             print(f"node {i:3d}: sample {t1-t0:6.2f}s" f" construct {t2-t1:6.2f}s (B+A+C)")
+        if not cyclic:
+            self._retire(nSlabs-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
         return (A_i, B_i, T_hbs_new, C_i)
 
     # ------------------------------------------------------------------
