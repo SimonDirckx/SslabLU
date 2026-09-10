@@ -5,7 +5,34 @@ from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 import torch
 import time
-HBSnew._UV_QR_MODE[0] = 'chol'    # or 'chol', or 'chol2'
+import gc
+_CENSUS = [True]
+def census(tag, topn=12):
+    if not _CENSUS[0]:
+        return
+    seen, big, total = set(), [], 0
+    for o in gc.get_objects():
+        try:
+            if not torch.is_tensor(o) or not o.is_cuda:
+                continue
+            st = o.untyped_storage()
+            p = st.data_ptr()
+            if p in seen:
+                continue
+            seen.add(p)
+            mb = st.nbytes() / 2**20
+            total += mb
+            if mb > 32:
+                big.append((mb, tuple(o.shape)))
+        except Exception:
+            pass
+    big.sort(reverse=True)
+    print(f"[{tag}] alloc {torch.cuda.memory_allocated()/2**30:5.2f} GB "
+          f"peak {torch.cuda.max_memory_allocated()/2**30:5.2f} GB "
+          f"reachable {total/2**10:5.2f} GB "
+          f"in {len(big)} blocks >32MB")
+    for mb, sh in big[:topn]:
+        print(f"        {mb:8.1f} MB  {sh}")
 
 def _resolve_device(spec):
     if spec is None or spec == 'auto':
@@ -785,6 +812,10 @@ class RedBlackSolverHBS(DirectSolver):
 
         self.nSlabs = nSlabs
         self.RB     = RB
+        for h in self._blocks:
+            if getattr(h, '_built_by_rb', False) and hasattr(h, 'evict'):
+                h.evict()
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # _build_level_fused  -- tier-2 shared solves
@@ -832,6 +863,13 @@ class RedBlackSolverHBS(DirectSolver):
                 op.evict()
         Xm.pop(idx,None)
         Xp.pop(idx,None)
+    def _release(self, *ops):
+        """Spill operators back to host once their last consumer in this
+        sweep has run.  The solve touches every block in the tree, so without
+        this the working set is the whole factorization."""
+        for op in ops:
+            if op is not None and hasattr(op, 'evict'):
+                op.evict()
 
     def _build_level_fused(self, m, nSlabs, RB_level, rk):
         SiM   = RB_level[0]
@@ -847,7 +885,7 @@ class RedBlackSolverHBS(DirectSolver):
         Psi = torch.randn(m,s,generator=self._tgen,device=self.compute_device,dtype=self._tdtype)
 
         # ---------------------------------------------------------------
-        # pass 1 -- eliminated (odd) nodes: one fused solve each
+        # eliminated (odd) nodes: one fused solve each
         #
         #   Xm_k = T_k^{-1} S^-_k Om   feeds B_{k-1} and A_{k+1}
         #   Xp_k = T_k^{-1} S^+_k Om   feeds C_{k-1} and B_{k+1}
@@ -855,9 +893,25 @@ class RedBlackSolverHBS(DirectSolver):
         # Xp is skipped for the final odd node in the non-cyclic case: its two
         # consumers are C_{nSlabs-2} (structurally zero, since S^+_{nSlabs-1}
         # = 0) and B_{nSlabs}, which does not exist.
+        #
+        # Filled LAZILY, on first use from the retained-node loop below.
+        # Running this eagerly as a separate pass put nSlabs/2 blocks of
+        # (m, 2s) on the device -- 6.2 GB at Ntot=2^20, s=778 -- and, worse,
+        # forced every odd-index SiM/SiP/T_hbs resident at once, since _ap/_sv
+        # prefetch and nothing released them until _retire ran.  That is
+        # 21.5 GB at nSlabs=8, where the inputs are the previous level's
+        # compressed HBS blocks (~1.8 GB each).  Each odd k is consumed by
+        # exactly two retained nodes, i = k-1 and i = k+1, and _retire(i-1)
+        # pops it after the second, so the lazy version holds two X blocks.
         # ---------------------------------------------------------------
         Xm, Xp = {}, {}
-        for k in range(1, nSlabs, 2):
+
+        def _ensure_X(k):
+            """Fill Xm[k] (and Xp[k] where needed) if not already present.
+            Idempotent: node k-1 builds it as its kR, node k+1 reuses it as
+            its kL, so each odd k costs one prefetch and one solve."""
+            if k in Xm:
+                return
             need_p = cyclic or (k != nSlabs - 1)
             if _is_id(T_hbs[k]):
                 # T_k^{-1} is a no-op, so there is no solve to fuse.  Going
@@ -869,21 +923,25 @@ class RedBlackSolverHBS(DirectSolver):
                 if need_p:
                     Xp[k] = self._ap(SiP[k], Om)
                 self.nIdSkipped += 1
-                continue
+                return
 
             cols = [self._ap(SiM[k], Om)]
             if need_p:
                 cols.append(self._ap(SiP[k], Om))
             RHS = cols[0] if len(cols) == 1 else torch.cat(cols, dim=1)
-            h = T_hbs[k]
-
+            del cols
             X = self._sv(T_hbs[k], RHS)        # one solve, up to 2s columns
+            del RHS
             Xm[k] = X[:, :s]
             if need_p:
                 Xp[k] = X[:, s:]
+        def _spill(t):
+            return None if t is None else t.to('cpu')
 
+        def _unspill(t):
+            return None if t is None else t.to(self.compute_device)
         # ---------------------------------------------------------------
-        # pass 2 -- retained (even) nodes
+        # retained (even) nodes
         # ---------------------------------------------------------------
         B_i, T_hbs_new, A_i, C_i = [], [], [], []
 
@@ -915,12 +973,15 @@ class RedBlackSolverHBS(DirectSolver):
                     if hasattr(op, 'release_ulv'):
                         op.release_ulv()
                 # forward: one apply of S^+_i covering both B and C
+                _ensure_X(kR)
                 cols = [Xm[kR]] if C_is_zero else [Xm[kR], Xp[kR]]
                 W = self._ap(SiP[i], cols[0] if len(cols) == 1
                              else torch.cat(cols, dim=1))
+                del cols
                 Y_B = Y_B - W[:, :s]
                 if not C_is_zero:
-                    Y_C = -W[:, s:]
+                    Y_C = _spill(-W[:, s:])
+                del W
 
                 # adjoint: t^+ = T_{i+1}^{-T} (S^+_i)^T Psi serves B and C
                 rhs_p = self._apT(SiP[i], Psi)
@@ -929,18 +990,22 @@ class RedBlackSolverHBS(DirectSolver):
                     self.nIdSkipped += 1
                 else:
                     tp = self._sv(T_hbs[kR], rhs_p, mode='T')
+                del rhs_p
                 Z_B = Z_B - self._apT(SiM[kR], tp)
                 if not C_is_zero:
-                    Z_C = -self._apT(SiP[kR], tp)
+                    Z_C = _spill(-self._apT(SiP[kR], tp))
+                del tp
 
             if has_left:
                 for op in (SiP[kL], SiM[kL]):
                     if hasattr(op, 'release_ulv'):
                         op.release_ulv()
                 # Xp first (B term), Xm second (A term)
+                _ensure_X(kL)
                 W = self._ap(SiM[i], torch.cat([Xp[kL], Xm[kL]], dim=1))
                 Y_B = Y_B - W[:, :s]
-                Y_A = -W[:, s:]
+                Y_A = _spill(-W[:, s:])
+                del W
 
                 # adjoint: t^- = T_{i-1}^{-T} (S^-_i)^T Psi serves B and A
                 rhs_m = self._apT(SiM[i], Psi)
@@ -949,8 +1014,10 @@ class RedBlackSolverHBS(DirectSolver):
                     self.nIdSkipped += 1
                 else:
                     tm = self._sv(T_hbs[kL], rhs_m, mode='T')
+                del rhs_m
                 Z_B = Z_B - self._apT(SiP[kL], tm)
-                Z_A = -self._apT(SiM[kL], tm)
+                Z_A = _spill(-self._apT(SiM[kL], tm))
+                del tm
 
             # Guard the degenerate case where neither branch ran: Y_B/Z_B
             # would still alias Om/Psi, which construct would then receive as
@@ -983,21 +1050,28 @@ class RedBlackSolverHBS(DirectSolver):
                 tpo = T_hbs[kR] if has_right else None
                 B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
 
+            del Y_B, Z_B
+
             # A_i and C_i become SiM / SiP one level down and are only ever
             # applied, never solved with -- no ULV, unconditionally.
             A_i.append(zero_op(m, dtype) if A_is_zero
                        else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
                                                    compute_ULV=False,
                                                    label=f"A[{i}] (nSlabs={nSlabs})"))
+            del Y_A, Z_A
             C_i.append(zero_op(m, dtype) if C_is_zero
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
+            del Y_C, Z_C
+
             if not cyclic:
                 self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
                 self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
             self._sync();t2=time.time()
-            print(f"node {i:3d}: sample {t1-t0:6.2f}s" f" construct {t2-t1:6.2f}s (B+A+C)")
+            print(f"node {i:3d}: sample {t1-t0:6.2f}s"
+                  f" construct {t2-t1:6.2f}s (B+A+C)"
+                  f" alloc {torch.cuda.memory_allocated()/2**30:5.2f} GB")
         if not cyclic:
             self._retire(nSlabs-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
         return (A_i, B_i, T_hbs_new, C_i)
@@ -1097,6 +1171,14 @@ class RedBlackSolverHBS(DirectSolver):
 
                 vPrime[j*m:(j+1)*m,:] = contrib
 
+                # SiM[i]/SiP[i] have no further consumer at this level.
+                # T_hbs[prev] was read by node i-2 (as its next) and by this
+                # node; T_hbs[next] is still needed by node i+2.
+                self._release(SiM[i], SiP[i])
+                if prev is not None:
+                    self._release(T_hbs[prev])
+
+            self._release(*T_hbs)
             vPrimes.append(vPrime)
 
         # ---- coarsest solve -------------------------------------------
@@ -1121,9 +1203,55 @@ class RedBlackSolverHBS(DirectSolver):
 
                 blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
                 vPrimes[l-1][(i+1)*m:(i+2)*m,:] = self._sv(T_hbs[i+1],blk)
+                self._release(SiM[i+1], SiP[i+1], T_hbs[i+1])
         out = vPrimes[0]
         if was_vector:
             out = out[:,0]
         if input_is_numpy:
             return out.detach().cpu().numpy()
         return out
+    def footprint(self, verbose=True):
+        """Size of the factorization, by group and by tensor list, and how
+        much of it is currently resident on the compute device.
+
+        The per-list breakdown decides which storage lever is worth pulling:
+        Dmats dominating points at the native-to-sibling-B conversion (each
+        parent's 2rk x 2rk discrepancy block becomes two rk x rk sibling
+        blocks), Umats/Vmats dominating points at per-level rank truncation."""
+        tot = {'core': 0, 'ulv': 0}
+        res = {'core': 0, 'ulv': 0}
+        sub = {}
+        nblk = 0
+
+        for h in self._blocks:
+            if not getattr(h, '_built_by_rb', False) or not hasattr(h, '_GROUPS'):
+                continue
+            nblk += 1
+            for grp, names in h._GROUPS.items():
+                gtot = 0
+                for nm in names:
+                    lst = getattr(h, nm, None) or []
+                    n = sum(t.nbytes for t in lst if torch.is_tensor(t))
+                    sub[(grp, nm)] = sub.get((grp, nm), 0) + n
+                    gtot += n
+                tot[grp] = tot.get(grp, 0) + gtot
+                if h._resident.get(grp) is not None:
+                    res[grp] = res.get(grp, 0) + gtot
+
+        if verbose:
+            print(f"  {nblk} solver-owned blocks")
+            for grp in tot:
+                print(f"    {grp:5s} total {tot[grp]/2**30:6.2f} GB   "
+                      f"resident {res[grp]/2**30:6.2f} GB")
+                for (g, nm), n in sorted(sub.items(), key=lambda kv: -kv[1]):
+                    if g == grp and n:
+                        print(f"      {nm:8s} {n/2**30:6.2f} GB  "
+                              f"{100*n/max(tot[grp],1):5.1f}%")
+            allt = sum(tot.values())
+            print(f"    {'all':5s} total {allt/2**30:6.2f} GB   "
+                  f"resident {sum(res.values())/2**30:6.2f} GB")
+            free, cap = torch.cuda.mem_get_info()
+            print(f"    device capacity {cap/2**30:6.2f} GB, "
+                  f"free {free/2**30:6.2f} GB")
+
+        return {'total': tot, 'resident': res, 'by_list': sub}

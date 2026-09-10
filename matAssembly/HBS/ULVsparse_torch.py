@@ -193,22 +193,31 @@ def block_diag_add_tens(A,B,device):
     return C
 
 def apply_sparse_block_tens(A,B,device,mode='N'):
-    
-    #A is block matrix
-    k = A.shape[2]
-    n = A.shape[1]
-    Nb = A.shape[0]
-    if mode=='N':    
-        C = torch.zeros(size = (Nb*n,B.shape[1]),device=device)
-        for i in range(Nb):
-            C[i*n:(i+1)*n,:] = A[i,:,:]@B[i*k:(i+1)*k,:]
-    elif mode=='T':
-        C = torch.zeros(size = (k*Nb,B.shape[1]),device=device)
-        for i in range(Nb):
-            C[i*k:(i+1)*k,:] = A[i,:,:].T@B[i*n:(i+1)*n,:]
+    """C[i] = A[i] @ B[i]  (mode='N')  or  A[i].T @ B[i]  (mode='T'),
+    with A (Nb, n, k) and B stored flat as (Nb*kB, nrhs).
+
+    The loop form issued 2*Nb kernel launches per call -- one gemm plus one
+    slice-assign into a zeroed buffer -- each on a matrix far too small to
+    fill the device.  torch.bmm dispatches the whole batch as a single
+    cublasDgemmStridedBatched.  Same transformation as
+    HBStorch.block_matvec, which this now mirrors."""
+    Nb   = A.shape[0]
+    n    = A.shape[1]
+    k    = A.shape[2]
+    nrhs = B.shape[1]
+    nB   = k if mode == 'N' else n
+    if B.shape[0] != Nb * nB:
+        raise ValueError(
+            f"apply_sparse_block_tens: mode={mode!r} expects B with "
+            f"{Nb*nB} rows (Nb={Nb} x {nB}), got {B.shape[0]}")
+    Bm = B.reshape(Nb, nB, nrhs)
+    if mode == 'N':
+        C = torch.bmm(A, Bm)                      # (Nb, n, nrhs)
+    elif mode == 'T':
+        C = torch.bmm(A.mT, Bm)                   # (Nb, k, nrhs)
     else:
         raise ValueError("mode not recognized")
-    return C
+    return C.reshape(Nb * C.shape[1], nrhs)
 
 def block_solve_tens(A,B,device,mode='N'):
     Nb = A.shape[0]

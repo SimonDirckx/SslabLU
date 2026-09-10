@@ -58,7 +58,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 15.
+kh = 5.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -116,8 +116,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(256,256,ndim=3)
+    a = np.array([H/4,1/32,1/32])
+    assembler = mA.rkHMatAssembler(64,64,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
@@ -131,9 +131,26 @@ for indp in range(len(pvec)):
     print("type rhslist  = ",type(rhs_list))
     print("len rhs_list  = ",len(rhs_list))
     print("Ntot = ",Ntot)
+    tree = S_rk_list[0][0].tree
+    rk = 64
+    P = tree.perm_leaf
+    print("perm is identity?", np.array_equal(np.asarray(tree.perm_leaf), np.arange(nc)))
+    sizes = np.array([len(tree.get_box_inds(l)) for l in tree.get_leaves()])
+    print("nc                 ", nc)
+    print("len(perm_leaf)     ", len(P), " unique:", len(np.unique(P)))
+    print("duplicated DOFs    ", len(P)-len(np.unique(P)))
+    print("S block shape      ", S_rk_list[0][0].shape)
+    print("nleaves / nlevels  ", tree.nleaves, tree.nlevels,
+      " balanced:", tree.nleaves == 2**(tree.nlevels-1))
+    print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
+    print("leaf exact?        ", len(P)//tree.nleaves <= rk)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,256,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,64,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
+    rb_solver._nsamples = lambda rk: 330        # then repeat with 330
+    print("rb rk      =", rb_solver.rk)
+    print("rb s       =", rb_solver._nsamples(rb_solver.rk))
+    print("tree mls   =", rb_solver.tree._min_leaf_size)
     rb_solver.factorize(S_rk_list)
     rb_solver.print_timing()
     print("RB solver factorized in ",time.time()-tic,"s")
@@ -148,7 +165,8 @@ for indp in range(len(pvec)):
     assert h._resident['core'] == h.compute_device
     r = rb_solver.residency_report()
     print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
-
+    v = np.random.standard_normal(Ntot)
+    print("delta =", np.linalg.norm(Stot@rb_solver.solve(v) - v)/np.linalg.norm(v))
     def matvec_rb(v):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
@@ -156,15 +174,15 @@ for indp in range(len(pvec)):
     v = np.random.standard_normal(size=(Sinv_HBS_rb.shape[0],))
     u = Sinv_HBS_rb@v
     print("RB solver time = ",time.time()-tic)
-
+    tot = rb_solver.footprint()
     ptgInfo = gmres_info()
     prbgInfo = gmres_info()
     
-    stol = 1e-8*H*H
+    stol = 1e-8
     if Version(scipy.__version__)>=Version("1.14"):
-        uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=prbgInfo,maxiter=100,restart=100,M=Sinv_HBS_rb)
+        uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=prbgInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
     else:
-        uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=prbgInfo,maxiter=100,restart=100,M=Sinv_HBS_rb)
+        uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=prbgInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
     res_rb = Stot@uhat_rb-rhstot
     print("=============SUMMARY==============")
     print("H                        = ",'%10.3E'%H)
