@@ -58,7 +58,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 5.
+kh = 100.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -116,8 +116,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/32,1/32])
-    assembler = mA.rkHMatAssembler(64,64,ndim=3)
+    a = np.array([H/4,1/64,1/64])
+    assembler = mA.rkHMatAssembler(512,300,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
@@ -146,8 +146,8 @@ for indp in range(len(pvec)):
     print("leaf exact?        ", len(P)//tree.nleaves <= rk)
 
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,64,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
-    rb_solver._nsamples = lambda rk: 330        # then repeat with 330
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,300,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
+    #rb_solver._nsamples = lambda rk: 1334
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
     print("tree mls   =", rb_solver.tree._min_leaf_size)
@@ -175,67 +175,4 @@ for indp in range(len(pvec)):
     u = Sinv_HBS_rb@v
     print("RB solver time = ",time.time()-tic)
     tot = rb_solver.footprint()
-    ptgInfo = gmres_info()
-    prbgInfo = gmres_info()
-    
-    stol = 1e-8
-    if Version(scipy.__version__)>=Version("1.14"):
-        uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=prbgInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-    else:
-        uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=prbgInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-    res_rb = Stot@uhat_rb-rhstot
-    print("=============SUMMARY==============")
-    print("H                        = ",'%10.3E'%H)
-    print("ord                      = ",p)
-    print("npan_dim                 = ",(int)(H/a[0]),',',(int)(.5/a[1]))
-    print("nc                       = ",OMS.nc)
-    print("L2 rel. res rb           = ", np.linalg.norm(res_rb)/np.linalg.norm(rhstot))
-    print("pGMRES iters rb          = ", prbgInfo.niter)
-    print("==================================")
-    nc = OMS.nc
-    err_tot = 0
-    uhat = uhat_rb
-    for slabInd in range(len(dSlabs)):
-        geom    = np.array(dSlabs[slabInd])
-        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
-        solver  = oms.solverWrap.solverWrapper(opts)
-        solver.construct(geom,Helm,False,False)
-        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-        startL = slabInd-1
-        startR = slabInd+1
-        g = np.zeros(shape=(XXb.shape[0],))
-        g[Igb] = bc(XXb[Igb,:])
-        if startL>-1:
-            g[Il] = uhat[startL*nc:(startL+1)*nc]
-        if startR<len(dSlabs):
-            g[Ir] = uhat[startR*nc:(startR+1)*nc]
-        ghat = bc(XXb)
-        err_loc = np.linalg.norm(ghat-g)/np.linalg.norm(g)
-        err_tot = np.max([err_loc,err_tot])
-        print("===================LOCAL ERR===================")
-        print("err ghat = ",err_loc)
-        print("===============================================")
-    
-    print("===================GLOBAL ERR===================")
-    print("err_tot = ",err_tot)
-    print("===============================================")
-    err[indp] = err_tot
-    sample_time[indp] = OMS.stats.sampl_timing
-    compr_time[indp] = OMS.stats.compr_timing
-    discr_time[indp] = OMS.stats.discr_timing
 
-
-fileName = 'cube.csv'
-errMat = np.zeros(shape=(len(pvec),5))
-errMat[:,0] = pvec
-errMat[:,1] = err
-errMat[:,2] = sample_time
-errMat[:,3] = compr_time
-errMat[:,4] = discr_time
-with open(fileName,'w') as f:
-    f.write('p,err,sample,compr,discr\n')
-    np.savetxt(f,errMat,fmt='%.16e',delimiter=',')
-
-plt.figure(0)
-plt.semilogy(pvec,err)
-plt.show()

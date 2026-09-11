@@ -1,4 +1,3 @@
-
 import time
 import torch
 import torch.linalg as tla
@@ -11,13 +10,13 @@ with R upper triangular
 Q,R,W given in reduced format
 
 '''
-def convert_to_torch_tens(A,Nb,device):
-    n = A.shape[0]//Nb
-    k = A.shape[1]
-    B = torch.zeros(size = (Nb,n,k),device=device)
-    for i in range(Nb):
-        B[i,:,:] = A[i*n:(i+1)*n,:]
-    return B
+def convert_to_torch_tens(A, Nb, device):
+    """(Nb*n, k) -> (Nb, n, k).  A view when A is contiguous (the permuted
+    gathers in constructHBS/constructHBS_ULV are), so no second copy of the
+    samples is made; callers may modify the result in place, which modifies A."""
+    A = A.to(device)
+    n = A.shape[0] // Nb
+    return A[:Nb * n].reshape(Nb, n, A.shape[1])
 def convert_to_blkdiag(A):
     n = A.shape[1]
     k = A.shape[2]
@@ -220,20 +219,39 @@ def apply_sparse_block_tens(A,B,device,mode='N'):
     return C.reshape(Nb * C.shape[1], nrhs)
 
 def block_solve_tens(A,B,device,mode='N'):
-    Nb = A.shape[0]
-    n = A.shape[1]
-    k = A.shape[2]
+    """Solve A[i] X[i] = B[i]  (mode='N')  or  A[i]^T X[i] = B[i]  (mode='T')
+    for upper triangular A of shape (Nb, m, m), B stored flat as (Nb*m, nrhs).
+
+    Every caller passes R or its leading (n-k)x(n-k) block, both exactly upper
+    triangular from Householder QR.  One batched trsm replaces a Python loop
+    of Nb pivoted LU factorizations, each of which also synchronized on its
+    info check.  No singularity check: a zero pivot yields inf/nan instead of
+    the exception torch.linalg.solve would raise."""
+    Nb, m = A.shape[0], A.shape[1]
+    nrhs  = B.shape[1]
+    if B.shape[0] != Nb * m:
+        raise ValueError(f"block_solve_tens: expected {Nb*m} rows, got {B.shape[0]}")
+    if m == 0:
+        return B.new_empty((0, nrhs))
+    Bm = B.reshape(Nb, m, nrhs)
     if mode == 'N':
-        C = torch.zeros(size = (n*Nb,B.shape[1]),device=device)
-        for i in range(Nb):
-            C[i*n:(i+1)*n,:] = tla.solve(A[i,:,:],B[i*n:(i+1)*n,:])
-    elif mode=='T':
-        C = torch.zeros(size = (k*Nb,B.shape[1]),device=device)
-        for i in range(Nb):
-            C[i*k:(i+1)*k,:] = tla.solve(A[i,:,:].T,B[i*n:(i+1)*n,:])
+        X = torch.linalg.solve_triangular(A, Bm, upper=True)
+    elif mode == 'T':
+        X = torch.linalg.solve_triangular(A.mT, Bm, upper=False)
     else:
         raise ValueError("Mode not recognized")
-    return C
+    return X.reshape(Nb * m, nrhs)
+
+
+def _W_parts(Wlist, Vmats, i, n, k):
+    """(W1, V) at level i.  Wlist[i] is either the complement W1 alone
+    (n x (n-k), current HBSMAT) or the legacy concatenation [W1 | V]."""
+    W = Wlist[i]
+    if W.shape[2] == n:
+        return W[:, :, :n-k], W[:, :, n-k:]
+    if Vmats is None:
+        raise ValueError("Wlist holds only the complement W1; pass Vmats to solve()")
+    return W, Vmats[i]
 
 
 
@@ -284,7 +302,7 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
 
         tic = time.time()
         if i<len(Utens):
-            Wlist+=[W]
+            Wlist+=[W[:, :, :n-k].contiguous()]    # V half duplicates Vtens[i]
             if i == 0:
                 Uu = sparse_block_mult_tens(Q[:,:,:(n-k)],Utens[0],device,mode='T')
                 Ud = sparse_block_mult_tens(Q[:,:,(n-k):],Utens[0],device,mode='T')
@@ -303,70 +321,89 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
         
     return Qlist,Wlist,Uulist,Rlist,NNvec
 
-def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N'):
-    if mode=='N':
-        L = len(Dmats)
-        if rhs.ndim == 1:
-            rhshat = rhs[:,None].detach().clone().to(device)
-        else:
-            rhshat = rhs.detach().clone().to(device)
-        for i in range(len(Qlist)):
-            rtmp = rhshat[NNvec[i]:,:].detach().clone().to(device)
-            if i<len(Qlist)-1:
-                n = Umats[i].shape[1]
-                k = Umats[i].shape[2]
-                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block_tens(Qlist[i][:,:,:(n-k)],rtmp,device,mode='T')
-                rhshat[NNvec[i+1]:,:] = apply_sparse_block_tens(Qlist[i][:,:,(n-k):],rtmp,device,mode='T')
-            else:
-                rhshat[NNvec[i]:NNvec[i+1],:] = apply_sparse_block_tens(Qlist[i],rtmp,device,mode='T')
-        
-        y = torch.zeros(size=rhshat.shape,device=device)
+def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N',Vmats=None):
+    """Apply the inverse (mode='N') or inverse transpose (mode='T') of the
+    HBS operator from its ULV factors.
 
-        y[NNvec[L-1]:,:] = block_solve_tens(Rlist[L-1],rhshat[NNvec[L-1]:,:],device)
-        v = apply_sparse_block_tens(Dmats[L-1],y[NNvec[L-1]:,:],device)
+    Nothing is written into rhs or into any shared buffer, so there are no
+    defensive clones.  The sweeps carry the not-yet-eliminated part as a
+    running tensor instead of overwriting slices of a full-length copy, which
+    is what previously forced a clone of the whole tail at every level.
 
-        for i in range(L-2,-1,-1):
-            n = Umats[i].shape[1]
-            k = Umats[i].shape[2]
-            rhs0    =   rhshat[NNvec[i]:NNvec[i+1],:]\
-                        -apply_sparse_block_tens(Uulist[i],v,device)\
-                        -apply_sparse_block_tens(Rlist[i][:,:,n-k:],y[NNvec[i+1]:,:],device)
-            y[NNvec[i]:NNvec[i+1],:]    = block_solve_tens(Rlist[i][:,:,:n-k],rhs0,device).detach().clone().to(device)
-            y[NNvec[i]:,:]              = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],y[NNvec[i]:NNvec[i+1],:],device)\
-                                        +apply_sparse_block_tens(Wlist[i][:,:,(n-k):],y[NNvec[i+1]:,:],device)
-            v       = apply_sparse_block_tens(Umats[i],v,device).detach().clone().to(device)\
-                    +apply_sparse_block_tens(Dmats[i],y[NNvec[i]:,:],device)
-        if rhs.ndim==1:
-            y = torch.flatten(y)
-    elif mode == 'T':
-        L = len(Dmats)
-        if rhs.ndim == 1:
-            rhshat = rhs[:,None].detach().clone().to(device)
-        else:
-            rhshat = rhs.detach().clone().to(device)
-        y = rhshat.detach().clone().to(device)
-        v = torch.zeros(size=(Umats[0].shape[0]*Umats[0].shape[1],rhshat.shape[1]),device=device)
-        for i in range(L-1):
-            n = Umats[i].shape[1]
-            k = Umats[i].shape[2]
-            rhscopy = rhshat.detach().clone().to(device)
-            rhshat[:NNvec[i+1]-NNvec[i],:] = apply_sparse_block_tens(Wlist[i][:,:,:(n-k)],rhscopy,device,mode='T')
-            rhshat[NNvec[i+1]-NNvec[i]:,:] = apply_sparse_block_tens(Wlist[i][:,:,(n-k):],rhscopy,device,mode='T')
-            y[NNvec[i]:NNvec[i+1],:] = block_solve_tens(Rlist[i][:,:,:n-k],rhshat[:NNvec[i+1]-NNvec[i],:],device,mode='T')
-            v=apply_sparse_block_tens(Uulist[i],y[NNvec[i]:NNvec[i+1],:],device,mode='T')+apply_sparse_block_tens(Umats[i],v,device,mode='T')
-            rhshat = rhshat[NNvec[i+1]-NNvec[i]:,:]-apply_sparse_block_tens(Rlist[i][:,:,n-k:],y[NNvec[i]:NNvec[i+1],:],device,mode='T')-apply_sparse_block_tens(Dmats[i+1],v,device,mode='T')
-        y[NNvec[-2]:,:] = block_solve_tens(Rlist[-1],rhshat,device,mode='T')
-        for i in range(len(Qlist)-1,-1,-1):
-            if i<len(Qlist)-1:
-                n = Umats[i].shape[1]
-                k = Umats[i].shape[2]
-                y[NNvec[i]:,:] = apply_sparse_block_tens(Qlist[i][:,:,:n-k],y[NNvec[i]:NNvec[i+1],:],device)\
-                    +apply_sparse_block_tens(Qlist[i][:,:,n-k:],y[NNvec[i+1]:,:],device)
-            else:
-                y[NNvec[i]:NNvec[i+1],:] = apply_sparse_block_tens(Qlist[i],y[NNvec[i]:NNvec[i+1],:],device)
-
-            
-    else:
+    Vmats is required when Wlist stores only the complement W1 (what
+    HBSMAT builds); with legacy [W1 | V] lists it may be omitted.
+    NNvec is no longer needed and kept only for signature compatibility.
+    """
+    if mode not in ('N', 'T'):
         raise NotImplementedError("mode not recognized")
+    L = len(Dmats)
+    was_vector = (rhs.ndim == 1)
+    r = rhs[:, None] if was_vector else rhs
+    r = r.to(device)                    # no copy if already there; never written
+    nrhs = r.shape[1]
 
-    return y
+    if mode == 'N':
+        # ---- Q^* sweep: one bmm per level, peel off the eliminated rows ----
+        chat = []
+        x = r
+        for i in range(L):
+            Q = Qlist[i]
+            Nb, n = Q.shape[0], Q.shape[1]
+            C = torch.bmm(Q.mT, x.reshape(Nb, n, nrhs))        # (Nb, n, nrhs)
+            if i < L - 1:
+                k = Umats[i].shape[2]
+                chat.append(C[:, :n-k, :].reshape(-1, nrhs))
+                x = C[:, n-k:, :].reshape(-1, nrhs)
+            else:
+                chat.append(C.reshape(-1, nrhs))
+
+        # ---- back substitution; x holds the solution in level-(i+1) coords
+        x = block_solve_tens(Rlist[L-1], chat[L-1], device)
+        if L > 1:
+            v = apply_sparse_block_tens(Dmats[L-1], x, device)
+        for i in range(L-2, -1, -1):
+            Nb, n, k = Umats[i].shape
+            W1, V = _W_parts(Wlist, Vmats, i, n, k)
+            rhs0 = chat[i] \
+                 - apply_sparse_block_tens(Uulist[i], v, device) \
+                 - apply_sparse_block_tens(Rlist[i][:, :, n-k:], x, device)
+            yi = block_solve_tens(Rlist[i][:, :, :n-k], rhs0, device)
+            x  = apply_sparse_block_tens(W1, yi, device) \
+               + apply_sparse_block_tens(V, x, device)
+            if i > 0:      # v is only consumed by the next (finer) level
+                v = apply_sparse_block_tens(Umats[i], v, device) \
+                  + apply_sparse_block_tens(Dmats[i], x, device)
+
+    else:
+        # ---- forward sweep: W^* and R^{-*}, level by level ------------------
+        ys = []
+        v  = None                        # U_0^T v with v = 0 on the first level
+        for i in range(L-1):
+            Nb, n, k = Umats[i].shape
+            W1, V = _W_parts(Wlist, Vmats, i, n, k)
+            r1 = apply_sparse_block_tens(W1, r, device, mode='T')
+            r2 = apply_sparse_block_tens(V,  r, device, mode='T')
+            yi = block_solve_tens(Rlist[i][:, :, :n-k], r1, device, mode='T')
+            ys.append(yi)
+            v_new = apply_sparse_block_tens(Uulist[i], yi, device, mode='T')
+            if v is not None:
+                v_new = v_new + apply_sparse_block_tens(Umats[i], v, device, mode='T')
+            v = v_new
+            r = r2 \
+              - apply_sparse_block_tens(Rlist[i][:, :, n-k:], yi, device, mode='T') \
+              - apply_sparse_block_tens(Dmats[i+1], v, device, mode='T')
+        x = block_solve_tens(Rlist[L-1], r, device, mode='T')
+
+        # ---- Q sweep back down: one bmm per level ---------------------------
+        for i in range(L-1, -1, -1):
+            Q = Qlist[i]
+            if i == L - 1:
+                x = apply_sparse_block_tens(Q, x, device)
+            else:
+                Nb, n = Q.shape[0], Q.shape[1]
+                k = Umats[i].shape[2]
+                z = torch.cat((ys[i].reshape(Nb, n-k, nrhs),
+                               x.reshape(Nb, k, nrhs)), dim=1)
+                x = torch.bmm(Q, z).reshape(-1, nrhs)
+
+    return x[:, 0] if was_vector else x

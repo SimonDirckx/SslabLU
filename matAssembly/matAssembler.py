@@ -107,7 +107,7 @@ class matAssembler:
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
-            s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
             tic = time.time()
             Om = np.random.standard_normal((linOp.shape[0],s))
             Psi = np.random.standard_normal((linOp.shape[1],s))

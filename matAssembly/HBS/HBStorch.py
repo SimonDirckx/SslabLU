@@ -15,6 +15,57 @@ _UV_SYNC   = [False]
 _UV_MODE = ['ne']
 _MATMAT_CHUNK = [256]
 _EIGH_CHUNK = [128]
+_PIN_HOST = [True]      # page-lock host masters; set False if host RAM is tight
+_SOLVE_CHUNK = [512]
+
+
+def _dev_eq(a, b):
+    """Device equality that treats 'cuda' and 'cuda:<current>' as equal.
+    torch.device('cuda') != torch.device('cuda:0') under ==, and the RB solver
+    assigns an indexed compute_device to blocks built with an unindexed one."""
+    a, b = torch.device(a), torch.device(b)
+    if a.type != b.type:
+        return False
+    if a.type != 'cuda':
+        return True
+    cur = torch.cuda.current_device()
+    return ((a.index if a.index is not None else cur) ==
+            (b.index if b.index is not None else cur))
+
+
+class _HostBuffer:
+    """Flat host buffer holding one group's master copy, page-locked in place.
+
+    Allocated pageable at the exact size and registered with cudaHostRegister
+    instead of torch.empty(..., pin_memory=True): the caching host allocator
+    rounds each request up to a power of two and keeps freed blocks cached, so
+    for multi-GB factor groups pin_memory can nearly double host usage.
+
+    Lifetime: __del__ unregisters while self.t still holds the storage, so the
+    memory is never freed while registered.  Views that outlive this object
+    stay valid; they are merely no longer page-locked.  If registration is
+    unavailable (ROCm, driver refusal, _PIN_HOST off) the buffer is pageable:
+    evicts stay copy-free, uploads become synchronous.
+    """
+    __slots__ = ('t', 'registered')
+
+    def __init__(self, numel, dtype):
+        self.t = torch.empty(numel, dtype=dtype)
+        self.registered = False
+        if _PIN_HOST[0] and numel > 0 and torch.cuda.is_available():
+            try:
+                rc = torch.cuda.cudart().cudaHostRegister(
+                    self.t.data_ptr(), self.t.numel() * self.t.element_size(), 0)
+                self.registered = (rc is None) or (int(rc) == 0)
+            except Exception:
+                self.registered = False
+
+    def __del__(self):
+        if getattr(self, 'registered', False):
+            try:
+                torch.cuda.cudart().cudaHostUnregister(self.t.data_ptr())
+            except Exception:
+                pass
 
 def uv_timers_reset():
     _UV_TQR[0] = _UV_TBASIS[0] = _UV_TSETUP[0] = 0.0
@@ -436,6 +487,9 @@ class HBSMAT:
                      'Qlist', 'Wlist', 'Rlist', 'Uulist')
 
     def __init__(self,A=None,device=None,tree=None,quad=False):
+        # perm lives in a one-element box so that .T views (shallow __dict__
+        # copies) see the same object when residency rebinds it.
+        self._permbox = [None]
         self.Umats  =   []
         self.Vmats  =   []
         self.Dmats  =   []
@@ -454,7 +508,8 @@ class HBSMAT:
         self.compute_device = dev
         self.home           = torch.device('cpu')
         self._resident = {'core': dev, 'ulv': dev}
-        self._dirty    = {'core': dev != self.home, 'ulv': dev != self.home}
+        # host master per group: None until the first evict snapshots it
+        self._host     = {'core': None, 'ulv': None}
         self.strict    = False
         self.nFill = self.nSpill = 0
         self.bytesH2D = self.bytesD2H = 0
@@ -496,6 +551,8 @@ class HBSMAT:
         self.Umats = Umats
         self.Dmats = Dmats
         self.Vmats = Vmats
+        self._host['core'] = None
+        self._resident['core'] = Dmats[0].device if torch.is_tensor(Dmats[0]) else None
         self.perm = torch.arange(Dmats[0].shape[0])
         self.fac = fac
         self.Nb = Nbvec[0]
@@ -521,7 +578,9 @@ class HBSMAT:
             if self.A is None:
                 raise ValueError("Samples and LinOP cannot both be None")
             else:
-                s = 2*max(rk,self.tree._min_leaf_size)+rk+10
+                # hard requirement max(fac*rk, nl) + rk at the worst level,
+                # plus oversampling p = rk there (every other level has more)
+                s = self.fac*max(rk, self.nl) + rk + 10
 
                 Om = np.random.standard_normal(size = (self.A.shape[1],s))
                 Psi= np.random.standard_normal(size = (self.A.shape[0],s))
@@ -539,6 +598,7 @@ class HBSMAT:
         self.Nbvec = [Nb]
         nl = self.nl
         self.nSamples = s
+        self._reset_residency()
         tic = time.time()
         if torch.is_tensor(self.perm):
             self.perm = self.perm.to(self.compute_device)
@@ -615,6 +675,7 @@ class HBSMAT:
         self.Nbvec = [Nb]
         nl = self.nl
         self.nSamples = s
+        self._reset_residency()
         tic = time.time()
         if torch.is_tensor(self.perm):
             self.perm = self.perm.to(self.compute_device)
@@ -691,6 +752,10 @@ class HBSMAT:
             
             Q,W,Ru,R_22,NN = ULVsparse.compute_QRW_sparse(Rhat,V_ell,self.Nbvec[-1],device=self.device)
             self.Qlist+=[Q]
+            if W is not None:
+                # W = [W1 | V_ell] and the V_ell half is Vmats[-1] verbatim.
+                # Store only the complement; ULVsparse.solve reads V from Vmats.
+                W = W[:, :, :W.shape[2] - V_ell.shape[2]].contiguous()
             self.Wlist+=[W]
             self.Rlist+=[Ru]
             self.NNvec=np.append(self.NNvec,self.NNvec[-1]+NN)
@@ -717,81 +782,78 @@ class HBSMAT:
         return view
 
     def matvec(self,v):
-        return self.matmat(v)
+        return self._apply(v, transpose=False)
     def rmatvec(self,v):
-        return self.rmatmat(v)
+        return self._apply(v, transpose=True)
 
     def matmat(self,v,chunk=None):
-        self._require_resident('matmat')
-        c = _MATMAT_CHUNK[0] if chunk is None else chunk
-        if c and v.shape[1] > c:
-            out = torch.empty((v.shape[0], v.shape[1]), dtype=v.dtype, device=v.device)
-            for j0 in range(0, v.shape[1], c):
-                out[:, j0:j0+c] = self.matmat(v[:, j0:j0+c], chunk=0)
-            return out
-        dev = self.compute_device
-        numpy_input = isinstance(v, np.ndarray)
-        if numpy_input:
-            v = torch.from_numpy(v)
-        v = v.to(device = dev,dtype = self.Dmats[0].dtype)
-        if v.ndim==1:
-            vperm = v[self.perm,None]
-        else:
-            vperm= v[self.perm,:]
-        VV = []
-        Nb = self.Nb
-        VV+=[vperm]
-        for lvl in range(len(self.Vmats)):
-            v_lvl = block_matvec(self.Vmats[lvl],VV[lvl],self.device,mode='T')
-            VV+=[v_lvl]
-            Nb=Nb//self.fac
-        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device)
-        for lvl in range(len(self.Umats)-1,-1,-1):
-            uperm = block_matvec(self.Umats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device)
-            Nb=Nb*self.fac
-        u = torch.zeros(size=uperm.shape,device=self.device)
-        u[self.perm,:] = uperm
-        if v.ndim==1:
-            u = u.flatten()
-        if numpy_input:
-            u = u.cpu().numpy()
-        return u
+        return self._apply(v, transpose=False, chunk=chunk)
 
-    def rmatmat(self,v,chunk = None):
-        self._require_resident('matmat')
-        c = _MATMAT_CHUNK[0] if chunk is None else chunk
-        if c and v.shape[1] > c:
-            out = torch.empty((v.shape[0], v.shape[1]), dtype=v.dtype, device=v.device)
-            for j0 in range(0, v.shape[1], c):
-                out[:, j0:j0+c] = self.matmat(v[:, j0:j0+c], chunk=0)
-            return out
-        dev = self.compute_device
+    def rmatmat(self,v,chunk=None):
+        return self._apply(v, transpose=True, chunk=chunk)
+
+    def _apply(self, v, transpose, chunk=None):
+        """A v (transpose=False) or A^T v (transpose=True).
+
+        All input normalization happens BEFORE chunking, so the chunk loop
+        only ever sees a 2-D tensor on compute_device with dtype_t, and the
+        return type does not depend on the column count:
+            numpy in  -> numpy out (host)
+            tensor in -> tensor on compute_device
+            1-D in    -> 1-D out
+        """
+        self._require_resident('rmatmat' if transpose else 'matmat')
+        if v.ndim not in (1, 2):
+            raise ValueError(f"expected 1-D or 2-D input, got ndim={v.ndim}")
         numpy_input = isinstance(v, np.ndarray)
-        if numpy_input:
-            v = torch.from_numpy(v)
-        v = v.to(dev,dtype = self.Dmats[0].dtype)
-        if v.ndim==1:
-            vperm = v[self.perm,None]
+        was_vector  = (v.ndim == 1)
+
+        V = self._as_local(v)                      # tensor, compute_device, dtype_t
+        if was_vector:
+            V = V[:, None]
+
+        n_in  = int(self.shape[0] if transpose else self.shape[1])
+        n_out = int(self.shape[1] if transpose else self.shape[0])
+        if V.shape[0] != n_in:
+            raise ValueError(
+                f"{'rmatmat' if transpose else 'matmat'}: expected {n_in} rows, "
+                f"got {V.shape[0]}")
+
+        c = _MATMAT_CHUNK[0] if chunk is None else chunk
+        if c and V.shape[1] > c:
+            out = torch.empty((n_out, V.shape[1]), dtype=V.dtype, device=V.device)
+            for j0 in range(0, V.shape[1], c):
+                out[:, j0:j0+c] = self._apply_2d(V[:, j0:j0+c], transpose)
         else:
-            vperm= v[self.perm,:]
-        VV = []
-        Nb = self.Nb
-        VV+=[vperm]
-        for lvl in range(len(self.Umats)):
-            v_lvl = block_matvec(self.Umats[lvl],VV[lvl],self.device,mode='T')
-            VV+=[v_lvl]
-            Nb=Nb//self.fac
-        uperm = block_matvec(self.Dmats[-1],VV[-1],self.device,mode='T')
-        for lvl in range(len(self.Vmats)-1,-1,-1):
-            uperm = block_matvec(self.Vmats[lvl],uperm,self.device)+ block_matvec(self.Dmats[lvl],VV[lvl],self.device,mode='T')
-            Nb=Nb*self.fac
-        u = torch.zeros(size=uperm.shape,device=self.device)
-        u[self.perm,:] = uperm
-        if v.ndim==1:
-            u = u.flatten()
+            out = self._apply_2d(V, transpose)
+
+        if was_vector:
+            out = out[:, 0]
         if numpy_input:
-            u = u.cpu().numpy()
-        return u
+            out = out.cpu().numpy()
+        return out
+
+    def _apply_2d(self, V, transpose):
+        """Core HBS apply.  V: 2-D tensor on compute_device, original ordering.
+
+        matmat and rmatmat differ only in which basis list runs the upward
+        (restriction) sweep and in the mode used on D, so they share one body;
+        the previous copy-pasted pair is how rmatmat ended up calling matmat.
+        """
+        dmode = 'T' if transpose else 'N'
+        down  = self.Umats if transpose else self.Vmats
+        up    = self.Vmats if transpose else self.Umats
+
+        VV = [V[self.perm, :]]
+        for M in down:
+            VV.append(block_matvec(M, VV[-1], self.device, mode='T'))
+        u = block_matvec(self.Dmats[-1], VV[-1], self.device, mode=dmode)
+        for lvl in range(len(up) - 1, -1, -1):
+            u = block_matvec(up[lvl], u, self.device) \
+              + block_matvec(self.Dmats[lvl], VV[lvl], self.device, mode=dmode)
+        out = torch.zeros_like(u)
+        out[self.perm, :] = u
+        return out
 
     def __matmul__(self, v):
         if self.mode == 'N':
@@ -808,6 +870,14 @@ class HBSMAT:
     def tree(self, t):
         self._tree = t
 
+    @property
+    def perm(self):
+        return self._permbox[0]
+
+    @perm.setter
+    def perm(self, p):
+        self._permbox[0] = p
+
     # ------------------------------------------------------------------
     # Device placement
     # ------------------------------------------------------------------
@@ -817,19 +887,51 @@ class HBSMAT:
             for name in self._GROUPS[g]:
                 yield g, getattr(self, name)
 
-    def _move(self, target, groups, non_blocking=False):
-        target = torch.device(target)
-        moved = 0
-        for g, lst in self._lists(groups):
-            for i, t in enumerate(lst):
-                if torch.is_tensor(t) and t.device != target:
-                    moved += t.nbytes
-                    lst[i] = t.to(target, non_blocking=non_blocking)
-        if 'core' in groups and torch.is_tensor(self.perm) \
-                and self.perm.device != target:
-            moved += self.perm.nbytes
-            self.perm = self.perm.to(target, non_blocking=non_blocking)
-        return moved
+    def _entries(self, g):
+        """(list_name, index) of every tensor slot in group g.  perm rides
+        with 'core' through its one-element box."""
+        names = self._GROUPS[g] + (('_permbox',) if g == 'core' else ())
+        return [(name, i) for name in names
+                for i, t in enumerate(getattr(self, name)) if torch.is_tensor(t)]
+
+    def _reset_residency(self, groups=None):
+        """Forget host masters: the live tensors are about to be rebuilt on
+        compute_device, so any snapshot of the old ones is stale."""
+        for g in (groups if groups is not None else tuple(self._GROUPS)):
+            self._host[g] = None
+            self._resident[g] = self.compute_device
+
+    def _snapshot(self, g):
+        """Build the immutable host master of group g from its live tensors.
+
+        The only device-to-host copy a group ever pays.  All tensors land in
+        one flat page-locked buffer per dtype; afterwards evict() rebinds to
+        views of it and prefetch() uploads from it asynchronously.  Correct
+        because factors are never modified in place after construction --
+        whatever rebuilds a group must drop its master first."""
+        ents  = self._entries(g)
+        sizes = {}
+        for name, i in ents:
+            t = getattr(self, name)[i]
+            sizes[t.dtype] = sizes.get(t.dtype, 0) + t.numel()
+        bufs = {dt: _HostBuffer(n, dt) for dt, n in sizes.items()}
+        offs = dict.fromkeys(sizes, 0)
+        views, devs, nD2H = [], set(), 0
+        for name, i in ents:
+            t  = getattr(self, name)[i]
+            o  = offs[t.dtype]
+            offs[t.dtype] = o + t.numel()
+            hv = bufs[t.dtype].t[o:o + t.numel()].view(t.shape)
+            hv.copy_(t, non_blocking=True)
+            if t.is_cuda:
+                devs.add(t.device)
+                nD2H += t.nbytes
+            views.append(hv)
+        for d in devs:                  # one sync per snapshot, not per tensor
+            torch.cuda.current_stream(d).synchronize()
+        rec = {'ents': ents, 'views': views, 'bufs': bufs}
+        self._host[g] = rec
+        return rec, nD2H
 
     def _group_resident(self, g):
         # A group with no tensors (e.g. ulv on a compute_ULV=False block)
@@ -837,16 +939,31 @@ class HBSMAT:
         if not any(len(getattr(self, n)) for n in self._GROUPS[g]):
             return True
         r = self._resident[g]
-        return r is not None and torch.device(r) == self.compute_device
+        return r is not None and _dev_eq(r, self.compute_device)
 
     def prefetch(self, groups=('core',), non_blocking=True):
-        """Stage a device mirror for the named groups. No-op if resident."""
+        """Stage a device mirror for the named groups. No-op if resident.
+
+        With a host master, each upload comes from page-locked memory and is
+        asynchronous.  Without one (never evicted) the live tensors are moved
+        directly; the master is created on the first evict instead."""
         need = [g for g in groups if not self._group_resident(g)]
         if not need:
             return self
-        n = self._move(self.compute_device, need, non_blocking=non_blocking)
+        dev, n = self.compute_device, 0
         for g in need:
-            self._resident[g] = self.compute_device
+            rec = self._host[g]
+            if rec is not None:
+                for (name, i), hv in zip(rec['ents'], rec['views']):
+                    getattr(self, name)[i] = hv.to(dev, non_blocking=non_blocking)
+                    n += hv.nbytes
+            else:
+                for name, i in self._entries(g):
+                    t = getattr(self, name)[i]
+                    if not _dev_eq(t.device, dev):
+                        getattr(self, name)[i] = t.to(dev, non_blocking=non_blocking)
+                        n += t.nbytes
+            self._resident[g] = dev
         self.nFill += 1
         self.bytesH2D += n
         return self
@@ -854,26 +971,27 @@ class HBSMAT:
     def evict(self, groups=('core', 'ulv')):
         """Drop the device mirror for the named groups.
 
-        A *dirty* group was built on device and has no home copy: it is
-        written back.  A *clean* group already has an identical home copy
-        -- it was staged in for read-only use -- so the tensors are rebound
-        to `home` and the device memory returns to the caching allocator
-        with no copy at all.  That clean path is what makes a
-        consume-before-evict schedule cost one bus crossing per block.
+        The first evict of a group after it is built snapshots it into a
+        page-locked host master (one D2H copy, one sync).  Every later evict
+        rebinds the tensor lists to views of that master: no copy, no sync,
+        and the device memory goes straight back to the caching allocator.
+        bytesD2H therefore counts real transfers only.
 
         compute_device is NOT touched.  An evicted block that is applied
         again must be re-staged, never silently demoted to host arithmetic;
         that is the whole point of this method existing instead of to('cpu').
         """
-        if self.compute_device == self.home:
-            return self 
+        if _dev_eq(self.compute_device, self.home):
+            return self
         for g in groups:
             if self._resident[g] is None:
                 continue
-            n = self._move(self.home, (g,))
-            if self._dirty[g]:
-                self.bytesD2H += n
-                self._dirty[g] = False
+            rec = self._host[g]
+            if rec is None:
+                rec, nD2H = self._snapshot(g)
+                self.bytesD2H += nD2H
+            for (name, i), hv in zip(rec['ents'], rec['views']):
+                getattr(self, name)[i] = hv
             self._resident[g] = None
             self.nSpill += 1
         return self
@@ -886,11 +1004,15 @@ class HBSMAT:
 
         moved = 0
         for g in self._GROUPS:
-            moved += self._move(device, (g,), non_blocking=non_blocking)
+            for name, i in self._entries(g):
+                t = getattr(self, name)[i]
+                if not _dev_eq(t.device, device):
+                    moved += t.nbytes
+                    getattr(self, name)[i] = t.to(device, non_blocking=non_blocking)
             self._resident[g] = device
-            self._dirty[g]    = False
+            self._host[g]     = None    # relocation: home changes, master is moot
 
-        # perm rides with 'core' inside _move, but normalize it here so a
+        # perm rides with 'core' in _entries, but normalize it here so a
         # tree-supplied numpy perm becomes a tensor on the target rather
         # than staying host-side and forcing an implicit H2D on every
         # fancy-index in matmat/constructHBS.
@@ -946,45 +1068,50 @@ class HBSMAT:
         self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
         self.tULV = time.time() - tic
         self._resident['ulv'] = self.compute_device
-        self._dirty['ulv']    = (self.compute_device != self.home)
+        self._host['ulv']     = None    # rebuilt: any old master is stale
 
-    def solve(self, b, mode='N'):
-        """Apply the inverse of the HBS operator via its ULV factorization.
+    def solve(self, b, mode='N', chunk=None, overwrite_b=False):
+        """Apply the inverse (mode='N') or inverse transpose (mode='T') of the
+        HBS operator via its ULV factorization.
 
         Permutation convention
         ----------------------
         The stored factors represent  A_p = P A P^T,  where P is the leaf
         permutation, (P v)[i] = v[perm[i]].  Therefore
 
-            A^{-1}   = P^T A_p^{-1}  P
-            A^{-T}   = P^T A_p^{-T}  P
+            A^{-1} = P^T A_p^{-1} P      and      A^{-T} = P^T A_p^{-T} P,
 
-        The same P appears on both sides in both modes, so the gather /
-        scatter around the ULV solve is IDENTICAL for 'N' and 'T'.
-        Transposing does not reverse it.  The only thing that changes is
-        which triangular sweep ULVsparse.solve runs.
+        so the gather / scatter around the ULV solve is identical in both
+        modes; only the triangular sweep in ULVsparse.solve differs.  (An
+        earlier version scattered the rhs and gathered the result for 'T',
+        which is wrong for any non-involutive permutation.)
 
-        An earlier version scattered the rhs and gathered the result in the
-        'T' branch, computing  P A_p^{-T} P^T.  That agrees with A^{-T}
-        only when P is an involution -- the identity permutation being the
-        obvious case, which is why it survived testing.  With a real
-        tree.perm_leaf it returns an O(1)-wrong answer, and since
-        RedBlackSolverHBS uses mode='T' to build the adjoint samples Z for
-        every compression below level 0, the error propagates into the
-        operators themselves rather than staying in one solve.
+        Memory
+        ------
+        The ULV sweeps hold roughly 7 rhs-sized tensors at their peak (the
+        permuted rhs, the peeled-off parts per level, and the leaf-level
+        W1*y, V*x and their sum).  For the 2s-column fused solves of the
+        red-black factorization that is the device-memory peak, so columns
+        are processed in chunks of `chunk` (default _SOLVE_CHUNK[0]; 0
+        disables chunking).  The transient then scales with the chunk, not
+        with b.shape[1].  Columns are independent, so the result is identical
+        up to BLAS kernel selection.
+
+        overwrite_b=True writes the solution into b itself (when b is a torch
+        tensor already on compute_device with the factor dtype, or a numpy
+        array aliased by a CPU compute device) and returns it, so no output
+        buffer is allocated.  Safe because each chunk's columns are gathered
+        (copied) before that chunk's solution is scattered back.  If b had
+        to be converted anyway, the private copy is always reused as output.
         """
-
         if not self.Qlist:
             raise RuntimeError(
                 "solve() requires the ULV factorization, but this HBSMAT has "
                 "an empty Qlist.  Build it with construct(..., compute_ULV=True) "
                 "or call compute_ULV() first."
             )
-
         if mode not in ('N', 'T'):
-            raise NotImplementedError(
-                f"mode '{mode}' not recognized. Use 'N' or 'T'."
-            )
+            raise NotImplementedError(f"mode '{mode}' not recognized. Use 'N' or 'T'.")
 
         self._require_resident('solve', need_ulv=True)
 
@@ -993,54 +1120,68 @@ class HBSMAT:
         # ------------------------------------------------------------
         input_is_numpy = isinstance(b, np.ndarray)
         input_is_torch = torch.is_tensor(b)
-
         if not (input_is_numpy or input_is_torch):
             raise TypeError("b must be either a numpy.ndarray or a torch.Tensor")
+        if b.ndim not in (1, 2):
+            raise ValueError(f"b must have ndim 1 or 2, got ndim={b.ndim}")
 
-        # Dmats is always populated; Umats is empty for a single-level tree.
         dtype_t = self.Dmats[0].dtype
-
         if input_is_numpy:
-            b_torch = torch.as_tensor(b, dtype=dtype_t,
-                                      device=self.compute_device)
+            src_ptr = b.__array_interface__['data'][0] if b.size else None
+            b_torch = torch.as_tensor(b, dtype=dtype_t, device=self.compute_device)
         else:
+            src_ptr = b.data_ptr() if b.numel() else None
             b_torch = b.to(device=self.compute_device, dtype=dtype_t)
 
-        if b_torch.ndim not in (1, 2):
-            raise ValueError(f"b must have ndim 1 or 2, got ndim={b_torch.ndim}")
+        # Did the conversion produce a private copy, or does b_torch alias b?
+        aliased = (src_ptr is not None) and (b_torch.data_ptr() == src_ptr)
 
         was_vector = (b_torch.ndim == 1)
         if was_vector:
             b_torch = b_torch[:, None]
 
-        # ------------------------------------------------------------
-        # Solve:  u = P^T ( ULV^{-1} ( P b ) )   for both modes
-        # ------------------------------------------------------------
-        bperm = b_torch[self.perm, :].clone()
+        nrow, ncol = b_torch.shape
+        if nrow != self.perm.shape[0]:
+            raise ValueError(f"solve: expected {self.perm.shape[0]} rows, got {nrow}")
 
-        uhat = ULVsparse.solve(
-            self.Umats,
-            self.Dmats,
-            self.Qlist,
-            self.Wlist,
-            self.Uulist,
-            self.Rlist,
-            self.NNvec,
-            bperm,
-            device=self.compute_device,
-            mode=mode,
-        )
+        # Output buffer: reuse b_torch when allowed (caller opted in) or when it
+        # is our own copy anyway; otherwise allocate.
+        if overwrite_b or not aliased:
+            out = b_torch
+        else:
+            out = torch.empty((nrow, ncol), dtype=dtype_t, device=b_torch.device)
 
-        u = torch.empty_like(uhat)
-        u[self.perm, :] = uhat
+        c = _SOLVE_CHUNK[0] if chunk is None else chunk
+        if not c or c > ncol:
+            c = max(ncol, 1)
+
+        # ------------------------------------------------------------
+        # Solve:  u = P^T ( ULV^{-1} ( P b ) ),  one column chunk at a time
+        # ------------------------------------------------------------
+        for j0 in range(0, ncol, c):
+            j1 = min(j0 + c, ncol)
+            bperm = b_torch[self.perm, j0:j1]      # advanced-index gather: a copy
+            uhat = ULVsparse.solve(
+                self.Umats,
+                self.Dmats,
+                self.Qlist,
+                self.Wlist,
+                self.Uulist,
+                self.Rlist,
+                self.NNvec,
+                bperm,
+                device=self.compute_device,
+                mode=mode,
+                Vmats=self.Vmats,
+            )
+            del bperm                              # free before the scatter
+            out[self.perm, j0:j1] = uhat           # columns j0:j1 already read
+            del uhat
 
         # ------------------------------------------------------------
         # Restore shape and array type
         # ------------------------------------------------------------
-        if was_vector:
-            u = u[:, 0]
-
+        u = out[:, 0] if was_vector else out
         if input_is_numpy:
             return u.detach().cpu().numpy()
-
         return u

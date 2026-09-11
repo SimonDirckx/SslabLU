@@ -579,9 +579,14 @@ class RedBlackSolverHBS(DirectSolver):
 
         Every operator sharing an Omega must use the same s.  All nodes share
         self.tree, so one value per level is consistent by construction.
+
+        max(fac*rk, nl) + rk is the hard floor at the worst level (leaf:
+        n = nl; interior: n = fac*rk), and the second rk is the oversampling
+        there.  Uses the leaf size HBSMAT actually uses, not _min_leaf_size.
         """
-        mls = getattr(self.tree, "_min_leaf_size", rk)
-        return 2 * max(rk, mls) + rk + 10
+        fac = 4 if self.quad else 2
+        nl  = len(self.tree.perm_leaf) // self.tree.nleaves
+        return max(fac * rk, nl) + 2 * rk
 
     def _want_ulv(self, compute_ULV):
         """Resolve a requested compute_ULV against the opt-out flag."""
@@ -906,6 +911,28 @@ class RedBlackSolverHBS(DirectSolver):
         # ---------------------------------------------------------------
         Xm, Xp = {}, {}
 
+        def _sv_overwrite(op, X, mode='N'):
+            """Solve, letting an HBSMAT reuse X's storage for the result.
+
+            X must not be read afterwards; the return value may alias it.
+            Needs HBSMAT.solve(..., overwrite_b=True).  Other operator types
+            (id_op, dead_op, RB_linop) go through the normal _sv."""
+            if isinstance(op, HBSnew.HBSMAT):
+                self.nSolve += 1
+                return op.solve(X, mode=mode, overwrite_b=True)
+            return self._sv(op, X, mode=mode)
+
+        def _sub(Y, D):
+            """Y - D, in place unless Y still aliases a shared test matrix.
+
+            With T_i = I, Y_B and Z_B start out as Om and Psi themselves, and
+            those are read by every compression at this level.  The first
+            update on such a node is therefore out of place; its result is a
+            fresh tensor, so every later update on that node runs in place."""
+            if Y is Om or Y is Psi:
+                return Y - D
+            return Y.sub_(D)
+
         def _ensure_X(k):
             """Fill Xm[k] (and Xp[k] where needed) if not already present.
             Idempotent: node k-1 builds it as its kR, node k+1 reuses it as
@@ -925,16 +952,21 @@ class RedBlackSolverHBS(DirectSolver):
                 self.nIdSkipped += 1
                 return
 
-            cols = [self._ap(SiM[k], Om)]
+            # Fill one (m, 2s) buffer directly, so at most one s-column apply
+            # output lives next to it (previously: both halves plus their
+            # concatenation).  The chunked solve then writes X into the same
+            # storage, so no separate output block is allocated either.
+            RHS = torch.empty(m, 2 * s if need_p else s,
+                              dtype=self._tdtype, device=self.compute_device)
+            RHS[:, :s] = self._ap(SiM[k], Om)
             if need_p:
-                cols.append(self._ap(SiP[k], Om))
-            RHS = cols[0] if len(cols) == 1 else torch.cat(cols, dim=1)
-            del cols
-            X = self._sv(T_hbs[k], RHS)        # one solve, up to 2s columns
-            del RHS
+                RHS[:, s:] = self._ap(SiP[k], Om)
+            X = _sv_overwrite(T_hbs[k], RHS)     # one solve, up to 2s columns
+            del RHS                              # X aliases it when in place
             Xm[k] = X[:, :s]
             if need_p:
                 Xp[k] = X[:, s:]
+
         def _spill(t):
             return None if t is None else t.to('cpu')
 
@@ -959,7 +991,7 @@ class RedBlackSolverHBS(DirectSolver):
             C_is_zero = (not cyclic) and i == nSlabs - 2
 
             # T_i Om and T_i^T Psi are Om and Psi themselves when T_i = I.
-            # The updates below are out-of-place, so no copy is needed here.
+            # _sub below keeps the first update out of place in that case.
             if _is_id(T[i]):
                 Y_B, Z_B = Om, Psi
                 self.nIdSkipped += 1
@@ -968,20 +1000,21 @@ class RedBlackSolverHBS(DirectSolver):
                 Z_B = self._apT(T[i], Psi)
             Y_A = Y_C = Z_A = Z_C = None
 
+            # Each former fused apply on cat([X1, X2]) is now two plain
+            # applies.  matmat/rmatmat chunk every call at _MATMAT_CHUNK
+            # columns anyway, so fusing bought no GPU work; it only cost the
+            # (m, 2s) concatenation plus an (m, 2s) output held at once.
+
             if has_right:
                 for op in (SiM[kR], SiP[kR]):
                     if hasattr(op, 'release_ulv'):
                         op.release_ulv()
-                # forward: one apply of S^+_i covering both B and C
                 _ensure_X(kR)
-                cols = [Xm[kR]] if C_is_zero else [Xm[kR], Xp[kR]]
-                W = self._ap(SiP[i], cols[0] if len(cols) == 1
-                             else torch.cat(cols, dim=1))
-                del cols
-                Y_B = Y_B - W[:, :s]
+
+                # forward: S^+_i Xm (B term) and S^+_i Xp (C term)
+                Y_B = _sub(Y_B, self._ap(SiP[i], Xm[kR]))
                 if not C_is_zero:
-                    Y_C = _spill(-W[:, s:])
-                del W
+                    Y_C = _spill(self._ap(SiP[i], Xp[kR]).neg_())
 
                 # adjoint: t^+ = T_{i+1}^{-T} (S^+_i)^T Psi serves B and C
                 rhs_p = self._apT(SiP[i], Psi)
@@ -989,23 +1022,22 @@ class RedBlackSolverHBS(DirectSolver):
                     tp = rhs_p
                     self.nIdSkipped += 1
                 else:
-                    tp = self._sv(T_hbs[kR], rhs_p, mode='T')
+                    tp = _sv_overwrite(T_hbs[kR], rhs_p, mode='T')
                 del rhs_p
-                Z_B = Z_B - self._apT(SiM[kR], tp)
+                Z_B = _sub(Z_B, self._apT(SiM[kR], tp))
                 if not C_is_zero:
-                    Z_C = _spill(-self._apT(SiP[kR], tp))
+                    Z_C = _spill(self._apT(SiP[kR], tp).neg_())
                 del tp
 
             if has_left:
                 for op in (SiP[kL], SiM[kL]):
                     if hasattr(op, 'release_ulv'):
                         op.release_ulv()
-                # Xp first (B term), Xm second (A term)
                 _ensure_X(kL)
-                W = self._ap(SiM[i], torch.cat([Xp[kL], Xm[kL]], dim=1))
-                Y_B = Y_B - W[:, :s]
-                Y_A = _spill(-W[:, s:])
-                del W
+
+                # forward: S^-_i Xp (B term) and S^-_i Xm (A term)
+                Y_B = _sub(Y_B, self._ap(SiM[i], Xp[kL]))
+                Y_A = _spill(self._ap(SiM[i], Xm[kL]).neg_())
 
                 # adjoint: t^- = T_{i-1}^{-T} (S^-_i)^T Psi serves B and A
                 rhs_m = self._apT(SiM[i], Psi)
@@ -1013,10 +1045,10 @@ class RedBlackSolverHBS(DirectSolver):
                     tm = rhs_m
                     self.nIdSkipped += 1
                 else:
-                    tm = self._sv(T_hbs[kL], rhs_m, mode='T')
+                    tm = _sv_overwrite(T_hbs[kL], rhs_m, mode='T')
                 del rhs_m
-                Z_B = Z_B - self._apT(SiP[kL], tm)
-                Z_A = _spill(-self._apT(SiM[kL], tm))
+                Z_B = _sub(Z_B, self._apT(SiP[kL], tm))
+                Z_A = _spill(self._apT(SiM[kL], tm).neg_())
                 del tm
 
             # Guard the degenerate case where neither branch ran: Y_B/Z_B
@@ -1026,6 +1058,9 @@ class RedBlackSolverHBS(DirectSolver):
                 Y_B = Om.clone()
             if Z_B is Psi:
                 Z_B = Psi.clone()
+            if not cyclic:
+                self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+                self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
             self._sync(); t1=time.time()
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
@@ -1065,9 +1100,6 @@ class RedBlackSolverHBS(DirectSolver):
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
             del Y_C, Z_C
 
-            if not cyclic:
-                self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
-                self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
             self._sync();t2=time.time()
             print(f"node {i:3d}: sample {t1-t0:6.2f}s"
                   f" construct {t2-t1:6.2f}s (B+A+C)"
@@ -1155,7 +1187,31 @@ class RedBlackSolverHBS(DirectSolver):
             nSlabs   = len(SiM)
             nReduced = nSlabs // 2
             vPrev    = vPrimes[-1]
-            vPrime   = torch.zeros(m * nReduced, nrhs,dtype=self._tdtype,device=dev)
+            # every block is written below, so no zero fill
+            vPrime   = torch.empty(m * nReduced, nrhs,dtype=self._tdtype,device=dev)
+
+            # T_k^{-1} vPrev_k for odd k is read by node k-1 (as `next`) and by
+            # node k+1 (as `prev`) -- the same solve on the same rhs.  Solve
+            # once, release T_hbs[k] immediately (the result is all anyone
+            # needs), and drop the result after its last reader.  In the
+            # non-cyclic case the last odd node has a single reader.
+            Tinv, uses = {}, {}
+
+            def _Tinv(k):
+                if k not in Tinv:
+                    blk = vPrev[k*m:(k+1)*m, :]
+                    if _is_id(T_hbs[k]):
+                        Tinv[k] = blk           # read-only use: no clone needed
+                        self.nIdSkipped += 1
+                    else:
+                        Tinv[k] = self._sv(T_hbs[k], blk)
+                        self._release(T_hbs[k])
+                    uses[k] = 2 if (self.cyclic or k != nSlabs - 1) else 1
+                x = Tinv[k]
+                uses[k] -= 1
+                if uses[k] == 0:
+                    del Tinv[k], uses[k]
+                return x
 
             for j in range(nReduced):
                 i = 2 * j
@@ -1163,22 +1219,20 @@ class RedBlackSolverHBS(DirectSolver):
                 prev = (i - 1) % nSlabs if (self.cyclic or i > 0)          else None
                 next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1) else None
 
-                contrib = vPrev[i*m:(i+1)*m].clone()
+                # out-of-place updates below; the slice assignment copies
+                contrib = vPrev[i*m:(i+1)*m, :]
                 if prev is not None:
-                    contrib = contrib - self._ap(SiM[i],self._sv(T_hbs[prev], vPrev[prev*m:(prev+1)*m,:]))
+                    contrib = contrib - self._ap(SiM[i], _Tinv(prev))
                 if next is not None:
-                    contrib = contrib - self._ap(SiP[i],self._sv(T_hbs[next],vPrev[next*m:(next+1)*m,:]))
+                    contrib = contrib - self._ap(SiP[i], _Tinv(next))
 
                 vPrime[j*m:(j+1)*m,:] = contrib
 
                 # SiM[i]/SiP[i] have no further consumer at this level.
-                # T_hbs[prev] was read by node i-2 (as its next) and by this
-                # node; T_hbs[next] is still needed by node i+2.
                 self._release(SiM[i], SiP[i])
-                if prev is not None:
-                    self._release(T_hbs[prev])
 
-            self._release(*T_hbs)
+            assert not Tinv, "forward reduction left cached solves unconsumed"
+            self._release(*T_hbs)       # no-op for already-released blocks
             vPrimes.append(vPrime)
 
         # ---- coarsest solve -------------------------------------------
