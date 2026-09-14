@@ -16,7 +16,7 @@ _UV_MODE = ['ne']
 _MATMAT_CHUNK = [256]
 _EIGH_CHUNK = [128]
 _PIN_HOST = [True]      # page-lock host masters; set False if host RAM is tight
-_SOLVE_CHUNK = [512]
+_SOLVE_CHUNK = [512]    # columns per ULV solve in HBSMAT.solve; 0 disables chunking
 
 
 def _dev_eq(a, b):
@@ -432,7 +432,11 @@ def compute_UV_pair(Om, Y, Psi, Z, rk, device, fast=False,mode=None):
         UU = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
         del G
     else:
-        UU = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
+        prev = torch.get_num_threads()
+        try:
+            UU = (tla.svd(L.to('cpu'), full_matrices=False).U[..., :k]).to(L.device)
+        finally:
+            torch.set_num_threads(prev)
     _uv_sync(Y.device); _UV_TBASIS[0] += time.time() - _t
 
     # .contiguous() on every slice: these are views into the (2Nb, r, n+ny)
@@ -580,7 +584,7 @@ class HBSMAT:
             else:
                 # hard requirement max(fac*rk, nl) + rk at the worst level,
                 # plus oversampling p = rk there (every other level has more)
-                s = self.fac*max(rk, self.nl) + rk + 10
+                s = max(self.fac*rk, self.nl) + 2*rk
 
                 Om = np.random.standard_normal(size = (self.A.shape[1],s))
                 Psi= np.random.standard_normal(size = (self.A.shape[0],s))
@@ -1093,9 +1097,9 @@ class HBSMAT:
         W1*y, V*x and their sum).  For the 2s-column fused solves of the
         red-black factorization that is the device-memory peak, so columns
         are processed in chunks of `chunk` (default _SOLVE_CHUNK[0]; 0
-        disables chunking).  The transient then scales with the chunk, not
-        with b.shape[1].  Columns are independent, so the result is identical
-        up to BLAS kernel selection.
+        disables chunking).  The transient then
+        scales with the chunk, not with b.shape[1].  Columns are independent,
+        so the result is identical up to BLAS kernel selection.
 
         overwrite_b=True writes the solution into b itself (when b is a torch
         tensor already on compute_device with the factor dtype, or a numpy

@@ -10,13 +10,24 @@ with R upper triangular
 Q,R,W given in reduced format
 
 '''
-def convert_to_torch_tens(A, Nb, device):
-    """(Nb*n, k) -> (Nb, n, k).  A view when A is contiguous (the permuted
-    gathers in constructHBS/constructHBS_ULV are), so no second copy of the
-    samples is made; callers may modify the result in place, which modifies A."""
-    A = A.to(device)
-    n = A.shape[0] // Nb
-    return A[:Nb * n].reshape(Nb, n, A.shape[1])
+def convert_to_torch_tens(A,Nb,device):
+    """(Nb*n, k) -> (Nb, n, k).
+
+    A VIEW when A is contiguous, which the permuted sample gathers in
+    constructHBS / constructHBS_ULV always are (advanced indexing returns a
+    fresh contiguous tensor).  The old loop copied into a zeroed buffer,
+    which held a second full copy of Om/Psi/Y/Z on the device -- 4H at the
+    compression peak -- and issued 4*Nb small kernels per construction.
+
+    Consequence: callers may modify the result in place, and that modifies A.
+    constructHBS* relies on exactly that (Y_ell -= ... writes into Ypr, which
+    is private to the call and never read again).  Do not pass a tensor that
+    is still needed afterwards.
+    """
+    if A.shape[0] % Nb:
+        raise ValueError(f"convert_to_torch_tens: {A.shape[0]} rows not divisible by Nb={Nb}")
+    n = A.shape[0]//Nb
+    return A.to(device).reshape(Nb, n, A.shape[1])
 def convert_to_blkdiag(A):
     n = A.shape[1]
     k = A.shape[2]

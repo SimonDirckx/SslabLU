@@ -6,6 +6,279 @@ from direct_solve.omsdirectsolve import DirectSolver
 import torch
 import time
 import gc
+import math
+import warnings
+class rkStrat:
+    """Per-stage HBS compression rank.
+
+    A "stage" is one step of a factorization that compresses freshly formed
+    operators from samples drawn through the operators of the previous stage.
+    For RedBlackSolverHBS that is one builder call: stage j consumes RB[j] and
+    produces RB[j+1], so rank(j) is the rank of everything in RB[j+1].  For a
+    Thomas-style sweep the stage is the step index of the recurrence.  The
+    class knows nothing about either; it maps a non-negative integer to a rank.
+
+    Why a schedule at all
+    ---------------------
+    The forward operators compress to near machine accuracy at a modest rank,
+    but each stage samples through the *inverse* of the previous stage's
+    diagonal.  The Schur complements fill in, their off-diagonal blocks get
+    less compressible, and a rank that was ample at the leaves is not ample at
+    the root -- which is also the block that gets inverted directly and whose
+    error lands straight in the residual.  Growing the rank with the stage
+    puts the resolution where the loss happens.  It is close to free: the
+    number of operators per stage halves while the rank grows by a factor g,
+    so per-stage sampling cost scales like g/2 and compression like g^2/2.
+
+    It cannot repair error already baked into the samples, though.  Stage j's
+    right-hand sides are generated with stage j-1's *compressed* operators, so
+    if stage j-1 was under-resolved, a higher rank at stage j only fits a
+    wrong operator more precisely.  Growth should start early rather than jump
+    at the end.
+
+    Modes
+    -----
+      'const'   r(e) = rk0
+      'linear'  r(e) = rk0 + rate*e        (rate = additive increment / stage)
+      'geom'    r(e) = rk0 * rate**e       (rate = multiplicative factor)
+
+    where e is the effective stage index (see skip_first_level).  Evaluation
+    is always from this closed form, never by iterating r *= rate.  Iterated
+    rounding compounds the rounding bias at every stage (upward here, since
+    the rule below rounds up), so the schedule drifts off the intended curve:
+    rk0=33, g=1.05 gives 33 35 36 38 40 42 44 46 from the closed form but
+    33 35 37 39 41 43 45 47 when iterated.
+
+    skip_first_level
+    ----------------
+    When the stage-0 diagonal is the identity there is no inversion at that
+    stage, so its samples carry only the input operators' own compression
+    error and no growth is warranted yet.  With skip_first_level=True
+    (default) the growth index is shifted, e = max(stage-1, 0), so stages 0
+    and 1 share the base rank and growth starts at stage 2.  This is only
+    sound when stage 0 really is inversion-free; RedBlackSolverHBS checks
+    that its level-0 diagonal is all id_op and copies the strategy with the
+    flag off when it is not.  (In a Thomas sweep the analogue is the i == 1
+    step, where S'_1 = I.)
+
+    Rounding
+    --------
+    Half-up to an integer, then up to the next multiple of round_to.  Rounding
+    up rather than to nearest means a schedule never silently gives back the
+    resolution it was asked for; round_to > 1 keeps the GEMM shapes aligned
+    and makes the schedule insensitive to small changes in rate.
+
+    Bounds
+    ------
+    rk_min is enforced.  rk_max only warns -- exceeding it is a decision for
+    the caller, not an error.  The binding practical limit is the HBS leaf
+    size nl: once rk >= nl the leaf blocks have k = min(rk, nl) = n, the null
+    complement W1 is empty and the leaf level compresses nothing.  Pass nl to
+    validate() to get that warning for a whole schedule up front.
+    """
+
+    _MODES = ('const', 'linear', 'geom')
+
+    def __init__(self, rk0, mode='const', rate=None, skip_first_level=True,
+                 rk_max=None, rk_min=1, round_to=1, monotone=False):
+        mode = str(mode).lower()
+        aliases = {'constant': 'const', 'c': 'const',
+                   'lin': 'linear', 'l': 'linear',
+                   'geometric': 'geom', 'g': 'geom', 'exp': 'geom'}
+        mode = aliases.get(mode, mode)
+        if mode not in self._MODES:
+            raise ValueError(f"mode must be one of {self._MODES}, got {mode!r}")
+
+        rk0 = int(rk0)
+        if rk0 < 1:
+            raise ValueError(f"rk0 must be >= 1, got {rk0}")
+        round_to = int(round_to)
+        if round_to < 1:
+            raise ValueError(f"round_to must be >= 1, got {round_to}")
+        rk_min = int(rk_min)
+        if rk_min < 1:
+            raise ValueError(f"rk_min must be >= 1, got {rk_min}")
+        if rk_max is not None:
+            rk_max = int(rk_max)
+            if rk_max < rk_min:
+                raise ValueError(f"rk_max ({rk_max}) < rk_min ({rk_min})")
+
+        if mode == 'const':
+            if rate not in (None, 0):
+                warnings.warn(f"rkStrat: mode='const' ignores rate={rate!r}",
+                              UserWarning, stacklevel=2)
+            rate = 0.0
+        else:
+            if rate is None:
+                raise ValueError(f"mode={mode!r} requires a rate "
+                                 "(increment per stage for 'linear', "
+                                 "multiplicative factor for 'geom')")
+            rate = float(rate)
+            if mode == 'geom':
+                if rate <= 0:
+                    raise ValueError(f"geometric factor must be > 0, got {rate}")
+                if rate < 1.0:
+                    warnings.warn(
+                        f"rkStrat: geometric factor {rate} < 1 gives a "
+                        "DECREASING rank schedule. Rank normally has to grow "
+                        "with the stage, because each stage samples through "
+                        "the previous stage's inverse. Proceeding as asked.",
+                        UserWarning, stacklevel=2)
+            elif rate < 0:
+                warnings.warn(
+                    f"rkStrat: linear increment {rate} < 0 gives a DECREASING "
+                    "rank schedule. Rank normally has to grow with the stage. "
+                    "Proceeding as asked.", UserWarning, stacklevel=2)
+
+        self.rk0   = rk0
+        self.mode  = mode
+        self.rate  = rate
+        self.rk_max   = rk_max
+        self.rk_min   = rk_min
+        self.round_to = round_to
+        self.monotone = bool(monotone)
+        self._skip_first_level = bool(skip_first_level)
+        self._cache  = {}
+        self._warned = set()
+
+    # -- constructors ---------------------------------------------------
+
+    @classmethod
+    def constant(cls, rk0, **kw):
+        return cls(rk0, mode='const', **kw)
+
+    @classmethod
+    def linear(cls, rk0, inc, **kw):
+        return cls(rk0, mode='linear', rate=inc, **kw)
+
+    @classmethod
+    def geometric(cls, rk0, factor, **kw):
+        return cls(rk0, mode='geom', rate=factor, **kw)
+
+    @classmethod
+    def coerce(cls, rk):
+        """Accept an rkStrat, or wrap a plain int as a constant schedule."""
+        if isinstance(rk, cls):
+            return rk
+        return cls.constant(int(rk))
+
+    def copy(self, **overrides):
+        """Shallow copy with fields overridden; warning state is not carried."""
+        kw = dict(rk0=self.rk0, mode=self.mode, rate=self.rate,
+                  skip_first_level=self._skip_first_level,
+                  rk_max=self.rk_max, rk_min=self.rk_min,
+                  round_to=self.round_to, monotone=self.monotone)
+        if self.mode == 'const':
+            kw['rate'] = None
+        kw.update(overrides)
+        return rkStrat(**kw)
+
+    # -- the flag, readable under either spelling ------------------------
+
+    @property
+    def skip_first_level(self):
+        return self._skip_first_level
+
+    @skip_first_level.setter
+    def skip_first_level(self, v):
+        if bool(v) != self._skip_first_level:
+            self._skip_first_level = bool(v)
+            self._cache.clear()
+
+    # -- evaluation ------------------------------------------------------
+
+    def _raw(self, stage):
+        e = stage - 1 if self._skip_first_level else stage
+        if e < 0:
+            e = 0
+        if self.mode == 'const':
+            return float(self.rk0)
+        if self.mode == 'linear':
+            return self.rk0 + self.rate * e
+        return self.rk0 * (self.rate ** e)
+
+    def rank(self, stage):
+        """Compression rank for `stage` (0-based)."""
+        stage = int(stage)
+        if stage < 0:
+            raise ValueError(f"stage must be >= 0, got {stage}")
+        if stage in self._cache:
+            return self._cache[stage]
+
+        r = int(math.floor(self._raw(stage) + 0.5))        # half-up
+        if self.round_to > 1:                              # up to a multiple
+            r = -(-r // self.round_to) * self.round_to
+        if r < self.rk_min:
+            r = self.rk_min
+        if self.monotone and stage > 0:
+            r = max(r, self.rank(stage - 1))
+
+        if self.rk_max is not None and r > self.rk_max and stage not in self._warned:
+            self._warned.add(stage)
+            warnings.warn(
+                f"rkStrat: rank {r} at stage {stage} exceeds rk_max="
+                f"{self.rk_max}. Not clamped -- using {r}.",
+                UserWarning, stacklevel=2)
+
+        self._cache[stage] = r
+        return r
+
+    __call__ = rank
+
+    def ranks(self, nstages):
+        return [self.rank(j) for j in range(int(nstages))]
+
+    # -- diagnostics -----------------------------------------------------
+
+    def validate(self, nstages, nl=None, label=''):
+        """Warn about a whole schedule up front. Returns the ranks."""
+        rs = self.ranks(nstages)
+        where = f" ({label})" if label else ''
+        if nl is not None:
+            nl = int(nl)
+            bad = [(j, r) for j, r in enumerate(rs) if r >= nl]
+            if bad:
+                warnings.warn(
+                    f"rkStrat{where}: rank reaches {bad[0][1]} at stage "
+                    f"{bad[0][0]} (and at {len(bad)} stage(s) in total), which "
+                    f"is >= the HBS leaf size nl={nl}. At the leaf level "
+                    "k = min(rk, nl) = n, so the null complement is empty and "
+                    "the leaf level compresses nothing; those blocks degrade "
+                    "toward dense. Lower rk0 or the rate, or use a larger "
+                    "leaf size.", UserWarning, stacklevel=2)
+            elif any(2 * r > nl for r in rs):
+                warnings.warn(
+                    f"rkStrat{where}: rank reaches {max(rs)} against leaf size "
+                    f"nl={nl}; above nl/2 the leaf compression saves little.",
+                    UserWarning, stacklevel=2)
+        return rs
+
+    def describe(self, nstages=None):
+        if self.mode == 'const':
+            body = f"rk = {self.rk0}"
+        elif self.mode == 'linear':
+            body = f"rk = {self.rk0} + {self.rate:g}*e"
+        else:
+            body = f"rk = {self.rk0} * {self.rate:g}^e"
+        bits = [body, f"e = stage{'-1' if self._skip_first_level else ''}"]
+        if self.round_to > 1:
+            bits.append(f"->mult of {self.round_to}")
+        if self.rk_max is not None:
+            bits.append(f"rk_max {self.rk_max} (warn only)")
+        if self.monotone:
+            bits.append("monotone")
+        s = f"rkStrat[{self.mode}]: " + ", ".join(bits)
+        if nstages:
+            s += "  ->  " + " ".join(str(r) for r in self.ranks(nstages))
+        return s
+
+    def __repr__(self):
+        return (f"rkStrat(rk0={self.rk0}, mode={self.mode!r}, rate={self.rate!r}, "
+                f"skip_first_level={self._skip_first_level}, rk_max={self.rk_max}, "
+                f"rk_min={self.rk_min}, round_to={self.round_to}, "
+                f"monotone={self.monotone})")
+
+
 _CENSUS = [True]
 def census(tag, topn=12):
     if not _CENSUS[0]:
@@ -69,7 +342,37 @@ def _rdtype(*ops):
     return np.result_type(*dts) if dts else np.float64
 
 
-class id_op(_NoResidency,LinearOperator):
+class _TorchDirect:
+    """Bypass scipy's numpy coercion for torch operands.
+
+    scipy's LinearOperator.matmat/rmatmat run np.asanyarray(X) before
+    dispatching to _matmat/_rmatmat, which raises on a CUDA tensor
+    ("can't convert cuda:0 device type tensor to numpy").  The _matmat
+    implementations in id_op/zero_op are already torch-aware, so route
+    tensors straight to them and leave the numpy path to scipy.
+
+    Must precede LinearOperator in the bases so these win the MRO.
+    """
+    def matmat(self, X):
+        return self._matmat(X) if torch.is_tensor(X) else super().matmat(X)
+
+    def rmatmat(self, X):
+        return self._rmatmat(X) if torch.is_tensor(X) else super().rmatmat(X)
+
+    def matvec(self, x):
+        if not torch.is_tensor(x):
+            return super().matvec(x)
+        y = self._matmat(x[:, None] if x.ndim == 1 else x)
+        return y[:, 0] if x.ndim == 1 else y
+
+    def rmatvec(self, x):
+        if not torch.is_tensor(x):
+            return super().rmatvec(x)
+        y = self._rmatmat(x[:, None] if x.ndim == 1 else x)
+        return y[:, 0] if x.ndim == 1 else y
+
+
+class id_op(_TorchDirect,_NoResidency,LinearOperator):
     """Identity operator."""
 
     def __init__(self, n, dtype=np.float64):
@@ -86,7 +389,11 @@ def _zeros_like_input(V,rows,dtype):
         return torch.zeros(rows,cols,dtype=V.dtype,device=V.device)
     return np.zeros((rows,cols),dtype=dtype)
 
-class zero_op(_NoResidency,LinearOperator):
+def _fmt(x):
+    return "    -    " if x is None else f"{x:9.2e}"
+
+
+class zero_op(_TorchDirect,_NoResidency,LinearOperator):
     """Zero operator; replaces a materialized dense zero block."""
     def __init__(self, n, dtype=np.float64, m=None):
         m = n if m is None else m
@@ -94,7 +401,7 @@ class zero_op(_NoResidency,LinearOperator):
         self.tree = None
         self.quad = None
     def _matmat(self, V):   return _zeros_like_input(V,self.shape[0],self.dtype)
-    def _rmatmat(self, v):  return _zeros_like_input(V,self.shape[1],self.dtype)
+    def _rmatmat(self, v):  return _zeros_like_input(v,self.shape[1],self.dtype)
     _matvec, _rmatvec = _matmat, _rmatmat
 
 
@@ -273,7 +580,17 @@ class ThomasSolverHBS(DirectSolver):
 
     def __init__(self,m,rk,cyclic=False):
         super().__init__(m,cyclic)
-        self.rk = rk
+        # rkStrat is not wired into this solver yet: the stages here are the
+        # steps of the recurrence (with i == 1, S'_1 = I, as the analogue of
+        # skip_first_level).  Accept one so the call signature matches
+        # RedBlackSolverHBS, but say plainly that only stage 0 is used.
+        self.rkStrat = rkStrat.coerce(rk)
+        if self.rkStrat.mode != 'const':
+            warnings.warn(
+                "ThomasSolverHBS does not implement a rank schedule yet; "
+                f"using the stage-0 rank {self.rkStrat.rank(0)} throughout.",
+                UserWarning, stacklevel=2)
+        self.rk = self.rkStrat.rank(0)
         self.solve_method = None
     def factorize_helper(self, S_rk_list, diagList=None):
         if diagList==None:
@@ -542,9 +859,16 @@ class RedBlackSolverHBS(DirectSolver):
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False,seed=None,
-                 compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False):
+                 compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False,
+                 oversample=None,
+                 debug_blocks=0, debug_inverse=True, debug_true_inverse=False,
+                 debug_seed=1234):
         super().__init__(m, cyclic)
-        self.rk   = rk
+        # rk may be an int (constant schedule) or an rkStrat.  self.rk stays
+        # the stage-0 rank so existing callers that read or print it, and
+        # _nsamples(self.rk), keep meaning what they meant.
+        self.rkStrat = rkStrat.coerce(rk)
+        self.rk   = self.rkStrat.rank(0)
         self.tree = tree
         self.quad = quad
         self.compress_diag = compress_diag
@@ -565,6 +889,41 @@ class RedBlackSolverHBS(DirectSolver):
         self.compute_device = _resolve_device(
             compute_device if compute_device is not None else device)
         self.strict_residency = strict_residency
+        # Oversampling above the hard floor; see _nsamples.  None -> p = rk.
+        self.oversample = oversample
+        if oversample is not None and not callable(oversample):
+            _p0 = self.oversampling(int(rk) if isinstance(rk, int)
+                                    else rk.rank(0))
+            if _p0 < 10:
+                warnings.warn(
+                    f"RedBlackSolverHBS: oversampling p={_p0} is very small; "
+                    "the randomized range finder needs a margin over the "
+                    "rank-rk floor and will be unreliable here.", UserWarning)
+        # --- per-block compression diagnostics (off by default) ----------
+        # debug_blocks = number of probe columns; 0 disables.  8-16 is plenty:
+        # the estimate is a Frobenius ratio over t columns, so its own
+        # relative noise is ~1/sqrt(t), which is far finer than the orders of
+        # magnitude this is meant to separate.  Cost is t/s of the sampling
+        # work (~1% at t=16, s=1600) plus one extra block held resident.
+        self.debug_blocks  = int(debug_blocks)
+        self.debug_inverse = bool(debug_inverse)
+        # inv_ref: ||B (B_hbs)^-1 W - W|| / ||W|| with B the UNCOMPRESSED
+        # reference chain -- a per-block analogue of the global residual, and
+        # unlike fwd it is sensitive to the small singular directions that
+        # the inverse depends on.  Costs memory: the neighbour operators must
+        # stay staged until after the B block is built and solved, instead of
+        # being retired before compression.
+        self.debug_true_inverse = bool(debug_true_inverse) and self.debug_blocks > 0
+        if self.debug_true_inverse:
+            warnings.warn(
+                "RedBlackSolverHBS: debug_true_inverse keeps up to six "
+                "neighbour blocks resident through each B compression "
+                "(~11 GB at nc=65536, rk=400). Expect a much higher peak, and "
+                "drop to a smaller problem if it does not fit.", UserWarning)
+        self.blockErrors   = []
+        self._dbg_stage    = 0
+        self._pgen = torch.Generator(device=self.compute_device)
+        self._pgen.manual_seed(int(debug_seed))
         self._blocks = []
         self._tdtype = torch.float64
         self._tgen   = torch.Generator(device=self.compute_device)
@@ -574,19 +933,56 @@ class RedBlackSolverHBS(DirectSolver):
     
     # ------------------------------------------------------------------
 
+    @property
+    def nl(self):
+        """Leaf size HBSMAT actually uses -- not tree._min_leaf_size."""
+        return len(self.tree.perm_leaf) // self.tree.nleaves
+
+    def oversampling(self, rk):
+        """Oversampling p for rank rk: the surplus over the hard floor.
+
+        See `oversample` in __init__ for the accepted forms.
+        """
+        p = self.oversample
+        if p is None:
+            return int(rk)                       # default: p = rk
+        if callable(p):
+            return int(p(rk))
+        if isinstance(p, int) and not isinstance(p, bool):
+            return int(p)                        # absolute count
+        return int(round(float(p) * rk))         # multiple of rk
+
     def _nsamples(self, rk):
-        """Sample count, matching HBSMAT.construct's internal choice.
+        """Sample count s = max(fac*rk, nl) + rk + p.
 
         Every operator sharing an Omega must use the same s.  All nodes share
-        self.tree, so one value per level is consistent by construction.
+        self.tree and one rank per stage, so one value per stage is consistent
+        by construction.
 
-        max(fac*rk, nl) + rk is the hard floor at the worst level (leaf:
-        n = nl; interior: n = fac*rk), and the second rk is the oversampling
-        there.  Uses the leaf size HBSMAT actually uses, not _min_leaf_size.
+        max(fac*rk, nl) + rk is the HARD FLOOR -- the point at which the null
+        space of Omega is just large enough to hold a rank-rk range at the
+        worst level (leaf: n = nl, k = min(rk, nl); interior: n = fac*rk,
+        k = rk).  Everything above it is oversampling, and p is now set
+        explicitly rather than falling out of the algebra:
+
+          p = rk (default)  reproduces max(fac*rk, nl) + 2*rk, the rule that
+                            gave s = 1600 and the best delta so far at
+                            rk = 400, kh = 100.
+          p = <int>         absolute, for holding p fixed across a rank sweep
+                            so the two effects can be separated.
+          p = <float>       a multiple of rk.
+          p = <callable>    p(rk).
+
+        Both earlier rules coupled p to something it should not depend on.
+        max(fac*rk,nl)+2*rk makes p track rank; 2*max(rk,nl)+rk+20 gives
+        p = 2*(nl - rk) + 20 at the interior levels, which COLLAPSES as rk
+        approaches nl (244 at rk=400, 20 at rk=512 for nl=512) -- exactly
+        over the range of ranks worth trying.
+
+        Uses the leaf size HBSMAT actually uses, not tree._min_leaf_size.
         """
         fac = 4 if self.quad else 2
-        nl  = len(self.tree.perm_leaf) // self.tree.nleaves
-        return max(fac * rk, nl) + 2 * rk
+        return max(fac * rk, self.nl) + rk + self.oversampling(rk)
 
     def _want_ulv(self, compute_ULV):
         """Resolve a requested compute_ULV against the opt-out flag."""
@@ -689,6 +1085,170 @@ class RedBlackSolverHBS(DirectSolver):
                     compute_ULV=ulv, fast=self.fast)
 
         return self._finish(h, ulv, label, spill=spill)
+    # ------------------------------------------------------------------
+    # block-level compression diagnostics
+    # ------------------------------------------------------------------
+    def _dbg_probe(self, t):
+        """t fresh probe columns, drawn from a generator of their own.
+
+        Deliberately NOT self._tgen: pulling from the sampling stream would
+        shift every subsequent Omega/Psi, so a debug run would no longer be
+        bit-comparable to a non-debug run at the same seed.  With a separate
+        generator the factorization is unchanged and only the measurement is
+        added.
+        """
+        return torch.randn(self.m, t, generator=self._pgen,
+                           device=self.compute_device, dtype=self._tdtype)
+
+    @staticmethod
+    def _relerr(approx, ref):
+        den = torch.linalg.norm(ref)
+        if den == 0:
+            return float(torch.linalg.norm(approx))      # absolute if ref is 0
+        return float(torch.linalg.norm(approx - ref) / den)
+
+    def _check_block(self, h, kind, nSlabs, node, rk, W, Q, ref_f, ref_a,
+                     apply_ref=None):
+        """Compare a freshly built block against the operator it approximates.
+
+        h must still be resident (build with spill=False).  W/Q are probe
+        columns independent of the Omega/Psi the block was compressed from, so
+        this is an OUT-OF-SAMPLE test: construct_D fits D to the sampled
+        columns by least squares, so reusing those columns would report a
+        fitting residual rather than an approximation error.
+        """
+        rec = dict(stage=self._dbg_stage, nSlabs=nSlabs, node=node, kind=kind,
+                   rk=rk, fwd=None, adj=None, inv=None, inv_ref=None,
+                   scale=None, invscale=None, cond=None)
+
+        if ref_f is not None:
+            rec['scale'] = float(torch.linalg.norm(ref_f) /
+                                 torch.linalg.norm(W))          # ||M|| proxy
+
+        if isinstance(h, dead_op):
+            rec['note'] = 'dead (no consumer)'
+            self.blockErrors.append(rec)
+            return rec
+
+        if isinstance(h, zero_op):
+            # A zero slot has nothing to compress, so 'fwd' is reported as the
+            # ABSOLUTE norm of the reference action -- it should be ~0.
+            #
+            # Two different situations used to print an identical 0.00e+00:
+            #   * no reference exists (no neighbour on that side), nothing was
+            #     measured;
+            #   * a reference exists and was measured to be zero.
+            # Only the second is evidence.  The first now reports None, which
+            # prints as '-', and says so in the note.
+            if ref_f is None:
+                rec['note'] = 'zero (no neighbour, not checked)'
+                self.blockErrors.append(rec)
+                return rec
+            rec['note'] = 'zero (checked)'
+            rec['fwd']  = float(torch.linalg.norm(ref_f))
+            if ref_a is not None:
+                rec['adj'] = float(torch.linalg.norm(ref_a))
+            # scale for a zero slot is an absolute norm too, not a ratio
+            tol = 1e-10 * float(torch.linalg.norm(W))
+            if rec['fwd'] > tol:
+                warnings.warn(
+                    f"{kind}[{node}] (nSlabs={nSlabs}) is stored as zero_op but "
+                    f"its reference action has norm {rec['fwd']:.3e} "
+                    f"(tol {tol:.3e}). The zero-slot analysis or the neighbour "
+                    "indexing is wrong; no rank will fix this.", UserWarning)
+            self.blockErrors.append(rec)
+            return rec
+
+        if ref_f is not None:
+            rec['fwd'] = self._relerr(h.matmat(W), ref_f)
+        if ref_a is not None:
+            rec['adj'] = self._relerr(h.rmatmat(Q), ref_a)
+        if self.debug_inverse and getattr(h, 'Qlist', None):
+            # One solve serves two purposes.
+            #   inv      -- consistency of the ULV factors with their own HBS
+            #               matrix; independent of compression accuracy.
+            #   invscale -- ||M^-1 W|| / ||W||, which with scale = ||M W|| /
+            #               ||W|| gives cond = scale * invscale.
+            #
+            # cond is a LOWER BOUND on the true condition number: a Gaussian
+            # probe of t columns underestimates both operator norms, more so
+            # for ||M^-1||, whose largest direction is a single singular
+            # vector the probe is unlikely to hit squarely.  Useful for
+            # orders of magnitude, not for a sharp number.
+            Xs = h.solve(W)
+            rec['invscale'] = float(torch.linalg.norm(Xs) /
+                                    torch.linalg.norm(W))
+            if rec['scale'] is not None:
+                rec['cond'] = rec['scale'] * rec['invscale']
+            rec['inv'] = self._relerr(h.matmat(Xs), W)
+            if apply_ref is not None:
+                # The same solve measured against the true operator instead
+                # of the compressed one.  inv stays near machine precision
+                # whatever the rank (the ULV factors are consistent with
+                # their own matrix); inv_ref is the number that should move
+                # with rank and track delta.
+                rec['inv_ref'] = self._relerr(apply_ref(Xs), W)
+            del Xs
+
+        self.blockErrors.append(rec)
+        return rec
+
+    def print_block_errors(self, per_block=False):
+        """Summary of the per-block compression check."""
+        if not self.blockErrors:
+            print(" no block diagnostics recorded (debug_blocks=0)")
+            return
+        print(f"\n HBS block compression check "
+              f"({self.debug_blocks} probe columns, out of sample)")
+        print(f"   {'stage':>5} {'nSlabs':>6} {'kind':>4} {'rk':>5} {'n':>4}"
+              f" {'fwd med':>9} {'fwd max':>9} {'adj max':>9} {'inv max':>9}"
+              f" {'inv_ref':>9} {'|M|':>9} {'|M^-1|':>9} {'cond':>9}  worst")
+        # Zero slots get their own row: grouping them with real blocks made
+        # the group inherit the first member's note, so a stage-0 'A' row of
+        # seven real blocks was labelled 'not checked' because A[0] is a zero
+        # slot -- while the C zero checks, whose group starts with a real
+        # block, were invisible.
+        key = lambda r: (r['stage'], r['kind'], r.get('note') is not None)
+        # sorted, not first-appearance: splitting zero slots into their own
+        # group otherwise interleaves them with the real A/C rows
+        order = {'B': 0, 'A': 1, 'C': 2}
+        seen = sorted({key(r) for r in self.blockErrors},
+                      key=lambda k: (k[0], order.get(k[1], 9), k[2]))
+        for k in seen:
+            grp  = [r for r in self.blockErrors if key(r) == k]
+            head = (f"   {k[0]:>5} {grp[0]['nSlabs']:>6} {k[1]:>4}"
+                    f" {grp[0]['rk']:>5} {len(grp):>4}")
+            col  = lambda n: [r[n] for r in grp if r.get(n) is not None]
+            f, a, iv, ivr = col('fwd'), col('adj'), col('inv'), col('inv_ref')
+            sc, isc, cd = col('scale'), col('invscale'), col('cond')
+            note = grp[0].get('note')
+            if not f:
+                print(f"{head}   {note or '-'}")
+                continue
+            med   = sorted(f)[len(f) // 2]
+            worst = max(grp, key=lambda r: r.get('fwd') or -1.0)
+            # '-' rather than nan for an empty group: A/C blocks are built
+            # with compute_ULV=False, so they have no inverse to measure.
+            # Printing nan there is indistinguishable from a real numerical
+            # failure, which is the one thing this table must not hide.
+            mx = lambda v: _fmt(max(v) if v else None)
+            print(f"{head}"
+                  f" {med:9.2e} {max(f):9.2e}"
+                  f" {mx(a)} {mx(iv)} {mx(ivr)} {mx(sc)} {mx(isc)} {mx(cd)}"
+                  f"  {worst['kind']}[{worst['node']}]"
+                  + (f"  {note}" if note else ""))
+
+        if per_block:
+            print("   ---- per block ----")
+            for r in self.blockErrors:
+                print(f"   nSlabs={r['nSlabs']:3d} {r['kind']}[{r['node']:3d}]"
+                      f" rk={r['rk']:4d}"
+                      f" fwd={_fmt(r['fwd'])} adj={_fmt(r['adj'])}"
+                      f" inv={_fmt(r['inv'])} inv_ref={_fmt(r.get('inv_ref'))}"
+                      f" |M|={_fmt(r['scale'])} |M^-1|={_fmt(r.get('invscale'))}"
+                      f" cond={_fmt(r.get('cond'))}"
+                      + (f"  {r['note']}" if r.get('note') else ""))
+
     def residency_report(self):
         b = self._blocks
         return dict(
@@ -798,10 +1358,33 @@ class RedBlackSolverHBS(DirectSolver):
 
         RB = [(SiM, T, T_hbs, SiP)]
 
+        # ---- rank schedule ------------------------------------------------
+        # Stage j is one builder call: it consumes RB[j] and produces RB[j+1],
+        # so strat.rank(j) is the rank of every operator in RB[j+1].
+        #
+        # skip_first_level is only sound when stage 0 carries no inversion,
+        # i.e. the level-0 diagonal is the identity.  A caller-supplied T that
+        # is not all id_op breaks that, so the flag is turned off for this
+        # factorization rather than silently under-resolving stage 1.
+        strat   = self.rkStrat
+        nstages = nSlabs.bit_length() - 1              # log2(nSlabs)
+        if strat.skip_first_level and not all(_is_id(op) for op in T):
+            warnings.warn(
+                "RedBlackSolverHBS: rkStrat has skip_first_level=True but the "
+                "level-0 diagonal is not the identity, so stage 0 does invert. "
+                "Disabling the skip for this factorization.", UserWarning)
+            strat = strat.copy(skip_first_level=False)
+        self.rkSchedule = strat.validate(nstages, nl=self.nl,
+                                         label='RedBlackSolverHBS')
+        print(" " + strat.describe(nstages))
+
         l = nSlabs
-        rk = self.rk
+        j = 0
         self.levelTimes=[]
+        self.blockErrors = []
         while l > 1:
+            rk = self.rkSchedule[j]
+            self._dbg_stage = j
             builder = self._build_level_fused if self.fused else self._build_level
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -810,9 +1393,10 @@ class RedBlackSolverHBS(DirectSolver):
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
             dt = time.time() - t0
-            self.levelTimes.append((l,dt))
-            print(f" level nSlabs = {l:5d} {dt:7.2f} s " f"({dt/(l//2):.4f}s/node)")
-            rk = rk  # + 20
+            self.levelTimes.append((l,dt,rk))
+            print(f" level nSlabs = {l:5d} rk = {rk:4d} {dt:7.2f} s "
+                  f"({dt/(l//2):.4f}s/node)")
+            j += 1
             l //= 2
 
         self.nSlabs = nSlabs
@@ -967,6 +1551,86 @@ class RedBlackSolverHBS(DirectSolver):
             if need_p:
                 Xp[k] = X[:, s:]
 
+        # ---------------------------------------------------------------
+        # debug probes.  W/Q are independent of Om/Psi, so the checks below
+        # are out of sample; Pm/Pp mirror Xm/Xp for the probe columns and are
+        # shared between the two nodes that consume each odd k, exactly as
+        # Xm/Xp are.  All of it is skipped entirely when debug_blocks == 0.
+        # ---------------------------------------------------------------
+        dbg = self.debug_blocks > 0
+        W = self._dbg_probe(self.debug_blocks) if dbg else None
+        Q = self._dbg_probe(self.debug_blocks) if dbg else None
+        Pm, Pp = {}, {}
+
+        def _ensure_P(k):
+            # Unlike _ensure_X this builds Pp for EVERY k, including the last
+            # odd node where Xp has no consumer.  That extra probe solve (t
+            # columns, not s) is what makes the C_is_zero slot checkable: its
+            # reference is -S^+_i T_k^-1 S^+_k W with S^+_k the zero operator,
+            # so a nonzero result means the zero-slot analysis is wrong.
+            if k in Pm:
+                return
+            if _is_id(T_hbs[k]):
+                Pm[k] = self._ap(SiM[k], W)
+                Pp[k] = self._ap(SiP[k], W)
+            else:
+                Pm[k] = self._sv(T_hbs[k], self._ap(SiM[k], W))
+                Pp[k] = self._sv(T_hbs[k], self._ap(SiP[k], W))
+
+        def _refs(i, has_left, has_right, kL, kR, A_is_zero, C_is_zero):
+            """Reference actions of B_i, A_i, C_i on the probes.
+
+            Mirrors the Y_*/Z_* expressions above term for term, so the check
+            measures compression error and not a re-derivation of the algebra.
+            """
+            fB = W.clone() if _is_id(T[i]) else self._ap(T[i], W)
+            aB = Q.clone() if _is_id(T[i]) else self._apT(T[i], Q)
+            fA = fC = aA = aC = None
+            if has_right:
+                _ensure_P(kR)
+                fB = fB - self._ap(SiP[i], Pm[kR])
+                # computed even when C_is_zero: that is the check
+                fC = -self._ap(SiP[i], Pp[kR])
+                rp = self._apT(SiP[i], Q)
+                tp = rp if _is_id(T_hbs[kR]) else self._sv(T_hbs[kR], rp, mode='T')
+                aB = aB - self._apT(SiM[kR], tp)
+                aC = -self._apT(SiP[kR], tp)   # also computed when C_is_zero
+            if has_left:
+                _ensure_P(kL)
+                fB = fB - self._ap(SiM[i], Pp[kL])
+                fA = -self._ap(SiM[i], Pm[kL])
+                rm = self._apT(SiM[i], Q)
+                tm = rm if _is_id(T_hbs[kL]) else self._sv(T_hbs[kL], rm, mode='T')
+                aB = aB - self._apT(SiP[kL], tm)
+                aA = -self._apT(SiM[kL], tm)
+            return {'B': (fB, aB), 'A': (fA, aA), 'C': (fC, aC)}
+
+        dbg_true = self.debug_true_inverse and dbg
+
+        def _apply_B(i, X, has_left, has_right, kL, kR):
+            """B_i X with the UNCOMPRESSED chain:
+
+                B_i = T_i - S^+_i T_{i+1}^-1 S^-_{i+1}
+                          - S^-_i T_{i-1}^-1 S^+_{i-1}
+
+            Same terms as the Y_B expression, but applied to an arbitrary X
+            rather than to Omega, so the Xm/Xp and Pm/Pp caches do not help:
+            every call costs 2 applies and 1 solve per neighbour, on X's
+            column count.  Only used for inv_ref, and only on t columns.
+            """
+            y = X.clone() if _is_id(T[i]) else self._ap(T[i], X)
+            if has_right:
+                t = self._ap(SiM[kR], X)
+                if not _is_id(T_hbs[kR]):
+                    t = self._sv(T_hbs[kR], t)
+                y = y - self._ap(SiP[i], t)
+            if has_left:
+                t = self._ap(SiP[kL], X)
+                if not _is_id(T_hbs[kL]):
+                    t = self._sv(T_hbs[kL], t)
+                y = y - self._ap(SiM[i], t)
+            return y
+
         def _spill(t):
             return None if t is None else t.to('cpu')
 
@@ -1058,9 +1722,25 @@ class RedBlackSolverHBS(DirectSolver):
                 Y_B = Om.clone()
             if Z_B is Psi:
                 Z_B = Psi.clone()
-            if not cyclic:
+
+            # Probe references must be built while the neighbour operators
+            # are still staged, i.e. before the retire below.  The comparison
+            # happens after each block is constructed.
+            refs = _refs(i, has_left, has_right, kL, kR,
+                         A_is_zero, C_is_zero) if dbg else None
+
+            # Retire BEFORE compressing, not after.  Everything nodes i-1 and
+            # i contribute has now been sampled into Y_*/Z_*; the three
+            # constructions below read only those and Om/Psi.  Retiring here
+            # keeps six operator blocks (~1.8 GB each) and X[i-1] off the
+            # device through all three compressions, which is where the peak
+            # sits.  _retire only evicts and pops X -- it does not clear the
+            # list slots -- so the RB_linop built in the compress_diag=False
+            # branch below still holds valid references.
+            if not cyclic and not dbg_true:
                 self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
                 self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+
             self._sync(); t1=time.time()
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
@@ -1068,12 +1748,26 @@ class RedBlackSolverHBS(DirectSolver):
             if need_ULV or self.compress_diag or not self.skip_unused_ulv:
                 B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_B, Z_B,
                                                compute_ULV=need_ULV,
-                                               label=f"B[{i}] (nSlabs={nSlabs})")
+                                               label=f"B[{i}] (nSlabs={nSlabs})",
+                                               spill=not dbg)
             else:
                 # compress_diag=False hands the uncompressed RB_linop to the
                 # next level as T[i], so this slot is read by nobody: skip
                 # the compression itself, not just the factorization.
                 B_hbs = self._dead_diag(f"B[{i}] (nSlabs={nSlabs})")
+            if dbg:
+                self._check_block(
+                    B_hbs, 'B', nSlabs, i, rk, W, Q, *refs['B'],
+                    apply_ref=(lambda X: _apply_B(i, X, has_left, has_right,
+                                                  kL, kR)) if dbg_true else None)
+                if hasattr(B_hbs, 'evict'):
+                    B_hbs.evict()          # _finish's spill, deferred past the probe
+            # With inv_ref the neighbours had to survive the B compression;
+            # release them now, before A and C, so the extra residency window
+            # covers one compression instead of three.
+            if not cyclic and dbg_true:
+                self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+                self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
             T_hbs_new.append(B_hbs)
 
             if self.compress_diag:
@@ -1092,13 +1786,25 @@ class RedBlackSolverHBS(DirectSolver):
             A_i.append(zero_op(m, dtype) if A_is_zero
                        else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
                                                    compute_ULV=False,
-                                                   label=f"A[{i}] (nSlabs={nSlabs})"))
+                                                   label=f"A[{i}] (nSlabs={nSlabs})",
+                                                   spill=not dbg))
+            if dbg:
+                self._check_block(A_i[-1], 'A', nSlabs, i, rk, W, Q, *refs['A'])
+                if hasattr(A_i[-1], 'evict'):
+                    A_i[-1].evict()
             del Y_A, Z_A
             C_i.append(zero_op(m, dtype) if C_is_zero
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
-                                                   label=f"C[{i}] (nSlabs={nSlabs})"))
+                                                   label=f"C[{i}] (nSlabs={nSlabs})",
+                                                   spill=not dbg))
+            if dbg:
+                self._check_block(C_i[-1], 'C', nSlabs, i, rk, W, Q, *refs['C'])
+                if hasattr(C_i[-1], 'evict'):
+                    C_i[-1].evict()
             del Y_C, Z_C
+            if dbg:
+                del refs
 
             self._sync();t2=time.time()
             print(f"node {i:3d}: sample {t1-t0:6.2f}s"
@@ -1106,6 +1812,7 @@ class RedBlackSolverHBS(DirectSolver):
                   f" alloc {torch.cuda.memory_allocated()/2**30:5.2f} GB")
         if not cyclic:
             self._retire(nSlabs-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+        Pm.clear(); Pp.clear()
         return (A_i, B_i, T_hbs_new, C_i)
 
     # ------------------------------------------------------------------

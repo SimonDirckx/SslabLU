@@ -1,6 +1,6 @@
 import numpy as np
 import direct_solve.omsdirectsolveHBS as omsdirect
-
+from direct_solve.omsdirectsolveHBS_torch import rkStrat
 import jax.numpy as jnp
 import torch
 import scipy
@@ -25,6 +25,8 @@ import direct_solve.omsdirectsolveHBS_torch as omsdirectHBS
 import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
 from scipy.sparse.linalg import LinearOperator
+import matAssembly.HBS.HBStorch as HBStorch
+HBStorch._UV_MODE[0] = 'qr'
 
 def dense_to_linop(A):
     A = np.array(A)
@@ -58,7 +60,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 100.
+kh = 50.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -117,7 +119,7 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(512,300,ndim=3)
+    assembler = mA.rkHMatAssembler(512,256,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
@@ -144,15 +146,18 @@ for indp in range(len(pvec)):
       " balanced:", tree.nleaves == 2**(tree.nlevels-1))
     print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
     print("leaf exact?        ", len(P)//tree.nleaves <= rk)
-
+    strat = rkStrat.linear(256,40,skip_first_level=False)
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,300,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda')
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=50)
+    import matAssembly.HBS.HBStorch as HBStorch
+    rb_solver.fast = False          # both switch to the SVD of L
     #rb_solver._nsamples = lambda rk: 1334
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
     print("tree mls   =", rb_solver.tree._min_leaf_size)
     rb_solver.factorize(S_rk_list)
     rb_solver.print_timing()
+    rb_solver.print_block_errors()
     print("RB solver factorized in ",time.time()-tic,"s")
     h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))
     assert h.compute_device.type == 'cuda'
@@ -175,4 +180,12 @@ for indp in range(len(pvec)):
     u = Sinv_HBS_rb@v
     print("RB solver time = ",time.time()-tic)
     tot = rb_solver.footprint()
+    gInfo = gmres_info()
+    stol = 1e-8
+
+    if Version(scipy.__version__)>=Version("1.14"):
+        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+    else:
+        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+
 
