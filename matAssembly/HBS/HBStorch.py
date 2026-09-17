@@ -1,22 +1,27 @@
-import numpy as np
-import scipy.linalg as splinalg
 import time
-import matAssembly.HBS.ULVsparse_torch as ULVsparse
-import torch.linalg as tla
+import numpy as np
 import torch
-import matAssembly.HBS.HBSnew as HBSnew
-#sparse block matrix operations
+import torch.linalg as tla
+import matAssembly.HBS.ULVsparse_torch as ULVsparse
 
-_UV_TQR    = [0.0]      # the QR of W = [Om^T | Y^T]
-_UV_TBASIS = [0.0]      # eigh/svd extraction of U from L
-_UV_TSETUP = [0.0]      # allocation and the two copies into W
+# ---------------------------------------------------------------------------
+# module knobs
+# ---------------------------------------------------------------------------
+_UV_TQR    = [0.0]      # factorization of the sample pair (Cholesky or QR)
+_UV_TBASIS = [0.0]      # extraction of U from the projected samples
+_UV_TSETUP = [0.0]      # forming the Gram/cross products, or the QR arena
 _UV_NCALL  = [0]
 _UV_SYNC   = [False]
-_UV_MODE = ['ne']
 _MATMAT_CHUNK = [256]
-_EIGH_CHUNK = [128]
-_PIN_HOST = [True]      # page-lock host masters; set False if host RAM is tight
-_SOLVE_CHUNK = [512]    # columns per ULV solve in HBSMAT.solve; 0 disables chunking
+_EIGH_CHUNK   = [128]   # upper bound on the eigh batch; 0 means "no cap"
+_EIGH_BYTES   = [1 << 30]  # and a byte budget for it, which is what actually
+                        # binds: syevd's workspace grows with the batch size
+                        # AND with the matrix size, so a fixed count that fits
+                        # at one ny asks for gigabytes at twice that ny
+_UV_ORTH_PASSES = [2]   # CholeskyQR passes in the fast path; 1 skips the
+                        # reorthogonalization and reinstates a cond(Om)^2 leak
+_PIN_HOST     = [True]  # page-lock host masters; set False if host RAM is tight
+_SOLVE_CHUNK  = [512]   # columns per ULV solve in HBSMAT.solve; 0 disables
 
 
 def _dev_eq(a, b):
@@ -67,6 +72,7 @@ class _HostBuffer:
             except Exception:
                 pass
 
+
 def uv_timers_reset():
     _UV_TQR[0] = _UV_TBASIS[0] = _UV_TSETUP[0] = 0.0
     _UV_NCALL[0] = 0
@@ -81,432 +87,346 @@ def _uv_sync(device):
     if _UV_SYNC[0] and torch.device(device).type == 'cuda':
         torch.cuda.synchronize()
 
+
+# ---------------------------------------------------------------------------
+# block arithmetic
+# ---------------------------------------------------------------------------
+
 def to_block_tensor(M, n, b):
-    """(n*b, s) -> (n, b, s) block tensor (analogue of convert_to_torch_tens)."""
-    s = M.shape[1]
-    return M.reshape(n, b, s)
+    """(n*b, s) -> (n, b, s) block tensor."""
+    return M.reshape(n, b, M.shape[1])
 
-def _rsolve(P, B, fast=False, rtol=None, QR=None):
-    """
-    Batched min-residual solution of  X @ B = P   (X = P B^+).
+
+def _rsolve(P, B, rtol=None):
+    """Batched min-residual solution of  X @ B = P   (X = P B^+).
+
     B: (Nb, n, s) with s >= n.  P: (Nb, ny, s).  Returns (Nb, ny, n).
-    Solves the transposed system B^T X^T = P^T, which is tall/overdetermined.
-    fast=True : QR + triangular solve (assumes full column rank of B^T).
-    fast=False: SVD applied factor-by-factor with an explicit relative cutoff.
-    QR        : optional precomputed (Q, R) of B.mT, see note below.
-    """
-    assert B.shape[-1] >= B.shape[-2], "undersampled: s < n, this is a different problem"
-
-    #if fast:
-    #    if QR is None:
-    #        Q, R = tla.qr(B.mT, mode='reduced')      # Q:(Nb,s,n)  R:(Nb,n,n)
-    #    else:
-    #        Q, R = QR
-    #    PQ = torch.bmm(P, Q)                          # (Nb, ny, n)
-    #    # X R^T = PQ ;  R^T is lower triangular, solve from the right
-    #    return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
-
-    U, S, Vh = tla.svd(B, full_matrices=False)        # U:(Nb,n,n) S:(Nb,n) Vh:(Nb,n,s)
+    SVD applied factor-by-factor with an explicit relative cutoff; the (s, n)
+    pseudo-inverse is never built."""
+    assert B.shape[-1] >= B.shape[-2], "undersampled: s < n, a different problem"
+    U, S, Vh = tla.svd(B, full_matrices=False)
     if rtol is None:
         rtol = max(B.shape[-1], B.shape[-2]) * torch.finfo(B.dtype).eps
-    Sinv = torch.where(S > rtol * S[..., :1], 1.0 / S, torch.zeros_like(S))
-    # X = P V S^+ U^T, applied right-to-left; the (s,n) pinv is never built
+    Sinv = torch.where(S > rtol * S[..., :1], S.reciprocal(), torch.zeros_like(S))
     return torch.bmm(torch.bmm(P, Vh.mT) * Sinv.unsqueeze(-2), U.mT)
 
-def block_solve_r(A,B,device,fast=False):
-    # batched: solves X[i] = A[i] @ pinv(B[i]) over the block dim
-    return _rsolve(A, B, fast=fast)
 
-def block_mult(A,B,device,mode='N'):
-    # A: (Nb, n, k), B: (Nb, k, m)
-    if mode=='N':
+def block_solve_r(A, B, device=None, fast=False):
+    """X[i] = A[i] @ pinv(B[i]), batched over the block dim.
+
+    `device` and `fast` are accepted for call-site compatibility and ignored:
+    the tensors carry their own device, and the QR variant of the pinv was
+    never enabled."""
+    return _rsolve(A, B)
+
+
+def block_mult(A, B, device=None, mode='N'):
+    """A: (Nb, n, k), B: (Nb, k, m)."""
+    if mode == 'N':
         return torch.bmm(A, B)
-    elif mode=='T':
+    elif mode == 'T':
         return torch.bmm(A.mT, B)
-    else:
-        raise ValueError("mode not recognized")
+    raise ValueError("mode not recognized")
 
-def block_matvec(A,B,device,mode='N'):
-    # A: (Nb, n, k), B: (Nb*nB, col) flat
+
+def block_matvec(A, B, device=None, mode='N'):
+    """A: (Nb, n, k) block diagonal; B: (Nb*nB, col) flat."""
     Nb  = A.shape[0]
-    k   = B.shape[1]
-    nB  = B.shape[0] // Nb
-    Bm  = B.reshape(Nb, nB, k)
-    if mode=='N':
-        return torch.bmm(A, Bm).reshape(Nb * A.shape[1], k)
-    elif mode=='T':
-        return torch.bmm(A.mT, Bm).reshape(Nb * A.shape[2], k)
-    else:
-        raise ValueError("mode not recognized")
-def block_mult_and_reduce(A,B,fac,device,mode='N'):
-    # A: (Nb, n, rk), B: (Nb, rk, s) or (Nb, n, s)
-    # After bmm: (Nb, *, s); reshape to group fac blocks together
+    col = B.shape[1]
+    Bm  = B.reshape(Nb, B.shape[0] // Nb, col)
+    if mode == 'N':
+        return torch.bmm(A, Bm).reshape(Nb * A.shape[1], col)
+    elif mode == 'T':
+        return torch.bmm(A.mT, Bm).reshape(Nb * A.shape[2], col)
+    raise ValueError("mode not recognized")
+
+
+def block_mult_and_reduce(A, B, fac, device=None, mode='N'):
+    """Block-wise product, then group fac consecutive blocks into one.
+
+    mode='N': A (Nb, n, rk), B (Nb, rk, s) -> (Nb//fac, fac*n,  s)
+    mode='T': A (Nb, n, rk), B (Nb, n,  s) -> (Nb//fac, fac*rk, s)"""
     Nb = A.shape[0]
-    if mode=='N':
-        C = torch.bmm(A, B)                             # (Nb, n, s)
-        return C.reshape(Nb//fac, fac*A.shape[1], B.shape[2])
-    elif mode=='T':
-        C = torch.bmm(A.mT, B)                         # (Nb, rk, s)
-        return C.reshape(Nb//fac, fac*A.shape[2], B.shape[2])
-    else:
-        raise ValueError("mode not recognized")
+    if mode == 'N':
+        C = torch.bmm(A, B)
+        return C.reshape(Nb // fac, fac * A.shape[1], B.shape[2])
+    elif mode == 'T':
+        C = torch.bmm(A.mT, B)
+        return C.reshape(Nb // fac, fac * A.shape[2], B.shape[2])
+    raise ValueError("mode not recognized")
 
 
-def _small_pinv_factors(R, s=None, rtol=None):
-    """B = R^T Q^T  =>  pinv(R^T) = Vh^T diag(Sinv) Uc^T, all n x n."""
-    n = R.shape[-1]
-    Uc, S, Vhc = tla.svd(R.mT, full_matrices=False)
-    if rtol is None:
-        rtol = max(s if s is not None else n, n) * torch.finfo(R.dtype).eps
-    Sinv = torch.where(S > rtol*S[...,:1], S.reciprocal(), torch.zeros_like(S))
-    return Uc, Sinv, Vhc
+def _cholqr2(X, need_q=True):
+    """CholeskyQR of X^T, repeated.  X: (Nb, m, s) with s >= m.
 
+    Returns (Q, R) with R (Nb, m, m) upper triangular and Q (Nb, m, s) having
+    orthonormal ROWS, so that  X = R^T Q  and  X X^T = R^T R.  Q is the
+    transpose of the usual thin factor of X^T; keeping it row-major in the
+    s direction avoids transposing an (s, m) tensor at every use.
 
-def _rsolve_qr(P, QR, s=None, fast=False):
-    """P B^+ where B = R^T Q^T. Replaces _rsolve(P, B)."""
-    Q, R = QR
-    PQ = torch.bmm(P, Q)                                  # (Nb, ny, n)
-    if fast:
-        return torch.linalg.solve_triangular(R.mT, PQ, upper=False, left=False)
-    Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
-    return torch.bmm(torch.bmm(PQ, Vhc.mT) * Sinv.unsqueeze(-2), Uc.mT)
+    Two passes give ||Q Q^T - I|| = O(u) and R accurate to O(u ||X||) as long
+    as cond(X) <= u^{-1/2}, i.e. the same backward stability as Householder
+    QR, at GEMM/TRSM throughput instead of batched geqrf.  A failed Cholesky
+    means cond(X) is past that bound; the Gram is then shifted by
+    11(ms + m(m+1)) u ||X||_F^2 and a third pass is run, which extends the
+    bound to cond(X) <= 1/u.
 
+    need_q=False skips the final triangular solve when only R is wanted,
+    saving one m^2 s TRSM.
 
-def _pinv_apply_left(QR, U, s=None, fast=False):
-    """B^+ U = Q pinv(R^T) U, applied to k columns."""
-    Q, R = QR
-    if fast:
-        T = torch.linalg.solve_triangular(R.mT, U, upper=False, left=True)
-    else:
-        Uc, Sinv, Vhc = _small_pinv_factors(R, s=s)
-        T = torch.bmm(Vhc.mT, Sinv.unsqueeze(-1) * torch.bmm(Uc.mT, U))
-    return torch.bmm(Q, T)                                # (Nb, s, k)
-def _tri_rsolve_T(R, P, rcond):
-    """P (R^T)^+ , R upper triangular n x n.  Triangular solve where R is
-    safely conditioned; SVD pseudo-inverse on the (rare) entries that are not.
-
-    Om is Gaussian with s >= n + k, so R_oo is well conditioned with
-    overwhelming probability -- the SVD branch is a guard, not the norm."""
-    d   = torch.diagonal(R, dim1=-2, dim2=-1).abs()
-    bad = (d.amin(-1) <= rcond * d.amax(-1).clamp_min(torch.finfo(R.dtype).tiny))
-
-    X = torch.linalg.solve_triangular(R.mT, P, upper=False, left=False)
-
-    if bool(bad.any()):                            # one sync, only when needed
-        idx = bad.nonzero(as_tuple=True)[0]
-        Uc, S, Vhc = tla.svd(R[idx].mT, full_matrices=False)
-        Sinv = torch.where(S > rcond * S[..., :1], S.reciprocal(),
-                           torch.zeros_like(S))
-        X[idx] = torch.bmm(torch.bmm(P[idx], Vhc.mT) * Sinv.unsqueeze(-2),
-                           Uc.mT)
-    return X
-def _tri_lsolve_T(R, U, rcond=1e-12):
-    d   = torch.diagonal(R, dim1=-2, dim2=-1).abs()
-    tiny = torch.finfo(R.dtype).tiny
-    bad = d.amin(-1) <= rcond * d.amax(-1).clamp_min(tiny)
-
-    T = torch.linalg.solve_triangular(R.mT, U, upper=False, left=True)
-
-    if bool(bad.any()):                   # one D2H sync, only when it fires
-        idx = bad.nonzero(as_tuple=True)[0]
-        Uc, S, Vhc = tla.svd(R[idx].mT, full_matrices=False)
-        Sinv = torch.where(S > rcond * S[..., :1], S.reciprocal(),
-                           torch.zeros_like(S))
-        # (R^T)^+ U = V S^+ U_c^T U
-        T[idx] = torch.bmm(Vhc.mT, Sinv.unsqueeze(-1) * torch.bmm(Uc.mT, U[idx]))
-    return T
-def _spd_factor(G, check=True):
-    """Factor G = Om Om^T.  Om is (n, s) Gaussian with s >= n + k, so G is SPD
-    with cond ~ ((1+sqrt(n/s))/(1-sqrt(n/s)))^2 -- about 100 at s/n = 1.5 and
-    14 at s/n = 3.  Cholesky is the right tool; the LU fallback is a guard.
-
-    Returns an opaque handle for _spd_solve.  `check` costs one D2H sync per
-    call; drop it once the path is validated."""
-    L, info = torch.linalg.cholesky_ex(G)
-    if check and bool(info.any()):
-        d = torch.diagonal(G, dim1=-2, dim2=-1).mean(-1)
-        eye = torch.eye(G.shape[-1], dtype=G.dtype, device=G.device)
-        L, info = torch.linalg.cholesky_ex(G + (1e-13 * d)[:, None, None] * eye)
-        if bool(info.any()):
-            return ('lu', torch.linalg.lu_factor(G))
-    return ('chol', L)
-def _spd_solve(fac, B):
-    kind, F = fac
-    if kind == 'chol':
-        return torch.cholesky_solve(B, F)
-    LU, piv = F
-    return torch.linalg.lu_solve(LU, piv, B)
-def _construct_D_ne(U, V, M_om, M_psi):
-    """D = (I - UU*) Y Om^+  +  U [ (I - VV*) Z Psi^+ ]* U*
-
-    M_om = Y Om^+ and M_psi = Z Psi^+ were already formed by the
-    normal-equations path, so this is four GEMMs and nothing else -- no
-    triangular solves, no SVD fallback, no width-s intermediate.
-
-    Equivalent to construct_D's QR branch term for term:
-      R_oy^T R_oo^{-T} = Y Om^T (R_oo^T R_oo)^{-1} = Y Om^T G^{-1} = M_om
-      R_pz^T R_pp^{-T} = Z Psi^T G_psi^{-1}                        = M_psi
+    Costs one D2H sync per pass, from the Cholesky info check.
     """
-    P = M_om - torch.bmm(U, torch.bmm(U.mT, M_om))     # (Nb, ny, n)
-    Gk = torch.bmm(M_psi, U)                           # (Nb, ny, k)
+    Nb, m, s = X.shape
+    assert s >= m, f"_cholqr2: need s >= m, got s={s}, m={m}"
+    eye = torch.eye(m, dtype=X.dtype, device=X.device)
+    npass = max(1, _UV_ORTH_PASSES[0])
+    Q, R, p = X, None, 0
+    while p < npass:
+        # G is symmetric to roundoff by construction and cholesky_ex reads one
+        # triangle, so the usual 0.5*(G + G^T) buys nothing and costs a second
+        # full (Nb, m, m) tensor -- 786 MB at the leaf with Nb=128, m=800,
+        # twice per call.
+        G = torch.bmm(Q, Q.mT)
+        Lc, info = torch.linalg.cholesky_ex(G)
+        if bool(info.any()):
+            sh = (11 * (m * s + m * (m + 1)) * torch.finfo(X.dtype).eps
+                  * torch.diagonal(G, dim1=-2, dim2=-1).sum(-1))
+            Lc, info = torch.linalg.cholesky_ex(G + sh[:, None, None] * eye)
+            if bool(info.any()):
+                raise torch.linalg.LinAlgError(
+                    "_cholqr2: shifted Cholesky failed; the sample block is "
+                    "rank-deficient past cond ~ 1/u")
+            npass = max(npass, p + 3)     # shifted CholeskyQR3
+        del G
+        Ri = Lc.mT                        # G = Ri^T Ri, Ri upper triangular
+        del Lc
+        p += 1
+        if need_q or p < npass:
+            # After the first pass Q is this function's own buffer, so the
+            # solve writes into it instead of allocating another (Nb, m, s):
+            # 1.6 GB at the leaf with s=1916.  TRSM is in-place on its
+            # right-hand side anyway, so passing out=Q is the intended path
+            # and not a copy.  The first pass must NOT do this -- Q is still
+            # the caller's X there, and for the A side that is Om or Psi,
+            # which the rest of the level reads.
+            Q = torch.linalg.solve_triangular(
+                Ri.mT, Q, upper=False, left=True,
+                out=(None if Q is X else Q))
+        R = Ri if R is None else torch.bmm(Ri, R)
+    return Q, R
+
+
+def construct_D(U, V, M_om, M_psi):
+    """D = (I - U U*) Y Om^+  +  U [ (I - V V*) Z Psi^+ ]* U*
+
+    with M_om = Y Om^+ and M_psi = Z Psi^+ supplied by compute_UV_pair, so
+    this is four GEMMs and nothing else -- no triangular solves, no SVD
+    fallback, no width-s intermediate.  Both branches of compute_UV_pair
+    return M in this form; the QR branch gets there via
+    R_oy^T R_oo^{-T} = Y Om^T (R_oo^T R_oo)^{-1} = Y Om^+."""
+    P  = M_om - torch.bmm(U, torch.bmm(U.mT, M_om))     # (Nb, ny, n)
+    Gk = torch.bmm(M_psi, U)                            # (Nb, ny, k)
     Gk = Gk - torch.bmm(V, torch.bmm(V.mT, Gk))
     return P + torch.bmm(U, Gk.mT)
-def construct_D(U, V, om_R, psi_R, fast=True, rcond=1e-12):
-    """D = (I-UU*) Y Om^+  +  U [ (I-VV*) Z Psi^+ ]^* U ... (see derivation)
 
-    Uses  Y Q_om = R_oy^T  and  Z Q_psi = R_pz^T, so neither Q nor any
-    width-s intermediate is ever formed.  All work is n x n and n x k.
-    """
-    if len(om_R)==1:
-        return _construct_D_ne(U,V,om_R[0],psi_R[0])
-    R_oo, R_oy = om_R
-    R_pp, R_pz = psi_R
 
-    # ---- term 1:  (I - UU*) R_oy^T R_oo^{-T} --------------------------
-    P = R_oy.mT                                   # (Nb, ny, n) == Y Q_om
-    P = P - torch.bmm(U, torch.bmm(U.mT, P))      # project, width n not s
-    term1 = _tri_rsolve_T(R_oo, P, rcond)         # X R_oo^T = P
+def compute_UV_pair(Om, Y, Psi, Z, rk, device=None, fast=False):
+    """Both halves of a level's basis computation.  `device` is accepted for
+    call-site compatibility and ignored; the tensors carry their own.
 
-    # ---- term 2:  U [ (I - VV*) R_pz^T R_pp^{-T} U ]^* ----------------
-    T  = _tri_lsolve_T(R_pp, U, rcond)            # R_pp^T T = U   -> (Nb,n,k)
-    G  = torch.bmm(R_pz.mT, T)                    # (Nb, ny, k)
-    G  = G - torch.bmm(V, torch.bmm(V.mT, G))
-    term2 = torch.bmm(U, G.mT)
+    Returns ((U, M_om), (V, M_psi)) with U the leading k left singular
+    vectors of Y (I - Om^+ Om) and M_om = Y Om^+ (and likewise V, M_psi from
+    Psi, Z).
 
-    return term1 + term2
-def _qr_R_only(W, mode='house', jitter=1e-12):
-    p = W.shape[-1]
-    A,tau = torch.geqrf(W)
+    fast=True   CholeskyQR2 on Om^T for the projector, then the singular
+                vectors of the projected samples via the Jordan-Wielandt
+                eigenproblem:
 
-    return torch.triu(A[...,:p,:])#tla.qr(W, mode='r').R
-def _eigh_topk(S, k, chunk=None):
-    """Top-k eigenvectors of a batch of SPD matrices, chunked over the batch.
+                    Om^T = Q1 R          CholeskyQR2, ||Q1^T Q1 - I|| = O(u)
+                    M    = (Y Q1) R^{-T}                        = Y Om^+
+                    Bp   = Y - (Y Q1) Q1^T                      = Y P_tau P_tau^T
+                    Bp   = RB^T QB       CholeskyQR2, R factor only
+                    U    = top-k eigenvectors of [[0, RB^T], [RB, 0]], top half
 
-    cusolver's batched syevd workspace scales with batch size; at
-    (512, 512, 512) float64 it asks for 2.19 GB in one allocation on top of
-    the eigenvector matrix.  The eigh is ~7% of the sweep, so chunking it is
-    close to free."""
-    c = _EIGH_CHUNK[0] if chunk is None else chunk
-    Nb = S.shape[0]
-    if not c or Nb <= c:
-        return tla.eigh(S).eigenvectors[..., -k:].flip(-1)
-    out = torch.empty((Nb, S.shape[-1], k), dtype=S.dtype, device=S.device)
-    for j in range(0, Nb, c):
-        out[j:j+c] = tla.eigh(S[j:j+c]).eigenvectors[..., -k:].flip(-1)
-    return out
-def _compute_UV_pair_ne(Om, Y, Psi, Z, k, fast=False):
-    """Normal-equations form of compute_UV_pair.  The large QR never exists.
+                Nothing is squared: the Grams are formed only to orthogonalize,
+                never to have their spectrum read.  The extraction resolves
+                sigma_j down to u sigma_1 rather than sqrt(u) sigma_1.
 
-        G  = Om Om^T                (Nb, n, n)   SPD, cond ~ 100
-        M  = (G^{-1} Om Y^T)^T      (Nb, ny, n)  = Y Om^+
-        Bp = Y - M Om               (Nb, ny, s)  = Y (I - Om^+ Om)
-        S  = Bp Bp^T                (Nb, ny, ny) = L L^T of the QR path
-        U  = top-k eigenvectors of S
+                The second CholeskyQR pass on Om^T is not decorative.  With Q1
+                orthonormal only to eps, I - Q1 Q1^T is not a projector and Bp
+                keeps a leak of size eps ||Y|| lying in row(Om) -- the very
+                component the projection removes.  One pass gives
+                eps ~ u cond(Om)^2 ~ 100u; two give eps = O(u).  Set
+                _UV_ORTH_PASSES[0] = 1 to measure what that is worth.
 
-    S is identical to the QR path's L L^T in exact arithmetic.  Bp is formed
-    explicitly rather than as Y Y^T - (Om Y^T)^T G^{-1}(Om Y^T): both are the
-    same matrix, but the subtraction form carries two powers of ||Y||/||Bp||
-    (the diagonal-dominance ratio) in its error, while Bp = Y - M Om carries
-    one -- the same as the Householder QR it replaces.
+                What remains is the cancellation floor u ||Y||/||Bp||, common
+                to every formulation in fixed precision (Householder QR on
+                [Om^T | Y^T] included) and expected to be O(10) u here.
+
+    fast=False  Householder QR of W = [Om^T | Y^T] = Q R, then
+
+                    M = R_oy^T R_oo^{-T},  L = R[n:, n:]^T,  U = svd(L).U
+
+                Q is never formed: nothing downstream needs it.  The SVD runs
+                on the host, which is why this path is slow.  Kept as the
+                reference the fast path is validated against.
 
     The two sides run sequentially rather than stacked into a 2Nb batch.
-    Stacking was measured at exactly zero speedup on the QR path (null_qr
-    130.01 s either way, since a per-matrix loop just loops twice as long) and
-    it doubles peak memory, which is now what binds.
-    """
-    U_om,  M_om  = _uv_ne_side(Om,  Y, k)
-    U_psi, M_psi = _uv_ne_side(Psi, Z, k)
-    return (U_om, (M_om,)), (U_psi, (M_psi,))
-
-
-def _uv_ne_side(A, B, k):
-    """One side of the pair; see _compute_UV_pair_ne for the algebra."""
-    Nb, ny, s = B.shape
-
-    _uv_sync(B.device); _t = time.time()
-    G = torch.bmm(A, A.mT)
-    G = 0.5 * (G + G.mT)
-    C = torch.bmm(A, B.mT)                  # (Nb, n, ny) = Om Y^T
-    fac = _spd_factor(G)
-    del G
-    X = _spd_solve(fac, C)                  # G^{-1} Om Y^T
-    del C, fac
-    M = X.mT.contiguous()                   # (Nb, ny, n) = Y Om^+
-    del X
-    _uv_sync(B.device); _UV_TQR[0] += time.time() - _t
-
-    _uv_sync(B.device); _t = time.time()
-    Bp = torch.baddbmm(B, M, A, beta=1.0, alpha=-1.0)    # Y - M Om
-    S = torch.bmm(Bp, Bp.mT)
-    del Bp
-    S = 0.5 * (S + S.mT)
-    UU = _eigh_topk(S, k)
-    del S
-    _uv_sync(B.device); _UV_TBASIS[0] += time.time() - _t
-    return UU, M
-def compute_UV(Om, Y, rk, device, fast=False):
-    """Returns (U, R_oo, R_oy) where W = [Om^T | Y^T] = Q R,
-       R_oo = R[:, :n, :n]  (upper triangular, n x n)
-       R_oy = R[:, :n, n:]  (n x ny)   -- note  Y Q_om = R_oy^T  exactly.
-       Q is never formed: nothing downstream needs it."""
-    Nb, ny, s = Y.shape
-    n = Om.shape[1]
-    k = min(rk, ny)
-    print(f"  lvl-shape Nb={Nb:5d} s={s:5d} n={n:4d} ny={ny:5d} k={k:4d}")
-    assert s >= n + k
-    _UV_NCALL[0] += 1
-    _uv_sync(Y.device); _t = time.time()
-    W = torch.empty((Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
-    W[:, :, :n].copy_(Om.mT)
-    W[:, :, n:].copy_(Y.mT)
-    _uv_sync(Y.device); _UV_TSETUP[0] += time.time() - _t
-    _uv_sync(Y.device); _t = time.time()
-    prev = torch.backends.cuda.preferred_linalg_library()
-    torch.backends.cuda.preferred_linalg_library('magma')
-    R = _qr_R_only(W, mode=_UV_QR_MODE[0])
-    torch.backends.cuda.preferred_linalg_library(prev)
-    _uv_sync(Y.device); _UV_TQR[0] += time.time() - _t
-    R_oo = R[:, :n, :n]
-    R_oy = R[:, :n, n:]
-    L    = R[:, n:, n:].mT                    # (Nb, ny, r-n)
-    _uv_sync(Y.device); _t = time.time()
-    if fast:
-        G = torch.bmm(L, L.mT); G = 0.5 * (G + G.mT)
-        U = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
-    else:
-        U = tla.svd(L.contiguous(), full_matrices=False).U[..., :k]
-    _uv_sync(Y.device); _UV_TBASIS[0] += time.time() - _t
-    return U, (R_oo.contiguous(), R_oy.contiguous())
-def compute_UV_pair(Om, Y, Psi, Z, rk, device, fast=False,mode=None):
-    """Both halves of a level's basis computation in one batched call.
-
-    compute_UV(Om, Y, ...) and compute_UV(Psi, Z, ...) operate on identically
-    shaped inputs -- Om and Psi are both (Nb, n, s), Y and Z both (Nb, ny, s)
-    -- so the two factorizations can be stacked along the batch dimension and
-    issued as one.  That doubles Nb for the QR and the basis extraction,
-    which together are ~90% of compression time and sit on a scaling curve
-    that is still improving at these batch sizes.
-
-    Returns ((U, om_R), (V, psi_R)), matching two compute_UV calls exactly.
-    The Om/Y result occupies batch entries [:Nb], Psi/Z entries [Nb:].
+    Stacking was measured at zero speedup (null_qr 130.01 s either way, since
+    a per-matrix loop just loops twice as long) and it doubles peak memory.
     """
     Nb, ny, s = Y.shape
     n = Om.shape[1]
     k = min(rk, ny)
-
     assert Psi.shape == Om.shape and Z.shape == Y.shape, \
-        "compute_UV_pair needs matching shapes; call compute_UV twice instead"
+        "compute_UV_pair needs matching shapes"
     assert s >= n + k, \
         "undersampled: not enough columns left after projecting off Om"
+    _UV_NCALL[0] += 2
+    dev = Y.device
+    out = []
 
-    _UV_NCALL[0] += 2          # counts as two logical compute_UV calls
+    for A, B in ((Om, Y), (Psi, Z)):
+        if fast:
+            # ---- P_tau as a projector: Q1 = orth(A^T), never a null basis --
+            _uv_sync(dev); _t = time.time()
+            QA, RA = _cholqr2(A)                  # A = RA^T QA, QA rows orthon.
+            _uv_sync(dev); _UV_TQR[0] += time.time() - _t
 
-    if (mode or _UV_MODE[0]) == 'ne':
-        return _compute_UV_pair_ne(Om, Y, Psi, Z, k, fast=fast)
+            # ---- B P_tau P_tau^T and M = B A^+ ----------------------------
+            _uv_sync(dev); _t = time.time()
+            C  = torch.bmm(B, QA.mT)              # (Nb, ny, n) = Y Q1
+            # A^+ = Q1 RA^{-T}, so M = C RA^{-T}: one triangular solve, no
+            # normal equations and no cond(A)^2.
+            M  = torch.linalg.solve_triangular(
+                RA.mT, C, upper=False, left=False).contiguous()
+            Bp = torch.baddbmm(B, C, QA, beta=1.0, alpha=-1.0)   # B - C Q1^T
+            del C, QA, RA
+            _uv_sync(dev); _UV_TSETUP[0] += time.time() - _t
 
-    # ---- setup: one arena, four copies -----------------------------------
-    _uv_sync(Y.device); _t = time.time()
-    W = torch.empty((2 * Nb, s, n + ny), dtype=Y.dtype, device=Y.device)
-    W[:Nb, :, :n].copy_(Om.mT)
-    W[:Nb, :, n:].copy_(Y.mT)
-    W[Nb:, :, :n].copy_(Psi.mT)
-    W[Nb:, :, n:].copy_(Z.mT)
-    _uv_sync(Y.device); _UV_TSETUP[0] += time.time() - _t
-    # ---- one QR over the doubled batch -----------------------------------
-    _uv_sync(Y.device); _t = time.time()
-    R = tla.qr(W, mode='r').R              # (2Nb, r, n+ny), r = min(s, n+ny)
-    _uv_sync(Y.device); _UV_TQR[0] += time.time() - _t
+            # ---- top-k left singular vectors of Bp, without squaring -------
+            _uv_sync(dev); _t = time.time()
+            _, RB = _cholqr2(Bp, need_q=False)    # Bp Bp^T = RB^T RB
+            del Bp
+            # Left singular vectors of Bp are those of L = RB^T, and they live
+            # in R^ny: the s direction is already gone.  Extract them from the
+            # Jordan-Wielandt form
+            #     H = [[0, L], [L^T, 0]],   eig(H) = +-sigma,
+            #     eigenvectors (u, +-v)/sqrt(2),
+            # which is assembled by block placement -- exactly, with no
+            # arithmetic -- and has ||H|| = sigma_1.  A backward-stable eigh
+            # therefore resolves directions down to sigma_j ~ u sigma_1, where
+            # eigh(Bp Bp^T) loses everything below sqrt(u) sigma_1 to the
+            # rounding error of forming the Gram.
+            # The eigenproblem is 2ny, so its workspace is 4x the ny version's
+            # at equal batch size -- dividing a fixed chunk COUNT by 4 does not
+            # track that, because the count itself was tuned at some other ny.
+            # Budget bytes: ~6x the batch covers H, the eigenvector output and
+            # cusolver's own scratch.  At ny=400 this gives the old chunk back;
+            # at ny=800 it backs off to a quarter of it, which is the whole
+            # point.
+            per = 6 * (2 * ny) ** 2 * RB.element_size()
+            c   = min(_EIGH_CHUNK[0] or Nb, Nb)
+            if _EIGH_BYTES[0]:
+                c = min(c, _EIGH_BYTES[0] // per)
+            c = max(1, c)
+            UU = torch.empty((Nb, ny, k), dtype=RB.dtype, device=dev)
+            H  = torch.zeros((min(c, Nb), 2 * ny, 2 * ny),
+                             dtype=RB.dtype, device=dev)
+            for j in range(0, Nb, c):
+                blk = RB[j:j+c]
+                Hv  = H[:blk.shape[0]]
+                Hv[:, :ny, ny:] = blk.mT
+                Hv[:, ny:, :ny] = blk
+                UU[j:j+c] = tla.eigh(Hv).eigenvectors[..., -k:].flip(-1)[:, :ny, :]
+            del H, RB
+            # Each column arrives as the top half of (u, v)/sqrt(2).  The two
+            # halves separate cleanly for distinct positive sigma; a +-pair is
+            # degenerate only where sigma ~ 0, so clamp before dividing and
+            # then restore orthonormality outright -- ULVsparse.compute_QRW_sparse
+            # builds the complement W1 from V and needs V^T V = I.
+            UU = UU / UU.norm(dim=-2, keepdim=True).clamp_min(
+                torch.finfo(UU.dtype).tiny)
+            Gk = torch.bmm(UU.mT, UU)             # (Nb, k, k), cheap
+            Lk, info = torch.linalg.cholesky_ex(Gk)   # symmetric by construction
+            if not bool(info.any()):
+                UU = torch.linalg.solve_triangular(Lk.mT, UU, upper=True,
+                                                   left=False)
+            del Gk, Lk
+            UU = UU.contiguous()
+            _uv_sync(dev); _UV_TBASIS[0] += time.time() - _t
+        else:
+            _uv_sync(dev); _t = time.time()
+            W = torch.empty((Nb, s, n + ny), dtype=B.dtype, device=dev)
+            W[:, :, :n].copy_(A.mT)
+            W[:, :, n:].copy_(B.mT)
+            _uv_sync(dev); _UV_TSETUP[0] += time.time() - _t
 
-    # W is dead here and is the largest tensor in the routine; dropping it
-    # before the basis extraction keeps peak usage close to the unmerged
-    # version rather than holding W and G simultaneously.
-    del W
+            _uv_sync(dev); _t = time.time()
+            R = tla.qr(W, mode='r').R          # (Nb, r, n+ny), r = min(s, n+ny)
+            del W                              # largest tensor here; drop it
+            # R_oo is upper triangular and well conditioned for Gaussian Om,
+            # so the pinv of Om^T is a triangular solve.
+            M = torch.linalg.solve_triangular(
+                R[:, :n, :n].mT, R[:, :n, n:].mT, upper=False,
+                left=False).contiguous()       # (Nb, ny, n) = Y Om^+
+            _uv_sync(dev); _UV_TQR[0] += time.time() - _t
 
-    L = R[:, n:, n:].mT                    # (2Nb, ny, r-n)
+            _uv_sync(dev); _t = time.time()
+            L = R[:, n:, n:].mT                # (Nb, ny, r-n)
+            UU = tla.svd(L.to('cpu'), full_matrices=False).U[..., :k]
+            UU = UU.to(dev).contiguous()
+            del R, L
+            _uv_sync(dev); _UV_TBASIS[0] += time.time() - _t
 
-    # ---- basis extraction, also over the doubled batch --------------------
-    _uv_sync(Y.device); _t = time.time()
-    if fast:
-        G = torch.bmm(L, L.mT)
-        G = 0.5 * (G + G.mT)
-        UU = tla.eigh(G).eigenvectors[..., -k:].flip(-1)
-        del G
-    else:
-        prev = torch.get_num_threads()
-        try:
-            UU = (tla.svd(L.to('cpu'), full_matrices=False).U[..., :k]).to(L.device)
-        finally:
-            torch.set_num_threads(prev)
-    _uv_sync(Y.device); _UV_TBASIS[0] += time.time() - _t
+        out.append((UU, M))
 
-    # .contiguous() on every slice: these are views into the (2Nb, r, n+ny)
-    # R, and holding any one of them alive would keep the whole thing
-    # allocated for as long as the returned tuples live.
-    om_R  = (R[:Nb, :n, :n].contiguous(), R[:Nb, :n, n:].contiguous())
-    psi_R = (R[Nb:, :n, :n].contiguous(), R[Nb:, :n, n:].contiguous())
-    U_out = UU[:Nb].contiguous()
-    V_out = UU[Nb:].contiguous()
-
-    return (U_out, om_R), (V_out, psi_R)
+    return out[0], out[1]
 
 
 class HBSMAT:
-    """
+    """HBS matrix: compression, apply, and ULV solve.
 
-    HBS mat in new framework
-
-    @init:
-            linear operator A
-            tree on DOFS (symmetric)
-            target rank k
-
-    @constructs: 
-            HBS approximation to the source-target map
-    @implements:
-            matvec (normal/transpose)
+    @init:      linear operator A, tree on DOFs (symmetric), target rank k
+    @constructs HBS approximation to the source-target map
+    @implements matvec/matmat (normal and transpose) and solve
 
     Device policy
     -------------
-    Every tensor the object stores lives on self.device.  There is no per-level
-    exception: Dmats is handled exactly like Umats and Vmats, so any consumer
-    that takes the whole list (ULVsparse.solve, ULVsparse.compute_ULV) sees a
-    list on one device.  Use to()/cpu() to relocate the whole object; that is
-    the only supported way to trade VRAM for host memory.
+    Every tensor the object stores lives on self.compute_device.  There is no
+    per-level exception, so any consumer that takes a whole list
+    (ULVsparse.solve, ULVsparse.compute_ULV) sees a list on one device.  Use
+    to()/cpu() to relocate the whole object; that is the only supported way to
+    trade VRAM for host memory.
 
-    Note on level ordering: the construction loop runs L-1 down to 0, so
-    Dmats[0] is the leaf level and Dmats[-1] is the ROOT.  Earlier versions
-    parked Dmats[-1] in pinned host memory under the name "leaf D"; that block
-    is in fact the smallest in the list (one block of side ~2*rk), so the
-    saving was negligible while the mixed-device list silently broke solve().
-
+    Level ordering: the construction loop runs L-1 down to 0, so Dmats[0] is
+    the leaf level and Dmats[-1] is the ROOT.
     """
 
     # every attribute holding a list of tensors; to() walks these.
-    # NNvec is numpy and Nbvec is a list of ints, so both stay put.
+    # Nbvec is a list of ints, so it stays put.
     _GROUPS = {
         'core': ('Umats', 'Vmats', 'Dmats'),
         'ulv' : ('Qlist', 'Wlist', 'Rlist', 'Uulist'),
     }
-    _tensor_lists = ('Umats', 'Vmats', 'Dmats',
-                     'Qlist', 'Wlist', 'Rlist', 'Uulist')
 
-    def __init__(self,A=None,device=None,tree=None,quad=False):
+    def __init__(self, A=None, device=None, tree=None, quad=False):
         # perm lives in a one-element box so that .T views (shallow __dict__
         # copies) see the same object when residency rebinds it.
         self._permbox = [None]
-        self.Umats  =   []
-        self.Vmats  =   []
-        self.Dmats  =   []
-        self.Qlist  =   []
-        self.Rlist  =   []
-        self.Wlist  =   []
-        self.Uulist =   []
+        self.Umats  = []
+        self.Vmats  = []
+        self.Dmats  = []
+        self.Qlist  = []
+        self.Rlist  = []
+        self.Wlist  = []
+        self.Uulist = []
         torch.set_default_dtype(torch.float64)
-        self.dtype = np.float64
+        self.dtype   = np.float64
         self.dtype_t = torch.float64
 
-        self.mode   =   'N'
-        self._tree  =   None
+        self.mode  = 'N'
+        self._tree = None
 
         dev = torch.device(device) if device is not None else torch.device('cpu')
         self.compute_device = dev
@@ -519,264 +439,216 @@ class HBSMAT:
         self.bytesH2D = self.bytesD2H = 0
 
         if A is not None:
-            self.A      =   A
-            self.shape  =   self.A.shape
-            self.dtype  = A.dtype
+            self.A     = A
+            self.shape = A.shape
+            self.dtype = A.dtype
 
         if tree is not None:
-            self.tree   =   tree
-            self.perm   =   tree.perm_leaf
-            self.Nb = tree.nleaves
-            self.nl = len(self.perm)//self.Nb
-            self.L = tree.nlevels
-            self.shape = (len(self.perm),len(self.perm))
-            
+            self.tree  = tree
+            self.perm  = tree.perm_leaf
+            self.Nb    = tree.nleaves
+            self.nl    = len(self.perm) // self.Nb
+            self.L     = tree.nlevels
+            self.shape = (len(self.perm), len(self.perm))
+
         self.blockSolveTime = 0
-        self.nullTime = 0
-        self.setupTime = 0
-        self.DTime = 0
-        self.tSample = 0
+        self.nullTime   = 0
+        self.setupTime  = 0
+        self.DTime      = 0
+        self.tSample    = 0
         self.tConstruct = 0
+        self.tULV       = 0
+        self.tCompress  = 0
         self.Nbvec = []
-        self.quad = quad
-        self.tULV = 0
-        self.tCompress = 0
-        if quad:
-            self.fac = 4
-        else:
-            self.fac = 2
-    def set_Nbvec(self,Nbvec):
-        self.Nbvec = Nbvec    
+        self.quad  = quad
+        self.fac   = 4 if quad else 2
+
+    def set_Nbvec(self, Nbvec):
+        self.Nbvec = Nbvec
         self.Nb = Nbvec[0]
-        self.nl = self.A.shape[0]//self.Nb
-        self.L = len(Nbvec)
-        self.perm   =   torch.arange(self.A.shape[0],dtype=torch.int64)
-    def set_mats(self,Umats,Dmats,Vmats,Nbvec,fac=4):
+        self.nl = self.A.shape[0] // self.Nb
+        self.L  = len(Nbvec)
+        self.perm = torch.arange(self.A.shape[0], dtype=torch.int64)
+
+    def set_mats(self, Umats, Dmats, Vmats, Nbvec, fac=4):
         self.Umats = Umats
         self.Dmats = Dmats
         self.Vmats = Vmats
         self._host['core'] = None
         self._resident['core'] = Dmats[0].device if torch.is_tensor(Dmats[0]) else None
-        self.perm = torch.arange(Dmats[0].shape[0])
-        self.fac = fac
-        self.Nb = Nbvec[0]
-        self.shape = torch.tensor([Dmats[0].shape[0],Dmats[0].shape[0]],dtype = torch.int64)
+        self.perm  = torch.arange(Dmats[0].shape[0])
+        self.fac   = fac
+        self.Nb    = Nbvec[0]
+        self.shape = torch.tensor([Dmats[0].shape[0], Dmats[0].shape[0]],
+                                  dtype=torch.int64)
         self.dtype = Dmats[0][0].dtype
+
     @property
     def nbytes(self):
-        ctr = 0
-        ctr+=sum([U.nbytes for U in self.Umats])
-        ctr+=sum([V.nbytes for V in self.Vmats])
-        ctr+=sum([D.nbytes for D in self.Dmats])
-        return ctr
+        return (sum(U.nbytes for U in self.Umats)
+                + sum(V.nbytes for V in self.Vmats)
+                + sum(D.nbytes for D in self.Dmats))
+
     @property
     def device(self):
         return str(self.compute_device)
-    def _as_local(self,X):
+
+    def _as_local(self, X):
         dev = self.compute_device
         if torch.is_tensor(X):
-            return X.to(device=dev,dtype=self.dtype_t,non_blocking=True)
-        return torch.from_numpy(X).to(device=dev,dtype=self.dtype_t)
-    def construct(self,rk,Om=None,Psi=None,Y=None,Z=None,compute_ULV=False,fast=False):
+            return X.to(device=dev, dtype=self.dtype_t, non_blocking=True)
+        return torch.from_numpy(X).to(device=dev, dtype=self.dtype_t)
+
+    # ------------------------------------------------------------------
+    # construction
+    # ------------------------------------------------------------------
+
+    def construct(self, rk, Om=None, Psi=None, Y=None, Z=None,
+                  compute_ULV=False, fast=False):
         if Om is None:
             if self.A is None:
                 raise ValueError("Samples and LinOP cannot both be None")
-            else:
-                # hard requirement max(fac*rk, nl) + rk at the worst level,
-                # plus oversampling p = rk there (every other level has more)
-                s = max(self.fac*rk, self.nl) + 2*rk
+            # hard requirement max(fac*rk, nl) + rk at the worst level, plus
+            # oversampling p = rk there (every other level has more)
+            s = max(self.fac * rk, self.nl) + 2 * rk
+            Om  = np.random.standard_normal(size=(self.A.shape[1], s))
+            Psi = np.random.standard_normal(size=(self.A.shape[0], s))
+            Y   = self.A @ Om
+            Z   = self.A.T @ Psi
+        self.constructHBS(rk, Om, Psi, Y, Z, fast=fast, with_ulv=compute_ULV)
 
-                Om = np.random.standard_normal(size = (self.A.shape[1],s))
-                Psi= np.random.standard_normal(size = (self.A.shape[0],s))
-                Y = self.A@Om
-                Z = self.A.T@Psi
+    def constructHBS(self, rk, Om0, Psi0, Y0, Z0, fast=False, with_ulv=False):
+        """Compress from samples Y = A Om, Z = A^T Psi.
 
-        if compute_ULV:
-            self.constructHBS_ULV(rk,Om,Psi,Y,Z,fast=fast)
-        else: 
-            self.constructHBS(rk,Om,Psi,Y,Z,fast=fast)
+        with_ulv=True interleaves the ULV factorization into the same sweep,
+        which is what makes it cheap: the level-(lvl) factors are still live
+        when the ULV step needs them.  The two used to be separate methods
+        with identical compression bodies.
+        """
+        # A sample may arrive boxed -- as a one-element list -- which is the
+        # caller's way of handing over its only reference.  The leaf
+        # permutation below is a gather, so it allocates a second full (m, s)
+        # copy while the source is still live; four of those is 5 GB at
+        # m = 100k, s = 1550.  Unboxing here and clearing the source right
+        # after each gather means at most one source and one copy coexist,
+        # and a boxed source is freed outright instead of waiting for the
+        # caller's frame to end.  Plain tensors still work: they are simply
+        # not freed early.
+        Om0  = Om0.pop()  if isinstance(Om0,  list) else Om0
+        Psi0 = Psi0.pop() if isinstance(Psi0, list) else Psi0
+        Y0   = Y0.pop()   if isinstance(Y0,   list) else Y0
+        Z0   = Z0.pop()   if isinstance(Z0,   list) else Z0
 
-    def constructHBS(self,rk,Om0,Psi0,Y0,Z0,fast=False):
-        s = Om0.shape[1]
+        s  = Om0.shape[1]
         Nb = self.Nb
+        nl = self.nl
         self.Nbvec = [Nb]
-        nl = self.nl
         self.nSamples = s
+        self.NNvec = np.zeros(shape=(0,), dtype=np.int64)
+        self.NNvec = np.append(self.NNvec, 0)
         self._reset_residency()
-        tic = time.time()
-        if torch.is_tensor(self.perm):
-            self.perm = self.perm.to(self.compute_device)
-        else:
-            self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
-                                        device=self.compute_device)        
-        Ompr  = self._as_local(Om0 )[self.perm, :]
-        Psipr = self._as_local(Psi0)[self.perm, :]
-        Ypr   = self._as_local(Y0  )[self.perm, :]
-        Zpr   = self._as_local(Z0  )[self.perm, :]
 
-        Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
-        Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
-        Om  = ULVsparse.convert_to_torch_tens(Ompr, self.Nb, device=self.device)
-        Psi = ULVsparse.convert_to_torch_tens(Psipr,self.Nb, device=self.device)
-
-
-        #Om  = to_block_tensor(Ompr,  Nb, nl)
-        #Psi = to_block_tensor(Psipr, Nb, nl)
-        #Y   = to_block_tensor(Ypr,   Nb, nl)
-        #Z   = to_block_tensor(Zpr,   Nb, nl)
-        
-        
-        nl = self.nl
-        self.setupTime+=time.time()-tic
-        self.tSample+=time.time()-tic
-        tic_compress = time.time()
-        for lvl in range(self.L-1,-1,-1):
-            
-            if lvl == self.L-1:
-                Om_ell      = Om
-                Psi_ell     = Psi
-                Y_ell       = Y
-                Z_ell       = Z
-                rkm = min(rk,nl)
-            else:
-                Y_ell       -=block_mult(D_ell,Om_ell,self.device)
-                Y_ell       = block_mult_and_reduce(U_ell,Y_ell,self.fac,self.device,mode='T')
-
-                Z_ell       -= block_mult(D_ell,Psi_ell,self.device,mode='T')
-                Z_ell       = block_mult_and_reduce(V_ell,Z_ell,self.fac,self.device,mode='T')
-                
-                Om_ell      = block_mult_and_reduce(V_ell,Om_ell,self.fac,self.device,mode='T')
-                Psi_ell     = block_mult_and_reduce(U_ell,Psi_ell,self.fac,self.device,mode='T')
-                
-                Nb = Nb//self.fac
-                rkm = min(rk,nl*((self.fac)**(self.L-1-lvl)))
-            
-            if lvl>0:
-                
-                tic = time.time()
-                
-                (U_ell,om_R),(V_ell,psi_R) = compute_UV_pair(Om_ell,Y_ell,Psi_ell,Z_ell,rkm,self.device,fast=fast)
-                
-                self.nullTime+=time.time()-tic
-                tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,om_R,psi_R,fast=fast)
-                self.DTime+= time.time()-tic
-                self.Dmats+=[D_ell]
-                self.Umats+=[U_ell]
-                self.Vmats+=[V_ell]
-            else:
-                tic = time.time()
-                D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
-                self.blockSolveTime+=time.time()-tic
-                # stored on self.device like every other level; use to()/cpu()
-                # to relocate the whole object rather than one block of it
-                self.Dmats+=[D_ell]
-            self.Nbvec+=[Nb]
-        self.tCompress = time.time()-tic_compress
-    def constructHBS_ULV(self,rk,Om0,Psi0,Y0,Z0,fast=True):
-        s = Om0.shape[1]
-        Nb = self.Nb
-        self.Nbvec = [Nb]
-        nl = self.nl
-        self.nSamples = s
-        self._reset_residency()
         tic = time.time()
         if torch.is_tensor(self.perm):
             self.perm = self.perm.to(self.compute_device)
         else:
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=self.compute_device)
-        Ompr  = self._as_local(Om0 )[self.perm, :]
-        Psipr = self._as_local(Psi0)[self.perm, :]
-        Ypr   = self._as_local(Y0  )[self.perm, :]
-        Zpr   = self._as_local(Z0  )[self.perm, :]
+        # advanced indexing returns a fresh contiguous tensor, so the reshape
+        # to (Nb, nl, s) is a view and the deflation below may write into it.
+        # Each source is dropped immediately after its gather, so the peak
+        # here is one source plus one copy, not four of each.
+        Om  = self._as_local(Om0)[self.perm, :].reshape(Nb, nl, s)
+        Om0 = None
+        Psi = self._as_local(Psi0)[self.perm, :].reshape(Nb, nl, s)
+        Psi0 = None
+        Y   = self._as_local(Y0)[self.perm, :].reshape(Nb, nl, s)
+        Y0  = None
+        Z   = self._as_local(Z0)[self.perm, :].reshape(Nb, nl, s)
+        Z0  = None
+        self.setupTime += time.time() - tic
+        self.tSample   += time.time() - tic
 
-        Y = ULVsparse.convert_to_torch_tens(Ypr,self.Nb,device=self.device)
-        Z = ULVsparse.convert_to_torch_tens(Zpr,self.Nb,device=self.device)
-        Om  = ULVsparse.convert_to_torch_tens(Ompr, self.Nb, device=self.device)
-        Psi = ULVsparse.convert_to_torch_tens(Psipr,self.Nb, device=self.device)
-        
-        Nb = self.Nb
-        nl = self.nl
-        self.setupTime+=time.time()-tic
-        self.tSample+=time.time()-tic
-        self.NNvec = np.zeros(shape=(0,),dtype=np.int64)
-        self.NNvec = np.append(self.NNvec,0)
         tic_compress = time.time()
-        for lvl in range(self.L-1,-1,-1):
-            
-            if lvl == self.L-1:
-                Om_ell      = Om
-                Psi_ell     = Psi
-                Y_ell       = Y
-                Z_ell       = Z
-                rkm = min(rk,nl)
+        for lvl in range(self.L - 1, -1, -1):
+
+            if lvl == self.L - 1:
+                Om_ell, Psi_ell, Y_ell, Z_ell = Om, Psi, Y, Z
+                rkm = min(rk, nl)
             else:
-                
-                Y_ell       -=block_mult(D_ell,Om_ell,self.device)
-                Y_ell       = block_mult_and_reduce(U_ell,Y_ell,self.fac,self.device,mode='T')
+                d = self.device
+                Y_ell  -= block_mult(D_ell, Om_ell, d)
+                Y_ell   = block_mult_and_reduce(U_ell, Y_ell, self.fac, d, mode='T')
+                Z_ell  -= block_mult(D_ell, Psi_ell, d, mode='T')
+                Z_ell   = block_mult_and_reduce(V_ell, Z_ell, self.fac, d, mode='T')
+                Om_ell  = block_mult_and_reduce(V_ell, Om_ell, self.fac, d, mode='T')
+                Psi_ell = block_mult_and_reduce(U_ell, Psi_ell, self.fac, d, mode='T')
+                Nb  = Nb // self.fac
+                rkm = min(rk, nl * (self.fac ** (self.L - 1 - lvl)))
+            self.Nbvec += [Nb]
 
-                Z_ell       -= block_mult(D_ell,Psi_ell,self.device,mode='T')
-                Z_ell       = block_mult_and_reduce(V_ell,Z_ell,self.fac,self.device,mode='T')
-                
-                Om_ell      = block_mult_and_reduce(V_ell,Om_ell,self.fac,self.device,mode='T')
-                Psi_ell     = block_mult_and_reduce(U_ell,Psi_ell,self.fac,self.device,mode='T')
-
-                
-                Nb = Nb//self.fac
-                rkm = min(rk,nl*(self.fac**(self.L-1-lvl)))
-            #print("lvl//Nb = ",lvl,"//",Nb)
-            self.Nbvec+=[Nb]
-            if lvl>0:
+            if lvl > 0:
                 tic = time.time()
-                (U_ell, om_R), (V_ell, psi_R) = compute_UV_pair(
+                (U_ell, M_om), (V_ell, M_psi) = compute_UV_pair(
                     Om_ell, Y_ell, Psi_ell, Z_ell, rkm, self.device, fast=fast)
                 self.nullTime += time.time() - tic
                 tic = time.time()
-                D_ell = construct_D(U_ell,V_ell,om_R,psi_R,fast=fast)
-                self.DTime+= time.time()-tic
-                self.Dmats+=[D_ell]
-                self.Umats+=[U_ell]
-                self.Vmats+=[V_ell]
+                D_ell = construct_D(U_ell, V_ell, M_om, M_psi)
+                self.DTime += time.time() - tic
+                self.Dmats += [D_ell]
+                self.Umats += [U_ell]
+                self.Vmats += [V_ell]
             else:
+                # root: D = Y Om^+, one block, so the explicit SVD pinv with a
+                # relative cutoff is affordable
                 tic = time.time()
-                D_ell = block_solve_r(Y_ell,Om_ell,self.device,fast=fast)
-                self.blockSolveTime+=time.time()-tic
-                # stored on self.device like every other level; use to()/cpu()
-                # to relocate the whole object rather than one block of it
-                self.Dmats+=[D_ell]
-                U_ell = torch.eye(D_ell.shape[1], dtype=D_ell.dtype,device=self.device)[None, :, :]
-            
-            tic = time.time()
-            if lvl==self.L-1:
-                    Rhat = D_ell
-            else:
-                Rhat = ULVsparse.sparse_block_mult_tens(Uhat,D_ell,device=self.device)
-                Rhat = ULVsparse.block_diag_add_tens(Rhat,R_22,device=self.device)
-            
-            Q,W,Ru,R_22,NN = ULVsparse.compute_QRW_sparse(Rhat,V_ell,self.Nbvec[-1],device=self.device)
-            self.Qlist+=[Q]
-            if W is not None:
-                # W = [W1 | V_ell] and the V_ell half is Vmats[-1] verbatim.
-                # Store only the complement; ULVsparse.solve reads V from Vmats.
-                W = W[:, :, :W.shape[2] - V_ell.shape[2]].contiguous()
-            self.Wlist+=[W]
-            self.Rlist+=[Ru]
-            self.NNvec=np.append(self.NNvec,self.NNvec[-1]+NN)
+                D_ell = block_solve_r(Y_ell, Om_ell, self.device, fast=fast)
+                self.blockSolveTime += time.time() - tic
+                self.Dmats += [D_ell]
+                if with_ulv:
+                    U_ell = torch.eye(D_ell.shape[1], dtype=D_ell.dtype,
+                                      device=self.compute_device)[None, :, :]
 
-            if lvl == self.L-1:
-                Uhat = U_ell
-            else:
-                Uhat = ULVsparse.sparse_block_mult_tens(Uhat,U_ell,device=self.device)
-            
-            Uu = ULVsparse.sparse_block_mult_tens(Q[:,:,:-rkm],Uhat,device=self.device,mode='T')
-            Ud = ULVsparse.sparse_block_mult_tens(Q[:,:,-rkm:],Uhat,device=self.device,mode='T')
-            self.Uulist+=[Uu]
-            Uhat=Ud
-            self.tULV +=time.time()-tic
+            if with_ulv:
+                tic = time.time()
+                dev = self.compute_device
+                if lvl == self.L - 1:
+                    Rhat = D_ell
+                else:
+                    Rhat = ULVsparse.sparse_block_mult_tens(Uhat, D_ell, device=dev)
+                    Rhat = ULVsparse.block_diag_add_tens(Rhat, R_22, device=dev)
+
+                Q, W, Ru, R_22, NN = ULVsparse.compute_QRW_sparse(
+                    Rhat, V_ell, self.Nbvec[-1], device=dev)
+                self.NNvec = np.append(self.NNvec, self.NNvec[-1] + NN)
+                self.Qlist += [Q]
+                if W is not None:
+                    # W = [W1 | V_ell] and the V_ell half is Vmats[-1]
+                    # verbatim.  Store only the complement; ULVsparse.solve
+                    # reads V from Vmats.
+                    W = W[:, :, :W.shape[2] - V_ell.shape[2]].contiguous()
+                self.Wlist += [W]
+                self.Rlist += [Ru]
+
+                if lvl == self.L - 1:
+                    Uhat = U_ell
+                else:
+                    Uhat = ULVsparse.sparse_block_mult_tens(Uhat, U_ell, device=dev)
+                Uu = ULVsparse.sparse_block_mult_tens(Q[:, :, :-rkm], Uhat,
+                                                      device=dev, mode='T')
+                Ud = ULVsparse.sparse_block_mult_tens(Q[:, :, -rkm:], Uhat,
+                                                      device=dev, mode='T')
+                self.Uulist += [Uu]
+                Uhat = Ud
+                self.tULV += time.time() - tic
+
         if self.compute_device.type == 'cuda':
             torch.cuda.synchronize()
-        self.tCompress = time.time()-tic_compress
+        self.tCompress = time.time() - tic_compress
+
+    # ------------------------------------------------------------------
+    # apply
+    # ------------------------------------------------------------------
 
     @property
     def T(self):
@@ -785,15 +657,23 @@ class HBSMAT:
         view.mode = 'T'
         return view
 
-    def matvec(self,v):
+    def __matmul__(self, v):
+        if self.mode == 'N':
+            return self.matmat(v)
+        elif self.mode == 'T':
+            return self.rmatmat(v)
+        raise ValueError("mode not recognized")
+
+    def matvec(self, v):
         return self._apply(v, transpose=False)
-    def rmatvec(self,v):
+
+    def rmatvec(self, v):
         return self._apply(v, transpose=True)
 
-    def matmat(self,v,chunk=None):
+    def matmat(self, v, chunk=None):
         return self._apply(v, transpose=False, chunk=chunk)
 
-    def rmatmat(self,v,chunk=None):
+    def rmatmat(self, v, chunk=None):
         return self._apply(v, transpose=True, chunk=chunk)
 
     def _apply(self, v, transpose, chunk=None):
@@ -812,7 +692,7 @@ class HBSMAT:
         numpy_input = isinstance(v, np.ndarray)
         was_vector  = (v.ndim == 1)
 
-        V = self._as_local(v)                      # tensor, compute_device, dtype_t
+        V = self._as_local(v)
         if was_vector:
             V = V[:, None]
 
@@ -841,8 +721,7 @@ class HBSMAT:
         """Core HBS apply.  V: 2-D tensor on compute_device, original ordering.
 
         matmat and rmatmat differ only in which basis list runs the upward
-        (restriction) sweep and in the mode used on D, so they share one body;
-        the previous copy-pasted pair is how rmatmat ended up calling matmat.
+        (restriction) sweep and in the mode used on D, so they share one body.
         """
         dmode = 'T' if transpose else 'N'
         down  = self.Umats if transpose else self.Vmats
@@ -850,21 +729,18 @@ class HBSMAT:
 
         VV = [V[self.perm, :]]
         for M in down:
-            VV.append(block_matvec(M, VV[-1], self.device, mode='T'))
-        u = block_matvec(self.Dmats[-1], VV[-1], self.device, mode=dmode)
+            VV.append(block_matvec(M, VV[-1], mode='T'))
+        u = block_matvec(self.Dmats[-1], VV[-1], mode=dmode)
         for lvl in range(len(up) - 1, -1, -1):
-            u = block_matvec(up[lvl], u, self.device) \
-              + block_matvec(self.Dmats[lvl], VV[lvl], self.device, mode=dmode)
+            u = block_matvec(up[lvl], u) \
+              + block_matvec(self.Dmats[lvl], VV[lvl], mode=dmode)
         out = torch.zeros_like(u)
         out[self.perm, :] = u
         return out
 
-    def __matmul__(self, v):
-        if self.mode == 'N':
-            return self.matmat(v)
-        elif self.mode == 'T':
-            return self.rmatmat(v)
-        raise ValueError("mode not recognized")
+    # ------------------------------------------------------------------
+    # tree / perm
+    # ------------------------------------------------------------------
 
     @property
     def tree(self):
@@ -883,7 +759,7 @@ class HBSMAT:
         self._permbox[0] = p
 
     # ------------------------------------------------------------------
-    # Device placement
+    # device placement
     # ------------------------------------------------------------------
 
     def _lists(self, groups):
@@ -938,12 +814,27 @@ class HBSMAT:
         return rec, nD2H
 
     def _group_resident(self, g):
-        # A group with no tensors (e.g. ulv on a compute_ULV=False block)
-        # is vacuously resident -- there is nothing to stage.
+        # A group with no tensors (e.g. ulv on a with_ulv=False block) is
+        # vacuously resident -- there is nothing to stage.
         if not any(len(getattr(self, n)) for n in self._GROUPS[g]):
             return True
         r = self._resident[g]
         return r is not None and _dev_eq(r, self.compute_device)
+
+    def _require_resident(self, what, need_ulv=False):
+        groups = ('core', 'ulv') if need_ulv else ('core',)
+        missing = [g for g in groups if not self._group_resident(g)]
+        if not missing:
+            return
+        if self.strict:
+            raise RuntimeError(
+                f"{what}() on an HBS block whose {'+'.join(missing)} factors "
+                f"are not resident on {self.compute_device} (resident="
+                f"{self._resident}). The block was evicted and nothing staged "
+                "it back. Under strict=True this is an error instead of a "
+                "silent fallback to host arithmetic."
+            )
+        self.prefetch(groups=missing)
 
     def prefetch(self, groups=('core',), non_blocking=True):
         """Stage a device mirror for the named groups. No-op if resident.
@@ -981,9 +872,9 @@ class HBSMAT:
         and the device memory goes straight back to the caching allocator.
         bytesD2H therefore counts real transfers only.
 
-        compute_device is NOT touched.  An evicted block that is applied
-        again must be re-staged, never silently demoted to host arithmetic;
-        that is the whole point of this method existing instead of to('cpu').
+        compute_device is NOT touched.  An evicted block that is applied again
+        must be re-staged, never silently demoted to host arithmetic; that is
+        the whole point of this method existing instead of to('cpu').
         """
         if _dev_eq(self.compute_device, self.home):
             return self
@@ -1003,9 +894,9 @@ class HBSMAT:
     def release_ulv(self):
         """Send the ULV factors home, keep the apply factors on device."""
         return self.evict(groups=('ulv',))
+
     def to(self, device, non_blocking=False):
         device = torch.device(device)
-
         moved = 0
         for g in self._GROUPS:
             for name, i in self._entries(g):
@@ -1017,9 +908,8 @@ class HBSMAT:
             self._host[g]     = None    # relocation: home changes, master is moot
 
         # perm rides with 'core' in _entries, but normalize it here so a
-        # tree-supplied numpy perm becomes a tensor on the target rather
-        # than staying host-side and forcing an implicit H2D on every
-        # fancy-index in matmat/constructHBS.
+        # tree-supplied numpy perm becomes a tensor on the target rather than
+        # staying host-side and forcing an implicit H2D on every fancy-index.
         if not torch.is_tensor(self.perm):
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=device)
@@ -1051,25 +941,22 @@ class HBSMAT:
             tot += self.perm.nbytes
         return tot
 
-    def _require_resident(self, what, need_ulv=False):
-        groups = ('core', 'ulv') if need_ulv else ('core',)
-        missing = [g for g in groups if not self._group_resident(g)]
-        if not missing:
-            return
-        if self.strict:
-            raise RuntimeError(
-                f"{what}() on an HBS block whose {'+'.join(missing)} factors "
-                f"are not resident on {self.compute_device} (resident="
-                f"{self._resident}). The block was evicted and nothing staged "
-                "it back. Under strict=True this is an error instead of a "
-                "silent fallback to host arithmetic."
-            )
-        self.prefetch(groups=missing)
+    # ------------------------------------------------------------------
+    # solve
+    # ------------------------------------------------------------------
 
     def compute_ULV(self):
+        """Factorize an already-compressed block.  constructHBS(with_ulv=True)
+        does this inline and more cheaply, since the level factors are still
+        live there; this is for blocks built with compute_ULV=False.
+
+        The `device` argument was missing in the previous version, so every
+        call raised TypeError before reaching ULVsparse."""
         self._require_resident('compute_ULV')
-        tic=time.time()
-        self.Qlist,self.Wlist,self.Uulist,self.Rlist,self.NNvec = ULVsparse.compute_ULV(self.Umats,self.Dmats,self.Vmats,self.Nbvec)
+        tic = time.time()
+        (self.Qlist, self.Wlist, self.Uulist,
+         self.Rlist, self.NNvec) = ULVsparse.compute_ULV(
+            self.Umats, self.Dmats, self.Vmats, self.Nbvec, self.compute_device)
         self.tULV = time.time() - tic
         self._resident['ulv'] = self.compute_device
         self._host['ulv']     = None    # rebuilt: any old master is stale
@@ -1086,27 +973,22 @@ class HBSMAT:
             A^{-1} = P^T A_p^{-1} P      and      A^{-T} = P^T A_p^{-T} P,
 
         so the gather / scatter around the ULV solve is identical in both
-        modes; only the triangular sweep in ULVsparse.solve differs.  (An
-        earlier version scattered the rhs and gathered the result for 'T',
-        which is wrong for any non-involutive permutation.)
+        modes; only the triangular sweep in ULVsparse.solve differs.
 
         Memory
         ------
-        The ULV sweeps hold roughly 7 rhs-sized tensors at their peak (the
-        permuted rhs, the peeled-off parts per level, and the leaf-level
-        W1*y, V*x and their sum).  For the 2s-column fused solves of the
-        red-black factorization that is the device-memory peak, so columns
-        are processed in chunks of `chunk` (default _SOLVE_CHUNK[0]; 0
-        disables chunking).  The transient then
-        scales with the chunk, not with b.shape[1].  Columns are independent,
-        so the result is identical up to BLAS kernel selection.
+        The ULV sweeps hold roughly 7 rhs-sized tensors at their peak.  For the
+        2s-column fused solves of the red-black factorization that is the
+        device-memory peak, so columns are processed in chunks of `chunk`
+        (default _SOLVE_CHUNK[0]; 0 disables chunking).  Columns are
+        independent, so the result is identical up to BLAS kernel selection.
 
         overwrite_b=True writes the solution into b itself (when b is a torch
         tensor already on compute_device with the factor dtype, or a numpy
         array aliased by a CPU compute device) and returns it, so no output
         buffer is allocated.  Safe because each chunk's columns are gathered
-        (copied) before that chunk's solution is scattered back.  If b had
-        to be converted anyway, the private copy is always reused as output.
+        (copied) before that chunk's solution is scattered back.  If b had to
+        be converted anyway, the private copy is always reused as output.
         """
         if not self.Qlist:
             raise RuntimeError(
@@ -1119,12 +1001,8 @@ class HBSMAT:
 
         self._require_resident('solve', need_ulv=True)
 
-        # ------------------------------------------------------------
-        # Input handling
-        # ------------------------------------------------------------
         input_is_numpy = isinstance(b, np.ndarray)
-        input_is_torch = torch.is_tensor(b)
-        if not (input_is_numpy or input_is_torch):
+        if not (input_is_numpy or torch.is_tensor(b)):
             raise TypeError("b must be either a numpy.ndarray or a torch.Tensor")
         if b.ndim not in (1, 2):
             raise ValueError(f"b must have ndim 1 or 2, got ndim={b.ndim}")
@@ -1148,8 +1026,8 @@ class HBSMAT:
         if nrow != self.perm.shape[0]:
             raise ValueError(f"solve: expected {self.perm.shape[0]} rows, got {nrow}")
 
-        # Output buffer: reuse b_torch when allowed (caller opted in) or when it
-        # is our own copy anyway; otherwise allocate.
+        # Output buffer: reuse b_torch when allowed (caller opted in) or when
+        # it is our own copy anyway; otherwise allocate.
         if overwrite_b or not aliased:
             out = b_torch
         else:
@@ -1159,32 +1037,19 @@ class HBSMAT:
         if not c or c > ncol:
             c = max(ncol, 1)
 
-        # ------------------------------------------------------------
-        # Solve:  u = P^T ( ULV^{-1} ( P b ) ),  one column chunk at a time
-        # ------------------------------------------------------------
+        # u = P^T ( ULV^{-1} ( P b ) ), one column chunk at a time
         for j0 in range(0, ncol, c):
             j1 = min(j0 + c, ncol)
             bperm = b_torch[self.perm, j0:j1]      # advanced-index gather: a copy
             uhat = ULVsparse.solve(
-                self.Umats,
-                self.Dmats,
-                self.Qlist,
-                self.Wlist,
-                self.Uulist,
-                self.Rlist,
-                self.NNvec,
-                bperm,
-                device=self.compute_device,
-                mode=mode,
+                self.Umats, self.Dmats, self.Qlist, self.Wlist, self.Uulist,
+                self.Rlist, self.NNvec, bperm, device=self.compute_device, mode=mode,
                 Vmats=self.Vmats,
             )
             del bperm                              # free before the scatter
             out[self.perm, j0:j1] = uhat           # columns j0:j1 already read
             del uhat
 
-        # ------------------------------------------------------------
-        # Restore shape and array type
-        # ------------------------------------------------------------
         u = out[:, 0] if was_vector else out
         if input_is_numpy:
             return u.detach().cpu().numpy()

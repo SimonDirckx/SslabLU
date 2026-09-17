@@ -26,7 +26,7 @@ import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
 from scipy.sparse.linalg import LinearOperator
 import matAssembly.HBS.HBStorch as HBStorch
-HBStorch._UV_MODE[0] = 'qr'
+
 
 def dense_to_linop(A):
     A = np.array(A)
@@ -60,7 +60,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 50.
+kh = 100.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -146,11 +146,9 @@ for indp in range(len(pvec)):
       " balanced:", tree.nleaves == 2**(tree.nlevels-1))
     print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
     print("leaf exact?        ", len(P)//tree.nleaves <= rk)
-    strat = rkStrat.linear(256,40,skip_first_level=False)
+    strat = rkStrat.linear(256,20,skip_first_level=False)
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=50)
-    import matAssembly.HBS.HBStorch as HBStorch
-    rb_solver.fast = False          # both switch to the SVD of L
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100)
     #rb_solver._nsamples = lambda rk: 1334
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
@@ -176,16 +174,33 @@ for indp in range(len(pvec)):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
     tic = time.time()
-    v = np.random.standard_normal(size=(Sinv_HBS_rb.shape[0],))
-    u = Sinv_HBS_rb@v
+    v = np.random.standard_normal(Ntot)
+    b = Stot @ v
+    u, info = gmres(Stot, b, rtol=1e-14, M=Sinv_HBS_rb, maxiter=200, restart=50)
+    print("kappa lower bound:", np.linalg.norm(u-v)/np.linalg.norm(v) / 1e-14)
+    print("artificial solution error: ",np.linalg.norm(u-v)/np.linalg.norm(v))
     print("RB solver time = ",time.time()-tic)
     tot = rb_solver.footprint()
     gInfo = gmres_info()
-    stol = 1e-8
-
+    stol = 1e-14
+    tic = time.time()
     if Version(scipy.__version__)>=Version("1.14"):
         uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
     else:
         uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-
-
+    print("elapsed time gmres = ",time.time()-tic)
+    print("pGMRES iters rb          = ", gInfo.niter)
+    nc = OMS.nc
+    for slabInd in range(len(dSlabs)):
+        geom    = np.array(dSlabs[slabInd])
+        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
+        solver  = oms.solverWrap.solverWrapper(opts)
+        solver.construct(geom,Helm,False,False)
+        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+        XXc = XXi[Ic,:]
+        gc = bc(XXc)
+        gc_hat = u[slabInd*nc:(slabInd+1)*nc]
+        err_loc = np.linalg.norm(gc_hat-gc)/np.linalg.norm(gc)
+        print("===================LOCAL ERR===================")
+        print("err ghat = ",err_loc)
+        print("===============================================")

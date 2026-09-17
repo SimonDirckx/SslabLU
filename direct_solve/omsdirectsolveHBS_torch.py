@@ -1073,10 +1073,22 @@ class RedBlackSolverHBS(DirectSolver):
         dev = self.compute_device
 
         def _prep(X):
-            if torch.is_tensor(X):
-                return X.to(device=dev, dtype=torch.float64,
-                            non_blocking=True).contiguous()
-            return np.ascontiguousarray(X)
+            # X may be boxed (a one-element list): the caller has given up its
+            # reference so that constructHBS can free the tensor as soon as it
+            # has permuted it.  Convert in place and hand the box on, so the
+            # device copy made here is handed over too rather than being
+            # pinned by this frame for the whole construction.
+            box = isinstance(X, list)
+            v   = X[0] if box else X
+            if torch.is_tensor(v):
+                v = v.to(device=dev, dtype=torch.float64,
+                         non_blocking=True).contiguous()
+            else:
+                v = np.ascontiguousarray(v)
+            if box:
+                X[0] = v
+                return X
+            return v
 
         h = HBSnew.HBSMAT(device=dev, tree=self.tree, quad=self.quad)
         h.construct(rk,
@@ -1452,6 +1464,39 @@ class RedBlackSolverHBS(DirectSolver):
                 op.evict()
         Xm.pop(idx,None)
         Xp.pop(idx,None)
+    def _release_early(self, *ops):
+        """Spill operators that still have a consumer later in the level.
+
+        _retire handles operators that are finished for good (i-1 and i, plus
+        their cached solves).  This is the other case: an operator node i is
+        done with, but which node i+2 will ask for again.  It goes home to its
+        host master now and is staged back then -- a transfer, not a
+        recomputation, and small against the 50 s of compression it makes room
+        for.
+
+        Granularity matters at the coarse levels.  At nSlabs=4 a block is
+        4.4 GB and a ULV-carrying diagonal 8.7 GB, so the working set has to be
+        cut per operator and per phase rather than per node:
+
+          * T_i goes as soon as Y_B/Z_B are formed -- it is used nowhere else;
+          * T_{kR}, T_{kL} go the moment their adjoint solve has produced
+            t^+/t^-, before the two applies that consume it;
+          * S^+_i goes at the end of the has_right branch, since the has_left
+            branch only ever touches S^-_i;
+          * each neighbour's A/C pair goes at the end of its own branch, so
+            the kL branch stages into the space the kR branch gave up.
+
+        Never touches Xm/Xp: those are the cached solves node i+2 reuses, and
+        popping them would make the solve run twice, which is the saving the
+        fused builder exists for.
+
+        No-op under strict_residency, where the re-stage would raise instead of
+        prefetching -- that being the point of the flag.
+        """
+        if self.strict_residency:
+            return
+        self._release(*ops)
+
     def _release(self, *ops):
         """Spill operators back to host once their last consumer in this
         sweep has run.  The solve touches every block in the tree, so without
@@ -1577,33 +1622,17 @@ class RedBlackSolverHBS(DirectSolver):
                 Pm[k] = self._sv(T_hbs[k], self._ap(SiM[k], W))
                 Pp[k] = self._sv(T_hbs[k], self._ap(SiP[k], W))
 
-        def _refs(i, has_left, has_right, kL, kR, A_is_zero, C_is_zero):
-            """Reference actions of B_i, A_i, C_i on the probes.
-
-            Mirrors the Y_*/Z_* expressions above term for term, so the check
-            measures compression error and not a re-derivation of the algebra.
-            """
-            fB = W.clone() if _is_id(T[i]) else self._ap(T[i], W)
-            aB = Q.clone() if _is_id(T[i]) else self._apT(T[i], Q)
-            fA = fC = aA = aC = None
-            if has_right:
-                _ensure_P(kR)
-                fB = fB - self._ap(SiP[i], Pm[kR])
-                # computed even when C_is_zero: that is the check
-                fC = -self._ap(SiP[i], Pp[kR])
-                rp = self._apT(SiP[i], Q)
-                tp = rp if _is_id(T_hbs[kR]) else self._sv(T_hbs[kR], rp, mode='T')
-                aB = aB - self._apT(SiM[kR], tp)
-                aC = -self._apT(SiP[kR], tp)   # also computed when C_is_zero
-            if has_left:
-                _ensure_P(kL)
-                fB = fB - self._ap(SiM[i], Pp[kL])
-                fA = -self._ap(SiM[i], Pm[kL])
-                rm = self._apT(SiM[i], Q)
-                tm = rm if _is_id(T_hbs[kL]) else self._sv(T_hbs[kL], rm, mode='T')
-                aB = aB - self._apT(SiP[kL], tm)
-                aA = -self._apT(SiM[kL], tm)
-            return {'B': (fB, aB), 'A': (fA, aA), 'C': (fC, aC)}
+        def _refs_init(i):
+            """Reference action of T_i alone; the neighbour contributions are
+            accumulated into this inside the has_right / has_left branches,
+            while the operators they need are still staged.  Each entry is
+            [forward, adjoint].  Mirrors the Y_*/Z_* expressions term for
+            term, so the check measures compression error and not a
+            re-derivation of the algebra."""
+            return {'B': [W.clone() if _is_id(T[i]) else self._ap(T[i], W),
+                          Q.clone() if _is_id(T[i]) else self._apT(T[i], Q)],
+                    'A': [None, None],
+                    'C': [None, None]}
 
         dbg_true = self.debug_true_inverse and dbg
 
@@ -1663,6 +1692,13 @@ class RedBlackSolverHBS(DirectSolver):
                 Y_B = self._ap(T[i], Om)
                 Z_B = self._apT(T[i], Psi)
             Y_A = Y_C = Z_A = Z_C = None
+            refs = _refs_init(i) if dbg else None
+
+            # T_i appears in exactly one place -- the two applies above (and
+            # the probe reference just built from them).  Neither branch
+            # touches it, so it need not be resident for the next 50 s.
+            if not dbg_true:
+                self._release_early(T[i], T_hbs[i])
 
             # Each former fused apply on cat([X1, X2]) is now two plain
             # applies.  matmat/rmatmat chunk every call at _MATMAT_CHUNK
@@ -1670,9 +1706,6 @@ class RedBlackSolverHBS(DirectSolver):
             # (m, 2s) concatenation plus an (m, 2s) output held at once.
 
             if has_right:
-                for op in (SiM[kR], SiP[kR]):
-                    if hasattr(op, 'release_ulv'):
-                        op.release_ulv()
                 _ensure_X(kR)
 
                 # forward: S^+_i Xm (B term) and S^+_i Xp (C term)
@@ -1688,15 +1721,47 @@ class RedBlackSolverHBS(DirectSolver):
                 else:
                     tp = _sv_overwrite(T_hbs[kR], rhs_p, mode='T')
                 del rhs_p
+
+                if dbg:
+                    # Probe references for this side, built while kR is staged.
+                    # fC/aC are computed even when C_is_zero: that is the check
+                    # on the zero-slot analysis.  Hoisted above the Z_* applies
+                    # so that every use of T_hbs[kR] at this node is behind us
+                    # before it is released.
+                    _ensure_P(kR)
+                    refs['B'][0] = refs['B'][0] - self._ap(SiP[i], Pm[kR])
+                    refs['C'][0] = -self._ap(SiP[i], Pp[kR])
+                    rp = self._apT(SiP[i], Q)
+                    tpr = rp if _is_id(T_hbs[kR]) else self._sv(T_hbs[kR], rp,
+                                                                mode='T')
+                    refs['B'][1] = refs['B'][1] - self._apT(SiM[kR], tpr)
+                    refs['C'][1] = -self._apT(SiP[kR], tpr)
+                    del rp, tpr
+
+                # The inverse of T_{kR} has done its work; with its ULV that is
+                # 8.7 GB at nSlabs=4, and the two applies below are where the
+                # high-water mark sits.
+                if not dbg_true:
+                    self._release_early(T[kR], T_hbs[kR])
+
                 Z_B = _sub(Z_B, self._apT(SiM[kR], tp))
                 if not C_is_zero:
                     Z_C = _spill(self._apT(SiP[kR], tp).neg_())
                 del tp
 
+                # kR's A/C pair must go before the has_left branch stages kL,
+                # not at the retire point below: holding both neighbour groups
+                # at once is 25 GB of operators at nSlabs=8.  S^+_i goes with
+                # them -- the has_left branch only ever touches S^-_i.
+                if not dbg_true:
+                    self._release_early(SiM[kR], SiP[kR], SiP[i])
+                    if not cyclic and i + 2 >= nSlabs:
+                        # no node i+2 to reuse them: this is the last retained
+                        # node, so its right-hand solves have no second consumer
+                        Xm.pop(kR, None)
+                        Xp.pop(kR, None)
+
             if has_left:
-                for op in (SiP[kL], SiM[kL]):
-                    if hasattr(op, 'release_ulv'):
-                        op.release_ulv()
                 _ensure_X(kL)
 
                 # forward: S^-_i Xp (B term) and S^-_i Xm (A term)
@@ -1711,9 +1776,27 @@ class RedBlackSolverHBS(DirectSolver):
                 else:
                     tm = _sv_overwrite(T_hbs[kL], rhs_m, mode='T')
                 del rhs_m
+
+                if dbg:
+                    _ensure_P(kL)
+                    refs['B'][0] = refs['B'][0] - self._ap(SiM[i], Pp[kL])
+                    refs['A'][0] = -self._ap(SiM[i], Pm[kL])
+                    rm = self._apT(SiM[i], Q)
+                    tmr = rm if _is_id(T_hbs[kL]) else self._sv(T_hbs[kL], rm,
+                                                                mode='T')
+                    refs['B'][1] = refs['B'][1] - self._apT(SiP[kL], tmr)
+                    refs['A'][1] = -self._apT(SiM[kL], tmr)
+                    del rm, tmr
+
+                if not dbg_true:
+                    self._release_early(T[kL], T_hbs[kL])
+
                 Z_B = _sub(Z_B, self._apT(SiP[kL], tm))
                 Z_A = _spill(self._apT(SiM[kL], tm).neg_())
                 del tm
+
+                if not dbg_true:
+                    self._release_early(SiM[kL], SiP[kL])
 
             # Guard the degenerate case where neither branch ran: Y_B/Z_B
             # would still alias Om/Psi, which construct would then receive as
@@ -1723,11 +1806,8 @@ class RedBlackSolverHBS(DirectSolver):
             if Z_B is Psi:
                 Z_B = Psi.clone()
 
-            # Probe references must be built while the neighbour operators
-            # are still staged, i.e. before the retire below.  The comparison
-            # happens after each block is constructed.
-            refs = _refs(i, has_left, has_right, kL, kR,
-                         A_is_zero, C_is_zero) if dbg else None
+            # Probe references were accumulated inside the branches above,
+            # while each side's operators were still staged.
 
             # Retire BEFORE compressing, not after.  Everything nodes i-1 and
             # i contribute has now been sampled into Y_*/Z_*; the three
@@ -1745,8 +1825,15 @@ class RedBlackSolverHBS(DirectSolver):
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
 
+            # Hand the B samples over: boxed, plus the local names dropped, so
+            # constructHBS holds the only reference and can free each one the
+            # moment it has been permuted.  Om/Psi are NOT handed over -- the
+            # A and C compressions below read them again.
+            Y_box, Z_box = [Y_B], [Z_B]
+            del Y_B, Z_B
+
             if need_ULV or self.compress_diag or not self.skip_unused_ulv:
-                B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_B, Z_B,
+                B_hbs = self._hbs_from_samples(rk, Om, Psi, Y_box, Z_box,
                                                compute_ULV=need_ULV,
                                                label=f"B[{i}] (nSlabs={nSlabs})",
                                                spill=not dbg)
@@ -1768,6 +1855,11 @@ class RedBlackSolverHBS(DirectSolver):
             if not cyclic and dbg_true:
                 self._retire(i-1,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
                 self._retire(i  ,SiM,SiP,T,T_hbs,Xm,Xp,nSlabs)
+                # dbg_true kept both neighbours alive through the B
+                # compression; release the right one now, since _retire only
+                # reaches i-1 and i.
+                if has_right:
+                    self._release_early(SiM[kR], SiP[kR], T[kR], T_hbs[kR])
             T_hbs_new.append(B_hbs)
 
             if self.compress_diag:
@@ -1779,12 +1871,16 @@ class RedBlackSolverHBS(DirectSolver):
                 tpo = T_hbs[kR] if has_right else None
                 B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
 
-            del Y_B, Z_B
+            del Y_box, Z_box
 
             # A_i and C_i become SiM / SiP one level down and are only ever
             # applied, never solved with -- no ULV, unconditionally.
+            # Handed over like B's: these arrive spilled to host, so the
+            # device copy _prep makes is the one that matters.
+            YA_box, ZA_box = [Y_A], [Z_A]
+            del Y_A, Z_A
             A_i.append(zero_op(m, dtype) if A_is_zero
-                       else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
+                       else self._hbs_from_samples(rk, Om, Psi, YA_box, ZA_box,
                                                    compute_ULV=False,
                                                    label=f"A[{i}] (nSlabs={nSlabs})",
                                                    spill=not dbg))
@@ -1792,9 +1888,11 @@ class RedBlackSolverHBS(DirectSolver):
                 self._check_block(A_i[-1], 'A', nSlabs, i, rk, W, Q, *refs['A'])
                 if hasattr(A_i[-1], 'evict'):
                     A_i[-1].evict()
-            del Y_A, Z_A
+            del YA_box, ZA_box
+            YC_box, ZC_box = [Y_C], [Z_C]
+            del Y_C, Z_C
             C_i.append(zero_op(m, dtype) if C_is_zero
-                       else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
+                       else self._hbs_from_samples(rk, Om, Psi, YC_box, ZC_box,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})",
                                                    spill=not dbg))
@@ -1802,7 +1900,7 @@ class RedBlackSolverHBS(DirectSolver):
                 self._check_block(C_i[-1], 'C', nSlabs, i, rk, W, Q, *refs['C'])
                 if hasattr(C_i[-1], 'evict'):
                     C_i[-1].evict()
-            del Y_C, Z_C
+            del YC_box, ZC_box
             if dbg:
                 del refs
 
