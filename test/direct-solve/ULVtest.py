@@ -60,7 +60,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 100.
+kh = 99.7
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -101,9 +101,9 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 17
+N = 33
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([8],dtype = np.int64)
+pvec = np.array([10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -119,13 +119,13 @@ for indp in range(len(pvec)):
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
     a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(512,256,ndim=3)
+    assembler = mA.rkHMatAssembler(800,500,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=0)
+    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=1)
     print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=0)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=1)
     niter = 0
     print("type SrkList  = ",type(S_rk_list))
     print("len SrkList  = ",len(S_rk_list))
@@ -146,7 +146,7 @@ for indp in range(len(pvec)):
       " balanced:", tree.nleaves == 2**(tree.nlevels-1))
     print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
     print("leaf exact?        ", len(P)//tree.nleaves <= rk)
-    strat = rkStrat.linear(256,20,skip_first_level=False)
+    strat = rkStrat.constant(400)
     tic = time.time()
     rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100)
     #rb_solver._nsamples = lambda rk: 1334
@@ -199,7 +199,7 @@ for indp in range(len(pvec)):
         Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
         XXc = XXi[Ic,:]
         gc = bc(XXc)
-        gc_hat = u[slabInd*nc:(slabInd+1)*nc]
+        gc_hat = uhat[slabInd*nc:(slabInd+1)*nc]
         err_loc = np.linalg.norm(gc_hat-gc)/np.linalg.norm(gc)
         print("===================LOCAL ERR===================")
         print("err ghat = ",err_loc)

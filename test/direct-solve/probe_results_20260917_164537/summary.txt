@@ -1,0 +1,6 @@
+run_probes.sh  Thu Sep 17 04:45:37 PM CDT 2026
+kh=99.7  N=33  p=10  leaf=0.03125  leaf_size=800  reduced_gpu=1
+
+=== (A) RIGHT ERR vs HBS rank, kh=99.7, discretization fixed ===
+    rank       RIGHT_ERR        LEFT_ERR
+      32  (rc=0, see sweep_rank32.log)               -
