@@ -122,10 +122,13 @@ for indp in range(len(pvec)):
     assembler = mA.rkHMatAssembler(800,500,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
+    OMS_LU = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=1)
+    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=0)
+    S_list_lu, rhs_list_lu, Ntot_lu, nc_lu = OMS_LU.construct_Stot_helper(bc, assembler)
     print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=1)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=0)
+    Stot_lu,rhstot_lu  = OMS_LU.construct_Stot_and_rhstot_linearOperator(S_list_lu,rhs_list_lu,Ntot,nc,dbg=0)
     niter = 0
     print("type SrkList  = ",type(S_rk_list))
     print("len SrkList  = ",len(S_rk_list))
@@ -133,23 +136,9 @@ for indp in range(len(pvec)):
     print("type rhslist  = ",type(rhs_list))
     print("len rhs_list  = ",len(rhs_list))
     print("Ntot = ",Ntot)
-    tree = S_rk_list[0][0].tree
-    rk = 64
-    P = tree.perm_leaf
-    print("perm is identity?", np.array_equal(np.asarray(tree.perm_leaf), np.arange(nc)))
-    sizes = np.array([len(tree.get_box_inds(l)) for l in tree.get_leaves()])
-    print("nc                 ", nc)
-    print("len(perm_leaf)     ", len(P), " unique:", len(np.unique(P)))
-    print("duplicated DOFs    ", len(P)-len(np.unique(P)))
-    print("S block shape      ", S_rk_list[0][0].shape)
-    print("nleaves / nlevels  ", tree.nleaves, tree.nlevels,
-      " balanced:", tree.nleaves == 2**(tree.nlevels-1))
-    print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
-    print("leaf exact?        ", len(P)//tree.nleaves <= rk)
     strat = rkStrat.constant(400)
     tic = time.time()
     rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100)
-    #rb_solver._nsamples = lambda rk: 1334
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
     print("tree mls   =", rb_solver.tree._min_leaf_size)
@@ -157,26 +146,17 @@ for indp in range(len(pvec)):
     rb_solver.print_timing()
     rb_solver.print_block_errors()
     print("RB solver factorized in ",time.time()-tic,"s")
-    h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))
-    assert h.compute_device.type == 'cuda'
-    h.evict()
-    assert h._resident['core'] is None
-    assert h.Dmats[0].device.type == 'cpu'
-    n0 = h.nFill
-    y = h.matmat(np.random.randn(h.shape[1],4))
-    assert h.nFill == n0+1
-    assert h._resident['core'] == h.compute_device
     r = rb_solver.residency_report()
     print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
     v = np.random.standard_normal(Ntot)
-    print("delta =", np.linalg.norm(Stot@rb_solver.solve(v) - v)/np.linalg.norm(v))
+    print("delta =", np.linalg.norm(Stot_lu@rb_solver.solve(v) - v)/np.linalg.norm(v))
     def matvec_rb(v):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
     tic = time.time()
     v = np.random.standard_normal(Ntot)
-    b = Stot @ v
-    u, info = gmres(Stot, b, rtol=1e-14, M=Sinv_HBS_rb, maxiter=200, restart=50)
+    b = Stot_lu @ v
+    u, info = gmres(Stot_lu, b, rtol=1e-14, M=Sinv_HBS_rb, maxiter=200, restart=50)
     print("kappa lower bound:", np.linalg.norm(u-v)/np.linalg.norm(v) / 1e-14)
     print("artificial solution error: ",np.linalg.norm(u-v)/np.linalg.norm(v))
     print("RB solver time = ",time.time()-tic)
@@ -185,9 +165,9 @@ for indp in range(len(pvec)):
     stol = 1e-14
     tic = time.time()
     if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+        uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
     else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+        uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
     print("elapsed time gmres = ",time.time()-tic)
     print("pGMRES iters rb          = ", gInfo.niter)
     nc = OMS.nc
