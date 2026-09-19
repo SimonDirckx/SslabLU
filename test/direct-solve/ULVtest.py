@@ -60,7 +60,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 99.7
+kh = 100.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -103,7 +103,7 @@ def bc(p):
 
 N = 33
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([10],dtype = np.int64)
+pvec = np.array([8],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -118,8 +118,8 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(800,500,ndim=3)
+    a = np.array([H/2,1/64,1/64])
+    assembler = mA.rkHMatAssembler(512,300,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
     OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
     OMS_LU = oms.oms_lu(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
@@ -136,7 +136,7 @@ for indp in range(len(pvec)):
     print("type rhslist  = ",type(rhs_list))
     print("len rhs_list  = ",len(rhs_list))
     print("Ntot = ",Ntot)
-    strat = rkStrat.constant(400)
+    strat = rkStrat.constant(300)
     tic = time.time()
     rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100)
     print("rb rk      =", rb_solver.rk)
@@ -149,25 +149,33 @@ for indp in range(len(pvec)):
     r = rb_solver.residency_report()
     print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
     v = np.random.standard_normal(Ntot)
-    print("delta =", np.linalg.norm(Stot_lu@rb_solver.solve(v) - v)/np.linalg.norm(v))
+    rsv = rb_solver.solve(v)
+    tic = time.time()
+    vprime = Stot_lu@rsv
+    print("Stot_lu apply time = ",time.time()-tic)
+    print("delta =", np.linalg.norm(vprime - v)/np.linalg.norm(v))
     def matvec_rb(v):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
     tic = time.time()
     v = np.random.standard_normal(Ntot)
     b = Stot_lu @ v
-    u, info = gmres(Stot_lu, b, rtol=1e-14, M=Sinv_HBS_rb, maxiter=200, restart=50)
-    print("kappa lower bound:", np.linalg.norm(u-v)/np.linalg.norm(v) / 1e-14)
+    u, info = gmres(Stot_lu, b, rtol=1e-6, M=Sinv_HBS_rb, maxiter=20, restart=20)
+    print("kappa lower bound:", np.linalg.norm(u-v)/np.linalg.norm(v) / 1e-6)
     print("artificial solution error: ",np.linalg.norm(u-v)/np.linalg.norm(v))
     print("RB solver time = ",time.time()-tic)
+    v = np.random.standard_normal(Ntot)
+    tic = time.time()
+    b = Sinv_HBS_rb@v
+    print("precond apply time = ",time.time()-tic)
     tot = rb_solver.footprint()
     gInfo = gmres_info()
-    stol = 1e-14
+    stol = 1e-8
     tic = time.time()
     if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+        uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=20,restart=20,M=Sinv_HBS_rb)
     else:
-        uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+        uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=20,restart=20,M=Sinv_HBS_rb)
     print("elapsed time gmres = ",time.time()-tic)
     print("pGMRES iters rb          = ", gInfo.niter)
     nc = OMS.nc

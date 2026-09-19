@@ -9,6 +9,11 @@ Both share bookkeeping and the global S-operator assembly through _omsBase.
 
 Changes relative to the original are tagged  # FIX:  (correctness) and  # OPT:
 (performance / hygiene).
+
+oms_lu uses a FUSED interface operator per slab: the left and right source
+faces share one local solve,  (A^{-1} (B_l v_l + B_r v_r))[Ic],  instead of
+two separate solves.  This halves the number of local solves per application
+of I + S and does not require stiff_mat_const.
 """
 
 from __future__ import annotations
@@ -783,20 +788,37 @@ class oms_lu(_omsBase):
 
     # ------------------------------------------------------------------ #
 
-    def compute_stmaps(self, Il, Ic, Ir, XXi, XXb, solver, pts_l=None, pts_r=None):
-        A_solver = solver.solver_ii
+    @staticmethod
+    def _coupling(solver):
+        """(Bcols, nrows) of the local solve, by problem type."""
         ptype = solver.opts.problem_type
-
         if ptype == "Dirichlet":
-            Bcols = solver.Aib
-            nrows = len(solver.Ii)
-        elif ptype == "mixed":
-            Bcols = solver.E
-            nrows = len(solver.Ii) + len(solver.JN)
-        else:
-            raise NameError(
-                "solver problem type not recognized: must be 'Dirichlet' or 'mixed'."
-            )
+            return solver.Aib, len(solver.Ii)
+        if ptype == "mixed":
+            return solver.E, len(solver.Ii) + len(solver.JN)
+        raise NameError(
+            "solver problem type not recognized: must be 'Dirichlet' or 'mixed'."
+        )
+
+    def _fused_linop(self, Ic, J, solver):
+        """
+        OPT: one operator per slab,  x |-> (A^{-1} B[:, J] x)[Ic],  where J is
+             the concatenation of the slab's source faces in the order of
+             glob_source_dofs (left, then right).  Because
+                 B[:, [Il, Ir]] @ [v_l; v_r] = B_l v_l + B_r v_r,
+             a single local solve serves both faces.
+        """
+        Bcols, nrows = self._coupling(solver)
+        return self._make_st_linop(Ic, J, Bcols, solver.solver_ii, nrows)
+
+    def compute_stmaps(self, Il, Ic, Ir, XXi, XXb, solver, pts_l=None, pts_r=None):
+        """
+        Separate left/right source-target maps.  No longer used by
+        construct_Stot_helper (see _fused_linop); kept for callers that need
+        per-face stMap objects, e.g. for compression.
+        """
+        A_solver = solver.solver_ii
+        Bcols, nrows = self._coupling(solver)
 
         Linop_r = self._make_st_linop(Ic, Ir, Bcols, A_solver, nrows)
         Linop_l = self._make_st_linop(Ic, Il, Bcols, A_solver, nrows)
@@ -836,7 +858,15 @@ class oms_lu(_omsBase):
     def construct_Stot_helper(self, bc, reduced_load=None, dbg=0):
         """
         Construct S_lu_list and the other helpers needed for the S operator.
+
+        S_lu_list[i] is a one-element list [S_i]: the fused operator of slab i,
+        acting on the concatenation of its source blocks glob_source_dofs[i].
         """
+        # OPT: calling this twice used to keep a second full set of local
+        #      solvers (factorizations) alive through self.solvers.
+        self.solvers = []
+        self.idx = []
+        self.ncs = []
         connectivity = self.connectivity
         slabs = self.slabList
 
@@ -873,33 +903,42 @@ class oms_lu(_omsBase):
             glob_target_dofs.append(range(startCentral, startCentral + nc))
             startCentral += nc
 
+            L, R = connectivity[slabInd][0], connectivity[slabInd][1]
+            # FIX: same guard as in oms -- geometric faces and connectivity
+            #      must agree, or the operator is applied to the wrong dofs.
+            if (len(Il) > 0) != (L >= 0):
+                raise ValueError(
+                    "slab %d: left connectivity says %s but %d left-face dofs "
+                    "were found" % (slabInd, L, len(Il)))
+            if (len(Ir) > 0) != (R >= 0):
+                raise ValueError(
+                    "slab %d: right connectivity says %s but %d right-face dofs "
+                    "were found" % (slabInd, R, len(Ir)))
+
+            # Source faces in glob_source_dofs order (see compute_global_dofs).
+            if L < 0:
+                J, tag = np.asarray(Ir), "r"
+            elif R < 0:
+                J, tag = np.asarray(Il), "l"
+            else:
+                J, tag = np.concatenate([np.asarray(Il), np.asarray(Ir)]), "lr"
+
             # Under stiff_mat_const identical (Ic, J) pairs give the identical
             # operator, so build each distinct one once.
-            key_l = self._block_key(Ic, Il, 'l') if self.stiff_mat_const else None
-            key_r = self._block_key(Ic, Ir, 'r') if self.stiff_mat_const else None
-            if (key_l is not None and key_l in self._block_cache
-                    and key_r in self._block_cache):
-                A_l = self._block_cache[key_l][0]
-                A_r = self._block_cache[key_r][0]
+            key = self._block_key(Ic, J, tag) if self.stiff_mat_const else None
+            if key is not None and key in self._block_cache:
+                S_i = self._block_cache[key][0]
                 self._n_reused += 1
             else:
-                st_l, st_r = self.compute_stmaps(Il, Ic, Ir, XXi, XXb, solver,
-                                                 pts_l=pts_l, pts_r=pts_r)
-                A_l, A_r = st_l.A, st_r.A
+                S_i = self._fused_linop(Ic, J, solver)
                 self._n_assembled += 1
-                if key_l is not None:
-                    self._block_cache[key_l] = (A_l, float("nan"))
-                    self._block_cache[key_r] = (A_r, float("nan"))
+                if key is not None:
+                    self._block_cache[key] = (S_i, float("nan"))
 
             rhs_list.append(
                 self._local_rhs(solver, bc, Ic, Igb, XXb, reduced_load, slabInd))
 
-            if connectivity[slabInd][0] < 0:
-                S_lu_list.append([A_r])
-            elif connectivity[slabInd][1] < 0:
-                S_lu_list.append([A_l])
-            else:
-                S_lu_list.append([A_l, A_r])
+            S_lu_list.append([S_i])
 
             if dbg > 0:
                 print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
@@ -915,6 +954,78 @@ class oms_lu(_omsBase):
         self.compute_global_dofs()
 
         return S_lu_list, rhs_list, Ntot, self.ncs
+
+    # ------------------------------------------------------------------ #
+
+    def construct_Stot_and_rhstot_linearOperator(
+        self, S_list, rhs_list, Ntot, nc=None, dbg=0
+    ):
+        """
+        Global I + S for fused per-slab operators: slab i's operator acts on
+        the concatenation of v over glob_source_dofs[i].
+
+        Lists in the old two-block format ([S_l, S_r] per interior slab) are
+        detected and handed to the base implementation unchanged.
+        """
+        tgt = [_as_index(b) for b in self.glob_target_dofs]
+        src = [[_as_index(b) for b in row] for row in self.glob_source_dofs]
+
+        def _blen(b):
+            return (b.stop - b.start) if isinstance(b, slice) else len(b)
+
+        lens = [[_blen(b) for b in row] for row in src]
+        fused = all(
+            len(row) == 1 and row[0].shape[1] == sum(lens[i])
+            for i, row in enumerate(S_list)
+        )
+        if not fused:
+            return super().construct_Stot_and_rhstot_linearOperator(
+                S_list, rhs_list, Ntot, nc, dbg)
+
+        dts = [_dtype_of(np.asarray(r)) for r in rhs_list]
+        dts += [_dtype_of(row[0]) for row in S_list]
+        dtype = np.result_type(*dts)
+
+        rhstot = np.zeros(Ntot, dtype=dtype)
+        for i, rhs in enumerate(rhs_list):
+            rhstot[tgt[i]] = rhs
+
+        ops = [row[0] for row in S_list]
+
+        def smatmat(v, transpose=False):
+            v_in = np.asarray(v)
+            oneD = v_in.ndim == 1
+            v_tmp = v_in[:, np.newaxis] if oneD else v_in
+
+            result = v_tmp.astype(np.result_type(v_tmp.dtype, dtype), copy=True)
+
+            if not transpose:
+                for i, ti in enumerate(tgt):
+                    srcs = src[i]
+                    if len(srcs) == 1:
+                        x = v_tmp[srcs[0]]
+                    else:
+                        x = np.concatenate([v_tmp[sj] for sj in srcs], axis=0)
+                    result[ti] += ops[i] @ x          # ONE local solve
+            else:
+                for i, ti in enumerate(tgt):
+                    y = ops[i].T @ v_tmp[ti]          # ONE local solve
+                    off = 0
+                    for sj, n in zip(src[i], lens[i]):
+                        result[sj] += y[off:off + n]
+                        off += n
+
+            return result.ravel() if oneD else result
+
+        Linop = LinearOperator(
+            shape=(Ntot, Ntot),
+            dtype=dtype,
+            matvec=smatmat,
+            rmatvec=lambda v: smatmat(v, transpose=True),
+            matmat=smatmat,
+            rmatmat=lambda v: smatmat(v, transpose=True),
+        )
+        return Linop, rhstot
 
     # ------------------------------------------------------------------ #
 
