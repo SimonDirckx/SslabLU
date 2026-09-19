@@ -26,6 +26,55 @@ import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
 from scipy.sparse.linalg import LinearOperator
 import matAssembly.HBS.HBStorch as HBStorch
+from torch.overrides import TorchFunctionMode
+from concurrent.futures import ThreadPoolExecutor
+
+#### SAFETY FOR THE FIRST MULTI-GPU RUN
+# 1) Host masters in ordinary (pageable) memory: rules out page-locked memory
+#    exhaustion.  Slower transfers; irrelevant at this size.
+HBStorch._PIN_HOST[0] = False
+
+# 2) Tripwire: raise, before it happens, on any torch call from any module
+#    that would move data between two GPUs.  Torch function modes are per
+#    thread, so it is also entered in each of the solver's GPU worker threads.
+def _cuda_devs(xs):
+    """Every CUDA device a call touches: its tensors' and its device arguments."""
+    out = set()
+    for a in xs:
+        if isinstance(a, (list, tuple)):
+            out |= _cuda_devs(a)
+        elif torch.is_tensor(a):
+            if a.is_cuda:
+                out.add(a.device)
+        elif isinstance(a, (str, torch.device)) and str(a).startswith('cuda'):
+            d = torch.device(a)
+            out.add(d if d.index is not None else torch.device('cuda', torch.cuda.current_device()))
+    return out
+
+class NoPeerCopy(TorchFunctionMode):
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.device:        # constructing a device moves nothing
+            return func(*args, **kwargs)
+        devs = _cuda_devs([*args, *kwargs.values()])
+        if func is torch.Tensor.cuda:
+            d = args[1] if len(args) > 1 else kwargs.get('device')
+            devs |= _cuda_devs([torch.device('cuda', d) if isinstance(d, int) else (d or 'cuda')])
+        if len(devs) > 1:
+            raise RuntimeError(f"tripwire: GPU-to-GPU data movement blocked in "
+                               f"{getattr(func, '__name__', func)} {sorted(map(str, devs))}")
+        return func(*args, **kwargs)
+
+class _TripwireExecutor(ThreadPoolExecutor):
+    def __init__(self, max_workers, initializer=None, initargs=()):
+        def init(*a):
+            NoPeerCopy().__enter__()
+            if initializer is not None:
+                initializer(*a)
+        super().__init__(max_workers, initializer=init, initargs=initargs)
+
+omsdirectHBS.ThreadPoolExecutor = _TripwireExecutor
+NoPeerCopy().__enter__()        # main thread
 
 
 def dense_to_linop(A):
@@ -138,7 +187,7 @@ for indp in range(len(pvec)):
     print("Ntot = ",Ntot)
     strat = rkStrat.constant(300)
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100)
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=100,devices='all')
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
     print("tree mls   =", rb_solver.tree._min_leaf_size)
@@ -147,6 +196,7 @@ for indp in range(len(pvec)):
     rb_solver.print_block_errors()
     print("RB solver factorized in ",time.time()-tic,"s")
     r = rb_solver.residency_report()
+    print("devices =", rb_solver.devices, " pinned GB =", r['GB_pinned'], " unregister failures =", r['unregFailed'])
     print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
     v = np.random.standard_normal(Ntot)
     rsv = rb_solver.solve(v)

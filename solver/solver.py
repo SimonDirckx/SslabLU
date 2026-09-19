@@ -5,7 +5,7 @@ from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
-import solver.HPSInterp as interp
+#import solver.HPSInterp as interp
 import mumps
 
 # Things we need to add:

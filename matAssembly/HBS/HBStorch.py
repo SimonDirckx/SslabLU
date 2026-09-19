@@ -1,4 +1,5 @@
 import time
+import threading
 import numpy as np
 import torch
 import torch.linalg as tla
@@ -21,6 +22,10 @@ _EIGH_BYTES   = [1 << 30]  # and a byte budget for it, which is what actually
 _UV_ORTH_PASSES = [2]   # CholeskyQR passes in the fast path; 1 skips the
                         # reorthogonalization and reinstates a cond(Om)^2 leak
 _PIN_HOST     = [True]  # page-lock host masters; set False if host RAM is tight
+_PIN_MAX      = [None]  # cap on page-locked bytes (None: no cap); beyond it, pageable
+_PINNED       = [0]     # page-locked bytes currently registered
+_UNREG_FAILED = []      # buffers whose unregister failed: kept alive, never freed locked
+_PIN_LOCK     = threading.Lock()
 _SOLVE_CHUNK  = [512]   # columns per ULV solve in HBSMAT.solve; 0 disables
 
 
@@ -38,6 +43,35 @@ def _dev_eq(a, b):
             (b.index if b.index is not None else cur))
 
 
+def _canon(dev):
+    """torch.device with an explicit index: a bare 'cuda' is pinned to the
+    GPU current at this moment, so later calls from other threads (whose
+    current GPU may differ) cannot resolve it elsewhere."""
+    dev = torch.device(dev)
+    if dev.type == 'cuda' and dev.index is None:
+        dev = torch.device('cuda', torch.cuda.current_device())
+    return dev
+
+
+def free_gpu():
+    """The CUDA device with the most free memory.  Asks NVML (pynvml, from
+    nvidia-ml-py), which counts other processes and creates no CUDA context;
+    without it falls back to cudaMemGetInfo, which creates one on every GPU
+    it inspects."""
+    best, most = 0, -1
+    for i in range(torch.cuda.device_count()):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            free = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(
+                torch.cuda._get_nvml_device_index(i))).free
+        except Exception:
+            free = torch.cuda.mem_get_info(i)[0]
+        if free > most:
+            best, most = i, free
+    return torch.device('cuda', best)
+
+
 class _HostBuffer:
     """Flat host buffer holding one group's master copy, page-locked in place.
 
@@ -52,25 +86,45 @@ class _HostBuffer:
     unavailable (ROCm, driver refusal, _PIN_HOST off) the buffer is pageable:
     evicts stay copy-free, uploads become synchronous.
     """
-    __slots__ = ('t', 'registered')
+    __slots__ = ('t', 'registered', 'evs')
 
     def __init__(self, numel, dtype):
         self.t = torch.empty(numel, dtype=dtype)
         self.registered = False
-        if _PIN_HOST[0] and numel > 0 and torch.cuda.is_available():
-            try:
-                rc = torch.cuda.cudart().cudaHostRegister(
-                    self.t.data_ptr(), self.t.numel() * self.t.element_size(), 0)
-                self.registered = (rc is None) or (int(rc) == 0)
-            except Exception:
-                self.registered = False
+        self.evs = []           # events fencing in-flight uploads from self.t
+        nbytes = numel * self.t.element_size()
+        if not (_PIN_HOST[0] and numel > 0 and torch.cuda.is_available()):
+            return
+        with _PIN_LOCK:         # reserve first, so concurrent buffers respect the cap
+            if _PIN_MAX[0] is not None and _PINNED[0] + nbytes > _PIN_MAX[0]:
+                return
+            _PINNED[0] += nbytes
+        try:
+            # flag 1 = cudaHostRegisterPortable: page-locked for every GPU,
+            # and unregisterable from any thread whatever its current device
+            rc = torch.cuda.cudart().cudaHostRegister(self.t.data_ptr(), nbytes, 1)
+            self.registered = (rc is None) or (int(rc) == 0)
+        except Exception:
+            self.registered = False
+        if not self.registered:
+            with _PIN_LOCK:
+                _PINNED[0] -= nbytes
 
     def __del__(self):
-        if getattr(self, 'registered', False):
-            try:
-                torch.cuda.cudart().cudaHostUnregister(self.t.data_ptr())
-            except Exception:
-                pass
+        if not getattr(self, 'registered', False):
+            return
+        try:
+            for e in self.evs:  # an upload may still be reading this memory
+                e.synchronize()
+            rc = torch.cuda.cudart().cudaHostUnregister(self.t.data_ptr())
+            ok = (rc is None) or (int(rc) == 0)
+        except Exception:
+            ok = False
+        if ok:
+            with _PIN_LOCK:
+                _PINNED[0] -= self.t.numel() * self.t.element_size()
+        else:
+            _UNREG_FAILED.append(self.t)
 
 
 def uv_timers_reset():
@@ -428,7 +482,7 @@ class HBSMAT:
         self.mode  = 'N'
         self._tree = None
 
-        dev = torch.device(device) if device is not None else torch.device('cpu')
+        dev = _canon(device) if device is not None else torch.device('cpu')
         self.compute_device = dev
         self.home           = torch.device('cpu')
         self._resident = {'core': dev, 'ulv': dev}
@@ -550,7 +604,7 @@ class HBSMAT:
 
         tic = time.time()
         if torch.is_tensor(self.perm):
-            self.perm = self.perm.to(self.compute_device)
+            self.perm = self.perm.cpu().to(self.compute_device)
         else:
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=self.compute_device)
@@ -848,10 +902,20 @@ class HBSMAT:
         dev, n = self.compute_device, 0
         for g in need:
             rec = self._host[g]
+            if rec is None and any(getattr(self, name)[i].is_cuda and
+                                   not _dev_eq(getattr(self, name)[i].device, dev)
+                                   for name, i in self._entries(g)):
+                rec, nD2H = self._snapshot(g)   # never GPU-to-GPU: via host
+                self.bytesD2H += nD2H
             if rec is not None:
                 for (name, i), hv in zip(rec['ents'], rec['views']):
                     getattr(self, name)[i] = hv.to(dev, non_blocking=non_blocking)
                     n += hv.nbytes
+                if dev.type == 'cuda':
+                    ev = torch.cuda.Event()
+                    ev.record(torch.cuda.current_stream(dev))
+                    for b in rec['bufs'].values():
+                        b.evs = [e for e in b.evs if not e.query()] + [ev]
             else:
                 for name, i in self._entries(g):
                     t = getattr(self, name)[i]
@@ -891,12 +955,32 @@ class HBSMAT:
             self.nSpill += 1
         return self
 
+    def handle(self, device):
+        """This block on `device` with residency state of its own.  Shares the
+        immutable host masters (no host copy), so one block can serve several
+        GPUs without their evicts and prefetches interfering.  The block must
+        have a master for every non-empty group, i.e. have been evicted."""
+        if any(self._entries(g) and self._host[g] is None for g in self._GROUPS):
+            raise RuntimeError("handle() needs host masters: evict() the block first")
+        h = object.__new__(self.__class__)
+        h.__dict__ = self.__dict__.copy()
+        for name in sum(self._GROUPS.values(), ('_permbox',)):
+            setattr(h, name, list(getattr(self, name)))
+        for rec in filter(None, self._host.values()):
+            for (name, i), hv in zip(rec['ents'], rec['views']):
+                getattr(h, name)[i] = hv
+        h._host = dict(self._host)
+        h._resident = dict.fromkeys(self._GROUPS)
+        h.compute_device = _canon(device)
+        h.nFill = h.nSpill = h.bytesH2D = h.bytesD2H = 0
+        return h
+
     def release_ulv(self):
         """Send the ULV factors home, keep the apply factors on device."""
         return self.evict(groups=('ulv',))
 
     def to(self, device, non_blocking=False):
-        device = torch.device(device)
+        device = _canon(device)
         moved = 0
         for g in self._GROUPS:
             for name, i in self._entries(g):

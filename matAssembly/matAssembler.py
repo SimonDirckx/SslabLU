@@ -1,6 +1,3 @@
-
-
-
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 from matAssembly.HBS import HBSTree as HBS
@@ -105,7 +102,7 @@ class matAssembler:
             start = time.time()
             quad = False # currently only binary trees supported
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            device = HBStorch.free_gpu() if torch.cuda.is_available() else torch.device('cpu')
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
             s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 20
             tic = time.time()
@@ -116,6 +113,7 @@ class matAssembler:
             self.stats.timeSample=time.time()-tic
             tic = time.time()
             HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z,fast=True)
+            HBSmat.evict()      # leave the GPU free: the block lives on host until used
             self.stats.timeCompress=HBSmat.tCompress
             self.stats.nbytes = HBSmat.nbytes
             

@@ -418,3 +418,4 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N',Vmats=N
                 x = torch.bmm(Q, z).reshape(-1, nrhs)
 
     return x[:, 0] if was_vector else x
+

@@ -8,6 +8,9 @@ import time
 import gc
 import math
 import warnings
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 class rkStrat:
     """Per-stage HBS compression rank.
 
@@ -317,7 +320,8 @@ def _resolve_device(spec):
             "is False. Pass 'cpu' or 'auto' if a host fallback is acceptable."
         )
     if dev.type == 'cuda' and dev.index is None:
-        dev = torch.device('cuda', torch.cuda.current_device())
+        torch.cuda.empty_cache()    # our own cache must not count as used
+        dev = HBSnew.free_gpu()
     return dev
 
 # ---------------------------------------------------------------------------
@@ -862,7 +866,7 @@ class RedBlackSolverHBS(DirectSolver):
                  compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False,
                  oversample=None,
                  debug_blocks=0, debug_inverse=True, debug_true_inverse=False,
-                 debug_seed=1234):
+                 debug_seed=1234, perm=None, devices=None):
         super().__init__(m, cyclic)
         # rk may be an int (constant schedule) or an rkStrat.  self.rk stays
         # the stage-0 rank so existing callers that read or print it, and
@@ -871,6 +875,12 @@ class RedBlackSolverHBS(DirectSolver):
         self.rk   = self.rkStrat.rank(0)
         self.tree = tree
         self.quad = quad
+        # One read-only host copy of the leaf permutation for every block
+        # built here; each block uploads its own device copy from it.
+        self._perm = torch.as_tensor(tree.perm_leaf if perm is None else perm,
+                                     dtype=torch.int64).cpu()
+        self._keep, self._shared = (), set()   # see _hold
+        self._stop = threading.Event()          # set when a GPU worker fails
         self.compress_diag = compress_diag
         self.fused  = fused
         self.device = device
@@ -886,8 +896,18 @@ class RedBlackSolverHBS(DirectSolver):
         self.nULV         = 0   
         self.nULVSkipped  = 0   
         self.nDeadSkipped = 0
+        # devices: build on several GPUs ('all', or a list); the solve runs on
+        # compute_device, by default the first of them.
+        if devices == 'all':
+            devices = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
+        self.devices = [_resolve_device(d) for d in devices] if devices else None
+        if self.devices and (len({str(d) for d in self.devices}) < len(self.devices)
+                             or cyclic or not fused or not compress_diag):
+            raise ValueError("multi-GPU factorization needs distinct devices, "
+                             "cyclic=False, fused=True and compress_diag=True")
         self.compute_device = _resolve_device(
-            compute_device if compute_device is not None else device)
+            compute_device if compute_device is not None else
+            (self.devices[0] if self.devices else device))
         self.strict_residency = strict_residency
         # Oversampling above the hard floor; see _nsamples.  None -> p = rk.
         self.oversample = oversample
@@ -1026,16 +1046,30 @@ class RedBlackSolverHBS(DirectSolver):
             h._built_by_rb = True
             self._blocks.append(h)
             return h
-    def _adopt(self, op):
-        """Take ownership of an operator.
-        """
-        if hasattr(op, 'evict'):
-            op.compute_device = self.compute_device
-            op.strict         = self.strict_residency
-            op.warn_on_demote = True
-            self._blocks.append(op)
+    def _adopt(self, op, seen):
+        """Take ownership of an input block.  It is first released from the
+        GPU it was built on (evicted to its host master, even if to() made a
+        GPU its home).  If it is bound to another device, the solver works on
+        a handle sharing that master instead, so the block itself is never
+        re-pointed.  Positions holding the same object get the same handle."""
+        if id(op) in seen:
+            return seen[id(op)]
+        if self.compute_device.type == 'cuda' and not isinstance(op, HBSnew.HBSMAT):
+            raise TypeError(f"GPU factorization needs HBStorch.HBSMAT input blocks, "
+                            f"got {type(op).__name__}")
+        h = op
+        if isinstance(op, HBSnew.HBSMAT):
+            if op.compute_device.type == 'cpu':     # host-built: free to re-point
+                op.compute_device = self.compute_device
+            op.home = torch.device('cpu')
             op.evict()
-        return op
+            if not HBSnew._dev_eq(op.compute_device, self.compute_device):
+                h = op.handle(self.compute_device)
+            h.strict         = self.strict_residency
+            h.warn_on_demote = True
+            self._blocks.append(h)
+        seen[id(op)] = h
+        return h
     def _finish(self, h, ulv, label, spill=True):
         self.nConstruct += 1
         if ulv:
@@ -1059,6 +1093,7 @@ class RedBlackSolverHBS(DirectSolver):
         ulv   = self._want_ulv(compute_ULV)
 
         h = HBSnew.HBSMAT(linop, device=dev, tree=self.tree, quad=self.quad)
+        h.perm = self._perm
         h.construct(rkloc, compute_ULV=ulv, fast=self.fast)
 
         return self._finish(h, ulv, label, spill=spill)
@@ -1091,6 +1126,7 @@ class RedBlackSolverHBS(DirectSolver):
             return v
 
         h = HBSnew.HBSMAT(device=dev, tree=self.tree, quad=self.quad)
+        h.perm = self._perm
         h.construct(rk,
                     Om=_prep(Om), Psi=_prep(Psi),
                     Y=_prep(Y),   Z=_prep(Z),
@@ -1269,7 +1305,9 @@ class RedBlackSolverHBS(DirectSolver):
                 nSpill  = sum(getattr(x,'nSpill',0) for x in b),
                 GB_H2D  = sum(getattr(x,'bytesH2D',0)for x in b)/10**9,
                 GB_D2H  = sum(getattr(x,'bytesD2H',0)for x in b)/10**9,
-                GB_total= sum(x.device_nbytes() for x in b)/10**9
+                GB_total= sum(x.device_nbytes() for x in b)/10**9,
+                GB_pinned   = HBSnew._PINNED[0]/10**9,
+                unregFailed = len(HBSnew._UNREG_FAILED)
                 )
 
     # ------------------------------------------------------------------
@@ -1350,16 +1388,22 @@ class RedBlackSolverHBS(DirectSolver):
         if not ((nSlabs & (nSlabs - 1) == 0) and nSlabs != 0):
             raise ValueError("Number of slabs must be a power of 2.")
         HBSnew.uv_timers_reset()
+        self._blocks = []           # a previous factorization's blocks are released
         HBSnew._UV_SYNC[0] = (self.compute_device.type == 'cuda')
         self._dtype = S_rk_list[0][0].dtype
 
-        SiM = [self._adopt(_[0]) for _ in S_rk_list]
-        SiP = [self._adopt(_[-1])for _ in S_rk_list]
+        seen = {}
+        SiM = [self._adopt(_[0], seen) for _ in S_rk_list]
+        SiP = [self._adopt(_[-1], seen) for _ in S_rk_list]
+        torch.cuda.empty_cache()    # hand the input blocks' GPU memory back
 
         # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
             SiM[0]  = zero_op(m, self._dtype)
             SiP[-1] = zero_op(m, self._dtype)
+        ops = SiM + SiP
+        self._shared = {h for h in ops
+                        if isinstance(h, HBSnew.HBSMAT) and ops.count(h) > 1}
 
         if T is None:
             T = [id_op(m, self._dtype) for _ in range(nSlabs)]
@@ -1393,14 +1437,17 @@ class RedBlackSolverHBS(DirectSolver):
         l = nSlabs
         j = 0
         self.levelTimes=[]
+        self._stop.clear()
         self.blockErrors = []
         while l > 1:
             rk = self.rkSchedule[j]
             self._dbg_stage = j
-            builder = self._build_level_fused if self.fused else self._build_level
+            builder = (self._build_level_multi if self.devices else
+                       self._build_level_fused if self.fused else self._build_level)
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.time()
+            self._hold(self._shared if j == 0 else ())
             RB.append(builder(m, l, RB[-1], rk))
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -1411,11 +1458,13 @@ class RedBlackSolverHBS(DirectSolver):
             j += 1
             l //= 2
 
+        self._hold(())
         self.nSlabs = nSlabs
         self.RB     = RB
         for h in self._blocks:
             if getattr(h, '_built_by_rb', False) and hasattr(h, 'evict'):
                 h.evict()
+                h.compute_device = self.compute_device
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -1460,7 +1509,7 @@ class RedBlackSolverHBS(DirectSolver):
             return
         for lst in (SiM,SiP,T,T_hbs):
             op = lst[idx]
-            if hasattr(op,'evict'):
+            if hasattr(op,'evict') and op not in self._keep:
                 op.evict()
         Xm.pop(idx,None)
         Xp.pop(idx,None)
@@ -1502,10 +1551,69 @@ class RedBlackSolverHBS(DirectSolver):
         sweep has run.  The solve touches every block in the tree, so without
         this the working set is the whole factorization."""
         for op in ops:
-            if op is not None and hasattr(op, 'evict'):
+            if op is not None and hasattr(op, 'evict') and op not in self._keep:
                 op.evict()
 
-    def _build_level_fused(self, m, nSlabs, RB_level, rk):
+    def _hold(self, ops):
+        """Exempt ops from _release/_retire from now on, and release whatever
+        was held before.  _hold(()) just releases.  Used for input blocks that
+        stiff_mat_const places at many level-0 positions: staged once for the
+        level instead of once per position."""
+        held, self._keep = self._keep, set(ops)
+        self._release(*held)
+
+    def _build_level_multi(self, m, nSlabs, RB_level, rk):
+        """One level on several GPUs.  Each GPU builds a contiguous range of
+        the retained nodes, in a thread of its own, on a shallow copy of this
+        solver bound to its device.  Nothing passes between GPUs: a worker
+        reads every operator from its host master, through a handle of its
+        own when the operator is bound to another device, and the eliminated
+        node on a range boundary is solved on both sides of it."""
+        idx  = list(range(0, nSlabs, 2))
+        G    = min(len(self.devices), len(idx))
+        seed = int(self._rng.integers(2**62))
+        ws, jobs, exs = [], [], []
+        try:
+            for g, dev in enumerate(self.devices[:G]):
+                memo = {}                       # one handle per operator
+                for o in (o for lst in RB_level for o in lst):
+                    if id(o) not in memo:
+                        memo[id(o)] = (o.handle(dev) if isinstance(o, HBSnew.HBSMAT)
+                                       and not HBSnew._dev_eq(o.compute_device, dev) else o)
+                w = copy.copy(self)
+                w.compute_device, w._blocks, w.blockErrors = dev, [], []
+                w._keep = {memo[id(o)] for o in self._shared if id(o) in memo}
+                w._tgen = torch.Generator(device=dev).manual_seed(seed)
+                w._pgen = torch.Generator(device=dev).manual_seed(seed + 1)
+                ex = ThreadPoolExecutor(1, initargs=(dev,), initializer=
+                                        torch.cuda.set_device if dev.type == 'cuda' else None)
+                exs.append(ex)
+                jobs.append(ex.submit(w._build_level_fused, m, nSlabs,
+                                      [[memo[id(o)] for o in lst] for lst in RB_level],
+                                      rk, idx[g*len(idx)//G:(g+1)*len(idx)//G]))
+                ex.submit(w._hold, ())                   # then, on the same thread,
+                ex.submit(w._release, *memo.values())    # leave the GPU empty
+                ws.append(w)
+            wait(jobs, return_when=FIRST_EXCEPTION)
+        finally:
+            if not all(f.done() for f in jobs) or any(f.exception() for f in jobs):
+                self._stop.set()
+            for ex in exs:
+                ex.shutdown(wait=True)
+        errs = [f.exception() for f in jobs if f.exception()]
+        errs = [e for e in errs if not isinstance(e, InterruptedError)] + errs
+        if errs:
+            raise errs[0]
+        for k in ('nConstruct', 'nULV', 'nULVSkipped', 'nDeadSkipped',
+                  'nSolve', 'nApply', 'nIdSkipped'):
+            setattr(self, k, sum(getattr(w, k) for w in ws) - (G - 1)*getattr(self, k))
+        for w in ws:
+            self._blocks += w._blocks
+            self.blockErrors += w.blockErrors
+        res = [f.result() for f in jobs]
+        return tuple(sum((r[q] for r in res), []) for q in range(4))
+
+    def _build_level_fused(self, m, nSlabs, RB_level, rk, nodes=None):
         SiM   = RB_level[0]
         T     = RB_level[1]
         T_hbs = RB_level[2]
@@ -1670,7 +1778,9 @@ class RedBlackSolverHBS(DirectSolver):
         # ---------------------------------------------------------------
         B_i, T_hbs_new, A_i, C_i = [], [], [], []
 
-        for i in range(0, nSlabs, 2):
+        for i in (range(0, nSlabs, 2) if nodes is None else nodes):
+            if self._stop.is_set():
+                raise InterruptedError("stopped: another GPU worker failed")
             has_left  = cyclic or i > 0
             has_right = cyclic or i < nSlabs - 1
             kL = (i - 1) % nSlabs
@@ -1905,7 +2015,7 @@ class RedBlackSolverHBS(DirectSolver):
                 del refs
 
             self._sync();t2=time.time()
-            print(f"node {i:3d}: sample {t1-t0:6.2f}s"
+            print(f"[{self.compute_device}] node {i:3d}: sample {t1-t0:6.2f}s"
                   f" construct {t2-t1:6.2f}s (B+A+C)"
                   f" alloc {torch.cuda.memory_allocated()/2**30:5.2f} GB")
         if not cyclic:
@@ -1988,6 +2098,7 @@ class RedBlackSolverHBS(DirectSolver):
 
         for l in range(len(RB) - 1):
             SiM, _, T_hbs, SiP = RB[l]
+            self._hold(self._shared if l == 0 else ())
 
             nSlabs   = len(SiM)
             nReduced = nSlabs // 2
@@ -2040,12 +2151,14 @@ class RedBlackSolverHBS(DirectSolver):
             self._release(*T_hbs)       # no-op for already-released blocks
             vPrimes.append(vPrime)
 
+        self._hold(())
         # ---- coarsest solve -------------------------------------------
         vPrimes[-1] = self._sv(RB[-1][2][0],vPrimes[-1])
 
         # ---- back substitution ----------------------------------------
         for l in range(len(RB) - 1, 0, -1):
             SiM, _, T_hbs, SiP = RB[l - 1]
+            self._hold(self._shared if l == 1 else ())
 
             nSlabs   = len(SiM)
             nReduced = nSlabs // 2
@@ -2063,6 +2176,7 @@ class RedBlackSolverHBS(DirectSolver):
                 blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
                 vPrimes[l-1][(i+1)*m:(i+2)*m,:] = self._sv(T_hbs[i+1],blk)
                 self._release(SiM[i+1], SiP[i+1], T_hbs[i+1])
+        self._hold(())
         out = vPrimes[0]
         if was_vector:
             out = out[:,0]
