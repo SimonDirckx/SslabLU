@@ -10,6 +10,28 @@ with R upper triangular
 Q,R,W given in reduced format
 
 '''
+
+# ---------------------------------------------------------------------------
+# module knobs
+# ---------------------------------------------------------------------------
+_QR_CHUNK = [0]   # blocks per batched QR call; 0 means "the whole batch at once"
+
+
+def _qr_batches(Nb):
+    """[(j0, j1), ...] covering range(Nb), honouring _QR_CHUNK.
+
+    A single (0, Nb) pair is the default, and both QR helpers below take a
+    fast path for it that returns the factors directly instead of copying
+    them into a preallocated buffer.  The knob exists because the batched
+    form holds every block's Q at once where the old per-block loop held
+    one: at the coarse red-black levels, where n is large, that peak can be
+    the binding constraint even though the throughput is better.
+    """
+    c = _QR_CHUNK[0] or Nb
+    c = max(int(c), 1)
+    return [(j, min(j + c, Nb)) for j in range(0, Nb, c)]
+
+
 def convert_to_torch_tens(A,Nb,device):
     """(Nb*n, k) -> (Nb, n, k).
 
@@ -37,14 +59,35 @@ def convert_to_blkdiag(A):
         B[i*n:(i+1)*n,:] = A[i,:,:]
     return B
 
-def block_qr_tens(A,device):
-    n = A.shape[1]
-    k = A.shape[2]
-    Nb = A.shape[0]
-    C = torch.zeros(size = (Nb,n,n-k),device=device)
-    for i in range(Nb):
-        Q,_ = tla.qr(A[i,:,:],mode='complete')
-        C[i,:,:] = Q[:,k:]
+def block_qr_tens(A, device=None):
+    """Orthonormal basis for the complement of each block's column space.
+
+    A: (Nb, n, k) with k <= n.  Returns (Nb, n, n-k) whose columns span
+    range(A[i])^perp, from the trailing columns of a complete QR.
+
+    One batched QR replaces a Python loop of Nb single-matrix cuSOLVER
+    calls, each of which also copied its result into a slice of a zeroed
+    buffer -- 2*Nb kernel launches per call on matrices far too small to
+    fill the device.  `device` is accepted for call-site compatibility and
+    ignored: the tensor carries its own, as does its dtype (the old buffer
+    was allocated at the default dtype regardless of A's).
+
+    The result is a fresh contiguous tensor, not a view into Q, so callers
+    may write into it and the (Nb, n, n) Q is freed on return.
+    """
+    Nb, n, k = A.shape
+    if k > n:
+        raise ValueError(f"block_qr_tens: need k <= n, got n={n}, k={k}")
+
+    batches = _qr_batches(Nb)
+    if len(batches) <= 1:
+        return tla.qr(A, mode='complete').Q[:, :, k:].contiguous()
+
+    C = A.new_empty((Nb, n, n - k))
+    for j0, j1 in batches:
+        Q = tla.qr(A[j0:j1], mode='complete').Q
+        C[j0:j1] = Q[:, :, k:]
+        del Q
     return C
 
 def block_Q_and_R(W1,W2,Dtot,Nb,device):
@@ -59,14 +102,36 @@ def block_Q_and_R(W1,W2,Dtot,Nb,device):
         # = Q0
         # = R0
     return Q,R
-def block_Q_and_R_tens(W12,Dtot,device):
-    n = Dtot.shape[1]
-    Nb = Dtot.shape[0]
-    Q = torch.zeros(size = (Nb,n,n),device=device)
-    R = torch.zeros(size = (Nb,n,n),device=device)
-    for i in range(Nb):
-        [Q[i,:,:],R[i,:,:]]   = tla.qr(Dtot[i,:,:]@W12[i,:,:])
-    return Q,R
+def block_Q_and_R_tens(W12, Dtot, device=None):
+    """Reduced QR of D[i] @ W12[i], batched over the block dim.
+
+    Dtot: (Nb, n, p), W12: (Nb, p, m).  Returns Q (Nb, n, min(n,m)) and
+    R (Nb, min(n,m), m).  The loop form issued 2*Nb launches for the
+    products alone and then Nb separate cuSOLVER QRs; one bmm and one
+    batched QR replace both.  `device` is accepted for call-site
+    compatibility and ignored.
+    """
+    if W12.shape[0] != Dtot.shape[0] or W12.shape[1] != Dtot.shape[2]:
+        raise ValueError(
+            f"block_Q_and_R_tens: shape mismatch, Dtot {tuple(Dtot.shape)} "
+            f"@ W12 {tuple(W12.shape)}")
+
+    Nb, n = Dtot.shape[0], Dtot.shape[1]
+    m = W12.shape[2]
+
+    batches = _qr_batches(Nb)
+    if len(batches) <= 1:
+        return tla.qr(torch.bmm(Dtot, W12))
+
+    r = min(n, m)
+    Q = Dtot.new_empty((Nb, n, r))
+    R = Dtot.new_empty((Nb, r, m))
+    for j0, j1 in batches:
+        Qc, Rc = tla.qr(torch.bmm(Dtot[j0:j1], W12[j0:j1]))
+        Q[j0:j1] = Qc
+        R[j0:j1] = Rc
+        del Qc, Rc
+    return Q, R
 def compute_QR_sparse(Dtot,Wtot,k,device):
     Nb = Dtot.shape[0]
     if Nb==1:
@@ -133,73 +198,116 @@ def compute_QRW_sparse(Dtot,Vtot,Nb,device):
         tmv += time.time()-tic
     #print("tVc//tQ//tmv//tinit = ",tVc,"//",tQ,"//",tmv,"//",tinit)
     return Q,W12,Ru,R22,NN
-def sparse_block_mult_tens(A,B,device,mode='N'):
-    
-    '''
-    Multiply block diag matrices
-    INPUT  
-        A,B     :   Block diagonal matrices (reduced form)
-        NbA,NbA :   Number of blocks for A and B
-        mode    :   wheter A@B (Normal, 'N') or A.T@B (Transpose,'T')
-    OUTPUT
-        C       :   product of A and B, in reduced form
-    '''
-    NbA = A.shape[0]
-    NbB = B.shape[0]
-    na = A.shape[1]
-    ka = A.shape[2]
-    nb = B.shape[1]
-    kb = B.shape[2]
-    if mode=='N':
-        # this assumes NbA>=NbB
-        fac = (NbA//NbB)
-        C = torch.zeros(size = (NbB,fac*na,kb),device=device)
-        
-        #startA=0
-        for i in range(NbB):
-            Asub = torch.zeros(size = (fac*na,fac*ka),device=device)
-            for j in range(fac):
-                Asub[j*na:(j+1)*na,:][:,j*ka:(j+1)*ka] = A[fac*i+j,:,:]#startA+j*na:startA+(j+1)*na,:]
-            C[i,:,:] = Asub@B[i,:,:]
-            #startA+=fac*na
-    elif mode=='T':
-        # this assumes NbB=NbA
-        C = torch.zeros(size = (NbA,ka,kb),device=device)
-        for i in range(NbA):
-            C[i,:,:] = A[i,:,:].T@B[i,:,:]
+def sparse_block_mult_tens(A, B, device=None, mode='N'):
+    """Multiply block diagonal matrices, both in reduced form.
 
+    mode='N': A (NbA, na, ka), B (NbB, fac*ka, kb) with fac = NbA//NbB.
+              Returns (NbB, fac*na, kb), the product of B with the block
+              diagonal whose fac consecutive A blocks sit on the diagonal of
+              output block i.
+    mode='T': A (Nb, n, k), B (Nb, n, kb) -> (Nb, k, kb), C[i] = A[i]^T B[i].
+
+    The 'N' branch used to materialize that (fac*na, fac*ka) block diagonal
+    explicitly, one output block at a time, and multiply through its zeros:
+    fac times the necessary flops (2x normally, 4x with quad=True), a zeroed
+    buffer of fac^2 the useful size per block, and 1 + fac launches per
+    block on top.  Block i's j-th row stripe is just A[fac*i+j] @ B[i]'s
+    j-th row stripe, so the whole thing is one bmm over a reshape -- the
+    same transformation HBStorch.block_mult_and_reduce already applies to
+    the identical pattern in the compression sweep.
+
+    `device` is accepted for call-site compatibility and ignored; the result
+    carries A's device and dtype rather than the default dtype.
+    """
+    NbA, na, ka = A.shape
+    NbB, nb, kb = B.shape
+
+    if mode == 'N':
+        if NbB == 0 or NbA % NbB:
+            raise ValueError(
+                f"sparse_block_mult_tens: NbA={NbA} is not a multiple of "
+                f"NbB={NbB}")
+        fac = NbA // NbB
+        if nb != fac * ka:
+            raise ValueError(
+                f"sparse_block_mult_tens: mode='N' expects B with {fac*ka} "
+                f"rows (fac={fac} x ka={ka}), got {nb}")
+        # B (NbB, fac*ka, kb) -> (NbB*fac, ka, kb): the row stripes of each
+        # output block, in the same order as A's blocks.
+        return torch.bmm(A, B.reshape(NbA, ka, kb)).reshape(NbB, fac * na, kb)
+
+    if mode == 'T':
+        if NbA != NbB:
+            raise ValueError(
+                f"sparse_block_mult_tens: mode='T' needs NbA == NbB, got "
+                f"{NbA} and {NbB}")
+        if na != nb:
+            raise ValueError(
+                f"sparse_block_mult_tens: mode='T' expects B with {na} rows, "
+                f"got {nb}")
+        return torch.bmm(A.mT, B)
+
+    raise ValueError("mode not recognized")
+
+
+def block_diag_add_tens(A, B, device=None, inplace=False):
+    """Add the finer block diagonal B into the coarser one A.
+
+    A: (NbA, fac*nB, fac*kB), B: (NbA*fac, nB, kB).  B's blocks
+    fac*i .. fac*i+fac-1 land on the diagonal of A's block i.  Returns the
+    sum in reduced form.
+
+    The nested Python loop wrote NbA*fac tiny in-place adds through chained
+    slices.  Viewing A as (NbA, fac, nB, fac, kB) exposes those targets as
+    the (dim 1, dim 3) diagonal, which `torch.diagonal` gives as a strided
+    VIEW, so one add_ covers the whole level.
+
+    inplace
+    -------
+    The old version bound C = A and returned A mutated, while reading as a
+    pure function.  Both call sites pass a tensor they have just built and
+    do not read again, so the mutation was harmless there, but nothing in
+    the signature said so.  The default is now a copy; pass inplace=True
+    where the caller owns A and the copy of a (NbA, fac*nB, fac*kB) tensor
+    is worth avoiding, which at the coarse levels it is.
+
+    `device` is accepted for call-site compatibility and ignored.
+    """
+    NbA, nA, kA = A.shape
+    NbB, nB, kB = B.shape
+
+    if kA < kB:
+        raise ValueError(
+            "block_diag_add_tens: A must be the COARSER operand (kA >= kB), "
+            f"got kA={kA}, kB={kB}; swap the arguments")
+    if kB == 0 or kA % kB:
+        raise ValueError(
+            f"block_diag_add_tens: kA={kA} is not a multiple of kB={kB}")
+    fac = kA // kB
+    if nA != fac * nB:
+        raise ValueError(
+            f"block_diag_add_tens: expected A with {fac*nB} rows per block "
+            f"(fac={fac} x nB={nB}), got {nA}")
+    if NbB != NbA * fac:
+        raise ValueError(
+            f"block_diag_add_tens: expected {NbA*fac} B blocks "
+            f"(NbA={NbA} x fac={fac}), got {NbB}")
+
+    if inplace:
+        if not A.is_contiguous():
+            raise ValueError(
+                "block_diag_add_tens: inplace=True needs a contiguous A; the "
+                "diagonal view below cannot be taken otherwise")
+        C = A
     else:
-        raise(ValueError("mode not recognized"))
+        C = A.clone()
+        if not C.is_contiguous():
+            C = C.contiguous()
 
-
-    return C
-
-
-def block_diag_add_tens(A,B,device):
-    '''
-    Add block diag matrices
-    INPUT  
-        A,B     :   Block diagonal matrices (reduced form)
-        NbA,NbA :   Number of blocks for A and B
-    OUTPUT
-        C       :   sum of A and B, in reduced form
-    '''
-    kA = A.shape[2]
-    kB = B.shape[2]
-    NbA = A.shape[0]
-    NbB = B.shape[0]
-    nA=A.shape[1]
-    nB=B.shape[1]
-    assert(NbA*nA==NbB*nB)
-    k = min(kA,kB)
-    fac = max(kA//k,kB//k)
-    if kA>=kB:
-        C=A
-        for i in range(NbA):
-            for j in range(fac):
-                C[i,j*nB:(j+1)*nB,:][:,j*kB:(j+1)*kB]+=B[i*fac+j,:,:]
-    else:
-        raise(ValueError("put smol frist"))
+    # (NbA, fac, nB, fac, kB); the diagonal over the two fac axes is
+    # (NbA, nB, kB, fac), with the block index j last.
+    C.view(NbA, fac, nB, fac, kB).diagonal(dim1=1, dim2=3).add_(
+        B.reshape(NbA, fac, nB, kB).permute(0, 2, 3, 1))
     return C
 
 def apply_sparse_block_tens(A,B,device,mode='N'):
@@ -300,7 +408,9 @@ def compute_ULV(Utens,Dtens,Vtens,Nbvec,device):
             k = Vtens[0].shape[2]
         else:
             Rhat = sparse_block_mult_tens(Uhat,Dtens[i],device)
-            Rhat = block_diag_add_tens(Rhat,R_22,device)
+            # Rhat was built one line up and is read nowhere else, so the add
+            # stays in place; the default would clone it.
+            Rhat = block_diag_add_tens(Rhat,R_22,device,inplace=True)
             
             if i<len(Vtens):
                 Q,W,Ru,R_22,NN = compute_QRW_sparse(Rhat,Vtens[i],Nbvec[i],device)
@@ -418,4 +528,3 @@ def solve(Umats,Dmats,Qlist,Wlist,Uulist,Rlist,NNvec,rhs,device,mode='N',Vmats=N
                 x = torch.bmm(Q, z).reshape(-1, nrhs)
 
     return x[:, 0] if was_vector else x
-

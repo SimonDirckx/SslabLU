@@ -1,5 +1,6 @@
+import os
 import time
-import threading
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import torch.linalg as tla
@@ -22,11 +23,19 @@ _EIGH_BYTES   = [1 << 30]  # and a byte budget for it, which is what actually
 _UV_ORTH_PASSES = [2]   # CholeskyQR passes in the fast path; 1 skips the
                         # reorthogonalization and reinstates a cond(Om)^2 leak
 _PIN_HOST     = [True]  # page-lock host masters; set False if host RAM is tight
-_PIN_MAX      = [None]  # cap on page-locked bytes (None: no cap); beyond it, pageable
-_PINNED       = [0]     # page-locked bytes currently registered
-_UNREG_FAILED = []      # buffers whose unregister failed: kept alive, never freed locked
-_PIN_LOCK     = threading.Lock()
 _SOLVE_CHUNK  = [512]   # columns per ULV solve in HBSMAT.solve; 0 disables
+_UV_BASIS     = ['svd_dev']  # fast-path basis extraction:
+                        #   'svd_host'  SVD of L = RB^T (ny x ny) on the host,
+                        #               batch-parallel, one LAPACK thread each
+                        #   'svd_dev'   same SVD on the device (torch.linalg.svd)
+                        #   'jw'        previous Jordan-Wielandt eigh (2ny x 2ny)
+                        #               on the device, kept for A/B comparison
+_SVD_WORKERS  = [0]     # host threads for 'svd_host'; 0 means the CPUs this process may use
+_SVD_POOL     = [None, 0]   # (executor, its worker count), created lazily
+_SVD_DEV_DRIVER = ['gesvd']  # for 'svd_dev': 'gesvd' or 'gesvdj', never 'gesvda'
+_UV_CHUNK_ELEMS = [1<<28]  # cap on c*max(n,ny)*s per compute_UV_pair call,
+                        # i.e. per batched cuSOLVER/cuBLAS/MAGMA launch.  Blocks
+                        # are independent, so chunking is exact.  0 disables.
 
 
 def _dev_eq(a, b):
@@ -43,35 +52,6 @@ def _dev_eq(a, b):
             (b.index if b.index is not None else cur))
 
 
-def _canon(dev):
-    """torch.device with an explicit index: a bare 'cuda' is pinned to the
-    GPU current at this moment, so later calls from other threads (whose
-    current GPU may differ) cannot resolve it elsewhere."""
-    dev = torch.device(dev)
-    if dev.type == 'cuda' and dev.index is None:
-        dev = torch.device('cuda', torch.cuda.current_device())
-    return dev
-
-
-def free_gpu():
-    """The CUDA device with the most free memory.  Asks NVML (pynvml, from
-    nvidia-ml-py), which counts other processes and creates no CUDA context;
-    without it falls back to cudaMemGetInfo, which creates one on every GPU
-    it inspects."""
-    best, most = 0, -1
-    for i in range(torch.cuda.device_count()):
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            free = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(
-                torch.cuda._get_nvml_device_index(i))).free
-        except Exception:
-            free = torch.cuda.mem_get_info(i)[0]
-        if free > most:
-            best, most = i, free
-    return torch.device('cuda', best)
-
-
 class _HostBuffer:
     """Flat host buffer holding one group's master copy, page-locked in place.
 
@@ -86,45 +66,25 @@ class _HostBuffer:
     unavailable (ROCm, driver refusal, _PIN_HOST off) the buffer is pageable:
     evicts stay copy-free, uploads become synchronous.
     """
-    __slots__ = ('t', 'registered', 'evs')
+    __slots__ = ('t', 'registered')
 
     def __init__(self, numel, dtype):
         self.t = torch.empty(numel, dtype=dtype)
         self.registered = False
-        self.evs = []           # events fencing in-flight uploads from self.t
-        nbytes = numel * self.t.element_size()
-        if not (_PIN_HOST[0] and numel > 0 and torch.cuda.is_available()):
-            return
-        with _PIN_LOCK:         # reserve first, so concurrent buffers respect the cap
-            if _PIN_MAX[0] is not None and _PINNED[0] + nbytes > _PIN_MAX[0]:
-                return
-            _PINNED[0] += nbytes
-        try:
-            # flag 1 = cudaHostRegisterPortable: page-locked for every GPU,
-            # and unregisterable from any thread whatever its current device
-            rc = torch.cuda.cudart().cudaHostRegister(self.t.data_ptr(), nbytes, 1)
-            self.registered = (rc is None) or (int(rc) == 0)
-        except Exception:
-            self.registered = False
-        if not self.registered:
-            with _PIN_LOCK:
-                _PINNED[0] -= nbytes
+        if _PIN_HOST[0] and numel > 0 and torch.cuda.is_available():
+            try:
+                rc = torch.cuda.cudart().cudaHostRegister(
+                    self.t.data_ptr(), self.t.numel() * self.t.element_size(), 0)
+                self.registered = (rc is None) or (int(rc) == 0)
+            except Exception:
+                self.registered = False
 
     def __del__(self):
-        if not getattr(self, 'registered', False):
-            return
-        try:
-            for e in self.evs:  # an upload may still be reading this memory
-                e.synchronize()
-            rc = torch.cuda.cudart().cudaHostUnregister(self.t.data_ptr())
-            ok = (rc is None) or (int(rc) == 0)
-        except Exception:
-            ok = False
-        if ok:
-            with _PIN_LOCK:
-                _PINNED[0] -= self.t.numel() * self.t.element_size()
-        else:
-            _UNREG_FAILED.append(self.t)
+        if getattr(self, 'registered', False):
+            try:
+                torch.cuda.cudart().cudaHostUnregister(self.t.data_ptr())
+            except Exception:
+                pass
 
 
 def uv_timers_reset():
@@ -210,6 +170,102 @@ def block_mult_and_reduce(A, B, fac, device=None, mode='N'):
     raise ValueError("mode not recognized")
 
 
+def _svd_worker_init():
+    # Per-thread state: with an OpenMP backend the intra-op thread count is a
+    # per-thread ICV, so each pool thread pins its own to 1 once.  These
+    # threads do nothing else, so it is never restored.
+    torch.set_num_threads(1)
+
+
+def _svd_pool():
+    nw = _SVD_WORKERS[0] or len(os.sched_getaffinity(0))
+    if _SVD_POOL[0] is None or _SVD_POOL[1] != nw:
+        if _SVD_POOL[0] is not None:
+            _SVD_POOL[0].shutdown(wait=True)
+        _SVD_POOL[0] = ThreadPoolExecutor(max_workers=nw,
+                                          initializer=_svd_worker_init)
+        _SVD_POOL[1] = nw
+    return _SVD_POOL[0]
+
+
+def _left_sv_jw_1(Rb, k):
+    """Fallback for one block: Jordan-Wielandt eigh on the host, same as the
+    'jw' path.  Returns the top halves (u/sqrt(2)); the renormalization and
+    reorthogonalization in compute_UV_pair restore unit columns."""
+    ny = Rb.shape[-1]
+    H = Rb.new_zeros((2 * ny, 2 * ny))
+    H[:ny, ny:] = Rb.mT
+    H[ny:, :ny] = Rb
+    return tla.eigh(H).eigenvectors[:, -k:].flip(-1)[:ny, :]
+
+
+def _left_sv_host(RB, k):
+    """Top-k left singular vectors of L = RB^T, per block, on the host, in
+    torch.
+
+    RB: (Nb, ny, ny) upper triangular with Bp Bp^T = RB^T RB, so the left
+    singular vectors of Bp are exactly those of L.  Returns (Nb, ny, k) on
+    RB's device, columns ordered by decreasing sigma.
+
+    Golub-Kahan bidiagonalization of L (torch CPU svd = LAPACK gesdd) is
+    backward stable to O(u ||L||), the same accuracy class as eigh of the
+    Jordan-Wielandt form, at size ny instead of 2ny.
+
+    Threading.  torch releases the GIL inside ops, so Python threads run the
+    SVDs concurrently.  The batch is split into one contiguous chunk per
+    worker, and each worker issues one batched CPU svd on its chunk (torch
+    loops the chunk internally, one LAPACK call per block).  One LAPACK
+    thread per block:
+      - main thread: torch.set_num_threads(1) around the map, which also
+        sets MKL's process-wide count; restored afterwards;
+      - worker threads: torch.set_num_threads(1) once, in _svd_worker_init,
+        for the per-thread OpenMP setting.
+
+    If a chunk raises LinAlgError (gesdd non-convergence), that chunk is
+    redone block by block, and any block that fails again falls back to the
+    host Jordan-Wielandt eigh.
+    """
+    Rh = RB.detach().to('cpu')                # ~ny^2*8 bytes per block
+    Nb, ny, _ = Rh.shape
+    out = torch.empty((Nb, ny, k), dtype=Rh.dtype)
+
+    def work(lo, hi):
+        L = Rh[lo:hi].mT
+        try:
+            out[lo:hi] = tla.svd(L, full_matrices=False).U[..., :k]
+        except torch.linalg.LinAlgError:
+            for i in range(lo, hi):
+                try:
+                    out[i] = tla.svd(Rh[i].mT, full_matrices=False).U[:, :k]
+                except torch.linalg.LinAlgError:
+                    out[i] = _left_sv_jw_1(Rh[i], k)
+
+    pool = _svd_pool()
+    nw = min(_SVD_POOL[1], Nb)
+    bounds = [(Nb * j) // nw for j in range(nw + 1)]
+    prev = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        futs = [pool.submit(work, bounds[j], bounds[j + 1])
+                for j in range(nw) if bounds[j + 1] > bounds[j]]
+        for f in futs:
+            f.result()
+    finally:
+        torch.set_num_threads(prev)
+    return out.to(RB.device)
+
+
+def _left_sv_dev(RB, k):
+    """Same quantity as _left_sv_host, computed on RB's device with
+    torch.linalg.svd.  Driver from _SVD_DEV_DRIVER: 'gesvd' (QR iteration,
+    most robust) or 'gesvdj' (Jacobi, also accurate).  Never 'gesvda', which
+    is approximate.  The driver argument is CUDA-only, so it is ignored on CPU.
+    """
+    drv = _SVD_DEV_DRIVER[0] if RB.device.type == 'cuda' else None
+    U = tla.svd(RB.mT, full_matrices=False, driver=drv).U
+    return U[..., :k].contiguous()
+
+
 def _cholqr2(X, need_q=True):
     """CholeskyQR of X^T, repeated.  X: (Nb, m, s) with s >= m.
 
@@ -264,8 +320,7 @@ def _cholqr2(X, need_q=True):
             # the caller's X there, and for the A side that is Om or Psi,
             # which the rest of the level reads.
             Q = torch.linalg.solve_triangular(
-                Ri.mT, Q, upper=False, left=True,
-                out=(None if Q is X else Q))
+                Ri.mT, Q, upper=False, left=True)
         R = Ri if R is None else torch.bmm(Ri, R)
     return Q, R
 
@@ -300,7 +355,10 @@ def compute_UV_pair(Om, Y, Psi, Z, rk, device=None, fast=False):
                     M    = (Y Q1) R^{-T}                        = Y Om^+
                     Bp   = Y - (Y Q1) Q1^T                      = Y P_tau P_tau^T
                     Bp   = RB^T QB       CholeskyQR2, R factor only
-                    U    = top-k eigenvectors of [[0, RB^T], [RB, 0]], top half
+                    U    = top-k left singular vectors of RB^T
+                           (_UV_BASIS 'svd_host': host SVD, default), or
+                           top half of top-k eigenvectors of
+                           [[0, RB^T], [RB, 0]]  (_UV_BASIS 'jw')
 
                 Nothing is squared: the Grams are formed only to orthogonalize,
                 never to have their spectrum read.  The extraction resolves
@@ -362,39 +420,53 @@ def compute_UV_pair(Om, Y, Psi, Z, rk, device=None, fast=False):
             _uv_sync(dev); _t = time.time()
             _, RB = _cholqr2(Bp, need_q=False)    # Bp Bp^T = RB^T RB
             del Bp
-            # Left singular vectors of Bp are those of L = RB^T, and they live
-            # in R^ny: the s direction is already gone.  Extract them from the
-            # Jordan-Wielandt form
-            #     H = [[0, L], [L^T, 0]],   eig(H) = +-sigma,
-            #     eigenvectors (u, +-v)/sqrt(2),
-            # which is assembled by block placement -- exactly, with no
-            # arithmetic -- and has ||H|| = sigma_1.  A backward-stable eigh
-            # therefore resolves directions down to sigma_j ~ u sigma_1, where
-            # eigh(Bp Bp^T) loses everything below sqrt(u) sigma_1 to the
-            # rounding error of forming the Gram.
-            # The eigenproblem is 2ny, so its workspace is 4x the ny version's
-            # at equal batch size -- dividing a fixed chunk COUNT by 4 does not
-            # track that, because the count itself was tuned at some other ny.
-            # Budget bytes: ~6x the batch covers H, the eigenvector output and
-            # cusolver's own scratch.  At ny=400 this gives the old chunk back;
-            # at ny=800 it backs off to a quarter of it, which is the whole
-            # point.
-            per = 6 * (2 * ny) ** 2 * RB.element_size()
-            c   = min(_EIGH_CHUNK[0] or Nb, Nb)
-            if _EIGH_BYTES[0]:
-                c = min(c, _EIGH_BYTES[0] // per)
-            c = max(1, c)
-            UU = torch.empty((Nb, ny, k), dtype=RB.dtype, device=dev)
-            H  = torch.zeros((min(c, Nb), 2 * ny, 2 * ny),
-                             dtype=RB.dtype, device=dev)
-            for j in range(0, Nb, c):
-                blk = RB[j:j+c]
-                Hv  = H[:blk.shape[0]]
-                Hv[:, :ny, ny:] = blk.mT
-                Hv[:, ny:, :ny] = blk
-                UU[j:j+c] = tla.eigh(Hv).eigenvectors[..., -k:].flip(-1)[:, :ny, :]
-            del H, RB
-            # Each column arrives as the top half of (u, v)/sqrt(2).  The two
+            if _UV_BASIS[0] == 'svd_host':
+                # Left singular vectors of Bp are those of L = RB^T (ny x ny).
+                # Direct SVD of L never forms the Gram, so like the JW form
+                # below it resolves sigma_j down to ~u sigma_1, but the dense
+                # reduction is at size ny instead of 2ny and runs on the host
+                # (see _left_sv_host for why host + batch-parallel).
+                UU = _left_sv_host(RB, k)
+            elif _UV_BASIS[0] == 'svd_dev':
+                UU = _left_sv_dev(RB, k)
+            else:
+                # Left singular vectors of Bp are those of L = RB^T, and they live
+                # in R^ny: the s direction is already gone.  Extract them from the
+                # Jordan-Wielandt form
+                #     H = [[0, L], [L^T, 0]],   eig(H) = +-sigma,
+                #     eigenvectors (u, +-v)/sqrt(2),
+                # which is assembled by block placement -- exactly, with no
+                # arithmetic -- and has ||H|| = sigma_1.  A backward-stable eigh
+                # therefore resolves directions down to sigma_j ~ u sigma_1, where
+                # eigh(Bp Bp^T) loses everything below sqrt(u) sigma_1 to the
+                # rounding error of forming the Gram.
+                # The eigenproblem is 2ny, so its workspace is 4x the ny version's
+                # at equal batch size -- dividing a fixed chunk COUNT by 4 does not
+                # track that, because the count itself was tuned at some other ny.
+                # Budget bytes: ~6x the batch covers H, the eigenvector output and
+                # cusolver's own scratch.  At ny=400 this gives the old chunk back;
+                # at ny=800 it backs off to a quarter of it, which is the whole
+                # point.
+                per = 6 * (2 * ny) ** 2 * RB.element_size()
+                c   = min(_EIGH_CHUNK[0] or Nb, Nb)
+                if _EIGH_BYTES[0]:
+                    c = min(c, _EIGH_BYTES[0] // per)
+                c = max(1, c)
+                UU = torch.empty((Nb, ny, k), dtype=RB.dtype, device=dev)
+                H  = torch.zeros((min(c, Nb), 2 * ny, 2 * ny),
+                                 dtype=RB.dtype, device=dev)
+                for j in range(0, Nb, c):
+                    blk = RB[j:j+c]
+                    Hv  = H[:blk.shape[0]]
+                    Hv[:, :ny, ny:] = blk.mT
+                    Hv[:, ny:, :ny] = blk
+                    UU[j:j+c] = tla.eigh(Hv).eigenvectors[..., -k:].flip(-1)[:, :ny, :]
+                del H
+            del RB
+            # Kept unchanged for both paths.  For 'svd_host' the columns are
+            # already orthonormal to O(u) and this is a near no-op (the
+            # optional fix #4 would drop it there).  For 'jw':
+            # each column arrives as the top half of (u, v)/sqrt(2).  The two
             # halves separate cleanly for distinct positive sigma; a +-pair is
             # degenerate only where sigma ~ 0, so clamp before dividing and
             # then restore orthonormality outright -- ULVsparse.compute_QRW_sparse
@@ -436,6 +508,36 @@ def compute_UV_pair(Om, Y, Psi, Z, rk, device=None, fast=False):
         out.append((UU, M))
 
     return out[0], out[1]
+
+
+def compute_UV_pair_chunked(Om, Y, Psi, Z, rk, device=None, fast=False):
+    """compute_UV_pair split along the block (batch) dimension.
+
+    Every quantity in compute_UV_pair is computed per block, so running it on
+    slices of the batch gives the same result.  Keeping each batched library
+    call below _UV_CHUNK_ELEMS elements avoids 32-bit size/offset limits in
+    batched potrf/trsm at large Nb, and also bounds the peak of the
+    Q / Bp / Gram temporaries.
+    """
+    Nb, ny, s = Y.shape
+    n = Om.shape[1]
+    cap = _UV_CHUNK_ELEMS[0]
+    c = Nb if not cap else max(1, min(Nb, cap // max(1, max(n, ny) * s)))
+    if c >= Nb:
+        return compute_UV_pair(Om, Y, Psi, Z, rk, device, fast=fast)
+    U = V = Mo = Mp = None
+    for j in range(0, Nb, c):
+        sl = slice(j, j + c)
+        (u, mo), (v, mp) = compute_UV_pair(Om[sl], Y[sl], Psi[sl], Z[sl],
+                                           rk, device, fast=fast)
+        if U is None:
+            U  = u.new_empty((Nb,) + tuple(u.shape[1:]))
+            V  = v.new_empty((Nb,) + tuple(v.shape[1:]))
+            Mo = mo.new_empty((Nb,) + tuple(mo.shape[1:]))
+            Mp = mp.new_empty((Nb,) + tuple(mp.shape[1:]))
+        U[sl], V[sl], Mo[sl], Mp[sl] = u, v, mo, mp
+        del u, v, mo, mp
+    return (U, Mo), (V, Mp)
 
 
 class HBSMAT:
@@ -482,7 +584,7 @@ class HBSMAT:
         self.mode  = 'N'
         self._tree = None
 
-        dev = _canon(device) if device is not None else torch.device('cpu')
+        dev = torch.device(device) if device is not None else torch.device('cpu')
         self.compute_device = dev
         self.home           = torch.device('cpu')
         self._resident = {'core': dev, 'ulv': dev}
@@ -604,7 +706,7 @@ class HBSMAT:
 
         tic = time.time()
         if torch.is_tensor(self.perm):
-            self.perm = self.perm.cpu().to(self.compute_device)
+            self.perm = self.perm.to(self.compute_device)
         else:
             self.perm = torch.as_tensor(self.perm, dtype=torch.int64,
                                         device=self.compute_device)
@@ -643,7 +745,7 @@ class HBSMAT:
 
             if lvl > 0:
                 tic = time.time()
-                (U_ell, M_om), (V_ell, M_psi) = compute_UV_pair(
+                (U_ell, M_om), (V_ell, M_psi) = compute_UV_pair_chunked(
                     Om_ell, Y_ell, Psi_ell, Z_ell, rkm, self.device, fast=fast)
                 self.nullTime += time.time() - tic
                 tic = time.time()
@@ -902,20 +1004,10 @@ class HBSMAT:
         dev, n = self.compute_device, 0
         for g in need:
             rec = self._host[g]
-            if rec is None and any(getattr(self, name)[i].is_cuda and
-                                   not _dev_eq(getattr(self, name)[i].device, dev)
-                                   for name, i in self._entries(g)):
-                rec, nD2H = self._snapshot(g)   # never GPU-to-GPU: via host
-                self.bytesD2H += nD2H
             if rec is not None:
                 for (name, i), hv in zip(rec['ents'], rec['views']):
                     getattr(self, name)[i] = hv.to(dev, non_blocking=non_blocking)
                     n += hv.nbytes
-                if dev.type == 'cuda':
-                    ev = torch.cuda.Event()
-                    ev.record(torch.cuda.current_stream(dev))
-                    for b in rec['bufs'].values():
-                        b.evs = [e for e in b.evs if not e.query()] + [ev]
             else:
                 for name, i in self._entries(g):
                     t = getattr(self, name)[i]
@@ -955,32 +1047,12 @@ class HBSMAT:
             self.nSpill += 1
         return self
 
-    def handle(self, device):
-        """This block on `device` with residency state of its own.  Shares the
-        immutable host masters (no host copy), so one block can serve several
-        GPUs without their evicts and prefetches interfering.  The block must
-        have a master for every non-empty group, i.e. have been evicted."""
-        if any(self._entries(g) and self._host[g] is None for g in self._GROUPS):
-            raise RuntimeError("handle() needs host masters: evict() the block first")
-        h = object.__new__(self.__class__)
-        h.__dict__ = self.__dict__.copy()
-        for name in sum(self._GROUPS.values(), ('_permbox',)):
-            setattr(h, name, list(getattr(self, name)))
-        for rec in filter(None, self._host.values()):
-            for (name, i), hv in zip(rec['ents'], rec['views']):
-                getattr(h, name)[i] = hv
-        h._host = dict(self._host)
-        h._resident = dict.fromkeys(self._GROUPS)
-        h.compute_device = _canon(device)
-        h.nFill = h.nSpill = h.bytesH2D = h.bytesD2H = 0
-        return h
-
     def release_ulv(self):
         """Send the ULV factors home, keep the apply factors on device."""
         return self.evict(groups=('ulv',))
 
     def to(self, device, non_blocking=False):
-        device = _canon(device)
+        device = torch.device(device)
         moved = 0
         for g in self._GROUPS:
             for name, i in self._entries(g):

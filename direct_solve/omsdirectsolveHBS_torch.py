@@ -8,9 +8,8 @@ import time
 import gc
 import math
 import warnings
-import copy
-import threading
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
+import re
+import collections
 class rkStrat:
     """Per-stage HBS compression rank.
 
@@ -320,8 +319,7 @@ def _resolve_device(spec):
             "is False. Pass 'cpu' or 'auto' if a host fallback is acceptable."
         )
     if dev.type == 'cuda' and dev.index is None:
-        torch.cuda.empty_cache()    # our own cache must not count as used
-        dev = HBSnew.free_gpu()
+        dev = torch.device('cuda', torch.cuda.current_device())
     return dev
 
 # ---------------------------------------------------------------------------
@@ -765,6 +763,187 @@ class ThomasSolverHBS(DirectSolver):
 # HBS Red-Black solver
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# solve-stage block cache
+# ---------------------------------------------------------------------------
+
+def _is_oom(e):
+    for name in ('OutOfMemoryError',):
+        cls = getattr(torch, name, None) or getattr(torch.cuda, name, None)
+        if cls is not None and isinstance(e, cls):
+            return True
+    return isinstance(e, RuntimeError) and 'out of memory' in str(e)
+
+
+def _managed(op):
+    """Blocks with HBStorch residency (host master + device mirror)."""
+    return (hasattr(op, '_GROUPS') and hasattr(op, 'prefetch')
+            and hasattr(op, 'evict') and hasattr(op, '_group_resident'))
+
+
+def _group_nbytes(op, groups):
+    """Bytes of the named groups, wherever the tensors currently live."""
+    n = 0
+    for g in groups:
+        for nm in op._GROUPS.get(g, ()):
+            for t in (getattr(op, nm, None) or []):
+                if torch.is_tensor(t):
+                    n += t.nbytes
+    return n
+
+
+class _SolveCache:
+    """Keeps HBS blocks resident on the device across uses within a solve.
+
+    Replacement for "evict every block right after its use".  Blocks stay
+    on the device until room is needed; the victim is chosen as
+
+      1. the least recently used block with NO remaining use in this solve
+         (known exactly: solve() hands over its full plan up front), else
+      2. the least recently used block overall.
+
+    Rule 1 keeps an operator that is used again later -- e.g. one S_rk_list
+    object shared by every slab -- and drops finished ones first.  Rule 2 is
+    plain LRU, which suits the solve's order: the coarse diagonals touched
+    last in forward reduction are the first ones back substitution needs.
+
+    Room is needed when either
+      * the cache would exceed its cap (solve_cache_bytes), or
+      * free device memory (driver-free plus allocator-cached) would drop
+        below the incoming block plus `reserve`.
+    The free-memory test is re-read before every load, so allocations made
+    elsewhere shrink the cache instead of causing an OOM.
+
+    Worst case (nothing fits) degenerates to the old behaviour: only the
+    block in use is resident.  If a load or the operation itself still runs
+    out of memory, everything else is evicted and the operation is retried
+    once -- safe because apply and (non-overwriting) solve do not modify
+    their input.  A second OOM propagates.
+
+    Block sizes are taken as core+ulv regardless of what is loaded, so the
+    cap is conservative.
+    """
+
+    def __init__(self, device, cap=None):
+        self.dev     = torch.device(device)
+        self.cap     = cap
+        self.reserve = 0
+        self.keep    = False
+        self.lru     = collections.OrderedDict()    # id -> op, oldest first
+        self.size    = {}                           # id -> bytes counted
+        self.uses    = {}                           # id -> remaining uses
+        self.bytes   = 0
+        self.stats   = {}
+
+    @property
+    def active(self):
+        return self.dev.type == 'cuda'
+
+    def headroom(self):
+        free, _ = torch.cuda.mem_get_info(self.dev)
+        return (free + torch.cuda.memory_reserved(self.dev)
+                - torch.cuda.memory_allocated(self.dev))
+
+    # -- lifecycle ------------------------------------------------------
+    def begin(self, plan, reserve, keep=False):
+        self.reserve = int(reserve)
+        self.keep    = bool(keep)
+        self.uses    = {}
+        for op in plan:
+            if _managed(op):
+                self.uses[id(op)] = self.uses.get(id(op), 0) + 1
+        self.stats = dict(hits=0, loads=0, evictions=0, oom_retries=0,
+                          peak_GB=self.bytes / 1e9)
+        # carried over from a previous solve but not used by this one
+        for k in [k for k in self.lru if k not in self.uses]:
+            self._evict(k)
+
+    def end(self):
+        self.uses = {}
+        if not self.keep:
+            self.flush()
+
+    def flush(self, keep_id=None):
+        for k in [k for k in self.lru if k != keep_id]:
+            self._evict(k)
+
+    # -- internals ------------------------------------------------------
+    def _evict(self, k):
+        op = self.lru.pop(k)
+        self.bytes -= self.size.pop(k)
+        op.evict()
+        if self.stats:
+            self.stats['evictions'] += 1
+
+    def _victim(self, exclude):
+        for k in self.lru:                          # rule 1
+            if k != exclude and self.uses.get(k, 0) <= 0:
+                return k
+        for k in self.lru:                          # rule 2
+            if k != exclude:
+                return k
+        return None
+
+    def _make_room(self, need, exclude):
+        while True:
+            over_cap = self.cap is not None and self.bytes + need > self.cap
+            short    = self.headroom() < need + self.reserve
+            if not (over_cap or short):
+                return
+            k = self._victim(exclude)
+            if k is None:
+                return          # nothing left to give; proceed as before
+            self._evict(k)
+
+    def _acquire(self, op, groups):
+        k = id(op)
+        if k in self.lru:
+            self.lru.move_to_end(k)
+            self.stats['hits'] += 1
+            # cached for applies, now needed for a solve: ULV may be missing
+            missing = tuple(g for g in groups if not op._group_resident(g))
+            if missing:
+                self._make_room(_group_nbytes(op, missing), exclude=k)
+                op.prefetch(groups=missing)
+            return
+        sz = _group_nbytes(op, op._GROUPS)
+        self._make_room(sz, exclude=k)
+        op.prefetch(groups=tuple(groups))
+        self.lru[k]  = op
+        self.size[k] = sz
+        self.bytes  += sz
+        self.stats['loads'] += 1
+        self.stats['peak_GB'] = max(self.stats['peak_GB'], self.bytes / 1e9)
+
+    def _done(self, op):
+        k = id(op)
+        if k in self.uses:
+            self.uses[k] -= 1
+        # finished for this solve and not wanted for the next one: free now
+        if not self.keep and self.uses.get(k, 0) <= 0 and k in self.lru:
+            self._evict(k)
+
+    # -- public ---------------------------------------------------------
+    def run(self, op, groups, fn):
+        """fn() with op resident for `groups`."""
+        if not (self.active and _managed(op)):
+            return fn()
+        try:
+            self._acquire(op, groups)
+            out = fn()
+        except Exception as e:
+            if not _is_oom(e):
+                raise
+            self.stats['oom_retries'] += 1
+            out = None
+            self.flush(keep_id=id(op))
+            torch.cuda.empty_cache()
+            self._acquire(op, groups)
+            out = fn()
+        self._done(op)
+        return out
+
+
 class RedBlackSolverHBS(DirectSolver):
     """
     Block-tridiagonal solver using cyclic reduction (red-black),
@@ -866,8 +1045,25 @@ class RedBlackSolverHBS(DirectSolver):
                  compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False,
                  oversample=None,
                  debug_blocks=0, debug_inverse=True, debug_true_inverse=False,
-                 debug_seed=1234, perm=None, devices=None):
+                 debug_seed=1234,
+                 solve_cache_bytes=None, solve_keep_cache=False,
+                 solve_reserve_bytes=None):
         super().__init__(m, cyclic)
+        # --- solve-stage block cache (see _SolveCache) ---------------------
+        # solve_cache_bytes : hard cap on bytes the cache may keep resident;
+        #                     None = limited only by free device memory,
+        #                     0 = keep nothing beyond the block in use.
+        # solve_keep_cache  : keep cached blocks resident after solve()
+        #                     returns, so the next solve() reuses them.  Off
+        #                     by default: the memory stays held until
+        #                     release_solve_cache() or the next factorize().
+        # solve_reserve_bytes: device memory the cache always leaves free for
+        #                     the solve's own working tensors; None = auto.
+        self.solve_cache_bytes   = solve_cache_bytes
+        self.solve_keep_cache    = bool(solve_keep_cache)
+        self.solve_reserve_bytes = solve_reserve_bytes
+        self._solve_cache        = None
+        self.solveCacheStats     = {}
         # rk may be an int (constant schedule) or an rkStrat.  self.rk stays
         # the stage-0 rank so existing callers that read or print it, and
         # _nsamples(self.rk), keep meaning what they meant.
@@ -875,12 +1071,6 @@ class RedBlackSolverHBS(DirectSolver):
         self.rk   = self.rkStrat.rank(0)
         self.tree = tree
         self.quad = quad
-        # One read-only host copy of the leaf permutation for every block
-        # built here; each block uploads its own device copy from it.
-        self._perm = torch.as_tensor(tree.perm_leaf if perm is None else perm,
-                                     dtype=torch.int64).cpu()
-        self._keep, self._shared = (), set()   # see _hold
-        self._stop = threading.Event()          # set when a GPU worker fails
         self.compress_diag = compress_diag
         self.fused  = fused
         self.device = device
@@ -896,18 +1086,8 @@ class RedBlackSolverHBS(DirectSolver):
         self.nULV         = 0   
         self.nULVSkipped  = 0   
         self.nDeadSkipped = 0
-        # devices: build on several GPUs ('all', or a list); the solve runs on
-        # compute_device, by default the first of them.
-        if devices == 'all':
-            devices = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
-        self.devices = [_resolve_device(d) for d in devices] if devices else None
-        if self.devices and (len({str(d) for d in self.devices}) < len(self.devices)
-                             or cyclic or not fused or not compress_diag):
-            raise ValueError("multi-GPU factorization needs distinct devices, "
-                             "cyclic=False, fused=True and compress_diag=True")
         self.compute_device = _resolve_device(
-            compute_device if compute_device is not None else
-            (self.devices[0] if self.devices else device))
+            compute_device if compute_device is not None else device)
         self.strict_residency = strict_residency
         # Oversampling above the hard floor; see _nsamples.  None -> p = rk.
         self.oversample = oversample
@@ -945,6 +1125,7 @@ class RedBlackSolverHBS(DirectSolver):
         self._pgen = torch.Generator(device=self.compute_device)
         self._pgen.manual_seed(int(debug_seed))
         self._blocks = []
+        self._block_ids = set()      # id() of every op in _blocks; see _adopt
         self._tdtype = torch.float64
         self._tgen   = torch.Generator(device=self.compute_device)
         if seed is not None:
@@ -1044,33 +1225,35 @@ class RedBlackSolverHBS(DirectSolver):
             h.compute_device = self.compute_device
             h.strict = self.strict_residency
             h._built_by_rb = True
-            self._blocks.append(h)
+            if id(h) not in self._block_ids:
+                self._block_ids.add(id(h))
+                self._blocks.append(h)
             return h
-    def _adopt(self, op, seen):
-        """Take ownership of an input block.  It is first released from the
-        GPU it was built on (evicted to its host master, even if to() made a
-        GPU its home).  If it is bound to another device, the solver works on
-        a handle sharing that master instead, so the block itself is never
-        re-pointed.  Positions holding the same object get the same handle."""
-        if id(op) in seen:
-            return seen[id(op)]
-        if self.compute_device.type == 'cuda' and not isinstance(op, HBSnew.HBSMAT):
-            raise TypeError(f"GPU factorization needs HBStorch.HBSMAT input blocks, "
-                            f"got {type(op).__name__}")
-        h = op
-        if isinstance(op, HBSnew.HBSMAT):
-            if op.compute_device.type == 'cpu':     # host-built: free to re-point
-                op.compute_device = self.compute_device
-            op.home = torch.device('cpu')
+    def _adopt(self, op):
+        """Take ownership of an operator.
+        """
+        if hasattr(op, 'evict'):
+            # S_rk_list commonly repeats the same operator object for every
+            # slab (translation-invariant slabs).  Register it once: listing it
+            # once per slab made traffic(), residency_report() and footprint()
+            # count its size and transfer counters once per slab.  _blocks
+            # holds a reference, so an id() cannot be reused while listed.
+            if id(op) in self._block_ids:
+                return op
+            op.compute_device = self.compute_device
+            op.strict         = self.strict_residency
+            op.warn_on_demote = True
+            self._block_ids.add(id(op))
+            self._blocks.append(op)
             op.evict()
-            if not HBSnew._dev_eq(op.compute_device, self.compute_device):
-                h = op.handle(self.compute_device)
-            h.strict         = self.strict_residency
-            h.warn_on_demote = True
-            self._blocks.append(h)
-        seen[id(op)] = h
-        return h
+        return op
     def _finish(self, h, ulv, label, spill=True):
+        # Recorded before _guard_no_ulv so traffic() can group blocks by
+        # kind / level; set via try in case the attribute is not settable.
+        try:
+            h._label = label
+        except Exception:
+            pass
         self.nConstruct += 1
         if ulv:
             self.nULV += 1
@@ -1093,7 +1276,6 @@ class RedBlackSolverHBS(DirectSolver):
         ulv   = self._want_ulv(compute_ULV)
 
         h = HBSnew.HBSMAT(linop, device=dev, tree=self.tree, quad=self.quad)
-        h.perm = self._perm
         h.construct(rkloc, compute_ULV=ulv, fast=self.fast)
 
         return self._finish(h, ulv, label, spill=spill)
@@ -1126,7 +1308,6 @@ class RedBlackSolverHBS(DirectSolver):
             return v
 
         h = HBSnew.HBSMAT(device=dev, tree=self.tree, quad=self.quad)
-        h.perm = self._perm
         h.construct(rk,
                     Om=_prep(Om), Psi=_prep(Psi),
                     Y=_prep(Y),   Z=_prep(Z),
@@ -1305,10 +1486,72 @@ class RedBlackSolverHBS(DirectSolver):
                 nSpill  = sum(getattr(x,'nSpill',0) for x in b),
                 GB_H2D  = sum(getattr(x,'bytesH2D',0)for x in b)/10**9,
                 GB_D2H  = sum(getattr(x,'bytesD2H',0)for x in b)/10**9,
-                GB_total= sum(x.device_nbytes() for x in b)/10**9,
-                GB_pinned   = HBSnew._PINNED[0]/10**9,
-                unregFailed = len(HBSnew._UNREG_FAILED)
+                GB_total= sum(x.device_nbytes() for x in b)/10**9
                 )
+
+    @staticmethod
+    def _block_size(h):
+        """Full size of a block from its tensor lists, independent of
+        whether it is currently resident (unlike device_nbytes())."""
+        return sum(t.nbytes
+                   for names in getattr(h, '_GROUPS', {}).values()
+                   for nm in names
+                   for t in (getattr(h, nm, None) or [])
+                   if torch.is_tensor(t))
+
+    def traffic(self, verbose=True):
+        """Host<->device traffic per (nSlabs, kind, parity) group.
+
+        Ratios are relative to the full block size (_block_size), not to
+        device_nbytes(), so they do not depend on what happens to be
+        resident when this is called.  Counters are cumulative over the
+        blocks' lifetime: call after factorize and again after each solve
+        and difference the results to get per-phase cost.
+
+        'par' is the parity of the block's index one level down, where it is
+        consumed: odd-indexed operators are staged by both neighbours in the
+        current fused builder.  Blocks without a label (the adopted level-0
+        inputs) are grouped as 'input'.
+
+        _spill() round trips of raw sample tensors are not counted here.
+        """
+        # key -> [nblocks, size, H2D, D2H, fills, spills]
+        agg = collections.defaultdict(lambda: [0, 0, 0, 0, 0, 0])
+        for h in self._blocks:
+            lab = getattr(h, '_label', None)
+            mo  = re.match(r'(\w)\[(\d+)\] \(nSlabs=(\d+)\)', lab) if lab else None
+            if mo:
+                kind, i, ns = mo.group(1), int(mo.group(2)), int(mo.group(3))
+                key = (ns, kind, 'odd' if (i // 2) % 2 else 'even')
+            else:
+                key = (0, 'input', '-')
+            a = agg[key]
+            a[0] += 1
+            a[1] += self._block_size(h)
+            a[2] += getattr(h, 'bytesH2D', 0)
+            a[3] += getattr(h, 'bytesD2H', 0)
+            a[4] += getattr(h, 'nFill', 0)
+            a[5] += getattr(h, 'nSpill', 0)
+
+        tot = sum(a[1] for a in agg.values())
+        h2d = sum(a[2] for a in agg.values())
+        d2h = sum(a[3] for a in agg.values())
+
+        if verbose:
+            print(f"{'nSlabs':>6} {'kind':>5} {'par':>4} {'n':>4} {'GB':>7} "
+                  f"{'H2D x':>6} {'D2H x':>6} {'fill/blk':>8} {'spill/blk':>9}")
+            for k in sorted(agg):
+                n, sz, bh, bd, f, s = agg[k]
+                print(f"{k[0]:>6} {k[1]:>5} {k[2]:>4} {n:>4} {sz/1e9:7.2f} "
+                      f"{bh/max(sz,1):6.2f} {bd/max(sz,1):6.2f} "
+                      f"{f/n:8.2f} {s/n:9.2f}")
+            print(f"total {tot/1e9:.2f} GB   H2D {h2d/max(tot,1):.2f}x   "
+                  f"D2H {d2h/max(tot,1):.2f}x")
+
+        return {'groups': {k: dict(n=v[0], bytes=v[1], H2D=v[2], D2H=v[3],
+                                   nFill=v[4], nSpill=v[5])
+                           for k, v in agg.items()},
+                'total_bytes': tot, 'H2D': h2d, 'D2H': d2h}
 
     # ------------------------------------------------------------------
 
@@ -1387,23 +1630,20 @@ class RedBlackSolverHBS(DirectSolver):
 
         if not ((nSlabs & (nSlabs - 1) == 0) and nSlabs != 0):
             raise ValueError("Number of slabs must be a power of 2.")
+        # A warm cache from a previous solve() holds device memory that this
+        # factorization needs, and refers to blocks about to be superseded.
+        self.release_solve_cache()
         HBSnew.uv_timers_reset()
-        self._blocks = []           # a previous factorization's blocks are released
         HBSnew._UV_SYNC[0] = (self.compute_device.type == 'cuda')
         self._dtype = S_rk_list[0][0].dtype
 
-        seen = {}
-        SiM = [self._adopt(_[0], seen) for _ in S_rk_list]
-        SiP = [self._adopt(_[-1], seen) for _ in S_rk_list]
-        torch.cuda.empty_cache()    # hand the input blocks' GPU memory back
+        SiM = [self._adopt(_[0]) for _ in S_rk_list]
+        SiP = [self._adopt(_[-1])for _ in S_rk_list]
 
         # Boundary zeros -- kept as zero LinearOperators so indexing is uniform.
         if not self.cyclic:
             SiM[0]  = zero_op(m, self._dtype)
             SiP[-1] = zero_op(m, self._dtype)
-        ops = SiM + SiP
-        self._shared = {h for h in ops
-                        if isinstance(h, HBSnew.HBSMAT) and ops.count(h) > 1}
 
         if T is None:
             T = [id_op(m, self._dtype) for _ in range(nSlabs)]
@@ -1437,17 +1677,14 @@ class RedBlackSolverHBS(DirectSolver):
         l = nSlabs
         j = 0
         self.levelTimes=[]
-        self._stop.clear()
         self.blockErrors = []
         while l > 1:
             rk = self.rkSchedule[j]
             self._dbg_stage = j
-            builder = (self._build_level_multi if self.devices else
-                       self._build_level_fused if self.fused else self._build_level)
+            builder = self._build_level_fused if self.fused else self._build_level
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.time()
-            self._hold(self._shared if j == 0 else ())
             RB.append(builder(m, l, RB[-1], rk))
             if self.compute_device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -1458,14 +1695,15 @@ class RedBlackSolverHBS(DirectSolver):
             j += 1
             l //= 2
 
-        self._hold(())
         self.nSlabs = nSlabs
         self.RB     = RB
         for h in self._blocks:
             if getattr(h, '_built_by_rb', False) and hasattr(h, 'evict'):
                 h.evict()
-                h.compute_device = self.compute_device
         torch.cuda.empty_cache()
+        # Every block now has a host master; warn once if any of them could
+        # not be page-locked (uploads from those are synchronous and slower).
+        self.pinned_report(verbose=False, warn=True)
 
     # ------------------------------------------------------------------
     # _build_level_fused  -- tier-2 shared solves
@@ -1509,7 +1747,7 @@ class RedBlackSolverHBS(DirectSolver):
             return
         for lst in (SiM,SiP,T,T_hbs):
             op = lst[idx]
-            if hasattr(op,'evict') and op not in self._keep:
+            if hasattr(op,'evict'):
                 op.evict()
         Xm.pop(idx,None)
         Xp.pop(idx,None)
@@ -1551,69 +1789,10 @@ class RedBlackSolverHBS(DirectSolver):
         sweep has run.  The solve touches every block in the tree, so without
         this the working set is the whole factorization."""
         for op in ops:
-            if op is not None and hasattr(op, 'evict') and op not in self._keep:
+            if op is not None and hasattr(op, 'evict'):
                 op.evict()
 
-    def _hold(self, ops):
-        """Exempt ops from _release/_retire from now on, and release whatever
-        was held before.  _hold(()) just releases.  Used for input blocks that
-        stiff_mat_const places at many level-0 positions: staged once for the
-        level instead of once per position."""
-        held, self._keep = self._keep, set(ops)
-        self._release(*held)
-
-    def _build_level_multi(self, m, nSlabs, RB_level, rk):
-        """One level on several GPUs.  Each GPU builds a contiguous range of
-        the retained nodes, in a thread of its own, on a shallow copy of this
-        solver bound to its device.  Nothing passes between GPUs: a worker
-        reads every operator from its host master, through a handle of its
-        own when the operator is bound to another device, and the eliminated
-        node on a range boundary is solved on both sides of it."""
-        idx  = list(range(0, nSlabs, 2))
-        G    = min(len(self.devices), len(idx))
-        seed = int(self._rng.integers(2**62))
-        ws, jobs, exs = [], [], []
-        try:
-            for g, dev in enumerate(self.devices[:G]):
-                memo = {}                       # one handle per operator
-                for o in (o for lst in RB_level for o in lst):
-                    if id(o) not in memo:
-                        memo[id(o)] = (o.handle(dev) if isinstance(o, HBSnew.HBSMAT)
-                                       and not HBSnew._dev_eq(o.compute_device, dev) else o)
-                w = copy.copy(self)
-                w.compute_device, w._blocks, w.blockErrors = dev, [], []
-                w._keep = {memo[id(o)] for o in self._shared if id(o) in memo}
-                w._tgen = torch.Generator(device=dev).manual_seed(seed)
-                w._pgen = torch.Generator(device=dev).manual_seed(seed + 1)
-                ex = ThreadPoolExecutor(1, initargs=(dev,), initializer=
-                                        torch.cuda.set_device if dev.type == 'cuda' else None)
-                exs.append(ex)
-                jobs.append(ex.submit(w._build_level_fused, m, nSlabs,
-                                      [[memo[id(o)] for o in lst] for lst in RB_level],
-                                      rk, idx[g*len(idx)//G:(g+1)*len(idx)//G]))
-                ex.submit(w._hold, ())                   # then, on the same thread,
-                ex.submit(w._release, *memo.values())    # leave the GPU empty
-                ws.append(w)
-            wait(jobs, return_when=FIRST_EXCEPTION)
-        finally:
-            if not all(f.done() for f in jobs) or any(f.exception() for f in jobs):
-                self._stop.set()
-            for ex in exs:
-                ex.shutdown(wait=True)
-        errs = [f.exception() for f in jobs if f.exception()]
-        errs = [e for e in errs if not isinstance(e, InterruptedError)] + errs
-        if errs:
-            raise errs[0]
-        for k in ('nConstruct', 'nULV', 'nULVSkipped', 'nDeadSkipped',
-                  'nSolve', 'nApply', 'nIdSkipped'):
-            setattr(self, k, sum(getattr(w, k) for w in ws) - (G - 1)*getattr(self, k))
-        for w in ws:
-            self._blocks += w._blocks
-            self.blockErrors += w.blockErrors
-        res = [f.result() for f in jobs]
-        return tuple(sum((r[q] for r in res), []) for q in range(4))
-
-    def _build_level_fused(self, m, nSlabs, RB_level, rk, nodes=None):
+    def _build_level_fused(self, m, nSlabs, RB_level, rk):
         SiM   = RB_level[0]
         T     = RB_level[1]
         T_hbs = RB_level[2]
@@ -1778,9 +1957,7 @@ class RedBlackSolverHBS(DirectSolver):
         # ---------------------------------------------------------------
         B_i, T_hbs_new, A_i, C_i = [], [], [], []
 
-        for i in (range(0, nSlabs, 2) if nodes is None else nodes):
-            if self._stop.is_set():
-                raise InterruptedError("stopped: another GPU worker failed")
+        for i in range(0, nSlabs, 2):
             has_left  = cyclic or i > 0
             has_right = cyclic or i < nSlabs - 1
             kL = (i - 1) % nSlabs
@@ -2015,7 +2192,7 @@ class RedBlackSolverHBS(DirectSolver):
                 del refs
 
             self._sync();t2=time.time()
-            print(f"[{self.compute_device}] node {i:3d}: sample {t1-t0:6.2f}s"
+            print(f"node {i:3d}: sample {t1-t0:6.2f}s"
                   f" construct {t2-t1:6.2f}s (B+A+C)"
                   f" alloc {torch.cuda.memory_allocated()/2**30:5.2f} GB")
         if not cyclic:
@@ -2096,93 +2273,238 @@ class RedBlackSolverHBS(DirectSolver):
         nrhs = v0.shape[1]
         vPrimes = [v0.clone()]
 
-        for l in range(len(RB) - 1):
-            SiM, _, T_hbs, SiP = RB[l]
-            self._hold(self._shared if l == 0 else ())
+        # Block residency for the whole solve goes through one cache instead
+        # of evicting after every use; see _SolveCache.  The arithmetic below
+        # is unchanged -- only _ap/_sv are wrapped, and the per-use _release
+        # calls are gone (the cache decides when a block leaves the device).
+        cache = self._get_solve_cache()
+        cache.begin(self._solve_plan(), reserve=self._solve_reserve(nrhs),
+                    keep=self.solve_keep_cache)
 
-            nSlabs   = len(SiM)
-            nReduced = nSlabs // 2
-            vPrev    = vPrimes[-1]
-            # every block is written below, so no zero fill
-            vPrime   = torch.empty(m * nReduced, nrhs,dtype=self._tdtype,device=dev)
+        def ap(op, X):
+            return cache.run(op, ('core',), lambda: self._ap(op, X))
 
-            # T_k^{-1} vPrev_k for odd k is read by node k-1 (as `next`) and by
-            # node k+1 (as `prev`) -- the same solve on the same rhs.  Solve
-            # once, release T_hbs[k] immediately (the result is all anyone
-            # needs), and drop the result after its last reader.  In the
-            # non-cyclic case the last odd node has a single reader.
-            Tinv, uses = {}, {}
+        def sv(op, X):
+            return cache.run(op, ('core', 'ulv'), lambda: self._sv(op, X))
 
-            def _Tinv(k):
-                if k not in Tinv:
-                    blk = vPrev[k*m:(k+1)*m, :]
-                    if _is_id(T_hbs[k]):
-                        Tinv[k] = blk           # read-only use: no clone needed
-                        self.nIdSkipped += 1
-                    else:
-                        Tinv[k] = self._sv(T_hbs[k], blk)
-                        self._release(T_hbs[k])
-                    uses[k] = 2 if (self.cyclic or k != nSlabs - 1) else 1
-                x = Tinv[k]
-                uses[k] -= 1
-                if uses[k] == 0:
-                    del Tinv[k], uses[k]
-                return x
+        try:
+            for l in range(len(RB) - 1):
+                SiM, _, T_hbs, SiP = RB[l]
 
-            for j in range(nReduced):
-                i = 2 * j
+                nSlabs   = len(SiM)
+                nReduced = nSlabs // 2
+                vPrev    = vPrimes[-1]
+                # every block is written below, so no zero fill
+                vPrime   = torch.empty(m * nReduced, nrhs,dtype=self._tdtype,device=dev)
 
-                prev = (i - 1) % nSlabs if (self.cyclic or i > 0)          else None
-                next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1) else None
+                # T_k^{-1} vPrev_k for odd k is read by node k-1 (as `next`) and
+                # by node k+1 (as `prev`) -- the same solve on the same rhs.
+                # Solve once and drop the result after its last reader.  In the
+                # non-cyclic case the last odd node has a single reader.
+                Tinv, uses = {}, {}
 
-                # out-of-place updates below; the slice assignment copies
-                contrib = vPrev[i*m:(i+1)*m, :]
-                if prev is not None:
-                    contrib = contrib - self._ap(SiM[i], _Tinv(prev))
-                if next is not None:
-                    contrib = contrib - self._ap(SiP[i], _Tinv(next))
+                def _Tinv(k):
+                    if k not in Tinv:
+                        blk = vPrev[k*m:(k+1)*m, :]
+                        if _is_id(T_hbs[k]):
+                            Tinv[k] = blk           # read-only use: no clone needed
+                            self.nIdSkipped += 1
+                        else:
+                            Tinv[k] = sv(T_hbs[k], blk)
+                        uses[k] = 2 if (self.cyclic or k != nSlabs - 1) else 1
+                    x = Tinv[k]
+                    uses[k] -= 1
+                    if uses[k] == 0:
+                        del Tinv[k], uses[k]
+                    return x
 
-                vPrime[j*m:(j+1)*m,:] = contrib
+                for j in range(nReduced):
+                    i = 2 * j
 
-                # SiM[i]/SiP[i] have no further consumer at this level.
-                self._release(SiM[i], SiP[i])
+                    prev = (i - 1) % nSlabs if (self.cyclic or i > 0)          else None
+                    next = (i + 1) % nSlabs if (self.cyclic or i < nSlabs - 1) else None
 
-            assert not Tinv, "forward reduction left cached solves unconsumed"
-            self._release(*T_hbs)       # no-op for already-released blocks
-            vPrimes.append(vPrime)
+                    # out-of-place updates below; the slice assignment copies
+                    contrib = vPrev[i*m:(i+1)*m, :]
+                    if prev is not None:
+                        contrib = contrib - ap(SiM[i], _Tinv(prev))
+                    if next is not None:
+                        contrib = contrib - ap(SiP[i], _Tinv(next))
 
-        self._hold(())
-        # ---- coarsest solve -------------------------------------------
-        vPrimes[-1] = self._sv(RB[-1][2][0],vPrimes[-1])
+                    vPrime[j*m:(j+1)*m,:] = contrib
 
-        # ---- back substitution ----------------------------------------
-        for l in range(len(RB) - 1, 0, -1):
-            SiM, _, T_hbs, SiP = RB[l - 1]
-            self._hold(self._shared if l == 1 else ())
+                assert not Tinv, "forward reduction left cached solves unconsumed"
+                vPrimes.append(vPrime)
 
-            nSlabs   = len(SiM)
-            nReduced = nSlabs // 2
+            # ---- coarsest solve ---------------------------------------
+            vPrimes[-1] = sv(RB[-1][2][0], vPrimes[-1])
 
-            for j in range(nReduced):
-                i = 2 * j
+            # ---- back substitution ------------------------------------
+            for l in range(len(RB) - 1, 0, -1):
+                SiM, _, T_hbs, SiP = RB[l - 1]
 
-                vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
+                nSlabs   = len(SiM)
+                nReduced = nSlabs // 2
 
-                next_j = (j + 1) % nReduced
-                contrib = self._ap(SiM[i+1],vPrimes[l][j*m:(j+1)*m,:])
-                if self.cyclic or j + 1 < nReduced:
-                    contrib = contrib + self._ap(SiP[i+1],vPrimes[l][next_j*m:(next_j+1)*m, :])
+                for j in range(nReduced):
+                    i = 2 * j
 
-                blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
-                vPrimes[l-1][(i+1)*m:(i+2)*m,:] = self._sv(T_hbs[i+1],blk)
-                self._release(SiM[i+1], SiP[i+1], T_hbs[i+1])
-        self._hold(())
+                    vPrimes[l-1][i*m:(i+1)*m] = vPrimes[l][j*m:(j+1)*m]
+
+                    next_j = (j + 1) % nReduced
+                    contrib = ap(SiM[i+1], vPrimes[l][j*m:(j+1)*m,:])
+                    if self.cyclic or j + 1 < nReduced:
+                        contrib = contrib + ap(SiP[i+1], vPrimes[l][next_j*m:(next_j+1)*m, :])
+
+                    blk = vPrimes[l-1][(i+1)*m:(i+2)*m] - contrib
+                    vPrimes[l-1][(i+1)*m:(i+2)*m,:] = sv(T_hbs[i+1], blk)
+        finally:
+            # Runs on error too, so a failed solve never leaves the cache
+            # holding device memory unless solve_keep_cache asked for it.
+            cache.end()
+            self.solveCacheStats = dict(cache.stats)
+
         out = vPrimes[0]
         if was_vector:
             out = out[:,0]
         if input_is_numpy:
             return out.detach().cpu().numpy()
         return out
+
+    # ------------------------------------------------------------------
+    # solve-stage cache plumbing
+    # ------------------------------------------------------------------
+    def _solve_plan(self):
+        """Every managed block use in solve(), in execution order.
+
+        Mirrors the loops in solve() exactly.  Only the COUNT per block is
+        load-bearing (it tells the cache when a block has no further use in
+        this solve); a mismatch costs transfers, never correctness, because
+        HBSMAT stages any non-resident block on use by itself.
+        """
+        RB, cyc, plan = self.RB, self.cyclic, []
+        for l in range(len(RB) - 1):
+            SiM, _, T_hbs, SiP = RB[l]
+            nS   = len(SiM)
+            seen = set()
+
+            def tinv(k):
+                if k not in seen:
+                    seen.add(k)
+                    if not _is_id(T_hbs[k]):
+                        plan.append(T_hbs[k])
+
+            for j in range(nS // 2):
+                i = 2 * j
+                prev = (i - 1) % nS if (cyc or i > 0)      else None
+                nxt  = (i + 1) % nS if (cyc or i < nS - 1) else None
+                if prev is not None:
+                    tinv(prev)
+                    plan.append(SiM[i])
+                if nxt is not None:
+                    tinv(nxt)
+                    plan.append(SiP[i])
+        plan.append(RB[-1][2][0])
+        for l in range(len(RB) - 1, 0, -1):
+            SiM, _, T_hbs, SiP = RB[l - 1]
+            nR = len(SiM) // 2
+            for j in range(nR):
+                i = 2 * j
+                plan.append(SiM[i + 1])
+                if cyc or j + 1 < nR:
+                    plan.append(SiP[i + 1])
+                plan.append(T_hbs[i + 1])
+        return plan
+
+    def _solve_reserve(self, nrhs):
+        """Device bytes the cache must always leave free for the solve's own
+        working tensors.  Deliberately generous: an over-estimate only means
+        a smaller cache, an under-estimate could mean an OOM retry."""
+        if self.solve_reserve_bytes is not None:
+            return int(self.solve_reserve_bytes)
+        if self.compute_device.type != 'cuda':
+            return 0
+        total = torch.cuda.get_device_properties(self.compute_device).total_memory
+        sc = getattr(HBSnew, '_SOLVE_CHUNK', [0])[0] or nrhs
+        mc = getattr(HBSnew, '_MATMAT_CHUNK', [0])[0] or nrhs
+        cols = max(min(nrhs, sc), min(nrhs, mc), 1)
+        # ULV sweeps hold ~7 rhs-sized tensors per chunk (HBSMAT.solve
+        # docstring); 16 leaves room for the apply and the local temporaries.
+        work = 16 * self.m * cols * 8
+        # every vPrimes level, as an upper bound on what is still to allocate
+        vprimes = 2 * self.m * self.nSlabs * nrhs * 8
+        return max(1 << 30, int(0.05 * total)) + work + vprimes
+
+    def _get_solve_cache(self):
+        c = self._solve_cache
+        if c is None or c.dev != self.compute_device:
+            if c is not None:
+                c.flush()
+            c = _SolveCache(self.compute_device)
+            self._solve_cache = c
+        c.cap = self.solve_cache_bytes
+        return c
+
+    def release_solve_cache(self):
+        """Evict every block the solve cache is holding on the device.
+        Only has an effect with solve_keep_cache=True (otherwise solve()
+        already empties the cache before returning)."""
+        c = getattr(self, '_solve_cache', None)
+        if c is not None:
+            c.flush()
+        self._solve_cache = None
+
+    # ------------------------------------------------------------------
+    # host-master page-locking check
+    # ------------------------------------------------------------------
+    def pinned_report(self, verbose=True, warn=False):
+        """How much of the factorization's host master memory is page-locked.
+
+        HBStorch page-locks each block's host master with cudaHostRegister
+        (_HostBuffer).  If registration fails -- _PIN_HOST off, driver
+        refusal, not enough lockable memory -- it silently falls back to
+        pageable memory, and every re-stage of that block becomes a slower,
+        synchronous copy.  Blocks that were never evicted have no master yet
+        and are not counted.
+        """
+        n_pin = n_page = 0
+        b_pin = b_page = 0
+        for h in self._blocks:
+            host = getattr(h, '_host', None)
+            if not isinstance(host, dict):
+                continue
+            for rec in host.values():
+                if not rec:
+                    continue
+                for buf in rec.get('bufs', {}).values():
+                    t = getattr(buf, 't', None)
+                    if t is None or t.numel() == 0:
+                        continue
+                    nb = t.numel() * t.element_size()
+                    if getattr(buf, 'registered', False):
+                        n_pin += 1
+                        b_pin += nb
+                    else:
+                        n_page += 1
+                        b_page += nb
+        rep = dict(pin_host_flag=bool(getattr(HBSnew, '_PIN_HOST', [None])[0]),
+                   n_pinned=n_pin, n_pageable=n_page,
+                   GB_pinned=b_pin / 1e9, GB_pageable=b_page / 1e9)
+        if verbose:
+            print(f"  host masters: {rep['GB_pinned']:.2f} GB page-locked in "
+                  f"{n_pin} buffers, {rep['GB_pageable']:.2f} GB pageable in "
+                  f"{n_page} buffers (_PIN_HOST={rep['pin_host_flag']})")
+        if warn and n_page:
+            warnings.warn(
+                f"RedBlackSolverHBS: {rep['GB_pageable']:.2f} GB of host "
+                f"masters in {n_page} buffers are NOT page-locked "
+                f"(_PIN_HOST={rep['pin_host_flag']}).  Re-staging those "
+                "blocks is synchronous and roughly half as fast.  Usual "
+                "causes: HBSnew._PIN_HOST[0] set False, or the OS lock limit "
+                "(ulimit -l) / available RAM too low for cudaHostRegister.",
+                UserWarning)
+        return rep
+
     def footprint(self, verbose=True):
         """Size of the factorization, by group and by tensor list, and how
         much of it is currently resident on the compute device.
