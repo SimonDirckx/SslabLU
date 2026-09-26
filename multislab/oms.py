@@ -17,6 +17,11 @@ The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  in both cases,
 computed during construction.  Re-evaluating it for new boundary data
 (construct_rhstot) needs keepLU; keepLU also enables uX_full.
 
+keepDense (default False): also form every block K_{i,i+-1} densely during
+construction, as the source-target map applied to the identity -- the exact,
+uncompressed counterpart of the HBS blocks (S_dense_list).  Costs one local
+solve with |J| right-hand sides per face and nc*|J| memory per face.
+
 Changes relative to the original are tagged  # FIX:  (correctness) and  # OPT:
 (performance / hygiene).
 
@@ -199,6 +204,7 @@ class omsStats:
         self.n_offloaded = 0           # device objects moved to host
         self.host_bytes = 0            # host bytes held by kept operators
         self.host_bytes_estimate = None  # projected after the first slab
+        self.dense_timing = None       # total time forming dense blocks (keepDense)
 
 
 
@@ -246,6 +252,16 @@ def _lookup(table, obj):
         if f is not None:
             return f
     return None
+
+
+def _host_ndarray(x):
+    """x as a host numpy array (device arrays are copied to the host)."""
+    f = _lookup(_DEVICE_MOVERS, x)
+    if f is not None:
+        r = f(x, False)
+        if r is not None:
+            x = r[0]
+    return np.asarray(x)
 
 
 # ---- defaults ------------------------------------------------------------- #
@@ -585,6 +601,11 @@ class oms:
     connectivity:  connectivity[i] = [left neighbour, right neighbour], <0 = none
     constructHBS:  compress K_{i,i+-1} into HBS blocks (needs an assembler)
     keepLU:        keep the local factorizations (exact operator, new rhs)
+    keepDense:     also form the blocks K_{i,i+-1} densely (no compression) as
+                   the source-target maps applied to the identity; available
+                   as S_dense_list, laid out like hbs_blocks.  For testing:
+                   one local solve with |J| right-hand sides and nc*|J|
+                   memory per face.
     stiff_mat_const: every slab is a rigid translate with identical local
                    matrices -> one factorization, one reference set-up
     offload:       move per-slab HBS blocks / LU factors that live on a CUDA
@@ -600,7 +621,7 @@ class oms:
 
     def __init__(self, slabList: list, pdo, gb, solver_opts, connectivity,
                  constructHBS=True, keepLU=False, stiff_mat_const=False,
-                 offload=None, pin_memory=False,
+                 offload=None, pin_memory=False, keepDense=False,
                  check_host_memory=True, host_mem_fraction=0.9):
         if not constructHBS and not keepLU:
             raise ValueError(
@@ -617,6 +638,7 @@ class oms:
         self.gb = gb
         self.constructHBS = bool(constructHBS)
         self.keepLU = bool(keepLU)
+        self.keepDense = bool(keepDense)
 
         self.glob_target_dofs = []
         self.glob_source_dofs = []
@@ -658,6 +680,8 @@ class oms:
 
         # ---- products of construct_Stot_helper ---------------------------- #
         self._S_hbs = []          # per slab: handle -> [blocks] (src order)
+        self._S_dense = []        # per slab: [dense blocks] (src order), keepDense
+        self._dense_cache = {}    # stiff_mat_const: (side, I, J) -> dense block
         self._rhs_cache = None    # (bc, reduced_load, rhs_list) from construction
         self._built = False
         self._S_lu = []           # per slab: fused LinearOperator
@@ -702,6 +726,7 @@ class oms:
     def close(self):
         """Release all kept operators (host and device)."""
         self._S_hbs, self._S_lu, self._lu_handles = [], [], []
+        self._S_dense, self._dense_cache = [], {}
         self._ref_hbs, self._ref_lu, self._block_cache = {}, {}, {}
         self._ref_solver = self.localSolver = None
         self._rhs_cache = None
@@ -746,11 +771,14 @@ class oms:
 
         lu_b = _host_nbytes(self._lu_handles[0].host_tree()) if self._lu_handles else 0
         hbs_b = _host_nbytes(self._S_hbs[0].host_tree()) if self._S_hbs else 0
+        dense_b = _host_nbytes(self._S_dense[0]) if self._S_dense else 0
         info_b = _host_nbytes(self._slab_info[0])
 
         per_face = hbs_b / max(n_faces_first, 1)
-        estimate = int((lu_b + info_b) * nslabs + per_face * total_faces)
-        held = lu_b + hbs_b + info_b
+        per_face_dense = dense_b / max(n_faces_first, 1)
+        estimate = int((lu_b + info_b) * nslabs
+                       + (per_face + per_face_dense) * total_faces)
+        held = lu_b + hbs_b + dense_b + info_b
         self.stats.host_bytes_estimate = estimate
 
         avail = _available_host_memory()
@@ -773,10 +801,13 @@ class oms:
                 parts.append("LU factors %s/slab" % _fmt_bytes(lu_b))
             if hbs_b:
                 parts.append("HBS blocks %s/face" % _fmt_bytes(per_face))
+            if dense_b:
+                parts.append("dense blocks %s/face" % _fmt_bytes(per_face_dense))
             raise MemoryError(
                 "oms: after slab 1 of %d the decomposition is projected to need "
                 "%s more host memory (total %s: %s), but only %s is available "
-                "(%.0f%% of %s).  Options: keepLU=False if the HBS operator "
+                "(%.0f%% of %s).  Options: keepDense=False unless the exact "
+                "blocks are needed, keepLU=False if the HBS operator "
                 "suffices, stiff_mat_const=True if the slabs are translates, "
                 "fewer / smaller slabs, or check_host_memory=False to try anyway."
                 % (nslabs, _fmt_bytes(need), _fmt_bytes(estimate),
@@ -1166,6 +1197,30 @@ class oms:
         return mat, ratio, err, tC, tS, shape_ok
 
     # ------------------------------------------------------------------ #
+    # dense blocks (keepDense)
+    # ------------------------------------------------------------------ #
+
+    def _dense_block(self, side, Ic, J, pts, XXi, solver):
+        """
+        One block formed densely: the source-target map of face `side`
+        applied to the identity, i.e. (A^{-1} B[:,J])[Ic] with no compression.
+        One local solve with len(J) right-hand sides.  Under stiff_mat_const
+        an identical (side, Ic, J) triple is served from the cache (the
+        solver is shared, so the block is too).
+
+        Returns (block, was_freshly_formed).
+        """
+        key = self._block_key(Ic, J, side) if self.stiff_mat_const else None
+        if key is not None and key in self._dense_cache:
+            return self._dense_cache[key], False
+        st = self._stmap(Ic, J, pts, XXi, solver)
+        D = _host_ndarray(st.A @ np.identity(len(J)))
+        del st
+        if key is not None:
+            self._dense_cache[key] = D
+        return D, True
+
+    # ------------------------------------------------------------------ #
     # reference set-up (stiff_mat_const)
     # ------------------------------------------------------------------ #
 
@@ -1273,6 +1328,7 @@ class oms:
         discrTime = 0.0
         compressTime = 0.0
         sampleTime = 0.0
+        denseTime = 0.0
         shapeMatch = True
         relerrl = 0.0
         relerrr = 0.0
@@ -1373,6 +1429,17 @@ class oms:
                     self._S_hbs.append(self._offload(blocks))
                 del blocks
 
+            # ---- dense blocks: exact, from the stMaps (keepDense) --------- #
+            if self.keepDense:
+                t0 = time.time()
+                self._S_dense.append([
+                    self._dense_block(side, Ic, J, pts, XXi, solver)[0]
+                    for side, J, pts in faces])
+                denseTime += time.time() - t0
+                if dbg > 1:
+                    print("SLAB %d dense blocks formed in %5.2f s"
+                          % (slabInd, time.time() - t0))
+
             # ---- kept LU / fused exact operator --------------------------- #
             if self.keepLU:
                 tag = "".join(f[0] for f in faces)
@@ -1432,6 +1499,7 @@ class oms:
         self.stats.n_assembled = self._n_assembled
         self.stats.n_reused = self._n_reused
         self.stats.n_offloaded = self._n_offloaded
+        self.stats.dense_timing = denseTime if self.keepDense else None
         self.stats.host_bytes = self.host_nbytes()
 
         if dbg > 0:
@@ -1635,6 +1703,22 @@ class oms:
         self._require_hbs()
         return self._S_hbs[slabInd].get()
 
+    @property
+    def S_dense_list(self):
+        """
+        The dense (uncompressed) counterpart of hbs_blocks, formed from the
+        source-target maps during construction (keepDense=True): one list per
+        slab, ordered like glob_source_dofs[slabInd] (left face, then right;
+        end slabs have a single block).  Host numpy arrays.  Under
+        stiff_mat_const, slabs whose faces match share the same arrays, so do
+        not modify them in place.
+        """
+        if not self.keepDense:
+            raise RuntimeError("S_dense_list needs keepDense=True")
+        if not self._S_dense:
+            raise RuntimeError("S_dense_list used before construct_Stot_helper()")
+        return self._S_dense
+
     def _require_hbs(self):
         if not self.constructHBS:
             raise RuntimeError("hbs_blocks needs constructHBS=True")
@@ -1644,7 +1728,7 @@ class oms:
     def host_nbytes(self):
         """Host bytes currently held by the kept operators and bookkeeping."""
         trees = [h.host_tree() for h in self._S_hbs + self._lu_handles]
-        return _host_nbytes([trees, self._slab_info, self._ref_hbs])
+        return _host_nbytes([trees, self._slab_info, self._ref_hbs, self._S_dense])
 
     def construct_rhstot(self, bc, reduced_load=None, dbg=0, rhsHBS=None):
         """
@@ -1743,6 +1827,8 @@ class oms:
             print("avg. compr. time             = ", compressTime / nasm)
         if compression is not None:
             print("compression rate             = ", compression)
+        if self.keepDense:
+            print("dense blocks kept (time)     = ", self.stats.dense_timing)
         print("total dofs                   = ",
               sum(len(dof) for dof in glob_target_dofs))
         if relerrl is not None:

@@ -666,7 +666,9 @@ class HBSMAT:
                 raise ValueError("Samples and LinOP cannot both be None")
             # hard requirement max(fac*rk, nl) + rk at the worst level, plus
             # oversampling p = rk there (every other level has more)
-            s = max(self.fac * rk, self.nl) + 2 * rk
+            n_max = max(self.nl, 2*rk)
+            p = 10
+            s = max(n_max + rk + p , (int)(np.ceil(1.5 * n_max)) )
             Om  = np.random.standard_normal(size=(self.A.shape[1], s))
             Psi = np.random.standard_normal(size=(self.A.shape[0], s))
             Y   = self.A @ Om
