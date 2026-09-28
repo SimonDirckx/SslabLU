@@ -68,7 +68,7 @@ class BlockTridiagonalSolver(DirectSolver):
         #
         # For solving Tx = d partitioned into blocks,
         # the Thomas Algorithm applies first foward elimination for i = 1 to n:
-        # A_i' = A_i (B_i-1)'^-1,   B_i' = B_i - G_i C_i-1,   d_i = d_i - A_i' d_i-1
+        # A_i' = A_i (B_i-1)'^-1,   B_i' = B_i - A_i C_i-1,   d_i = d_i - A_i' d_i-1
         #
         # Then backward substitution for i = n-1 to 0:
         # x_n = (B_n')^-1 d_n,   x_i = B_i' \ (d_i - C_i x_i+1)

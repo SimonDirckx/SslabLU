@@ -140,7 +140,7 @@ RHO0     =  1025.0        # reference seawater density [kg/m^3]
 FORCED     = os.environ.get("SSLABLU_FORCED", "1") != "0"
 TAU0       = float(os.environ.get("SSLABLU_TAU0",   "0.15"))   # wind stress amp [N/m^2]
 RDRAG      = float(os.environ.get("SSLABLU_RDRAG",  "1.0e-5")) # linear bottom drag [1/s] default was 1e-5, successful (with dirichlet BC) was 5e-5
-STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "0.5"))    # steric SSH half-range [m]
+STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "25.0"))    # steric SSH half-range [m], default 0.5
 GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","1.0e-5")) # steric relaxation rate [1/s]
 # y-wall Dirichlet data in FORCED: 1 = hold walls at the steric height eta_s
 # (tilt is BC-driven, establishes fast); 0 = zero walls, so the meridional tilt
@@ -154,6 +154,25 @@ WALL_STERIC = os.environ.get("SSLABLU_WALL_STERIC", "1") != "0" # Default 1
 # leakage is diagnosed by max|v| at the walls and by the mass residual vs the
 # steric-relaxation source (see the conservation figure). Overrides WALL_STERIC.
 WALL_NOFLUX = os.environ.get("SSLABLU_WALL_NOFLUX", "1") != "0"
+# The bare no-flux cheat is weakly UNSTABLE on long runs: the lagged zero-grad
+# copy closes a feedback loop with |G| slightly > 1 for a wall-trapped, grid-
+# scale mode, and the hard single-row v*=0 mask injects a Gibbs seed for it.
+# Three script-local stabilizers, all confined to a thin band of width SPONGE_W
+# next to the y-walls (dist = min(y, 1-y)):
+#   SPONGE_W    band width [y-units]; 0 => revert to the hard v* mask (baseline)
+#   SPONGE_RATE Rayleigh friction rate [1/s] in the band (absorbs the mode),
+#               smoothly ramped to 0 at the band edge (a too-abrupt sponge
+#               reflects). Applied to both u and v -> a frictional wall layer.
+#   WALL_RELAX  under-relaxation of the zero-grad wall copy (1 = full copy,
+#               <1 lowers the feedback-loop gain).
+# These do NOT touch the operator/gate; they only reshape the explicit predictor
+# and wall data. They mitigate, not cure -- the exact fix is the mixed-BC solve.
+SPONGE_W    = float(os.environ.get("SSLABLU_SPONGE_W",    "0.1"))
+SPONGE_RATE = float(os.environ.get("SSLABLU_SPONGE_RATE", "1.0e-3"))
+WALL_RELAX  = float(os.environ.get("SSLABLU_WALL_RELAX",  "1.0"))
+# Diagnostic: seed a finite grid-scale wall perturbation in the IC (0 = off) so
+# the wall-mode growth factor |G| can be read off a short run.
+SEED_WALL   = float(os.environ.get("SSLABLU_SEED_WALL",   "0.0"))
 
 # Meridional gap through the ridge (difference-of-tanh notch, cf. the Julia
 # ridge_function). GAP_DEPTH = 0 disables it (y-independent ridge); 1 cuts the
@@ -439,6 +458,18 @@ class SlabSolve:
         self.wall_in_b = np.array(inb, dtype=int)
         self.wall_in_j = np.array(inj, dtype=int)
 
+        # smooth wall band (dist = min(y, 1-y)); Hermite smoothstep s in [0,1]
+        # is 0 at the wall, 1 at/beyond the band edge, with zero slope at both
+        # ends (so tapering v* by it injects no Gibbs kink).
+        dist = np.minimum(yy - BNDS[0][1], BNDS[1][1] - yy)
+        if SPONGE_W > 0.0:
+            sfrac = np.clip(dist / SPONGE_W, 0.0, 1.0)
+            smoothstep = sfrac * sfrac * (3.0 - 2.0 * sfrac)
+        else:
+            smoothstep = (~self.wall_mask).astype(float)   # hard mask fallback
+        self.vtaper = smoothstep                    # multiplies v*  (0 at wall)
+        self.sponge = SPONGE_RATE * (1.0 - smoothstep)   # Rayleigh rate (max at wall)
+
     def wall_zero_grad(self, eta_field):
         """Zero-gradient Dirichlet data on the y-walls: value at the adjacent
         inward leaf node (eta_wall = eta_first-interior => d eta/dn ~ 0)."""
@@ -611,9 +642,9 @@ class ChannelModel:
         self.eta, self.u, self.v = [], [], []
         for s in self.sl:
             xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
-            if FORCED:
-                # uniform SSH at rest (the dynamic/mass field starts flat; the
-                # meridional tilt is induced by wind + steric relaxation)
+            if FORCED or SEED_WALL != 0.0:
+                # uniform SSH at rest. FORCED: tilt induced by wind + steric.
+                # SEED_WALL: a clean base for the wall-mode growth-rate probe.
                 self.eta.append(np.zeros_like(xg))
             else:
                 # geostrophic-adjustment bump (original scenario)
@@ -622,6 +653,19 @@ class ChannelModel:
                                 * np.exp(-IC_AY * (yg - IC_CY) ** 2))
             self.u.append(np.zeros_like(xg))
             self.v.append(np.zeros_like(xg))
+
+        # diagnostic seed: a finite-amplitude, x-grid-scale (checkerboard)
+        # perturbation on the wall rows, to excite the wall-trapped numerical
+        # mode directly so its growth factor |G| is measurable in a few hundred
+        # steps instead of the ~1e4 it takes to emerge from round-off.
+        if SEED_WALL != 0.0:
+            for i, s in enumerate(self.sl):
+                for b in range(s.nb):
+                    _, _, ix, _ = s.box_meta[b]
+                    wm = s.wall_mask[b]
+                    self.eta[i][b, wm] += SEED_WALL * ((-1.0) ** ix[wm])
+        # previous-step wall data, for the under-relaxed zero-grad copy
+        self.fgb_prev = [np.zeros(len(s.Igb)) for s in self.sl]
         self.t = 0.0
 
     def wall_eta(self, pts, t):
@@ -721,9 +765,14 @@ class ChannelModel:
                 vs = self.v[i] - dt * (FCOR * self.u[i])
 
             if WALL_NOFLUX:
-                # closed wall: no transport into the y-walls -> zero the
-                # predictor's wall-normal velocity there before div(H u*)
-                vs = np.where(s.wall_mask, 0.0, vs)
+                # (i) sponge: Rayleigh friction absorbing layer near the walls,
+                # damping the wall-trapped instability (both components)
+                if SPONGE_RATE > 0.0:
+                    us = us - dt * s.sponge * self.u[i]
+                    vs = vs - dt * s.sponge * self.v[i]
+                # (ii) smooth taper of the wall-normal velocity: 0 at the wall
+                # (no transport into it) but ramped, so no Gibbs seed
+                vs = vs * s.vtaper
 
             # div(H u*) = H (u*_x + v*_y) + H_x u* + H_y v*
             divHu = Hp * (s.gradx(us) + s.grady(vs)) + Hpx * us + Hpy * vs
@@ -737,8 +786,13 @@ class ChannelModel:
 
             if WALL_NOFLUX:
                 # zero-gradient Dirichlet: eta_wall = adjacent inward eta^n so
-                # d eta/dn ~ 0 (a discrete Neumann / no-flux wall)
+                # d eta/dn ~ 0 (a discrete Neumann / no-flux wall), optionally
+                # under-relaxed against last step's value to lower the loop gain
                 fgb = s.wall_zero_grad(self.eta[i])
+                if WALL_RELAX < 1.0:
+                    fgb = ((1.0 - WALL_RELAX) * self.fgb_prev[i]
+                           + WALL_RELAX * fgb)
+                self.fgb_prev[i] = fgb
             else:
                 fgb = self.wall_eta(s.XXb[s.Igb, :], tnew)   # Dirichlet wall data
             fvec = torch.from_numpy(R.reshape(-1, 1).copy())
@@ -812,7 +866,7 @@ p        = int(os.environ.get("SSLABLU_P", "12"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
 dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.25"))
-NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "19200")) # Default 48
+NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "400")) # Default 48, longest was 19200
 RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
@@ -858,6 +912,10 @@ if FORCED:
             else ("steric-held Dirichlet" if WALL_STERIC
                   else "zero Dirichlet (open reservoir)"))
     print("y-walls                  = ", wtxt)
+    if WALL_NOFLUX:
+        print("  sponge band / rate     =  %.3f / %.2E /s  taper=%s relax=%.2f"
+              % (SPONGE_W, SPONGE_RATE, "smooth" if SPONGE_W > 0 else "hard",
+                 WALL_RELAX))
 else:
     print("scenario                 =  bump (geostrophic adjustment)")
     print("wall forcing amplitude   = ", WALL_AMP, "m")
