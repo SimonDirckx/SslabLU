@@ -147,7 +147,7 @@ function build_model(grid, parameters)
     Fb = Forcing(b_relax, discrete_form = true, parameters = parameters)
 
     # minimal constant diffusivity, for numerical stability only (NOT in SslabLU)
-    horizontal_closure = HorizontalScalarDiffusivity(ν = 200.0, κ = 100.0)
+    horizontal_closure = HorizontalScalarDiffusivity(ν = 0.0, κ = 100.0)
     vertical_closure   = VerticalScalarDiffusivity(ν = 1e-3, κ = 1e-4)
 
     @info "Building the model..."
