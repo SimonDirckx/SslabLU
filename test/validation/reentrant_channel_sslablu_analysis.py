@@ -86,9 +86,14 @@ H = Lz * (1.0 - RIDGE_HR * gap * bump)   # wet depth > 0, in [0.2*Lz, Lz]
 # the continuous wet depth H. Staggered Face fields may carry an extra face in
 # a Bounded direction -> crop to (Nx, Ny, Nz).
 dz = Lz / Nz
-crop = lambda a: a[:Nx, :Ny, :Nz]
-ubar = crop(u).sum(axis=2) * dz / H
-vbar = crop(v).sum(axis=2) * dz / H
+if Nz == 1:
+    crop = lambda a: a[:Nx, :Ny]
+    ubar = crop(u) * dz / H
+    vbar = crop(v) * dz / H
+else:
+    crop = lambda a: a[:Nx, :Ny, :Nz]
+    ubar = crop(u).sum(axis=2) * dz / H
+    vbar = crop(v).sum(axis=2) * dz / H
 ssh = ssh[:Nx, :Ny]
 
 eta_zm = ssh.mean(axis=0)     # <eta>_x (y): the meridional tilt

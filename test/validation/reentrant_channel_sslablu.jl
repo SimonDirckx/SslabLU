@@ -49,7 +49,7 @@ graph_directory = "run_channel_sslablu_spinup" * string(Nspinup) * "/"
 # ---- resolution / geometry --------------------------------------------------
 const Nx = 80
 const Ny = 80
-const Nz = 16                # uniform in z (SslabLU has no vertical structure)
+const Nz = 1 #16                # uniform in z (SslabLU has no vertical structure)
 
 const Lx = 1000kilometers    # = 1e6 m  (SslabLU LCHAN)
 const Ly = 1000kilometers    # square channel (SslabLU domain is the unit square)
@@ -102,7 +102,7 @@ function make_grid(arch)
     set!(bottom, z_bottom)
     # GridFittedBottom snaps to cell faces; PartialCellBottom(bottom) gives a
     # smoother H(x,y) closer to SslabLU's continuous coefficient (see notes).
-    return ImmersedBoundaryGrid(underlying, GridFittedBottom(bottom))
+    return ImmersedBoundaryGrid(underlying, PartialCellBottom(bottom))
 end
 
 # ---- model ------------------------------------------------------------------
