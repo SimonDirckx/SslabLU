@@ -39,7 +39,7 @@ using JLD2
 Oceananigans.defaults.FloatType = Float64
 
 # ---- number of spin-up steps (CLI arg, like the template) -------------------
-Nspinup = 100
+Nspinup = 400
 if length(ARGS) >= 1
     Nspinup = parse(Int, ARGS[1])
 end
@@ -84,7 +84,7 @@ parameters = (
     Lx = Lx, Ly = Ly, Lz = Lz,
     τ    = 0.15 / ρ0,   # surface kinematic wind stress [m^2/s^2]  (SslabLU TAU0)
     μ    = 1e-5,        # linear bottom-drag rate [1/s]            (SslabLU RDRAG)
-    Bamp = 1.2e-3,      # meridional buoyancy half-amplitude [m/s^2] (~0.5 m steric)
+    Bamp = 0.0, #1.2e-3,      # meridional buoyancy half-amplitude [m/s^2] (~0.5 m steric)
     λb   = 1e5,         # buoyancy relaxation timescale [s]  (SslabLU 1/GAMMA_S)
 )
 

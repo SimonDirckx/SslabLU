@@ -140,8 +140,8 @@ RHO0     =  1025.0        # reference seawater density [kg/m^3]
 FORCED     = os.environ.get("SSLABLU_FORCED", "1") != "0"
 TAU0       = float(os.environ.get("SSLABLU_TAU0",   "0.15"))   # wind stress amp [N/m^2]
 RDRAG      = float(os.environ.get("SSLABLU_RDRAG",  "1.0e-5")) # linear bottom drag [1/s] default was 1e-5, successful (with dirichlet BC) was 5e-5
-STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "25.0"))    # steric SSH half-range [m], default 0.5
-GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","1.0e-5")) # steric relaxation rate [1/s]
+STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "0.0"))    # steric SSH half-range [m], default 0.5
+GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","0.0")) # steric relaxation rate [1/s], default 1.0e-5
 # y-wall Dirichlet data in FORCED: 1 = hold walls at the steric height eta_s
 # (tilt is BC-driven, establishes fast); 0 = zero walls, so the meridional tilt
 # must emerge purely from the interior GAMMA_S buoyancy relaxation (slower,
@@ -907,7 +907,7 @@ if FORCED:
           % (RDRAG, 1.0 / RDRAG / 3600.0))
     print("steric half-range        = ", '%6.3f m' % STERIC_AMP)
     print("steric relax GAMMA_S     = ", '%8.2E /s  (1/g = %5.1f h)'
-          % (GAMMA_S, 1.0 / GAMMA_S / 3600.0))
+          % (GAMMA_S, 0.0)) #1.0 / GAMMA_S / 3600.0))
     wtxt = ("closed / no-flux (zero-grad + v*=0)" if WALL_NOFLUX
             else ("steric-held Dirichlet" if WALL_STERIC
                   else "zero Dirichlet (open reservoir)"))
