@@ -1,0 +1,196 @@
+# =============================================================================
+# reentrant_channel_sslablu.jl
+#
+# Oceananigans.jl (v0.112) re-entrant channel configured as a close-to-1-to-1
+# comparison for the SslabLU barotropic implicit-free-surface channel
+# (test/validation/channel_barotropic_timestep.py).
+#
+# Structure copied from the baroclinic template reentrant_channel_baroclinic.jl,
+# then SIMPLIFIED toward the SslabLU configuration (mostly by REMOVING things):
+#   * f-plane (not beta-plane), southern hemisphere        f = -1e-4
+#   * IMPLICIT free surface (the SslabLU elliptic solve), not split-explicit
+#   * LINEAR dynamics: momentum_advection = nothing, tracer_advection = nothing
+#   * a single buoyancy tracer b (BuoyancyTracer) -- no T/S/EOS, no TKE/CATKE,
+#     no biharmonic closure, no stretched grid, no surface buoyancy flux
+#   * steric height as an honest, depth-independent MERIDIONAL buoyancy gradient
+#     imposed by a domain-wide Newtonian relaxation of b toward b_target(y).
+#     This is the honest analog of SslabLU's GAMMA_S relaxation of the SSH.
+#   * von Mises ridge + meridional gap bathymetry (same H(x,y) as SslabLU)
+#   * eastward (westerly) wind stress  tau0 * sin(pi y / Ly)
+#   * linear bottom drag
+#   * uniform SSH at rest initial condition (all fields 0); the tilt is INDUCED
+#
+# Because Nz > 1 with active buoyancy, this is a genuinely baroclinic model; the
+# apples-to-apples comparison against (barotropic) SslabLU is at the level of
+# the free-surface / barotropic-mode response, not the full 3D field. Keeping
+# b_target depth-independent makes the buoyancy-driven flow barotropic-
+# equivalent (no thermal-wind shear), which is as close to SslabLU as this
+# model class gets.
+#
+# Run:  julia --project reentrant_channel_sslablu.jl [Nspinup]
+# =============================================================================
+
+using Oceananigans
+using Oceananigans.Units
+using Oceananigans.Grids: ynode
+using Printf
+using JLD2
+
+Oceananigans.defaults.FloatType = Float64
+
+# ---- number of spin-up steps (CLI arg, like the template) -------------------
+Nspinup = 100
+if length(ARGS) >= 1
+    Nspinup = parse(Int, ARGS[1])
+end
+
+graph_directory = "run_channel_sslablu_spinup" * string(Nspinup) * "/"
+
+# ---- resolution / geometry --------------------------------------------------
+const Nx = 80
+const Ny = 80
+const Nz = 16                # uniform in z (SslabLU has no vertical structure)
+
+const Lx = 1000kilometers    # = 1e6 m  (SslabLU LCHAN)
+const Ly = 1000kilometers    # square channel (SslabLU domain is the unit square)
+const Lz = 4000.0            # m  (SslabLU H0)
+
+const halo_size = 4          # 4 for immersed grids
+
+# ---- physical constants -----------------------------------------------------
+const f  = -1e-4             # f-plane, southern hemisphere (SslabLU FCOR)
+const ρ0 = 1025.0            # reference density (SslabLU RHO0)
+
+# ---- SslabLU ridge + gap bathymetry -----------------------------------------
+# H(x,y)/Lz = 1 - hr * gap(y) * bump(x);  bottom z_b = -Lz * (H/Lz).
+# bump is a 1-periodic von Mises crest at x = Lx/2; gap cuts the crest to full
+# depth inside the meridional band [GAP_Y0, GAP_Y1] * Ly.
+const RIDGE_HR  = 0.8        # ridge height as a fraction of Lz
+const RIDGE_KB  = 40.0       # von Mises concentration (narrow crest)
+const GAP_DEPTH = 1.0        # 1 => crest fully cut to full depth in the gap
+const GAP_Y0    = 1 / 6      # gap band edges (fractions of Ly)
+const GAP_Y1    = 1 / 2
+const GAP_W     = 0.05       # tanh edge width (fraction of Ly)
+
+@inline bump_x(x) = exp(RIDGE_KB * (cos(2π * (x - Lx / 2) / Lx) - 1))
+@inline gap_y(y)  = 1 - 0.5 * GAP_DEPTH *
+                        (tanh((y - GAP_Y0 * Ly) / (GAP_W * Ly)) -
+                         tanh((y - GAP_Y1 * Ly) / (GAP_W * Ly)))
+@inline depth_frac(x, y) = 1 - RIDGE_HR * gap_y(y) * bump_x(x)
+@inline z_bottom(x, y)   = -Lz * depth_frac(x, y)   # bottom RISES over the ridge
+
+# ---- forcing / parameter bundle ---------------------------------------------
+parameters = (
+    Lx = Lx, Ly = Ly, Lz = Lz,
+    τ    = 0.15 / ρ0,   # surface kinematic wind stress [m^2/s^2]  (SslabLU TAU0)
+    μ    = 1e-5,        # linear bottom-drag rate [1/s]            (SslabLU RDRAG)
+    Bamp = 1.2e-3,      # meridional buoyancy half-amplitude [m/s^2] (~0.5 m steric)
+    λb   = 1e5,         # buoyancy relaxation timescale [s]  (SslabLU 1/GAMMA_S)
+)
+
+# ---- grid with immersed ridge -----------------------------------------------
+function make_grid(arch)
+    underlying = RectilinearGrid(arch,
+        topology = (Periodic, Bounded, Bounded),   # re-entrant x; closed y-walls
+        size = (Nx, Ny, Nz),
+        halo = (halo_size, halo_size, halo_size),
+        x = (0, Lx),
+        y = (0, Ly),
+        z = (-Lz, 0))
+
+    bottom = Field{Center, Center, Nothing}(underlying)
+    set!(bottom, z_bottom)
+    # GridFittedBottom snaps to cell faces; PartialCellBottom(bottom) gives a
+    # smoother H(x,y) closer to SslabLU's continuous coefficient (see notes).
+    return ImmersedBoundaryGrid(underlying, GridFittedBottom(bottom))
+end
+
+# ---- model ------------------------------------------------------------------
+function build_model(grid, parameters)
+
+    # eastward (westerly) wind stress on u at the surface: tau0 * sin(pi y / Ly)
+    @inline u_wind(x, y, t, p) = -p.τ * sin(π * y / p.Ly)
+    u_top = FluxBoundaryCondition(u_wind, parameters = parameters)
+
+    # linear bottom drag  ~ -mu * (column depth) * u_bottom   (template idiom)
+    @inline u_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * p.Lz * fields.u[i, j, 1]
+    @inline v_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * p.Lz * fields.v[i, j, 1]
+    u_bot = FluxBoundaryCondition(u_drag, discrete_form = true, parameters = parameters)
+    v_bot = FluxBoundaryCondition(v_drag, discrete_form = true, parameters = parameters)
+
+    u_bcs = FieldBoundaryConditions(top = u_top, bottom = u_bot)
+    v_bcs = FieldBoundaryConditions(bottom = v_bot)   # no wind on v
+
+    # steric height <-> honest meridional buoyancy gradient. Relax b toward a
+    # depth-independent, north-high target everywhere in the domain (the analog
+    # of SslabLU's GAMMA_S SSH relaxation toward eta_s(y) = A(2y - 1)).
+    @inline b_target(y, p) = p.Bamp * (2 * y / p.Ly - 1)     # warm equatorward (north-high)
+    @inline function b_relax(i, j, k, grid, clock, fields, p)
+        y = ynode(j, grid, Center())
+        @inbounds return -(fields.b[i, j, k] - b_target(y, p)) / p.λb
+    end
+    Fb = Forcing(b_relax, discrete_form = true, parameters = parameters)
+
+    # minimal constant diffusivity, for numerical stability only (NOT in SslabLU)
+    horizontal_closure = HorizontalScalarDiffusivity(ν = 200.0, κ = 100.0)
+    vertical_closure   = VerticalScalarDiffusivity(ν = 1e-3, κ = 1e-4)
+
+    @info "Building the model..."
+    model = HydrostaticFreeSurfaceModel(grid;
+        free_surface       = ImplicitFreeSurface(solver_method = :PreconditionedConjugateGradient),
+        # Fallback if ImplicitFreeSurface is unhappy with the immersed grid in
+        # v0.112 (this loses the SslabLU-style implicit elliptic solve):
+        # free_surface     = SplitExplicitFreeSurface(grid; substeps = 10),
+        coriolis           = FPlane(f = f),
+        buoyancy           = BuoyancyTracer(),
+        tracers            = (:b,),
+        momentum_advection = nothing,   # LINEAR momentum (SslabLU has no advection)
+        tracer_advection   = nothing,   # static steric target (b not advected)
+        closure            = (horizontal_closure, vertical_closure),
+        boundary_conditions = (u = u_bcs, v = v_bcs),
+        forcing            = (b = Fb,))
+
+    return model
+end
+
+# ---- spin-up loop -----------------------------------------------------------
+function spinup!(model, Δt, nsteps)
+    for _ in 1:nsteps
+        time_step!(model, Δt)
+    end
+    return nothing
+end
+
+# ---- run --------------------------------------------------------------------
+arch = CPU()
+Δt   = 15minutes            # 900 s (SslabLU dt = 0.25 h); the implicit free
+                            # surface removes the fast-gravity-wave CFL limit
+
+grid  = make_grid(arch)
+model = build_model(grid, parameters)
+
+@info @sprintf("Built model on %d x %d x %d grid; spinning up %d steps (Δt = %.0f s)...",
+               Nx, Ny, Nz, Nspinup, Δt)
+
+# Uniform SSH at rest: all prognostic fields default to 0, so NO initial
+# condition is set -- the meridional tilt + gap finger are INDUCED by the
+# forcing, exactly as in the SslabLU FORCED scenario.
+
+tic = time()
+spinup!(model, Δt, Nspinup)
+spinup_toc = time() - tic
+@info @sprintf("spin-up done in %.1f s", spinup_toc)
+
+# ---- save -------------------------------------------------------------------
+isdir(graph_directory) || mkdir(graph_directory)
+filename = graph_directory * "data_final.jld2"
+
+jldsave(filename;
+    Nx, Ny, Nz, Lx, Ly, Lz,
+    ssh = convert(Array, interior(model.free_surface.displacement)),  # template used .displacement
+    b   = convert(Array, interior(model.tracers.b)),
+    u   = convert(Array, interior(model.velocities.u)),
+    v   = convert(Array, interior(model.velocities.v)),
+    w   = convert(Array, interior(model.velocities.w)))
+
+@info "wrote $filename"
