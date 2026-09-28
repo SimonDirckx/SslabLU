@@ -27,12 +27,16 @@
 # equivalent (no thermal-wind shear), which is as close to SslabLU as this
 # model class gets.
 #
-# Run:  julia --project reentrant_channel_sslablu.jl [Nspinup]
+# Run:  julia --project reentrant_channel_sslablu.jl [Nspinup] [Nxy]
+#   Nxy (default 80) sets Nx = Ny, for the resolution study in
+#   channel_ssh_compare.py; output goes to run_channel_sslablu_spinup<N>[_n<Nxy>]/
 # =============================================================================
 
 using Oceananigans
 using Oceananigans.Units
 using Oceananigans.Grids: ynode
+using Oceananigans.Operators: Δzᶠᶜᶜ, Δzᶜᶠᶜ
+using Oceananigans.ImmersedBoundaries: static_column_depthᶜᶜᵃ, static_column_depthᶠᶜᵃ
 using Printf
 using JLD2
 
@@ -44,11 +48,14 @@ if length(ARGS) >= 1
     Nspinup = parse(Int, ARGS[1])
 end
 
-graph_directory = "run_channel_sslablu_spinup" * string(Nspinup) * "/"
-
 # ---- resolution / geometry --------------------------------------------------
-const Nx = 80
-const Ny = 80
+# Nx = Ny, optionally from the 2nd CLI arg (80 keeps the original directory name)
+const Nxy = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 80
+const Nx = Nxy
+const Ny = Nxy
+
+graph_directory = "run_channel_sslablu_spinup" * string(Nspinup) *
+                  (Nxy == 80 ? "" : "_n" * string(Nxy)) * "/"
 const Nz = 1 #16                # uniform in z (SslabLU has no vertical structure)
 
 const Lx = 1000kilometers    # = 1e6 m  (SslabLU LCHAN)
@@ -112,9 +119,17 @@ function build_model(grid, parameters)
     @inline u_wind(x, y, t, p) = -p.τ * sin(π * y / p.Ly)
     u_top = FluxBoundaryCondition(u_wind, parameters = parameters)
 
-    # linear bottom drag  ~ -mu * (column depth) * u_bottom   (template idiom)
-    @inline u_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * p.Lz * fields.u[i, j, 1]
-    @inline v_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * p.Lz * fields.v[i, j, 1]
+    # linear bottom drag: stress -mu * H(x,y) * u, i.e. tendency -mu * u (SslabLU
+    # -RDRAG * u). Oceananigans divides a bottom flux by the bottom cell's Δz,
+    # which on this PartialCellBottom grid with Nz = 1 IS the discrete column
+    # depth H at the u/v point, so using that same Δz makes the tendency exactly
+    # -mu * u, including over the ridge. (An `immersed =` BC would never fire
+    # here: with Nz = 1 the k = 1 bottom face is the underlying domain boundary,
+    # not an immersed face.) For Nz > 1 this is drag on the bottom cell only,
+    # and k = 1 lies inside the ridge -- see the warning below.
+    @inline u_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * Δzᶠᶜᶜ(i, j, 1, grid) * fields.u[i, j, 1]
+    @inline v_drag(i, j, grid, clock, fields, p) = @inbounds -p.μ * Δzᶜᶠᶜ(i, j, 1, grid) * fields.v[i, j, 1]
+    Nz == 1 || @warn "bottom drag is only mu*H*u (SslabLU-equivalent) for Nz = 1"
     u_bot = FluxBoundaryCondition(u_drag, discrete_form = true, parameters = parameters)
     v_bot = FluxBoundaryCondition(v_drag, discrete_form = true, parameters = parameters)
 
@@ -176,8 +191,17 @@ model = build_model(grid, parameters)
 # condition is set -- the meridional tilt + gap finger are INDUCED by the
 # forcing, exactly as in the SslabLU FORCED scenario.
 
+# run in two halves so the midpoint matches SslabLU's NSTEPS//2 snapshot
+Nmid = Nspinup ÷ 2
+snapshot(model) = (ssh = convert(Array, interior(model.free_surface.displacement)),
+                   u   = convert(Array, interior(model.velocities.u)),
+                   v   = convert(Array, interior(model.velocities.v)),
+                   t   = model.clock.time)
+
 tic = time()
-spinup!(model, Δt, Nspinup)
+spinup!(model, Δt, Nmid)
+mid = snapshot(model)
+spinup!(model, Δt, Nspinup - Nmid)
 spinup_toc = time() - tic
 @info @sprintf("spin-up done in %.1f s", spinup_toc)
 
@@ -185,8 +209,21 @@ spinup_toc = time() - tic
 isdir(graph_directory) || mkdir(graph_directory)
 filename = graph_directory * "data_final.jld2"
 
+# cell-center coordinates and the column depth the model ACTUALLY used
+# (PartialCellBottom-adjusted, incl. the minimum-fractional-cell-height cap);
+# channel_ssh_compare.py differences this against the analytic SslabLU H(x,y)
+xc = collect(xnodes(grid, Center()))
+yc = collect(ynodes(grid, Center()))
+Hc = [static_column_depthᶜᶜᵃ(i, j, grid) for i in 1:Nx, j in 1:Ny]
+# u-face depth min(H[i-1], H[i]): what the momentum/drag/continuity terms use
+xf = collect(xnodes(grid, Face()))
+Hu = [static_column_depthᶠᶜᵃ(i, j, grid) for i in 1:Nx, j in 1:Ny]
+
 jldsave(filename;
-    Nx, Ny, Nz, Lx, Ly, Lz,
+    Nx, Ny, Nz, Lx, Ly, Lz, xc, yc, Hc, xf, Hu,
+    dt = Δt, nsteps = Nspinup, nmid = Nmid,
+    t = model.clock.time, t_mid = mid.t,
+    ssh_mid = mid.ssh, u_mid = mid.u, v_mid = mid.v,
     ssh = convert(Array, interior(model.free_surface.displacement)),  # template used .displacement
     b   = convert(Array, interior(model.tracers.b)),
     u   = convert(Array, interior(model.velocities.u)),

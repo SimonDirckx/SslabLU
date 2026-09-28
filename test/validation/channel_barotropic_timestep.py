@@ -854,6 +854,42 @@ class ChannelModel:
     def snapshot(self, nx=8, ny=8):
         return self._resample(self.eta, nx, ny)
 
+    def eval_at(self, fields, xq, yq):
+        """Evaluate per-slab leaf fields at arbitrary points (x/L periodic,
+        y/L in [0,1]) with the owning 'own' leaf box's tensor-product
+        barycentric interpolant -- spectrally accurate, so this is the side
+        that moves when comparing against a lower-order (FV) model. The
+        seam slab's own boxes live at x < 0, hence the periodic shift into
+        each box's frame. Returns one array per field in `fields`."""
+        xq = np.mod(np.asarray(xq, dtype=float).ravel(), 1.0)
+        yq = np.asarray(yq, dtype=float).ravel()
+        outs = [np.full(xq.shape, np.nan) for _ in fields]
+        todo = np.ones(xq.shape, dtype=bool)
+        for i, s in enumerate(self.sl):
+            for b in s.own:
+                uxn, uyn, ix, iy = s.box_meta[b]
+                xm = np.mod(xq - uxn[0], 1.0) + uxn[0]
+                m = (todo & (xm <= uxn[-1])
+                     & (yq >= uyn[0]) & (yq <= uyn[-1]))
+                if not m.any():
+                    continue
+                Bx, By = bary_mat(uxn, xm[m]), bary_mat(uyn, yq[m])
+                U2 = np.zeros((len(uxn), len(uyn)))
+                for F, out in zip(fields, outs):
+                    U2[ix, iy] = F[i][b]
+                    out[m] = np.einsum('kj,jl,kl->k', Bx, U2, By)
+                todo &= ~m
+        assert not todo.any(), "eval_at: %d points not in any own box" % todo.sum()
+        return outs
+
+    def sample_centers(self, n):
+        """eta, u, v at the cell centers of a uniform n x n grid on the unit
+        square -- exactly the Oceananigans (Nx = Ny = n) tracer points."""
+        c = (np.arange(n) + 0.5) / n
+        X, Y = np.meshgrid(c, c, indexing='ij')
+        return [F.reshape(n, n) for F in
+                self.eval_at([self.eta, self.u, self.v], X, Y)]
+
 
 ################################################################
 #
@@ -872,6 +908,10 @@ CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 WALL_AMP = float(os.environ.get("SSLABLU_WALL_AMP", "0.0"))
 WALL_PERIOD = 12.42 * 3600.0                             # M2-ish tide [s]
+# SSH comparison export (channel_ssh_compare.py): eta/u/v sampled at the
+# Oceananigans cell centers of each n x n grid listed, at NSTEPS//2 and NSTEPS
+SSH_NS  = [int(v) for v in os.environ.get("SSLABLU_SSH_NS", "80,160,320").split(",") if v]
+SSH_OUT = os.environ.get("SSLABLU_SSH_OUT", "channel_timestep_ssh.npz")
 
 p_disc    = p + 2
 leaf_size = 2 * p
@@ -951,6 +991,7 @@ hist = {"t": [0.0], "dMC": [0.0], "dMN": [0.0], "E": [E0],
         "mass": [M0C], "massexp": [M0C], "massres": [0.0], "wvmax": [0.0],
         "t_slv": [], "t_rhs": [], "t_rec": []}
 cum_relax = 0.0     # running sum of the steric-relaxation mass source
+ssh_export = {}     # samples for channel_ssh_compare.py
 
 print("")
 if FORCED:
@@ -997,6 +1038,14 @@ for n in range(1, NSTEPS + 1):
 
     if n in (NSTEPS // 2, NSTEPS):
         snaps[n] = modC.snapshot()
+        tag = "final" if n == NSTEPS else "mid"
+        ssh_export["t_" + tag] = n * dt
+        ssh_export["eta_mean_" + tag] = modC.mass()   # unit-square area
+        for ns in SSH_NS:
+            e_, u_, v_ = modC.sample_centers(ns)
+            ssh_export["eta_%s_%d" % (tag, ns)] = e_
+            ssh_export["u_%s_%d" % (tag, ns)] = u_
+            ssh_export["v_%s_%d" % (tag, ns)] = v_
 
 maxeta_run = max(hist["maxeta"])
 stable = maxeta_run < 50.0 * max(ETA0, STERIC_AMP)
@@ -1045,6 +1094,14 @@ with open(csv_name, 'w') as f:
             "energy,max_eta,t_rhs,t_solve,t_recon\n")
     np.savetxt(f, rows, fmt='%.16e', delimiter=',')
 print("Wrote %s  (%d rows)" % (csv_name, rows.shape[0]))
+
+# ---- SSH comparison export (channel_ssh_compare.py) --------------------------
+np.savez(SSH_OUT, ns=np.array(SSH_NS), dt=dt, nsteps=NSTEPS, nmid=NSTEPS // 2,
+         L=LCHAN, H0=H0, p=p, N=N, npan_x=npan_x, npan_y=npan_y,
+         forced=FORCED, steric_amp=STERIC_AMP, gamma_s=GAMMA_S, tau0=TAU0,
+         rdrag=RDRAG, wall_noflux=WALL_NOFLUX, sponge_w=SPONGE_W,
+         sponge_rate=SPONGE_RATE, **ssh_export)
+print("Wrote %s  (eta/u/v at %s-squared cell centers)" % (SSH_OUT, SSH_NS))
 
 # ---- optional dt-convergence (rebuilds the operator per dt: slow) ----------
 if DO_DTCNV:
