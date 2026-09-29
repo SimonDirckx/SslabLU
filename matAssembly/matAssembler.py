@@ -88,13 +88,14 @@ class matAssembler:
     def assemble(self,stMap:solver.stMap,dbg=0):
         reduced = self.matOpts.reduced
         linOp = stMap.A
-
+        self.XXI = stMap.XXI
         print("MAT ASSEMBLER METHOD=%s" % self.matOpts.method) if dbg > 0 else None
         if self.matOpts.method == 'dense':
             tic = time.time()
             M=linOp@np.identity(linOp.shape[1])
             self.stats.timeSample = time.time()-tic
             self.stats.nbytes = M.nbytes
+            
             return M #linOp
         
         if self.matOpts.method == 'epsHBS':
@@ -104,22 +105,20 @@ class matAssembler:
             start = time.time()
             quad = False # currently only binary trees supported
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
-            if  torch.cuda.is_available():
-                device = torch.cuda.get_device_name()
-            else:
-                device = 'cpu'
+            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
-            s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            tic = time.time()
             Om = np.random.standard_normal((linOp.shape[0],s))
             Psi = np.random.standard_normal((linOp.shape[1],s))
             Y = linOp@Om
             Z = linOp.T@Psi
-            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z)
-            self.stats.timeSample=0
-            s = HBSmat.nSamples
-            self.stats.timeSample=HBSmat.tSample
-            self.stats.nbytes = HBSmat.nbytes
+            self.stats.timeSample=time.time()-tic
+            tic = time.time()
+            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z,fast=True)
             self.stats.timeCompress=HBSmat.tCompress
+            s = HBSmat.nSamples
+            self.stats.nbytes = HBSmat.nbytes
             
             if dbg>0:
                 print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))
