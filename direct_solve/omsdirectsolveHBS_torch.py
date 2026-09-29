@@ -512,6 +512,29 @@ def RB_linop(Ti, tm, tp, SiPi, SiMi, smp, spm):
     )
 
 
+def _sum_linop(*ops):
+    """Returns the LinearOperator  ops[0] + ops[1] + ...  (equal shapes).
+
+    Used for the periodic coarsest-level fold in RedBlackSolverHBS, where the
+    diagonal becomes B_0 + A_0 + C_0.
+    """
+    def smatmat(v, transpose=False):
+        v_tmp = v[:, np.newaxis] if v.ndim == 1 else v
+        result = ops[0].rmatmat(v_tmp) if transpose else ops[0].matmat(v_tmp)
+        for op in ops[1:]:
+            result = result + (op.rmatmat(v_tmp) if transpose else op.matmat(v_tmp))
+        return result.flatten() if v.ndim == 1 else result
+
+    return LinearOperator(
+        shape   = ops[0].shape,
+        dtype   = _rdtype(*ops),
+        matvec  = lambda v: smatmat(v),
+        rmatvec = lambda v: smatmat(v, transpose=True),
+        matmat  = lambda v: smatmat(v),
+        rmatmat = lambda v: smatmat(v, transpose=True),
+    )
+
+
 def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
     if id:
         def smatmat(v,transpose=False):
@@ -856,6 +879,21 @@ class RedBlackSolverHBS(DirectSolver):
 
     Operators built without a ULV get their `solve` replaced by a raising
     stub, so a consumer missed by the analysis above fails loudly.
+
+    ---------------------------------------------------------------------
+    PERIODIC COARSEST LEVEL  (cyclic=True)
+    ---------------------------------------------------------------------
+    At the last reduction (nSlabs == 2) the one retained node's left and
+    right neighbours are the same eliminated node, so the would-be
+    off-diagonals A_0 and C_0 couple node 0 to itself.  Its Schur complement
+    is therefore B_0 + A_0 + C_0, and that sum is what gets compressed and
+    factorized; A_0 and C_0 are not built separately and their slots hold
+    zero_op.  This is the dense RedBlackSolver's B_i[0] += A_i[0] + C_i[0].
+    The folded terms span the whole period, so leaving them out costs an
+    error that grows with the coupling length relative to the period: tiny
+    for a strongly screened operator, O(1e-2) for a Poisson-like one.  With
+    debug_blocks > 0 the B_0 probe reference includes A_0 + C_0, and A_0 /
+    C_0 are recorded as folded rather than checked as zero slots.
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False,seed=None,
@@ -1468,6 +1506,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         cyclic = self.cyclic
         dtype  = self._dtype
+        # periodic coarsest level: A_0 + C_0 fold into B_0 (class docstring)
+        fold   = cyclic and nSlabs == 2
 
         s   = self._nsamples(rk)
         Om  = torch.randn(m,s,generator=self._tgen,device=self.compute_device,dtype=self._tdtype)
@@ -1617,6 +1657,7 @@ class RedBlackSolverHBS(DirectSolver):
             rather than to Omega, so the Xm/Xp and Pm/Pp caches do not help:
             every call costs 2 applies and 1 solve per neighbour, on X's
             column count.  Only used for inv_ref, and only on t columns.
+            When folding, A_0 + C_0 are added, matching the folded Y_B.
             """
             y = X.clone() if _is_id(T[i]) else self._ap(T[i], X)
             if has_right:
@@ -1629,6 +1670,16 @@ class RedBlackSolverHBS(DirectSolver):
                 if not _is_id(T_hbs[kL]):
                     t = self._sv(T_hbs[kL], t)
                 y = y - self._ap(SiM[i], t)
+            if fold:
+                # A_0 X = -S^-_0 T_kL^-1 S^-_kL X,  C_0 X = -S^+_0 T_kR^-1 S^+_kR X
+                t = self._ap(SiM[kL], X)
+                if not _is_id(T_hbs[kL]):
+                    t = self._sv(T_hbs[kL], t)
+                y = y - self._ap(SiM[i], t)
+                t = self._ap(SiP[kR], X)
+                if not _is_id(T_hbs[kR]):
+                    t = self._sv(T_hbs[kR], t)
+                y = y - self._ap(SiP[i], t)
             return y
 
         def _spill(t):
@@ -1636,6 +1687,16 @@ class RedBlackSolverHBS(DirectSolver):
 
         def _unspill(t):
             return None if t is None else t.to(self.compute_device)
+
+        def _record_folded(i, kind):
+            """Debug record for A_0 / C_0 folded into B_0: never compressed,
+            so there is nothing to check, but the report should show them
+            rather than silently drop them (or flag them as bad zero slots)."""
+            self.blockErrors.append(dict(
+                stage=self._dbg_stage, nSlabs=nSlabs, node=i, kind=kind, rk=rk,
+                fwd=None, adj=None, inv=None, inv_ref=None, scale=None,
+                invscale=None, cond=None,
+                note='folded into B (cyclic coarsest level)'))
         # ---------------------------------------------------------------
         # retained (even) nodes
         # ---------------------------------------------------------------
@@ -1723,11 +1784,24 @@ class RedBlackSolverHBS(DirectSolver):
             if Z_B is Psi:
                 Z_B = Psi.clone()
 
+            if fold:
+                # The single retained node's left and right neighbours are the
+                # same eliminated node, so A_0 and C_0 couple node 0 to itself:
+                # its diagonal is B_0 + A_0 + C_0.  All three sample blocks are
+                # already in hand (A/C spilled to host), so fold them before
+                # the one compression that gets factorized.
+                Y_B = Y_B + _unspill(Y_A) + _unspill(Y_C)
+                Z_B = Z_B + _unspill(Z_A) + _unspill(Z_C)
+
             # Probe references must be built while the neighbour operators
             # are still staged, i.e. before the retire below.  The comparison
             # happens after each block is constructed.
             refs = _refs(i, has_left, has_right, kL, kR,
                          A_is_zero, C_is_zero) if dbg else None
+            if dbg and fold:
+                # the folded B_0 is checked against B_0 + A_0 + C_0
+                (fB, aB), (fA, aA), (fC, aC) = refs['B'], refs['A'], refs['C']
+                refs['B'] = (fB + fA + fC, aB + aA + aC)
 
             # Retire BEFORE compressing, not after.  Everything nodes i-1 and
             # i contribute has now been sampled into Y_*/Z_*; the three
@@ -1777,28 +1851,38 @@ class RedBlackSolverHBS(DirectSolver):
                 smp = SiM[kR] if has_right else None
                 tmo = T_hbs[kL] if has_left  else None
                 tpo = T_hbs[kR] if has_right else None
-                B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
+                B_lin = RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm)
+                if fold:
+                    B_lin = _sum_linop(B_lin, STS_linop(SiM[i], tmo, SiM[kL]),
+                                       STS_linop(SiP[i], tpo, SiP[kR]))
+                B_i.append(B_lin)
 
             del Y_B, Z_B
 
             # A_i and C_i become SiM / SiP one level down and are only ever
-            # applied, never solved with -- no ULV, unconditionally.
-            A_i.append(zero_op(m, dtype) if A_is_zero
+            # applied, never solved with -- no ULV, unconditionally.  When
+            # folded they are already inside B_0, and the one-node system left
+            # has no off-diagonal coupling: zero_op, nothing to compress.
+            A_i.append(zero_op(m, dtype) if A_is_zero or fold
                        else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
                                                    compute_ULV=False,
                                                    label=f"A[{i}] (nSlabs={nSlabs})",
                                                    spill=not dbg))
-            if dbg:
+            if dbg and fold:
+                _record_folded(i, 'A')
+            elif dbg:
                 self._check_block(A_i[-1], 'A', nSlabs, i, rk, W, Q, *refs['A'])
                 if hasattr(A_i[-1], 'evict'):
                     A_i[-1].evict()
             del Y_A, Z_A
-            C_i.append(zero_op(m, dtype) if C_is_zero
+            C_i.append(zero_op(m, dtype) if C_is_zero or fold
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})",
                                                    spill=not dbg))
-            if dbg:
+            if dbg and fold:
+                _record_folded(i, 'C')
+            elif dbg:
                 self._check_block(C_i[-1], 'C', nSlabs, i, rk, W, Q, *refs['C'])
                 if hasattr(C_i[-1], 'evict'):
                     C_i[-1].evict()
@@ -1827,6 +1911,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         cyclic = self.cyclic
         dtype  = self._dtype
+        # periodic coarsest level: A_0 + C_0 fold into B_0 (class docstring)
+        fold   = cyclic and nSlabs == 2
 
         B_i       = []
         T_hbs_new = []
@@ -1839,6 +1925,10 @@ class RedBlackSolverHBS(DirectSolver):
 
             need_ULV = self._needs_ulv(i, nSlabs)
             B_linop  = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
+            if fold:
+                B_linop = _sum_linop(B_linop,
+                                     STS_linop(SiM[i], tm, SiM[(i - 1) % nSlabs]),
+                                     STS_linop(SiP[i], tp, SiP[(i + 1) % nSlabs]))
 
             if need_ULV or self.compress_diag or not self.skip_unused_ulv:
                 B_hbs = self._hbs(B_linop, rk, compute_ULV=need_ULV,
@@ -1849,9 +1939,11 @@ class RedBlackSolverHBS(DirectSolver):
             B_i.append(B_hbs if self.compress_diag else B_linop)
             T_hbs_new.append(B_hbs)
 
+        # when folded, A_0 / C_0 are already inside B_0: zero_op, as in the
+        # fused builder
         A_i = []
         for i in range(0, nSlabs, 2):
-            if (not cyclic) and i == 0:
+            if ((not cyclic) and i == 0) or fold:
                 A_i.append(zero_op(m, dtype))
             else:
                 A_i.append(self._hbs(
@@ -1861,7 +1953,7 @@ class RedBlackSolverHBS(DirectSolver):
 
         C_i = []
         for i in range(0, nSlabs, 2):
-            if (not cyclic) and i == nSlabs - 2:
+            if ((not cyclic) and i == nSlabs - 2) or fold:
                 C_i.append(zero_op(m, dtype))
             else:
                 C_i.append(self._hbs(

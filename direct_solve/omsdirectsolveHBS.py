@@ -161,6 +161,29 @@ def RB_linop(Ti, tm, tp, SiPi, SiMi, smp, spm):
     )
 
 
+def _sum_linop(*ops):
+    """Returns the LinearOperator  ops[0] + ops[1] + ...  (equal shapes).
+
+    Used for the periodic coarsest-level fold in RedBlackSolverHBS, where the
+    diagonal becomes B_0 + A_0 + C_0.
+    """
+    def smatmat(v, transpose=False):
+        v_tmp = v[:, np.newaxis] if v.ndim == 1 else v
+        result = ops[0].rmatmat(v_tmp) if transpose else ops[0].matmat(v_tmp)
+        for op in ops[1:]:
+            result = result + (op.rmatmat(v_tmp) if transpose else op.matmat(v_tmp))
+        return result.flatten() if v.ndim == 1 else result
+
+    return LinearOperator(
+        shape   = ops[0].shape,
+        dtype   = _rdtype(*ops),
+        matvec  = lambda v: smatmat(v),
+        rmatvec = lambda v: smatmat(v, transpose=True),
+        matmat  = lambda v: smatmat(v),
+        rmatmat = lambda v: smatmat(v, transpose=True),
+    )
+
+
 def Sprime_Linop(Sl,Sprime_prev,Sr,id=False):
     if id:
         def smatmat(v,transpose=False):
@@ -495,6 +518,19 @@ class RedBlackSolverHBS(DirectSolver):
 
     Operators built without a ULV get their `solve` replaced by a raising
     stub, so a consumer missed by the analysis above fails loudly.
+
+    ---------------------------------------------------------------------
+    PERIODIC COARSEST LEVEL  (cyclic=True)
+    ---------------------------------------------------------------------
+    At the last reduction (nSlabs == 2) the one retained node's left and
+    right neighbours are the same eliminated node, so the would-be
+    off-diagonals A_0 and C_0 couple node 0 to itself.  Its Schur complement
+    is therefore B_0 + A_0 + C_0, and that sum is what gets compressed and
+    factorized; A_0 and C_0 are not built separately and their slots hold
+    zero_op.  This is the dense RedBlackSolver's B_i[0] += A_i[0] + C_i[0].
+    The folded terms span the whole period, so leaving them out costs an
+    error that grows with the coupling length relative to the period: tiny
+    for a strongly screened operator, O(1e-2) for a Poisson-like one.
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False,
@@ -726,6 +762,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         cyclic = self.cyclic
         dtype  = self._dtype
+        # periodic coarsest level: A_0 + C_0 fold into B_0 (class docstring)
+        fold   = cyclic and nSlabs == 2
 
         s   = self._nsamples(rk)
         Om  = self._rng.standard_normal(size=(m, s))
@@ -839,6 +877,15 @@ class RedBlackSolverHBS(DirectSolver):
             if Z_B is Psi:
                 Z_B = Psi.copy()
 
+            if fold:
+                # The single retained node's left and right neighbours are the
+                # same eliminated node, so A_0 and C_0 couple node 0 to itself:
+                # its diagonal is B_0 + A_0 + C_0.  All three sample blocks are
+                # already in hand, so fold them before the one compression that
+                # gets factorized.
+                Y_B = Y_B + Y_A + Y_C
+                Z_B = Z_B + Z_A + Z_C
+
             # ---- compress from the shared samples ----------------------
             need_ULV = self._needs_ulv(i, nSlabs)
 
@@ -860,15 +907,21 @@ class RedBlackSolverHBS(DirectSolver):
                 smp = SiM[kR] if has_right else None
                 tmo = T_hbs[kL] if has_left  else None
                 tpo = T_hbs[kR] if has_right else None
-                B_i.append(RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm))
+                B_lin = RB_linop(T[i], tmo, tpo, SiP[i], SiM[i], smp, spm)
+                if fold:
+                    B_lin = _sum_linop(B_lin, STS_linop(SiM[i], tmo, SiM[kL]),
+                                       STS_linop(SiP[i], tpo, SiP[kR]))
+                B_i.append(B_lin)
 
             # A_i and C_i become SiM / SiP one level down and are only ever
-            # applied, never solved with -- no ULV, unconditionally.
-            A_i.append(zero_op(m, dtype) if A_is_zero
+            # applied, never solved with -- no ULV, unconditionally.  When
+            # folded they are already inside B_0, and the one-node system left
+            # has no off-diagonal coupling: zero_op, nothing to compress.
+            A_i.append(zero_op(m, dtype) if A_is_zero or fold
                        else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
                                                    compute_ULV=False,
                                                    label=f"A[{i}] (nSlabs={nSlabs})"))
-            C_i.append(zero_op(m, dtype) if C_is_zero
+            C_i.append(zero_op(m, dtype) if C_is_zero or fold
                        else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
@@ -887,6 +940,8 @@ class RedBlackSolverHBS(DirectSolver):
 
         cyclic = self.cyclic
         dtype  = self._dtype
+        # periodic coarsest level: A_0 + C_0 fold into B_0 (class docstring)
+        fold   = cyclic and nSlabs == 2
 
         B_i       = []
         T_hbs_new = []
@@ -899,6 +954,10 @@ class RedBlackSolverHBS(DirectSolver):
 
             need_ULV = self._needs_ulv(i, nSlabs)
             B_linop  = RB_linop(T[i], tm, tp, SiP[i], SiM[i], smp, spm)
+            if fold:
+                B_linop = _sum_linop(B_linop,
+                                     STS_linop(SiM[i], tm, SiM[(i - 1) % nSlabs]),
+                                     STS_linop(SiP[i], tp, SiP[(i + 1) % nSlabs]))
 
             if need_ULV or self.compress_diag or not self.skip_unused_ulv:
                 B_hbs = self._hbs(B_linop, rk, compute_ULV=need_ULV,
@@ -909,9 +968,11 @@ class RedBlackSolverHBS(DirectSolver):
             B_i.append(B_hbs if self.compress_diag else B_linop)
             T_hbs_new.append(B_hbs)
 
+        # when folded, A_0 / C_0 are already inside B_0: zero_op, as in the
+        # fused builder
         A_i = []
         for i in range(0, nSlabs, 2):
-            if (not cyclic) and i == 0:
+            if ((not cyclic) and i == 0) or fold:
                 A_i.append(zero_op(m, dtype))
             else:
                 A_i.append(self._hbs(
@@ -921,7 +982,7 @@ class RedBlackSolverHBS(DirectSolver):
 
         C_i = []
         for i in range(0, nSlabs, 2):
-            if (not cyclic) and i == nSlabs - 2:
+            if ((not cyclic) and i == nSlabs - 2) or fold:
                 C_i.append(zero_op(m, dtype))
             else:
                 C_i.append(self._hbs(

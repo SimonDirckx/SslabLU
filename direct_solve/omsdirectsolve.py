@@ -1072,10 +1072,9 @@ class RedBlackSolver(DirectSolver):
         # with one node left its two wrap-around neighbours are itself, so A and
         # C fold into the diagonal.  Applied before the LU below.
         #
-        # NOTE: RedBlackSolverHBS._build_level and _build_level_fused have no
-        # counterpart to this, so the two solvers will disagree at the coarsest
-        # level whenever cyclic=True.  Kept here because dropping it makes the
-        # periodic solve wrong; see the accompanying notes.
+        # RedBlackSolverHBS (omsdirectsolveHBS and omsdirectsolveHBS_torch)
+        # applies the same fold in _build_level and _build_level_fused; see
+        # "PERIODIC COARSEST LEVEL" in its docstring.
         if len(B_dense) == 1 and cyclic:
             B_dense[0] = B_dense[0] + A_dense[0] + C_dense[0]
 
