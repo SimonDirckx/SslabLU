@@ -70,16 +70,21 @@ const ρ0 = 1025.0            # reference density (SslabLU RHO0)
 
 # ---- SslabLU ridge + gap bathymetry -----------------------------------------
 # H(x,y)/Lz = 1 - hr * gap(y) * bump(x);  bottom z_b = -Lz * (H/Lz).
-# bump is a 1-periodic von Mises crest at x = Lx/2; gap cuts the crest to full
+# bump is a 1-periodic von Mises crest at x = RIDGE_XC * Lx; gap cuts the crest to full
 # depth inside the meridional band [GAP_Y0, GAP_Y1] * Ly.
 const RIDGE_HR  = 0.8        # ridge height as a fraction of Lz
 const RIDGE_KB  = 40.0       # von Mises concentration (narrow crest)
+# crest position x/Lx: SAME env var and values as channel_barotropic_timestep.py
+# (1, default: 0.5 + 1/32, mid-panel in SslabLU's default leaf grid;
+#  0: 0.5, the original centered ridge on a SslabLU slab/panel edge)
+const RIDGE_MIDPANEL = get(ENV, "SSLABLU_RIDGE_MIDPANEL", "1") != "0"
+const RIDGE_XC  = 0.5 + (RIDGE_MIDPANEL ? 1 / 32 : 0.0)
 const GAP_DEPTH = 1.0        # 1 => crest fully cut to full depth in the gap
 const GAP_Y0    = 1 / 6      # gap band edges (fractions of Ly)
 const GAP_Y1    = 1 / 2
 const GAP_W     = 0.05       # tanh edge width (fraction of Ly)
 
-@inline bump_x(x) = exp(RIDGE_KB * (cos(2π * (x - Lx / 2) / Lx) - 1))
+@inline bump_x(x) = exp(RIDGE_KB * (cos(2π * (x - RIDGE_XC * Lx) / Lx) - 1))
 @inline gap_y(y)  = 1 - 0.5 * GAP_DEPTH *
                         (tanh((y - GAP_Y0 * Ly) / (GAP_W * Ly)) -
                          tanh((y - GAP_Y1 * Ly) / (GAP_W * Ly)))
@@ -178,7 +183,7 @@ end
 
 # ---- run --------------------------------------------------------------------
 arch = CPU()
-Δt   = 15minutes            # 900 s (SslabLU dt = 0.25 h); the implicit free
+Δt   = 7.5minutes            # 900 s (SslabLU dt = 0.25 h); the implicit free
                             # surface removes the fast-gravity-wave CFL limit
 
 grid  = make_grid(arch)
@@ -220,7 +225,7 @@ xf = collect(xnodes(grid, Face()))
 Hu = [static_column_depthᶠᶜᵃ(i, j, grid) for i in 1:Nx, j in 1:Ny]
 
 jldsave(filename;
-    Nx, Ny, Nz, Lx, Ly, Lz, xc, yc, Hc, xf, Hu,
+    Nx, Ny, Nz, Lx, Ly, Lz, xc, yc, Hc, xf, Hu, ridge_xc = RIDGE_XC,
     dt = Δt, nsteps = Nspinup, nmid = Nmid,
     t = model.clock.time, t_mid = mid.t,
     ssh_mid = mid.ssh, u_mid = mid.u, v_mid = mid.v,

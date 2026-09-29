@@ -55,9 +55,10 @@ RIDGE_HR, RIDGE_KB = 0.8, 40.0
 GAP_DEPTH, GAP_Y0, GAP_Y1, GAP_W = 1.0, 1.0 / 6.0, 1.0 / 2.0, 0.05
 
 
-def depth_analytic(x, y, H0):
-    """SslabLU H(x,y) in metres, x and y nondimensional (x/L, y/L)."""
-    bump = np.exp(RIDGE_KB * (np.cos(2.0 * np.pi * (x - 0.5)) - 1.0))
+def depth_analytic(x, y, H0, xc_ridge):
+    """SslabLU H(x,y) in metres, x and y nondimensional (x/L, y/L); crest at
+    x = xc_ridge (0.5 centered, 0.5 + 1/32 with SSLABLU_RIDGE_MIDPANEL=1)."""
+    bump = np.exp(RIDGE_KB * (np.cos(2.0 * np.pi * (x - xc_ridge)) - 1.0))
     gap = 1.0 - 0.5 * GAP_DEPTH * (np.tanh((y - GAP_Y0) / GAP_W) -
                                    np.tanh((y - GAP_Y1) / GAP_W))
     return H0 * (1.0 - RIDGE_HR * gap * bump)
@@ -104,6 +105,8 @@ if not jl_paths:
 
 L, H0, dt = float(S["L"]), float(S["H0"]), float(S["dt"])
 sponge_w = float(S["sponge_w"]) if bool(S["wall_noflux"]) else 0.0
+ridge_xc = float(S["ridge_xc"]) if "ridge_xc" in S else 0.5   # pre-shift npz files
+print("  ridge crest x/L = %.5f" % ridge_xc)
 print("SslabLU  : %s  (NSTEPS = %d, dt = %.0f s, p = %d, N = %d, samples at n = %s)"
       % (npz_path, nsteps, dt, int(S["p"]), int(S["N"]), list(S["ns"])))
 print("  forcing: tau0 = %.3f, rdrag = %.1e, steric = %.2f m, gamma_s = %.1e"
@@ -121,12 +124,17 @@ for jl in jl_paths:
         n = int(f["Nx"][()])
         O = {"xc": load(f, "xc") / L, "yc": load(f, "yc") / L, "Hc": load(f, "Hc"),
              "xf": load(f, "xf") / L, "Hu": load(f, "Hu"),
+             "ridge_xc": float(f["ridge_xc"][()]) if "ridge_xc" in f else 0.5,
              "nsteps": int(f["nsteps"][()]), "dt": float(f["dt"][()]),
              "final": (load(f, "ssh"), load(f, "u"), load(f, "v"), float(f["t"][()])),
              "mid": (load(f, "ssh_mid"), load(f, "u_mid"), load(f, "v_mid"), float(f["t_mid"][()]))}
     if O["nsteps"] != nsteps or O["dt"] != dt:
         print("skip %s: NSTEPS/dt = %d/%.0f s, SslabLU has %d/%.0f s"
               % (jl, O["nsteps"], O["dt"], nsteps, dt))
+        continue
+    if abs(O["ridge_xc"] - ridge_xc) > 1e-12:
+        print("skip %s: ridge crest x/L = %.5f, SslabLU has %.5f (SSLABLU_RIDGE_MIDPANEL mismatch)"
+              % (jl, O["ridge_xc"], ridge_xc))
         continue
     if "eta_final_%d" % n not in S:
         print("skip %s: no SslabLU samples at n = %d (set SSLABLU_SSH_NS)" % (jl, n))
@@ -141,7 +149,7 @@ for jl in jl_paths:
     # the same face: the depth Oceananigans' dynamics actually sees. (The
     # cell-center column depth equals the analytic H there to round-off.)
     Xf, _ = np.meshgrid(O["xf"][:n], yc, indexing='ij')
-    Hdiff = O["Hu"][:n, :n] - depth_analytic(Xf, Y, H0)
+    Hdiff = O["Hu"][:n, :n] - depth_analytic(Xf, Y, H0, ridge_xc)
 
     res = {}
     for tag in ("mid", "final"):

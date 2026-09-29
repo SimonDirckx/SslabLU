@@ -129,6 +129,14 @@ H0       =  4000.0        # reference depth [m]
 LCHAN    =  1.0e6         # channel width Ly [m]; domain nondimensionalized by this
 RIDGE_HR =  0.8           # ridge height as a fraction of H0
 RIDGE_KB =  40.0          # von-Mises concentration: larger = narrower ridge
+# Ridge crest position x/L. With the crest at 0.5 it sits exactly on slab
+# interface N/2 AND on a leaf-panel edge. SSLABLU_RIDGE_MIDPANEL=1 (default)
+# shifts it by half a panel, 1/32, which is mid-panel for the default
+# N * npan_x = 16 (panel edges at multiples of 2/(N*npan_x); checked below).
+# SSLABLU_RIDGE_MIDPANEL=0 restores the centered ridge. The SAME env var is
+# read by reentrant_channel_sslablu.jl, so one setting drives both models.
+RIDGE_MIDPANEL = os.environ.get("SSLABLU_RIDGE_MIDPANEL", "1") != "0"
+RIDGE_XC = 0.5 + (1.0 / 32.0 if RIDGE_MIDPANEL else 0.0)
 FCOR     = -1.0e-4        # Coriolis parameter [1/s] (explicit; needs |FCOR|*dt < 2)
 RHO0     =  1025.0        # reference seawater density [kg/m^3]
 
@@ -193,13 +201,13 @@ GATE_TOL = 1.0e-8        # hard-fail threshold for the manufactured gate
 
 
 def bump_x(x, lib):
-    """1-periodic Gaussian-like ridge profile, centered at x = 0.5."""
-    return lib.exp(RIDGE_KB * (lib.cos(2.0 * np.pi * (x - 0.5)) - 1.0))
+    """1-periodic Gaussian-like ridge profile, centered at x = RIDGE_XC."""
+    return lib.exp(RIDGE_KB * (lib.cos(2.0 * np.pi * (x - RIDGE_XC)) - 1.0))
 
 
 def dbump_x(x, lib):
     """d/dx of bump_x (analytic)."""
-    return (-2.0 * np.pi * RIDGE_KB * lib.sin(2.0 * np.pi * (x - 0.5))
+    return (-2.0 * np.pi * RIDGE_KB * lib.sin(2.0 * np.pi * (x - RIDGE_XC))
             * bump_x(x, lib))
 
 
@@ -226,7 +234,7 @@ def dgapfac(y, lib):
 
 def depth_frac(x, y, lib=np):
     """H(x,y)/H0 = 1 - hr*gap(y)*bump(x): the (nondimensional) bathymetry.
-    The ridge crest (bump peak at x = 0.5) is cut down to (1 - GAP_DEPTH) of
+    The ridge crest (bump peak at x = RIDGE_XC) is cut down to (1 - GAP_DEPTH) of
     its height inside the meridional gap band, opening a deep channel there."""
     return 1.0 - RIDGE_HR * gapfac(y, lib) * bump_x(x, lib)
 
@@ -901,8 +909,8 @@ N        = int(os.environ.get("SSLABLU_N", "8"))
 p        = int(os.environ.get("SSLABLU_P", "12"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
-dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.25"))
-NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "400")) # Default 48, longest was 19200
+dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.125"))
+NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "800")) # Default 48, longest was 19200
 RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
@@ -917,6 +925,15 @@ p_disc    = p + 2
 leaf_size = 2 * p
 dSlabs, connectivity, H = channel_dSlabs(N)
 a = np.array([H / npan_x, 0.5 / npan_y])
+
+# where the ridge crest sits relative to the x leaf-panel edges (multiples of
+# the panel width 2H/npan_x): 0 = on an edge, 0.5 = mid-panel
+panel_w = 2.0 * H / npan_x
+crest_frac = (RIDGE_XC / panel_w) % 1.0
+if RIDGE_MIDPANEL and abs(crest_frac - 0.5) > 0.25:
+    print("WARNING: SSLABLU_RIDGE_MIDPANEL=1 but the crest x = %.5f is at panel "
+          "fraction %.2f for N = %d, npan_x = %d (not mid-panel)"
+          % (RIDGE_XC, crest_frac, N, npan_x))
 opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a)
 
 dt   = 3600.0 * dt_hours
@@ -934,6 +951,9 @@ print("=============CHANNEL TIMESTEP SETUP=============")
 print("N slabs / interfaces     = ", N)
 print("p_disc                   = ", p_disc)
 print("panels (x per slab, y)   = ", npan_x, ",", npan_y)
+print("ridge crest x/L          = ", '%.5f' % RIDGE_XC,
+      " (panel fraction %.2f: %s)" % (crest_frac, "mid-panel" if RIDGE_MIDPANEL
+                                      else "centered, on slab/panel edge"))
 print("dt                       = ", '%6.3f h' % dt_hours,
       " ell/L = %.3f  ell^2 = %.4f" % (ell, ell2))
 print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
@@ -1097,7 +1117,7 @@ print("Wrote %s  (%d rows)" % (csv_name, rows.shape[0]))
 
 # ---- SSH comparison export (channel_ssh_compare.py) --------------------------
 np.savez(SSH_OUT, ns=np.array(SSH_NS), dt=dt, nsteps=NSTEPS, nmid=NSTEPS // 2,
-         L=LCHAN, H0=H0, p=p, N=N, npan_x=npan_x, npan_y=npan_y,
+         L=LCHAN, H0=H0, p=p, N=N, npan_x=npan_x, npan_y=npan_y, ridge_xc=RIDGE_XC,
          forced=FORCED, steric_amp=STERIC_AMP, gamma_s=GAMMA_S, tau0=TAU0,
          rdrag=RDRAG, wall_noflux=WALL_NOFLUX, sponge_w=SPONGE_W,
          sponge_rate=SPONGE_RATE, **ssh_export)
