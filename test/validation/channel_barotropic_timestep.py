@@ -21,9 +21,12 @@
 #
 # which is EXACTLY the operator of the sweep script (D = ell2 * H/H0 with
 # ell2 = g H0 dt^2 / L^2, screening coefficient +1). Since dt is fixed, the
-# operator is fixed: ONE S-map assembly and ONE cyclic block-Thomas
-# factorization (with the SMW corner correction) serve every timestep; the
-# per-step cost is a body-load rhs rebuild plus a block back-substitution.
+# operator is fixed: ONE S-map assembly and ONE factorization of the cyclic
+# block-tridiagonal interface system serve every timestep; the per-step cost
+# is a body-load rhs rebuild plus a block solve. The factorization is dense
+# cyclic red-black (cyclic reduction; the periodic corners are handled by the
+# reduction itself) by default, or cyclic block-Thomas with the SMW corner
+# correction (SSLABLU_SOLVER=thomas).
 # (Compare manuscript Sec. 6.1, which reused the S reduction but ran GMRES at
 # every IMEX step; and Sec. 5.3, which deferred the direct solver.)
 #
@@ -74,10 +77,12 @@
 #
 #   All outputs go to one directory per configuration (created as needed;
 #   rerunning identical settings overwrites):
-#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>]_dt<dt>s_nsteps<NSTEPS>[_ridgectr]/
+#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb]_dt<dt>s_nsteps<NSTEPS>[_ridgectr]/
 #   dt in seconds, %g-formatted exactly as reentrant_channel_sslablu.jl formats
 #   its Δt, so paired runs share the dt/nsteps tokens; _rk<RK> marks HBS-
-#   compressed S-maps, _ridgectr marks SSLABLU_RIDGE_MIDPANEL=0.
+#   compressed S-maps, _rb the red-black solver (no token = cyclic Thomas,
+#   as in runs made before red-black existed), _ridgectr marks
+#   SSLABLU_RIDGE_MIDPANEL=0.
 #   channel_timestep_diag.csv        per-step diagnostics
 #   channel_timestep_ssh.npz         eta/u/v samples for channel_ssh_compare.py
 #   channel_timestep_fields.png      eta snapshots at t = 0, T/2, T
@@ -91,6 +96,7 @@
 #   SSLABLU_DT_H       timestep in hours               (default 0.25)
 #   SSLABLU_NSTEPS     number of steps                 (default 48)
 #   SSLABLU_RK         HBS rank for S-maps; 0 = dense  (default 0)
+#   SSLABLU_SOLVER     rb (red-black; N must be a power of 2) | thomas  (default rb)
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m]             (default 0)
@@ -121,6 +127,8 @@ import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
 import multislab.omsdirectsolve as omsdirectsolve
+# NOT the same module as multislab.omsdirectsolve: this one has the solver classes
+from direct_solve.omsdirectsolve import RedBlackSolver
 
 CPU = torch.device('cpu')
 
@@ -611,8 +619,9 @@ def gate(ell2, geom, opts):
 
 class ChannelModel:
     """Backward-Euler IMEX barotropic channel. Fixed dt -> the elliptic
-    operator is fixed -> S assembly + cyclic Thomas factorization happen ONCE
-    (in __init__); step() rebuilds only the body-load rhs and back-substitutes.
+    operator is fixed -> S assembly + cyclic red-black (or Thomas)
+    factorization happen ONCE (in __init__); step() rebuilds only the
+    body-load rhs and solves with the stored factors.
     State eta [m], u, v [m/s] live on the per-slab leaf grids (nboxes, p^2);
     overlapping slabs each carry their own consistent copy, convdiv-style."""
 
@@ -634,10 +643,38 @@ class ChannelModel:
                 self.OMS.construct_Stot_helper(zero_bc, assembler, dbg=0)
         self.t_asm = time.perf_counter() - tic
 
+        # both solvers (and step()) use contiguous interface blocks i*nc:(i+1)*nc
+        assert all(list(d) == list(range(i * self.nc, (i + 1) * self.nc))
+                   for i, d in enumerate(self.OMS.glob_target_dofs)), \
+            "interface dofs are not contiguous per slab"
+
         tic = time.perf_counter()
-        self.T, self.smw = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
-            self.OMS, S_list, rhs0, self.Ntot, self.nc)
+        if SOLVER == "rb":
+            # identity diagonal (Stot = I + S); cyclic=True: the wrap-around
+            # couplings S_list[0][0] and S_list[-1][1] are reduced like any other
+            # HBS-compressed S-maps (SSLABLU_RK > 0) are densified first, as
+            # the Thomas path does implicitly: RK compresses the S-maps only,
+            # the factorization stays dense (RedBlackSolver can't negate HBSMAT)
+            I_nc = np.eye(self.nc)
+            S_rb = [[b if isinstance(b, np.ndarray) else np.asarray(b @ I_nc)
+                     for b in blocks] for blocks in S_list]
+            self.rb = RedBlackSolver(self.nc, cyclic=True)
+            self.rb.factorize(S_rb, [I_nc] * self.N)
+        else:
+            self.T, self.smw = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
+                self.OMS, S_list, rhs0, self.Ntot, self.nc)
         self.t_fac = time.perf_counter() - tic
+
+        # red-black cross-check: one solve against cyclic Thomas on a random rhs
+        # (Thomas factors are cheap at this size and are discarded afterwards)
+        self.rb_vs_thomas = np.nan
+        if SOLVER == "rb":
+            T_, smw_ = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
+                self.OMS, S_list, rhs0, self.Ntot, self.nc)
+            r = np.random.default_rng(0).standard_normal(self.Ntot)
+            x_th = omsdirectsolve.block_cyclic_tridiagonal_solve(self.OMS, T_, smw_, r)
+            self.rb_vs_thomas = (np.linalg.norm(self.solve(r) - x_th)
+                                 / np.linalg.norm(x_th))
 
         tic = time.perf_counter()
         self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
@@ -682,6 +719,14 @@ class ChannelModel:
         # previous-step wall data, for the under-relaxed zero-grad copy
         self.fgb_prev = [np.zeros(len(s.Igb)) for s in self.sl]
         self.t = 0.0
+
+    def solve(self, rhs):
+        """Interface system (I + S) u = rhs with the stored factorization."""
+        if SOLVER == "rb":
+            with redirect_stdout(io.StringIO()):   # RedBlackSolver.solve prints
+                return np.asarray(self.rb.solve(rhs)).ravel()
+        return omsdirectsolve.block_cyclic_tridiagonal_solve(
+            self.OMS, self.T, self.smw, rhs)
 
     def wall_eta(self, pts, t):
         """Dirichlet SSH on the y-walls. In the FORCED scenario the walls are
@@ -817,10 +862,9 @@ class ChannelModel:
             ustars.append(us); vstars.append(vs)
         t_rhs = time.perf_counter() - tic
 
-        # ---- one block back-substitution (factorization is reused) --------
+        # ---- one block solve (factorization is reused) --------------------
         tic = time.perf_counter()
-        uhat = omsdirectsolve.block_cyclic_tridiagonal_solve(
-            self.OMS, self.T, self.smw, rhstot)
+        uhat = self.solve(rhstot)
         t_slv = time.perf_counter() - tic
 
         # ---- reconstruction + velocity update -----------------------------
@@ -919,6 +963,13 @@ npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
 dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.0625"))
 NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "1600")) # Default 48, longest was 19200
 RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
+SOLVER   = os.environ.get("SSLABLU_SOLVER", "rb").lower()  # rb | thomas
+if SOLVER not in ("rb", "thomas"):
+    raise ValueError("SSLABLU_SOLVER must be 'rb' or 'thomas', got %r" % SOLVER)
+if SOLVER == "rb" and (N < 2 or N & (N - 1)):
+    # RedBlackSolver.factorize builds this error but never raises it
+    raise ValueError("red-black needs N = power of 2 slabs, got N = %d "
+                     "(or set SSLABLU_SOLVER=thomas)" % N)
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 WALL_AMP = float(os.environ.get("SSLABLU_WALL_AMP", "0.0"))
@@ -949,8 +1000,9 @@ ell2 = ell * ell
 
 # one output directory per configuration (see the header), so runs don't
 # overwrite each other
-graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s_dt%gs_nsteps%d%s" % (
+graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s" % (
     p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "",
+    "_rb" if SOLVER == "rb" else "",
     dt, NSTEPS, "" if RIDGE_MIDPANEL else "_ridgectr")
 SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
 
@@ -978,6 +1030,8 @@ print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
 print("f*dt (explicit Coriolis) = ", '%6.3f' % (FCOR * dt))
 print("S-map assembler          = ",
       ("HBS rk = %d" % RK) if RK > 0 else "dense")
+print("interface solver         = ",
+      "cyclic red-black (dense)" if SOLVER == "rb" else "cyclic block-Thomas + SMW (dense)")
 print("output directory         = ", graph_directory)
 if FORCED:
     print("scenario                 =  FORCED (wind + drag + steric)")
@@ -1009,6 +1063,9 @@ modC = ChannelModel(dt, True, make_assembler(), dSlabs, connectivity, H, opts,
                     label="divergence form")
 print("[divergence form]     assemble/factor/keep-slabs = "
       "%.2f / %.2f / %.2f s" % (modC.t_asm, modC.t_fac, modC.t_keep))
+if SOLVER == "rb":
+    print("[divergence form]     red-black vs Thomas, one random-rhs solve: "
+          "rel. diff = %.3E" % modC.rb_vs_thomas)
 modN = None
 if CMP_FORM:
     modN = ChannelModel(dt, False, make_assembler(), dSlabs, connectivity, H,
@@ -1257,7 +1314,7 @@ try:
 
     steps_ax = np.arange(1, NSTEPS + 1)
     axD[1, 1].plot(steps_ax, hist["t_rhs"], 'o-', label='body-load rhs')
-    axD[1, 1].plot(steps_ax, hist["t_slv"], 's-', label='cyclic back-subst.')
+    axD[1, 1].plot(steps_ax, hist["t_slv"], 's-', label='cyclic %s solve' % ("red-black" if SOLVER == "rb" else "Thomas"))
     axD[1, 1].plot(steps_ax, hist["t_rec"], '^-', label='reconstruction')
     axD[1, 1].set_xlabel('step'); axD[1, 1].set_ylabel('time [s]')
     axD[1, 1].set_title('per-step cost (factorization amortized: %.2f s once)'
@@ -1265,7 +1322,8 @@ try:
     axD[1, 1].grid(True, alpha=0.3); axD[1, 1].legend(fontsize=8)
 
     figD.suptitle('Channel barotropic timestepping: backward-Euler IMEX, '
-                  'reused cyclic-Thomas factorization', fontsize=12)
+                  'reused cyclic %s factorization'
+                  % ("red-black" if SOLVER == "rb" else "Thomas"), fontsize=12)
     figD.tight_layout(rect=[0, 0, 1, 0.96])
     figD.savefig(outpath('channel_timestep_diagnostics.png'), dpi=200)
 

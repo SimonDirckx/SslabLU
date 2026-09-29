@@ -232,7 +232,8 @@ for jl in jl_paths:
     pc = ax[1, 2].pcolormesh(xc, yc, Hdiff.T, cmap='BrBG', shading='auto',
                              vmin=-np.abs(Hdiff).max(), vmax=np.abs(Hdiff).max())
     fig.colorbar(pc, ax=ax[1, 2], shrink=0.85, label='[m]')
-    ax[1, 2].set_title(r"$H^u_{Ocean} - H_{analytic}$ at u-faces")
+    ax[1, 2].set_title("bathymetry error of the Oceananigans grid:\n"
+                       r"depth at u-points $\min(H_{i-1}, H_i)$ minus analytic $H$")
     for a in (ax[0, 0], ax[0, 1], ax[0, 2], ax[1, 2]):
         if sponge_w > 0:
             for y0, y1 in ((0.0, sponge_w), (1.0 - sponge_w, 1.0)):
@@ -243,12 +244,13 @@ for jl in jl_paths:
     ax[1, 0].plot(zS, yc, 'C0', label='SslabLU')
     ax[1, 0].plot(zO, yc, 'C3--', label='Oceananigans')
     ax[1, 0].set_xlabel(r"$\langle\eta'\rangle_x$ [m]"); ax[1, 0].set_ylabel('y / L')
-    ax[1, 0].set_title('zonal-mean SSH')
+    ax[1, 0].set_title(r"zonal-mean SSH $\langle\eta'\rangle_x(y)$")
     ax[1, 0].legend(fontsize=8); ax[1, 0].grid(True, alpha=0.3)
     ax[1, 1].plot(zS - zO, yc, 'k')
     ax[1, 1].axvline(0, color='0.5', lw=0.6)
     ax[1, 1].set_xlabel(r"$\Delta\langle\eta'\rangle_x$ [m]"); ax[1, 1].set_ylabel('y / L')
-    ax[1, 1].set_title('zonal-mean difference (S - O)')
+    ax[1, 1].set_title("zonal-mean SSH difference vs y\n"
+                       r"$\langle\eta'\rangle_x$: SslabLU $-$ Oceananigans")
     ax[1, 1].grid(True, alpha=0.3)
     for a in (ax[1, 0], ax[1, 1]):
         if sponge_w > 0:
@@ -257,7 +259,7 @@ for jl in jl_paths:
 
     fig.suptitle("SSH comparison at t = %.1f h, Oceananigans %d x %d (hatched: SslabLU wall sponge)"
                  % (r["t"] / 3600.0, n, n), fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.tight_layout(rect=[0, 0, 1, 0.95], h_pad=3.0)   # room for the 2-line titles
     out = os.path.join(out_dir, "channel_ssh_compare_n%d.png" % n)
     fig.savefig(out, dpi=200)
     plt.close(fig)
