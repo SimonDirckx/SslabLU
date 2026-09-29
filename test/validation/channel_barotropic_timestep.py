@@ -72,7 +72,14 @@
 #   OPTIONAL SSLABLU_DTCONV=1: dt-convergence ratios (~2.0 for backward Euler);
 #           rebuilds the operator per dt, so this is slow and off by default.
 #
+#   All outputs go to one directory per configuration (created as needed;
+#   rerunning identical settings overwrites):
+#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>]_dt<dt>s_nsteps<NSTEPS>[_ridgectr]/
+#   dt in seconds, %g-formatted exactly as reentrant_channel_sslablu.jl formats
+#   its Δt, so paired runs share the dt/nsteps tokens; _rk<RK> marks HBS-
+#   compressed S-maps, _ridgectr marks SSLABLU_RIDGE_MIDPANEL=0.
 #   channel_timestep_diag.csv        per-step diagnostics
+#   channel_timestep_ssh.npz         eta/u/v samples for channel_ssh_compare.py
 #   channel_timestep_fields.png      eta snapshots at t = 0, T/2, T
 #   channel_timestep_diagnostics.png mass drift / energy / max|eta| / timings
 #
@@ -909,8 +916,8 @@ N        = int(os.environ.get("SSLABLU_N", "8"))
 p        = int(os.environ.get("SSLABLU_P", "12"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
-dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.125"))
-NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "800")) # Default 48, longest was 19200
+dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.0625"))
+NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "1600")) # Default 48, longest was 19200
 RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
@@ -919,7 +926,7 @@ WALL_PERIOD = 12.42 * 3600.0                             # M2-ish tide [s]
 # SSH comparison export (channel_ssh_compare.py): eta/u/v sampled at the
 # Oceananigans cell centers of each n x n grid listed, at NSTEPS//2 and NSTEPS
 SSH_NS  = [int(v) for v in os.environ.get("SSLABLU_SSH_NS", "80,160,320").split(",") if v]
-SSH_OUT = os.environ.get("SSLABLU_SSH_OUT", "channel_timestep_ssh.npz")
+SSH_OUT = os.environ.get("SSLABLU_SSH_OUT", "")   # default: <graph_directory>/channel_timestep_ssh.npz
 
 p_disc    = p + 2
 leaf_size = 2 * p
@@ -939,6 +946,17 @@ opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a)
 dt   = 3600.0 * dt_hours
 ell  = np.sqrt(GRAV * H0) * dt / LCHAN
 ell2 = ell * ell
+
+# one output directory per configuration (see the header), so runs don't
+# overwrite each other
+graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s_dt%gs_nsteps%d%s" % (
+    p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "",
+    dt, NSTEPS, "" if RIDGE_MIDPANEL else "_ridgectr")
+SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
+
+
+def outpath(name):
+    return os.path.join(graph_directory, name)
 
 
 def make_assembler():
@@ -960,6 +978,7 @@ print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
 print("f*dt (explicit Coriolis) = ", '%6.3f' % (FCOR * dt))
 print("S-map assembler          = ",
       ("HBS rk = %d" % RK) if RK > 0 else "dense")
+print("output directory         = ", graph_directory)
 if FORCED:
     print("scenario                 =  FORCED (wind + drag + steric)")
     print("wind stress amp TAU0     = ", '%6.3f N/m^2' % TAU0)
@@ -1108,7 +1127,8 @@ print("=========================================================")
 
 # ---- CSV export -------------------------------------------------------------
 rows = np.array(rows)
-csv_name = "channel_timestep_diag.csv"
+os.makedirs(graph_directory, exist_ok=True)
+csv_name = outpath("channel_timestep_diag.csv")
 with open(csv_name, 'w') as f:
     f.write("step,t_hours,mass,tilt_NmS,max_u,max_v,wall_vn_max,mass_resid,"
             "energy,max_eta,t_rhs,t_solve,t_recon\n")
@@ -1185,7 +1205,7 @@ try:
         figF.suptitle('geostrophic adjustment over the ridge: one factorization, '
                       '%d back-substitutions' % NSTEPS, fontsize=11)
     figF.tight_layout(rect=[0, 0, 1, 0.93])
-    figF.savefig('channel_timestep_fields.png', dpi=200)
+    figF.savefig(outpath('channel_timestep_fields.png'), dpi=200)
 
     # ---- diagnostics ---------------------------------------------------------
     figD, axD = plt.subplots(2, 2, figsize=(11, 8))
@@ -1247,7 +1267,7 @@ try:
     figD.suptitle('Channel barotropic timestepping: backward-Euler IMEX, '
                   'reused cyclic-Thomas factorization', fontsize=12)
     figD.tight_layout(rect=[0, 0, 1, 0.96])
-    figD.savefig('channel_timestep_diagnostics.png', dpi=200)
+    figD.savefig(outpath('channel_timestep_diagnostics.png'), dpi=200)
 
     outnames = "channel_timestep_fields.png, channel_timestep_diagnostics.png"
 
@@ -1282,7 +1302,7 @@ try:
         figW.suptitle('Forcing fields: steady wind stress, steric target, '
                       'and bottom drag', fontsize=12)
         figW.tight_layout(rect=[0, 0, 1, 0.93])
-        figW.savefig('channel_timestep_forcings.png', dpi=200)
+        figW.savefig(outpath('channel_timestep_forcings.png'), dpi=200)
         outnames += ", channel_timestep_forcings.png"
 
     # ---- wall closure / mass conservation (FORCED only) ---------------------
@@ -1310,9 +1330,9 @@ try:
         figC.suptitle('Closed-wall diagnostics: is H u·n = 0 at the y-walls?',
                       fontsize=12)
         figC.tight_layout(rect=[0, 0, 1, 0.93])
-        figC.savefig('channel_timestep_conservation.png', dpi=200)
+        figC.savefig(outpath('channel_timestep_conservation.png'), dpi=200)
         outnames += ", channel_timestep_conservation.png"
 
-    print("wrote " + outnames)
+    print("wrote %s  (in %s/)" % (outnames, graph_directory))
 except Exception as e:
     print("plotting skipped:", e)

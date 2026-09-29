@@ -22,9 +22,12 @@
 #
 # Usage:
 #   python reentrant_channel_sslablu_analysis.py [path/to/data_final.jld2]
+# Default: the most recently written run_oceananigans_channel_*/data_final.jld2.
+# The figure is written next to the .jld2, in that run's directory.
 # (needs h5py + matplotlib; e.g. the hpsenv conda env, `pip install h5py`)
 # =============================================================================
 
+import os
 import sys
 import glob
 
@@ -42,10 +45,10 @@ GAP_DEPTH, GAP_Y0, GAP_Y1, GAP_W = 1.0, 1.0 / 6.0, 1.0 / 2.0, 0.05
 def find_file():
     if len(sys.argv) > 1:
         return sys.argv[1]
-    cands = sorted(glob.glob("run_channel_sslablu_spinup*/data_final.jld2"))
+    cands = glob.glob("run_oceananigans_channel_*/data_final.jld2")
     if not cands:
         sys.exit("no data_final.jld2 found; pass its path as an argument")
-    return cands[-1]
+    return max(cands, key=os.path.getmtime)
 
 
 def load(f, name):
@@ -143,6 +146,6 @@ for a in (ax[0, 0], ax[0, 1], ax[1, 0]):
 fig.suptitle('Oceananigans re-entrant channel (barotropic mode) '
              '-- SslabLU comparison', fontsize=12)
 fig.tight_layout(rect=[0, 0, 1, 0.96])
-out = 'oceananigans_channel_diagnostics.png'
+out = os.path.join(os.path.dirname(fn) or ".", 'oceananigans_channel_diagnostics.png')
 fig.savefig(out, dpi=200)
 print("wrote " + out)

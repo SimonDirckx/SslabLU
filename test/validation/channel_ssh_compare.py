@@ -27,20 +27,26 @@
 #     plateaus is the genuine model difference (walls, lateral viscosity,
 #     1st-order IMEX vs AB2, ...)
 #
-# Usage (from the repo root, after running both models with matching NSTEPS):
+# Usage (from the repo root, after running both models with matching dt and
+# NSTEPS; the Julia Δt is set in the .jl, SslabLU's by SSLABLU_DT_H):
 #   julia --project test/validation/reentrant_channel_sslablu.jl 400        # 80^2
 #   julia --project test/validation/reentrant_channel_sslablu.jl 400 160
 #   julia --project test/validation/reentrant_channel_sslablu.jl 400 320
 #   python test/validation/channel_barotropic_timestep.py
-#   python test/validation/channel_ssh_compare.py [ssh.npz] [a.jld2 b.jld2 ...]
-# Defaults: channel_timestep_ssh.npz and run_channel_sslablu_spinup<NSTEPS>*/.
+#   python test/validation/channel_ssh_compare.py [sslablu_run_dir | ssh.npz] [a.jld2 ...]
+# Defaults: the SslabLU run is the only run_sslablu_channel_*/ present (else
+# pass it; a legacy ./channel_timestep_ssh.npz is used if no run dirs exist).
+# The Oceananigans runs are every run_oceananigans_channel_n*/ whose name
+# carries the SAME dt, nsteps and ridge tokens as the SslabLU run.
 #
-# Outputs:
+# Outputs, written into the SslabLU run directory:
 #   channel_ssh_compare_n<N>.png        maps + zonal means + H difference
 #   channel_ssh_compare_convergence.png difference vs Oceananigans resolution
 #   channel_ssh_compare.csv             all metrics
 # =============================================================================
 
+import os
+import re
 import sys
 import glob
 
@@ -93,24 +99,44 @@ def rel_l2(d, ref, mask):
 
 # ---- inputs -----------------------------------------------------------------
 args = sys.argv[1:]
-npz_path = args[0] if args and args[0].endswith(".npz") else "channel_timestep_ssh.npz"
 jl_paths = [a for a in args if a.endswith(".jld2")]
+s_args = [a for a in args if not a.endswith(".jld2")]
+if s_args:
+    npz_path = s_args[0]
+    if os.path.isdir(npz_path):
+        npz_path = os.path.join(npz_path, "channel_timestep_ssh.npz")
+else:
+    cands = sorted(glob.glob("run_sslablu_channel_*/channel_timestep_ssh.npz"))
+    if not cands and os.path.exists("channel_timestep_ssh.npz"):
+        cands = ["channel_timestep_ssh.npz"]                   # legacy location
+    if not cands:
+        sys.exit("no SslabLU output found; pass a run_sslablu_channel_*/ directory")
+    if len(cands) > 1:
+        sys.exit("several SslabLU runs; pass one of:\n  "
+                 + "\n  ".join(os.path.dirname(c) for c in cands))
+    npz_path = cands[0]
+out_dir = os.path.dirname(npz_path) or "."   # comparison outputs go with the SslabLU run
 
 S = np.load(npz_path)
 nsteps = int(S["nsteps"])
-if not jl_paths:
-    jl_paths = sorted(glob.glob("run_channel_sslablu_spinup%d*/data_final.jld2" % nsteps))
-if not jl_paths:
-    sys.exit("no Oceananigans output for NSTEPS = %d; pass .jld2 paths" % nsteps)
-
 L, H0, dt = float(S["L"]), float(S["H0"]), float(S["dt"])
 sponge_w = float(S["sponge_w"]) if bool(S["wall_noflux"]) else 0.0
 ridge_xc = float(S["ridge_xc"]) if "ridge_xc" in S else 0.5   # pre-shift npz files
-print("  ridge crest x/L = %.5f" % ridge_xc)
-print("SslabLU  : %s  (NSTEPS = %d, dt = %.0f s, p = %d, N = %d, samples at n = %s)"
+
+if not jl_paths:
+    # directory tokens exactly as reentrant_channel_sslablu.jl writes them
+    pattern = "run_oceananigans_channel_n*_dt%gs_nsteps%d%s/data_final.jld2" % (
+        dt, nsteps, "_ridgectr" if abs(ridge_xc - 0.5) < 1e-12 else "")
+    jl_paths = sorted(glob.glob(pattern),
+                      key=lambda path: int(re.search(r"_n(\d+)_", path).group(1)))
+    if not jl_paths:
+        sys.exit("no Oceananigans output matching %s; pass .jld2 paths" % pattern)
+
+print("SslabLU  : %s  (NSTEPS = %d, dt = %g s, p = %d, N = %d, samples at n = %s)"
       % (npz_path, nsteps, dt, int(S["p"]), int(S["N"]), list(S["ns"])))
 print("  forcing: tau0 = %.3f, rdrag = %.1e, steric = %.2f m, gamma_s = %.1e"
       % (float(S["tau0"]), float(S["rdrag"]), float(S["steric_amp"]), float(S["gamma_s"])))
+print("  ridge crest x/L = %.5f" % ridge_xc)
 print("  interior band (outside wall sponge): %.3f <= y/L <= %.3f"
       % (sponge_w, 1.0 - sponge_w))
 
@@ -232,7 +258,7 @@ for jl in jl_paths:
     fig.suptitle("SSH comparison at t = %.1f h, Oceananigans %d x %d (hatched: SslabLU wall sponge)"
                  % (r["t"] / 3600.0, n, n), fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    out = "channel_ssh_compare_n%d.png" % n
+    out = os.path.join(out_dir, "channel_ssh_compare_n%d.png" % n)
     fig.savefig(out, dpi=200)
     plt.close(fig)
     print("wrote " + out)
@@ -242,11 +268,12 @@ if not rows:
 
 # ---- CSV ----------------------------------------------------------------------
 rows = np.array(rows)
-with open("channel_ssh_compare.csv", 'w') as f:
+csv_name = os.path.join(out_dir, "channel_ssh_compare.csv")
+with open(csv_name, 'w') as f:
     f.write("n,t_hours,is_final,relL2_full,relL2_interior,maxabs_full,maxabs_interior,"
             "tilt_S,tilt_O,mean_S,mean_O,relL2_u_interior,relL2_v_interior,maxabs_Hdiff\n")
     np.savetxt(f, rows, fmt='%.16e', delimiter=',')
-print("wrote channel_ssh_compare.csv (%d rows)" % rows.shape[0])
+print("wrote %s (%d rows)" % (csv_name, rows.shape[0]))
 
 # ---- convergence vs Oceananigans resolution -----------------------------------
 if len({c[0] for c in conv["final"]}) >= 2:
@@ -264,5 +291,6 @@ if len({c[0] for c in conv["final"]}) >= 2:
     ax.set_title('SSH difference vs Oceananigans resolution\n(plateau = model difference)')
     ax.grid(True, which='both', alpha=0.3); ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig("channel_ssh_compare_convergence.png", dpi=200)
-    print("wrote channel_ssh_compare_convergence.png")
+    out = os.path.join(out_dir, "channel_ssh_compare_convergence.png")
+    fig.savefig(out, dpi=200)
+    print("wrote " + out)

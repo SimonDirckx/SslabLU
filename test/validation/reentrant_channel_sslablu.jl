@@ -29,7 +29,11 @@
 #
 # Run:  julia --project reentrant_channel_sslablu.jl [Nspinup] [Nxy]
 #   Nxy (default 80) sets Nx = Ny, for the resolution study in
-#   channel_ssh_compare.py; output goes to run_channel_sslablu_spinup<N>[_n<Nxy>]/
+#   channel_ssh_compare.py. Output goes to one directory per configuration,
+#     run_oceananigans_channel_n<Nxy>_dt<Δt>s_nsteps<Nspinup>[_ridgectr]/
+#   (Δt in seconds, %g-formatted exactly as channel_barotropic_timestep.py
+#   formats its dt, so paired runs share the dt/nsteps tokens; _ridgectr marks
+#   SSLABLU_RIDGE_MIDPANEL=0). Rerunning identical settings overwrites.
 # =============================================================================
 
 using Oceananigans
@@ -49,13 +53,10 @@ if length(ARGS) >= 1
 end
 
 # ---- resolution / geometry --------------------------------------------------
-# Nx = Ny, optionally from the 2nd CLI arg (80 keeps the original directory name)
+# Nx = Ny, optionally from the 2nd CLI arg
 const Nxy = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 80
 const Nx = Nxy
 const Ny = Nxy
-
-graph_directory = "run_channel_sslablu_spinup" * string(Nspinup) *
-                  (Nxy == 80 ? "" : "_n" * string(Nxy)) * "/"
 const Nz = 1 #16                # uniform in z (SslabLU has no vertical structure)
 
 const Lx = 1000kilometers    # = 1e6 m  (SslabLU LCHAN)
@@ -183,8 +184,13 @@ end
 
 # ---- run --------------------------------------------------------------------
 arch = CPU()
-Δt   = 7.5minutes            # 900 s (SslabLU dt = 0.25 h); the implicit free
+Δt   = 225            # 900 s (SslabLU dt = 0.25 h); the implicit free
                             # surface removes the fast-gravity-wave CFL limit
+
+# one output directory per configuration (see the header), so runs don't
+# overwrite each other
+graph_directory = @sprintf("run_oceananigans_channel_n%d_dt%gs_nsteps%d%s/",
+                           Nxy, Δt, Nspinup, RIDGE_MIDPANEL ? "" : "_ridgectr")
 
 grid  = make_grid(arch)
 model = build_model(grid, parameters)
