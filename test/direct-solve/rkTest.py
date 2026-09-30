@@ -111,16 +111,28 @@ for indp in range(len(pvec)):
     S_rk_list = OMS.hbs_blocks
     S_dense_list = OMS.S_dense_list
     step = 10
-    strat = rkStrat.linear(rk0+step,step,skip_first_level=False)#slightly annoying, you have to add +x already baked in
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,quad=False,fast=True,identity_diag=True,diagnostics=True)
+    #strat = rkStrat.linear(rk0+step,step,skip_first_level=False)
+    strat = rkStrat.logarithmic(rk0+step,80,skip_first_level=False)
+    #strat = rkStrat.constant(rk0)
+    #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=True,fast=True,identity_diag=True,seed=None)
+    rb_solver = omsdirectHBS.ThomasSolverHBS(nc,strat,diagnostics=True)
     rb_solver.factorize(S_rk_list,S_exact=S_dense_list)
 
     print(rb_solver.report.table("comb",   rows="stages"))  # one level isolated
     print(rb_solver.report.table("ladder", rows="stages"))  # the solver's own path
+    for r in rb_solver.report.comb():
+        if r["block"] is not None and r["stage"] >= 3:
+            norm = r["dense_abs"] / r["dense_rel"]
+            print(f'{r["stage"]}  {r["block"]:22s}  norm {norm:.2e}  rel.err {r["dense_rel"]:.2e}')
     #print(rb_solver.report.table("ladder", rows="blocks"))  # blockwise H_k vs E_k
 
     uhat =rb_solver.solve(rhstot_lu)
-    Sdense_lu = Stot_lu@np.identity(nc*(N-1))
+    Sdense_lu = np.identity(nc*(N-1))
+    for i in range(len(S_dense_list)):
+        if i>0:
+            Sdense_lu[:,(i-1)*nc:i*nc][i*nc:(i+1)*nc,:] = S_dense_list[i][0]
+        if i<len(S_dense_list)-1:
+            Sdense_lu[:,(i+1)*nc:(i+2)*nc][i*nc:(i+1)*nc,:] = S_dense_list[i][-1]
     udense = np.linalg.solve(Sdense_lu,rhstot_lu)
     
     for slabInd in range(len(dSlabs)):

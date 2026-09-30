@@ -82,11 +82,11 @@ import numpy as np
 from scipy.linalg import lu_factor, lu_solve
 
 try:
-    from .omsdirectsolveHBS import (HBSnew, torch, zero_op, dead_op, id_op,
+    from .omsdirectsolveHBS import (HBSnew, torch, zero_op, dead_op, id_op, _is_id,
                                     _linop_from_mat, STS_linop, RB_linop,
                                     Sprime_Linop, Dprime_Linop, _sum_linop)
 except ImportError:
-    from omsdirectsolveHBS import (HBSnew, torch, zero_op, dead_op, id_op,
+    from omsdirectsolveHBS import (HBSnew, torch, zero_op, dead_op, id_op, _is_id,
                                    _linop_from_mat, STS_linop, RB_linop,
                                    Sprime_Linop, Dprime_Linop, _sum_linop)
 
@@ -377,32 +377,63 @@ def _dense_rb_inv(dense_levels, cyclic, m, lu):
                 lambda X: _rb_sweep(elim, coarse, cyclic, m, X, 'T'))
 
 
-def _thomas_sweep(L, P, R, X, m, mode):
+def _tb_apply(op, X, adj):
+    """Apply one factor block: None is the identity, ('LPinv', L, P) the
+    implicit multiplier L P^{-1}, anything else an operator or array."""
+    if op is None:
+        return X
+    if isinstance(op, tuple):
+        _, Lk, Pk = op
+        if adj:
+            return np.asarray(Pk.solve(_rmm(Lk, X), mode='T'))
+        return _mm(Lk, np.asarray(Pk.solve(X, mode='N')))
+    return _rmm(op, X) if adj else _mm(op, X)
+
+
+def _tb_inv(P, X, adj):
+    if P is None:
+        return X
+    return np.asarray(P.solve(X, mode='T' if adj else 'N'))
+
+
+def _thomas_factors(form, L, P, R, O):
+    """The partial factorization as A = Lf Uf, Lf lower bidiagonal
+    (diagonal Pl, sub-diagonal Q), Uf upper bidiagonal (diagonal Pu,
+    super-diagonal Z); None stands for an identity block."""
+    N = len(P)
+    ident = [None] * N
+    if form == 'normalized':
+        return P, list(L), ident, list(O)
+    if form == 'unnormalized_offdiag':
+        return ident, list(O), P, list(R)
+    return ident, [('LPinv', L[k], P[k]) for k in range(N - 1)], P, list(R)
+
+
+def _thomas_form_sweep(form, L, P, R, O, X, m, mode):
     """
-    Block Thomas solve (mode='N') or its adjoint (mode='T').  L[i] = block
-    (i+1, i), R[i] = block (i, i+1), P[i] = eliminated diagonals S'_i, each
-    with .solve(X, mode).  With Ã = L U (L unit lower, U with diagonal P):
-      forward   d_i = v_i - L_{i-1} P_{i-1}^{-1} d_{i-1};  x_i = P_i^{-1}(d_i - R_i x_{i+1})
-      adjoint   y_i = P_i^{-*}(v_i - R_{i-1}^* y_{i-1});   x_i = y_i - P_i^{-*} L_i^* x_{i+1}
+    Solve with A = Lf Uf (mode='N') or with its adjoint (mode='T'), for any
+    of the three Thomas forms (see _thomas_factors):
+      forward   y_i = Pl_i^{-1}(v_i - Q_{i-1} y_{i-1});     x_i = Pu_i^{-1}(y_i - Z_i x_{i+1})
+      adjoint   w_i = Pu_i^{-*}(v_i - Z_{i-1}^* w_{i-1});   x_i = Pl_i^{-*}(w_i - Q_i^* x_{i+1})
     """
+    Pl, Q, Pu, Z = _thomas_factors(form, L, P, R, O)
     N = len(P)
     sl = lambda k: slice(k * m, (k + 1) * m)
+    adj = mode != 'N'
+    first_inv, first_off, second_inv, second_off = (Pu, Z, Pl, Q) if adj else (Pl, Q, Pu, Z)
+    y = [_tb_inv(first_inv[0], X[sl(0)], adj)]
+    for i in range(1, N):
+        y.append(_tb_inv(first_inv[i], X[sl(i)] - _tb_apply(first_off[i - 1], y[i - 1], adj), adj))
     x = [None] * N
-    if mode == 'N':
-        d = [X[sl(0)]]
-        for i in range(1, N):
-            d.append(X[sl(i)] - _mm(L[i - 1], P[i - 1].solve(d[i - 1], mode='N')))
-        x[-1] = np.asarray(P[-1].solve(d[-1], mode='N'))
-        for i in range(N - 2, -1, -1):
-            x[i] = np.asarray(P[i].solve(d[i] - _mm(R[i], x[i + 1]), mode='N'))
-    else:
-        y = [np.asarray(P[0].solve(X[sl(0)], mode='T'))]
-        for i in range(1, N):
-            y.append(np.asarray(P[i].solve(X[sl(i)] - _rmm(R[i - 1], y[i - 1]), mode='T')))
-        x[-1] = y[-1]
-        for i in range(N - 2, -1, -1):
-            x[i] = y[i] - np.asarray(P[i].solve(_rmm(L[i], x[i + 1]), mode='T'))
+    x[-1] = _tb_inv(second_inv[-1], y[-1], adj)
+    for i in range(N - 2, -1, -1):
+        x[i] = _tb_inv(second_inv[i], y[i] - _tb_apply(second_off[i], x[i + 1], adj), adj)
     return np.vstack(x)
+
+
+def _thomas_sweep(L, P, R, X, m, mode):
+    """Unnormalized block Thomas solve (mode='N') or its adjoint (mode='T')."""
+    return _thomas_form_sweep('unnormalized', L, P, R, None, X, m, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +455,7 @@ class ErrorReport:
 
     def __init__(self, solver_name):
         self.solver_name = solver_name
+        self.seed = None             # the diagnostics' seed actually used
         self.records = []
 
     def add(self, kind, stage, block=None, **vals):
@@ -648,16 +680,23 @@ def _rb_compressor(solver, seed):
     same compute_ULV decision.  Samples come from the diagnostics' own
     generator, so the solver's draws are untouched."""
     schedule = getattr(solver, "rkSchedule", None)
+    schedule_off = getattr(solver, "rkScheduleOffdiag", None) or schedule
     rng = np.random.default_rng(seed)
 
     def compress(E, stage, label):
-        rank = schedule[stage - 1] if schedule and stage >= 1 else solver.rk
+        if schedule and stage >= 1:
+            r_diag, r_off = schedule[stage - 1], schedule_off[stage - 1]
+        else:
+            r_diag = r_off = solver.rk
         mt = _RB_LABEL.match(label or "")
+        coupling = bool(mt) and mt.group(1) in ("A", "C")
+        rank = r_off if coupling else r_diag
         need = bool(mt) and mt.group(1) == "B" and \
             solver._needs_ulv(int(mt.group(2)), int(mt.group(3)))
         ulv = solver._want_ulv(need)
         if solver.fused:
-            m, s = E.shape[0], solver._nsamples(rank)
+            # same width as the solver's shared Omega for this level
+            m, s = E.shape[0], solver._nsamples(max(r_diag, r_off))
             Om = rng.standard_normal((m, s))
             Psi = rng.standard_normal((m, s))
             h = HBSnew.HBSMAT(device=solver.device, tree=solver.tree, quad=solver.quad)
@@ -703,15 +742,20 @@ def diagnose_redblack(solver, S_exact=None, T_exact=None, rhs=None,
                taken as exact and stage-0 blocks are not compared.
     T_exact  : optional exact diagonals (default: the solver's level-0 T).
     rhs      : right-hand side for sol_* (default: seeded Gaussian).
+    seed     : seed for the diagnostics' own random draws; None draws fresh
+               entropy.  The seed used is recorded as report.seed.
     compress : optional callable (E_dense, stage, label) -> operator used for
                the comb's C(E_k); default compresses each block the way the
                solver compressed it (same path, rank and ULV decision).
     """
     RB, m, cyclic = solver.RB, solver.m, solver.cyclic
+    if seed is None:
+        seed = np.random.SeedSequence().entropy
     meter = _Meter(metrics, nprobe, power_iters, power_tol, seed)
     compress = compress or _rb_compressor(solver, seed + 1)
     dens, lu = _densifier(m), _lu_cache()
     rep = ErrorReport("RedBlackSolverHBS")
+    rep.seed = seed
     N = len(RB[0][1])
     L = len(RB)
     Z = np.zeros((m, m))
@@ -905,20 +949,29 @@ def _thomas_recurrence(P_start, k, L, R, D):
 
 
 def _thomas_compressor(solver):
-    """Compress a dense block exactly as ThomasSolverHBS compressed it at that
-    stage: from the operator, with a ULV, at the same rank (block k was built
-    by schedule stage k-1), tree, quad and device."""
+    """Compress a dense block exactly as ThomasSolverHBS compressed the block
+    it stands for: pivots from the operator with a ULV at the pivot rank of
+    their stage, off-diagonal blocks (labels 'C[..]' / 'Lam[..]') without a
+    ULV at the off-diagonal rank, with the same tree, quad and device."""
     with_diag = solver.solve_method == "diag"
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     schedule = getattr(solver, "rkSchedule", None)
+    schedule_off = getattr(solver, "rkScheduleOffdiag", None) or schedule
 
     def compress(E, stage, label):
-        rank = schedule[stage - 1] if schedule and stage >= 1 else solver.rk
-        like = solver.D[stage] if with_diag else solver.A[stage - 1]
+        off = label.startswith(("C[", "Lam["))
+        if schedule and stage >= 1:
+            rank = (schedule_off if off else schedule)[stage - 1]
+        else:
+            rank = solver.rk
+        if off:
+            like = solver.C[stage - 1] if label.startswith("C[") else solver.A[stage - 1]
+        else:
+            like = solver.D[stage] if with_diag else solver.A[stage - 1]
         kw = {} if with_diag else {"device": dev}
         h = HBSnew.HBSMAT(_linop_from_mat(E), tree=getattr(like, "tree", None),
                           quad=getattr(like, "quad", None), **kw)
-        h.construct(rank, compute_ULV=True, fast=True)
+        h.construct(rank, compute_ULV=not off, fast=True)
         return _as_cpu(h)
     return compress
 
@@ -926,17 +979,28 @@ def _thomas_compressor(solver):
 def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
                     metrics=ALL_METRICS, nprobe=5, power_iters=50,
                     power_tol=1e-4, seed=12345, compress=None):
-    """Comb and ladder errors for a factorized ThomasSolverHBS.
+    """Comb and ladder errors for a factorized ThomasSolverHBS, in any of its
+    three forms (normalized; unnormalized with compressed multipliers;
+    unnormalized with implicit multipliers).
 
     Stage 0 is the entry point (the input off-diagonals, and the input
-    diagonals in the with-diag variant); stage i >= 1 is S'_i (resp. B_i).
+    diagonals in the with-diag variant).  Stage k >= 1 forms the pivot S_k
+    and, in the compressed forms, the off-diagonal block from S_{k-1}:
+    C_{k-1} = S_{k-1}^{-1} R_{k-1} (normalized) or Lam_{k-1} = L_{k-1}
+    S_{k-1}^{-1}.  The stage-k term of the ladder is its contribution to
+    Ã_k - A:
+        pivot:     S_k - (D_k - L S_{k-1}^{-1} R | D_k - L C_{k-1} | D_k - Lam_{k-1} R)
+        normalized, super-diagonal (k-1, k):   S_{k-1} C_{k-1} - R_{k-1}
+        multipliers, sub-diagonal (k, k-1):     Lam_{k-1} S_{k-1} - L_{k-1}
 
     S_exact  : optional list of (left, right) exact blocks in the layout the
                solver was factorized with.  If omitted the inputs are taken
                as exact.
     D_exact  : optional exact diagonals for the with-diag variant.
+    seed     : seed for the diagnostics' own random draws; None draws fresh
+               entropy.  The seed used is recorded as report.seed.
     compress : optional callable (E_dense, stage, label) -> operator for the
-               comb's C(E_k); default compresses each block the way the
+               comb's compressions; default compresses each block the way the
                solver compressed it (same path, rank and ULV).
     """
     if solver.cyclic:
@@ -947,13 +1011,19 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
 
     m = solver.m
     with_diag = solver.solve_method == "diag"
+    form = getattr(solver, "form", "unnormalized")
+    has_off = form != "unnormalized"
     Lh, Bh, Rh = solver.A, solver.B, solver.C
+    Oh = getattr(solver, "O", None)
     n = len(Lh)
     N = n + 1
+    if seed is None:
+        seed = np.random.SeedSequence().entropy
     meter = _Meter(metrics, nprobe, power_iters, power_tol, seed)
     compress = compress or _thomas_compressor(solver)
     dens, lu = _densifier(m), _lu_cache()
-    rep = ErrorReport(f"ThomasSolverHBS ({solver.solve_method})")
+    rep = ErrorReport(f"ThomasSolverHBS ({solver.solve_method}, {form})")
+    rep.seed = seed
     I = np.eye(m)
 
     # ---- inputs, dense: as given to the solver, and exact -----------------
@@ -961,7 +1031,7 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
     Rd = [dens(Rh[i]) for i in range(n)]
     Dd = [dens(solver.D[i]) for i in range(N)] if with_diag else [I] * N
     # The two factorize paths index the left blocks differently:
-    #   id_diag:  Sl[i] = S_rk_list[i+1][0]   (entry i holds block (i, i-1))
+    #   id_diag:  Sl[i] = S_rk_list[i+1][0]   (entry i holds block (i+1, i))
     #   diag:     A[i]  = AB_list[i][0]       (entry i holds block (i+1, i))
     # S_exact is read with whichever convention the solver actually used.
     off = 0 if with_diag else 1
@@ -972,8 +1042,23 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
         Lx, Rx = Ld, Rd
     Dx = [dens(D_exact[i]) for i in range(N)] if D_exact is not None else Dd
 
-    Px = _thomas_recurrence(Dx[0], 0, Lx, Rx, Dx)     # exact path
+    def off_exact(P_j, j, Lb, Rb):
+        """Exact off-diagonal block formed from pivot P_j."""
+        if form == "normalized":
+            return np.linalg.solve(P_j, Rb[j])
+        return np.linalg.solve(P_j.T, Lb[j].T).T          # L_j P_j^{-1}
+
+    def continuation(P_start, k, Lb, Rb, Db):
+        """Exact pivots P_k.. and off-diagonal blocks k.. from P_k = P_start."""
+        P = _thomas_recurrence(P_start, k, Lb, Rb, Db)
+        O = [off_exact(P[t], k + t, Lb, Rb) for t in range(len(P) - 1)] if has_off else []
+        return P, O
+
+    Px = _thomas_recurrence(Dx[0], 0, Lx, Rx, Dx)          # exact path
+    Ox = [off_exact(Px[j], j, Lx, Rx) for j in range(n)] if has_off else None
+    first_exact = _is_id(Bh[0])      # solver took C_0 = R_0 / Lam_0 = L_0 exactly
     name = "B" if with_diag else "S'"
+    oname = "C" if form == "normalized" else "Lam"
 
     # level-0 input error (shared by comb and ladder)
     sigma0 = _BlockOp(N, m)
@@ -985,7 +1070,7 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
         for i in range(N):
             sigma0.add(i, i, Dd[i] - Dx[i])
 
-    # ---- blockwise ----------------------------------------------------------
+    # ---- blockwise, stage 0 --------------------------------------------------
     if meter.wants_norms():
         pairs = []
         if S_exact is not None:
@@ -998,17 +1083,44 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
             rep.add("comb", 0, lab, **vals)
             rep.add("ladder", 0, lab, **vals)
 
-    comb_blocks, comb_E, sigma = {}, {0: sigma0}, {0: sigma0}
+    # ---- stages 1..n ---------------------------------------------------------
+    comb_piv, comb_off, comb_E, sigma = {}, {}, {0: sigma0}, {0: sigma0}
     for i in range(1, N):
+        j = i - 1
         lab = f"{name}[{i}]"
         Hc = compress(Px[i], i, lab)
-        comb_blocks[i] = dens(Hc)
-        comb_E[i] = _BlockOp(N, m, [(i, i, comb_blocks[i] - Px[i])])
-        if with_diag:
-            f_i = Dprime_Linop(solver.D[i], Lh[i - 1], Rh[i - 1], Bh[i - 1])
+        cP = dens(Hc)
+        comb_piv[i] = cP
+        Bi, Bj = dens(Bh[i]), dens(Bh[j])
+        comb_entries = [(i, i, cP - Px[i])]
+        if form == "unnormalized":
+            if with_diag:
+                f_i = Dprime_Linop(solver.D[i], Lh[j], Rh[j], Bh[j])
+            else:
+                f_i = Sprime_Linop(Lh[j], Bh[j], Rh[j], id=(i == 1))
+            sig = [(i, i, Bi - _dense(f_i, m))]
         else:
-            f_i = Sprime_Linop(Lh[i - 1], Bh[i - 1], Rh[i - 1], id=(i == 1))
-        sigma[i] = _BlockOp(N, m, [(i, i, dens(Bh[i]) - dens(f_i))])
+            olab = f"{oname}[{j}]"
+            exact_first = first_exact and j == 0
+            if exact_first:
+                cO = Ox[0]
+            else:
+                Hco = compress(Ox[j], i, olab)
+                cO = dens(Hco)
+            comb_off[j] = cO
+            dO = cO - Ox[j]
+            Oj = dens(Oh[j])
+            if form == "normalized":
+                comb_entries = [(i, i, cP - Px[i] + Lx[j] @ dO), (j, i, Px[j] @ dO)]
+                sig = [(i, i, Bi - (Dd[i] - Ld[j] @ Oj)), (j, i, Bj @ Oj - Rd[j])]
+            else:
+                comb_entries = [(i, i, cP - Px[i] + dO @ Rx[j]), (i, j, dO @ Px[j])]
+                sig = [(i, i, Bi - (Dd[i] - Oj @ Rd[j])), (i, j, Oj @ Bj - Ld[j])]
+            if meter.wants_norms() and not exact_first:
+                rep.add("comb", i, olab, **meter.block(Hco, Ox[j], m, dens))
+                rep.add("ladder", i, olab, **meter.block(Oh[j], Ox[j], m, dens))
+        comb_E[i] = _BlockOp(N, m, comb_entries)
+        sigma[i] = _BlockOp(N, m, sig)
         if meter.wants_norms():
             rep.add("comb", i, lab, **meter.block(Hc, Px[i], m, dens))
             rep.add("ladder", i, lab, **meter.block(Bh[i], Px[i], m, dens))
@@ -1021,36 +1133,39 @@ def diagnose_thomas(solver, S_exact=None, D_exact=None, rhs=None,
                         + [(i, i + 1, Rx[i]) for i in range(n)])
         sigA = meter.power(A_op, N * m) if "power" in meter.metrics else None
 
-        def dense_inv(Lb, P, Rb):
+        def dense_inv(Lb, P, Rb, O):
             Ps = [lu(p) for p in P]
-            return _Inv(lambda X: _thomas_sweep(Lb, Ps, Rb, X, m, 'N'),
-                        lambda X: _thomas_sweep(Lb, Ps, Rb, X, m, 'T'))
+            return _Inv(lambda X: _thomas_form_sweep(form, Lb, Ps, Rb, O, X, m, 'N'),
+                        lambda X: _thomas_form_sweep(form, Lb, Ps, Rb, O, X, m, 'T'))
 
-        x_true = dense_inv(Lx, Px, Rx).solve(b)
+        x_true = _Inv(lambda X: _thomas_sweep(Lx, [lu(p) for p in Px], Rx, X, m, 'N'),
+                      None).solve(b)
 
         # comb: stage 0 = the solver's inputs with an exact recurrence;
-        # stage k = exact everywhere except S'_k -> C(E_k)
-        inv = dense_inv(Ld, _thomas_recurrence(Dd[0], 0, Ld, Rd, Dd), Rd)
+        # stage k = exact everywhere except stage k's compressed blocks
+        P0, O0 = continuation(Dd[0], 0, Ld, Rd, Dd)
+        inv = dense_inv(Ld, P0, Rd, O0)
         _stage_record(rep, meter, "comb", 0, A_op, sigA, comb_E[0], inv,
                       b, x_true, inv.solve(b))
         for k in range(1, N):
-            P = Px[:k] + _thomas_recurrence(comb_blocks[k], k, Lx, Rx, Dx)
-            inv = dense_inv(Lx, P, Rx)
+            Pc, Oc = continuation(comb_piv[k], k, Lx, Rx, Dx)
+            P = Px[:k] + Pc
+            O = (Ox[:k - 1] + [comb_off[k - 1]] + Oc) if has_off else None
+            inv = dense_inv(Lx, P, Rx, O)
             _stage_record(rep, meter, "comb", k, A_op, sigA, comb_E[k], inv,
                           b, x_true, inv.solve(b))
 
-        # ladder: the solver's stages 0..k.  Forward through its own solve
-        # code; adjoint through the same sweep on its blocks.
+        # ladder: the solver's stages 0..k, via its own solve code
         E = _BlockOp(N, m)
         for k in range(N):
             E = E + sigma[k]
-            Bs = list(Bh[:k + 1]) + [_DenseLU(P) for P in
-                                     _thomas_recurrence(dens(Bh[k]), k, Ld, Rd, Dd)[1:]]
-            if with_diag:
-                fwd = lambda X, Bs=Bs: np.asarray(solver.solve_with_diag(X.copy(), B=Bs))
-            else:
-                fwd = lambda X, Bs=Bs: np.asarray(solver.solve_id_diag(X.copy(), Sprime=Bs))
-            inv = _Inv(fwd, lambda X, Bs=Bs: _thomas_sweep(Lh, Bs, Rh, X, m, 'T'))
+            Pc, Oc = continuation(dens(Bh[k]), k, Ld, Rd, Dd)
+            Ps = list(Bh[:k + 1]) + [_DenseLU(p) for p in Pc[1:]]
+            Os = (list(Oh[:k]) + Oc) if has_off else None
+            inv = _Inv(lambda X, Ps=Ps, Os=Os: np.asarray(
+                           solver._solve_factored(X, pivots=Ps, offdiag=Os)),
+                       lambda X, Ps=Ps, Os=Os: _thomas_form_sweep(
+                           form, Lh, Ps, Rh, Os, X, m, 'T'))
             _stage_record(rep, meter, "ladder", k, A_op, sigA, E, inv,
                           b, x_true, inv.solve(b), lvl=sigma[k])
 

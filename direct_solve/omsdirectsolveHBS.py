@@ -46,8 +46,21 @@ class rkStrat:
       'const'   r(e) = rk0
       'linear'  r(e) = rk0 + rate*e        (rate = additive increment / stage)
       'geom'    r(e) = rk0 * rate**e       (rate = multiplicative factor)
+      'log'     r(e) = rk0 + (rk_end - rk0) * log2(1 + e/2) / log2(1 + E/2)
 
-    where e is the effective stage index (see skip_first_level).  Evaluation
+    where e is the effective stage index (see skip_first_level) and, for
+    'log', E is the effective index of the last stage, so the schedule runs
+    from rk0 to exactly rk_end.  The log2(1 + e/2) shape matches a Thomas
+    sweep to a red-black reduction by eliminated extent: Thomas block S'_i
+    has eliminated i slabs on one side, red-black level l has eliminated
+    2^l - 1, so i = 2^l - 1.  With the skip off, logarithmic(rk0, rk_end) on
+    a Thomas sweep equals linear(rk0, d) on the matching red-black levels
+    whenever rk_end - rk0 = d * log2(1 + E/2).
+
+    Unlike the other modes, 'log' depends on the number of stages, since it
+    is pinned to its last one.  validate(n) and ranks(n) -- which the
+    solvers call in factorize() -- set that length; rank(0) is always rk0,
+    and any later stage asked for before the length is known raises.  Evaluation
     is always from this closed form, never by iterating r *= rate.  Iterated
     rounding compounds the rounding bias at every stage (upward here, since
     the rule below rounds up), so the schedule drifts off the intended curve:
@@ -73,6 +86,17 @@ class rkStrat:
     resolution it was asked for; round_to > 1 keeps the GEMM shapes aligned
     and makes the schedule insensitive to small changes in rate.
 
+    Off-diagonal rank
+    -----------------
+    rk_offdiag (optional, any mode) fixes the rank of the off-diagonal
+    (coupling) blocks at that value for every stage, while the diagonal
+    blocks follow the schedule.  Couplings are only ever applied and often
+    compress to near machine precision at a modest rank; the diagonals, which
+    get inverted and absorb more of the domain at every stage, are the blocks
+    that need the growth.  rank(stage) is always the diagonal rank;
+    rank_offdiag(stage) is rk_offdiag if set, else the same as rank(stage).
+    Left unset, every block follows the schedule, as before.
+
     Bounds
     ------
     rk_min is enforced.  rk_max only warns -- exceeding it is a decision for
@@ -82,14 +106,16 @@ class rkStrat:
     validate() to get that warning for a whole schedule up front.
     """
 
-    _MODES = ('const', 'linear', 'geom')
+    _MODES = ('const', 'linear', 'geom', 'log')
 
     def __init__(self, rk0, mode='const', rate=None, skip_first_level=True,
-                 rk_max=None, rk_min=1, round_to=1, monotone=False):
+                 rk_max=None, rk_min=1, round_to=1, monotone=False,
+                 rk_end=None, rk_offdiag=None):
         mode = str(mode).lower()
         aliases = {'constant': 'const', 'c': 'const',
                    'lin': 'linear', 'l': 'linear',
-                   'geometric': 'geom', 'g': 'geom', 'exp': 'geom'}
+                   'geometric': 'geom', 'g': 'geom', 'exp': 'geom',
+                   'logarithmic': 'log', 'logarithm': 'log'}
         mode = aliases.get(mode, mode)
         if mode not in self._MODES:
             raise ValueError(f"mode must be one of {self._MODES}, got {mode!r}")
@@ -108,11 +134,32 @@ class rkStrat:
             if rk_max < rk_min:
                 raise ValueError(f"rk_max ({rk_max}) < rk_min ({rk_min})")
 
+        if mode != 'log' and rk_end is not None:
+            warnings.warn(f"rkStrat: mode={mode!r} ignores rk_end={rk_end!r}",
+                          UserWarning, stacklevel=2)
+            rk_end = None
         if mode == 'const':
             if rate not in (None, 0):
                 warnings.warn(f"rkStrat: mode='const' ignores rate={rate!r}",
                               UserWarning, stacklevel=2)
             rate = 0.0
+        elif mode == 'log':
+            if rate not in (None, 0):
+                warnings.warn(f"rkStrat: mode='log' ignores rate={rate!r}; "
+                              "it is set by rk0 and rk_end",
+                              UserWarning, stacklevel=2)
+            rate = None
+            if rk_end is None:
+                raise ValueError("mode='log' requires rk_end, the rank at the "
+                                 "last stage")
+            rk_end = int(rk_end)
+            if rk_end < 1:
+                raise ValueError(f"rk_end must be >= 1, got {rk_end}")
+            if rk_end < rk0:
+                warnings.warn(
+                    f"rkStrat: rk_end {rk_end} < rk0 {rk0} gives a DECREASING "
+                    "rank schedule. Rank normally has to grow with the stage. "
+                    "Proceeding as asked.", UserWarning, stacklevel=2)
         else:
             if rate is None:
                 raise ValueError(f"mode={mode!r} requires a rate "
@@ -135,14 +182,24 @@ class rkStrat:
                     "rank schedule. Rank normally has to grow with the stage. "
                     "Proceeding as asked.", UserWarning, stacklevel=2)
 
+        if rk_offdiag is not None:
+            if isinstance(rk_offdiag, bool) or int(rk_offdiag) != rk_offdiag:
+                raise ValueError(f"rk_offdiag must be an integer, got {rk_offdiag!r}")
+            rk_offdiag = int(rk_offdiag)
+            if rk_offdiag < 1:
+                raise ValueError(f"rk_offdiag must be >= 1, got {rk_offdiag}")
+
         self.rk0   = rk0
         self.mode  = mode
+        self.rk_offdiag = rk_offdiag
         self.rate  = rate
         self.rk_max   = rk_max
         self.rk_min   = rk_min
         self.round_to = round_to
         self.monotone = bool(monotone)
+        self.rk_end   = rk_end
         self._skip_first_level = bool(skip_first_level)
+        self._nstages = None          # schedule length ('log' only)
         self._cache  = {}
         self._warned = set()
 
@@ -161,6 +218,11 @@ class rkStrat:
         return cls(rk0, mode='geom', rate=factor, **kw)
 
     @classmethod
+    def logarithmic(cls, rk0, rk_end, **kw):
+        """rk0 at the first stage, rk_end at the last, logarithmic between."""
+        return cls(rk0, mode='log', rk_end=rk_end, **kw)
+
+    @classmethod
     def coerce(cls, rk):
         """Accept an rkStrat, or wrap a plain int as a constant schedule."""
         if isinstance(rk, cls):
@@ -172,8 +234,9 @@ class rkStrat:
         kw = dict(rk0=self.rk0, mode=self.mode, rate=self.rate,
                   skip_first_level=self._skip_first_level,
                   rk_max=self.rk_max, rk_min=self.rk_min,
-                  round_to=self.round_to, monotone=self.monotone)
-        if self.mode == 'const':
+                  round_to=self.round_to, monotone=self.monotone,
+                  rk_end=self.rk_end, rk_offdiag=self.rk_offdiag)
+        if self.mode in ('const', 'log'):
             kw['rate'] = None
         kw.update(overrides)
         return rkStrat(**kw)
@@ -192,14 +255,48 @@ class rkStrat:
 
     # -- evaluation ------------------------------------------------------
 
-    def _raw(self, stage):
+    def _effective(self, stage):
         e = stage - 1 if self._skip_first_level else stage
-        if e < 0:
-            e = 0
+        return e if e > 0 else 0
+
+    def _set_nstages(self, nstages):
+        """Bind the schedule length ('log' is pinned to its last stage)."""
+        nstages = int(nstages)
+        if self.mode == 'log' and nstages != self._nstages:
+            self._nstages = nstages
+            self._cache.clear()
+            if nstages >= 1 and self._effective(nstages - 1) == 0 \
+                    and self.rk_end != self.rk0 and 'short' not in self._warned:
+                self._warned.add('short')
+                warnings.warn(
+                    f"rkStrat: logarithmic schedule over {nstages} stage(s) "
+                    "has no stage past the base (skip_first_level shifts the "
+                    f"growth by one); every stage uses rk0={self.rk0}, not "
+                    f"rk_end={self.rk_end}.", UserWarning, stacklevel=3)
+
+    def _raw(self, stage):
+        e = self._effective(stage)
         if self.mode == 'const':
             return float(self.rk0)
         if self.mode == 'linear':
             return self.rk0 + self.rate * e
+        if self.mode == 'log':
+            if e == 0:
+                return float(self.rk0)
+            if self._nstages is None:
+                raise ValueError(
+                    "rkStrat: a logarithmic schedule is pinned to its last "
+                    "stage, so it needs the number of stages first: call "
+                    "ranks(n) or validate(n) (the solvers do this in "
+                    "factorize()).")
+            if stage >= self._nstages:
+                raise ValueError(f"stage {stage} is past the last stage "
+                                 f"({self._nstages - 1}) of this schedule")
+            E = self._effective(self._nstages - 1)
+            if E == 0:
+                return float(self.rk0)
+            return self.rk0 + (self.rk_end - self.rk0) * \
+                math.log2(1 + e / 2) / math.log2(1 + E / 2)
         return self.rk0 * (self.rate ** e)
 
     def rank(self, stage):
@@ -231,7 +328,22 @@ class rkStrat:
     __call__ = rank
 
     def ranks(self, nstages):
+        self._set_nstages(nstages)
         return [self.rank(j) for j in range(int(nstages))]
+
+    def rank_offdiag(self, stage):
+        """Compression rank of the off-diagonal (coupling) blocks at `stage`:
+        rk_offdiag if set, otherwise the scheduled rank."""
+        if self.rk_offdiag is None:
+            return self.rank(stage)
+        if int(stage) < 0:
+            raise ValueError(f"stage must be >= 0, got {stage}")
+        return self.rk_offdiag
+
+    def ranks_offdiag(self, nstages):
+        if self.rk_offdiag is None:
+            return self.ranks(nstages)
+        return [self.rk_offdiag] * int(nstages)
 
     # -- diagnostics -----------------------------------------------------
 
@@ -239,6 +351,12 @@ class rkStrat:
         """Warn about a whole schedule up front. Returns the ranks."""
         rs = self.ranks(nstages)
         where = f" ({label})" if label else ''
+        if nl is not None and self.rk_offdiag is not None:
+            if self.rk_offdiag >= int(nl):
+                warnings.warn(
+                    f"rkStrat{where}: off-diagonal rank {self.rk_offdiag} is >= "
+                    f"the HBS leaf size nl={int(nl)}; the leaf level of those "
+                    "blocks compresses nothing.", UserWarning, stacklevel=2)
         if nl is not None:
             nl = int(nl)
             bad = [(j, r) for j, r in enumerate(rs) if r >= nl]
@@ -263,6 +381,15 @@ class rkStrat:
             body = f"rk = {self.rk0}"
         elif self.mode == 'linear':
             body = f"rk = {self.rk0} + {self.rate:g}*e"
+        elif self.mode == 'log':
+            if nstages:
+                self._set_nstages(nstages)
+            E = None if self._nstages is None else self._effective(self._nstages - 1)
+            if E:
+                body = (f"rk = {self.rk0} + {(self.rk_end - self.rk0) / math.log2(1 + E / 2):g}"
+                        f"*log2(1 + e/2)  ({self.rk0} -> {self.rk_end}, E = {E})")
+            else:
+                body = f"rk = {self.rk0} -> {self.rk_end}, log2(1 + e/2) up to the last stage"
         else:
             body = f"rk = {self.rk0} * {self.rate:g}^e"
         bits = [body, f"e = stage{'-1' if self._skip_first_level else ''}"]
@@ -272,6 +399,8 @@ class rkStrat:
             bits.append(f"rk_max {self.rk_max} (warn only)")
         if self.monotone:
             bits.append("monotone")
+        if self.rk_offdiag is not None:
+            bits.append(f"off-diagonal rk = {self.rk_offdiag} (constant)")
         s = f"rkStrat[{self.mode}]: " + ", ".join(bits)
         if nstages:
             s += "  ->  " + " ".join(str(r) for r in self.ranks(nstages))
@@ -281,7 +410,10 @@ class rkStrat:
         return (f"rkStrat(rk0={self.rk0}, mode={self.mode!r}, rate={self.rate!r}, "
                 f"skip_first_level={self._skip_first_level}, rk_max={self.rk_max}, "
                 f"rk_min={self.rk_min}, round_to={self.round_to}, "
-                f"monotone={self.monotone})")
+                f"monotone={self.monotone}"
+                + (f", rk_end={self.rk_end}" if self.mode == 'log' else "")
+                + (f", rk_offdiag={self.rk_offdiag}" if self.rk_offdiag is not None else "")
+                + ")")
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +494,21 @@ def _is_id(op):
     front.
     """
     return isinstance(op, id_op)
+
+
+def _check_cyclic(cyclic, cls):
+    """cyclic must be a genuine boolean.  Anything else is almost always an
+    argument in the wrong position (e.g. a tree passed to ThomasSolverHBS,
+    which takes none), and a truthy object would silently select the cyclic
+    code path."""
+    if not isinstance(cyclic, (bool, np.bool_)):
+        hint = (" ThomasSolverHBS takes no tree/quad arguments: the trees come"
+                " from the blocks passed to factorize(). Call it as"
+                " ThomasSolverHBS(m, rk, cyclic=False, ...)."
+                if cls == "ThomasSolverHBS" else "")
+        raise TypeError(f"{cls}: cyclic must be True or False, got "
+                        f"{type(cyclic).__name__}.{hint}")
+    return bool(cyclic)
 
 
 def _leaf_size(tree):
@@ -505,6 +652,40 @@ def Dprime_Linop(D,A,B,Dprev):
     return Dprime
 
 
+def _op_linop(shape, dtype, mm, rmm):
+    """LinearOperator from block apply / adjoint-apply functions."""
+    return LinearOperator(
+        shape=shape, dtype=dtype,
+        matvec=lambda v: mm(np.asarray(v).reshape(-1, 1)).ravel(),
+        rmatvec=lambda v: rmm(np.asarray(v).reshape(-1, 1)).ravel(),
+        matmat=mm, rmatmat=rmm)
+
+
+def _inv_times_linop(P, R):
+    """P^{-1} R (the normalized off-diagonal block C = S^{-1} R)."""
+    return _op_linop(R.shape, _rdtype(P, R),
+                     lambda X: np.asarray(P.solve(np.asarray(R @ X))),
+                     lambda X: np.asarray(R.rmatmat(np.asarray(P.solve(X, mode='T')))))
+
+
+def _times_inv_linop(L, P):
+    """L P^{-1} (the unnormalized multiplier Lam = L S^{-1})."""
+    return _op_linop(L.shape, _rdtype(L, P),
+                     lambda X: np.asarray(L @ np.asarray(P.solve(X))),
+                     lambda X: np.asarray(P.solve(np.asarray(L.rmatmat(X)), mode='T')))
+
+
+def _diag_minus_product_linop(D, F, G):
+    """D - F G, with D = None meaning the identity."""
+    def mm(X):
+        base = X if D is None else np.asarray(D @ X)
+        return base - np.asarray(F @ np.asarray(G @ X))
+    def rmm(X):
+        base = X if D is None else np.asarray(D.rmatmat(X))
+        return base - np.asarray(G.rmatmat(np.asarray(F.rmatmat(X))))
+    return _op_linop(F.shape, _rdtype(F, G), mm, rmm)
+
+
 def _load_diagnostics():
     """Imported lazily: hbs_diagnostics imports this module."""
     try:
@@ -538,35 +719,100 @@ Uses that the diagonal is identity
 '''
 
 class ThomasSolverHBS(DirectSolver):
+    """
+    Block Thomas (block LU) solver for block tridiagonal systems with HBS
+    blocks.  Three forms, which produce the same pivots
 
-    def __init__(self,m,rk,cyclic=False,diagnostics=False,diagnostics_opts=None):
+        S_0 = D_0,   S_{k+1} = D_{k+1} - L_k S_k^{-1} R_k
+
+    and differ in which factor carries them and which new blocks are formed
+    (L_k is block (k+1,k), R_k block (k,k+1), D_k the diagonal; D_k = I in
+    the identity-diagonal case):
+
+    normalized=True (default)
+        A = Ltil Util, Ltil lower bidiagonal (diagonal S_k, sub-diagonal L_k),
+        Util unit upper bidiagonal with super-diagonal C_k = S_k^{-1} R_k.
+        Every C_k is formed and compressed as an HBS matrix, and the pivot
+        recurrence uses it: S_{k+1} = C(D_{k+1} - L_k C_k).  The back
+        substitution needs no solves.
+    normalized=False, compress_off_diag=True
+        A = L U, L unit lower bidiagonal with sub-diagonal Lam_k = L_k S_k^{-1},
+        U upper bidiagonal (diagonal S_k, super-diagonal R_k).  Every Lam_k is
+        formed and compressed, and S_{k+1} = C(D_{k+1} - Lam_k R_k).  The
+        forward sweep needs no solves.
+    normalized=False, compress_off_diag=False
+        The same L U, with the multipliers L_k S_k^{-1} applied implicitly (a
+        solve, then a multiplication) and S_{k+1} = C(D_{k+1} - L_k S_k^{-1} R_k).
+        Only the pivots are formed.
+
+    Per right-hand side the two compressed forms need n+1 solves with the
+    pivots and 2n off-diagonal multiplications; the implicit form needs about
+    2n solves.  In the compressed forms the recurrence uses the compressed
+    off-diagonal block, so every compression error enters the factorization
+    exactly once.  Where a pivot is exactly the identity (the first one in
+    the identity-diagonal case), the first off-diagonal block is taken exactly
+    (C_0 = R_0, Lam_0 = L_0) instead of being compressed.
+
+    Ranks: stage j forms the pivot S_{j+1} at rkStrat.rank(j) and, in the
+    compressed forms, the off-diagonal block from S_j at rkStrat.rank_offdiag(j).
+    """
+
+    FORMS = ('normalized', 'unnormalized_offdiag', 'unnormalized')
+
+    def __init__(self, m, rk, cyclic=False, diagnostics=False, diagnostics_opts=None,
+                 normalized=True, compress_off_diag=False):
         """diagnostics=True runs hbs_diagnostics.diagnose_thomas after every
         factorize and stores the result in self.report.  diagnostics_opts is
         passed through to it (metrics, rhs, nprobe, seed, ...).  Off by
-        default; when off, nothing extra is computed."""
-        super().__init__(m,cyclic)
+        default; when off, nothing extra is computed.
+
+        normalized, compress_off_diag: the factorization form (see the class
+        docstring).  compress_off_diag applies only with normalized=False."""
+        cyclic = _check_cyclic(cyclic, "ThomasSolverHBS")
+        super().__init__(m, cyclic)
         if diagnostics and cyclic:
             raise ValueError("diagnostics do not cover cyclic ThomasSolverHBS")
+        for name, val in (("normalized", normalized), ("compress_off_diag", compress_off_diag)):
+            if not isinstance(val, (bool, np.bool_)):
+                raise TypeError(f"ThomasSolverHBS: {name} must be True or False, "
+                                f"got {type(val).__name__}")
+        if normalized and compress_off_diag:
+            raise ValueError(
+                "ThomasSolverHBS: compress_off_diag applies only with "
+                "normalized=False; the normalized form always compresses its "
+                "off-diagonal blocks C_k = S_k^{-1} R_k.")
+        self.normalized = bool(normalized)
+        self.compress_off_diag = bool(compress_off_diag)
+        self.form = ('normalized' if self.normalized else
+                     'unnormalized_offdiag' if self.compress_off_diag else
+                     'unnormalized')
         # rk may be an int (constant schedule) or an rkStrat.  A stage is one
-        # step of the recurrence: stage j consumes S'_j and produces S'_{j+1},
-        # so strat.rank(j) is the rank of S'_{j+1} -- the same convention as
-        # RedBlackSolverHBS, with one block per stage.  self.rk stays the
-        # stage-0 rank; the per-stage ranks are in self.rkSchedule after
-        # factorize().
+        # step of the recurrence: stage j consumes S_j and produces S_{j+1},
+        # so strat.rank(j) is the rank of S_{j+1} -- the same convention as
+        # RedBlackSolverHBS, with one pivot per stage.  self.rk stays the
+        # stage-0 rank; the per-stage ranks are in self.rkSchedule (pivots)
+        # and self.rkScheduleOffdiag (off-diagonal blocks) after factorize().
         self.rkStrat = rkStrat.coerce(rk)
         self.rk = self.rkStrat.rank(0)
         self.rkSchedule = None
+        self.rkScheduleOffdiag = None
+        if self.rkStrat.rk_offdiag is not None and self.form == 'unnormalized':
+            warnings.warn(
+                "ThomasSolverHBS(normalized=False, compress_off_diag=False) "
+                "compresses no off-diagonal blocks, so rk_offdiag="
+                f"{self.rkStrat.rk_offdiag} has no effect.", UserWarning, stacklevel=2)
+        self.O = None                  # compressed off-diagonal blocks (C_k or Lam_k)
         self.solve_method = None
         self.diagnostics = diagnostics
         self.diagnostics_opts = dict(diagnostics_opts or {})
         self.report = None
 
     def _rank_schedule(self, nstages, first_diag, tree):
-        """Per-stage ranks for one factorization (stage j -> S'_{j+1}).
+        """Per-stage ranks for one factorization (stage j -> S_{j+1}).
 
         skip_first_level is only sound when stage 0 carries no inversion,
         i.e. the first diagonal is the identity (always so for id_diag,
-        where S'_0 = I).  Otherwise the flag is turned off for this
+        where S_0 = I).  Otherwise the flag is turned off for this
         factorization rather than silently under-resolving stage 1."""
         strat = self.rkStrat
         if (strat.skip_first_level and strat.mode != 'const'
@@ -578,164 +824,152 @@ class ThomasSolverHBS(DirectSolver):
             strat = strat.copy(skip_first_level=False)
         self.rkSchedule = strat.validate(nstages, nl=_leaf_size(tree),
                                          label='ThomasSolverHBS')
+        self.rkScheduleOffdiag = strat.ranks_offdiag(nstages)
         print(" " + strat.describe(nstages))
         return self.rkSchedule
 
     def factorize_helper(self, S_rk_list, diagList=None):
-        if diagList==None:
+        if diagList is None:
             self.factorize_id_diag(S_rk_list)
             self.solve_method = 'id_diag'
         else:
             self.factorize_with_diag(S_rk_list, diagList)
             self.solve_method = 'diag'
+
     def factorize_id_diag(self, S_rk_list):
-        if  torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
         """
-    
         [ I ] [S12] [ 0 ] [ 0 ]
         [S21] [ I ] [S23] [ 0 ]
         [ 0 ] [S32] [ I ] [S34]
         [ 0 ] [ 0 ] [S43] [ I ]
 
-        Using linear operators corresponding to the slabs of a slab solver, we will construct a block tridiagonal direct solver
-
-        This is based off of the Thomas algorithm, and used as a comparison point for red-black and nested dissection solvers.
-
-        The recurrence (can be derived)
-        ---------------------------------------------------------------------------
-        S'_1 = I
-        b'_1 = b_1
-        
-        and 
-        
-        S'_{i+1} = I-S_{i+1,i}S'_{i}\\S_{i,i+1}
-        b'_{i+1} = b_{i+1}-S_{i+1,i}\\S'_{i}\(b'_i)
-        ---------------------------------------------------------------------------
-        NOTE: different sign convention on S is possible, in this case, recurrence changes slightly
-
+        S_rk_list[i][0] is block (i, i-1) and S_rk_list[i][-1] block (i, i+1).
         """
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         m = S_rk_list[0][0].shape[0]
         n = len(S_rk_list) - 1
+        Sl = [S_rk_list[_][0] for _ in range(1, n + 1)]
+        Sr = [S_rk_list[_][-1] for _ in range(n)]
         I = id_op(m, S_rk_list[0][0].dtype)
-        Sl = [S_rk_list[_][0] for _ in range(1,n+1)]
-        Sprime = [I]
-        Sr = [S_rk_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
-        ranks = self._rank_schedule(n, I, Sl[0].tree if n > 0 else None)
-        for i in range(1, n+1):
-            rk = ranks[i-1]                    # stage i-1 produces S'_i
-            if i==1:
-                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[0],I,Sr[0],id=True),device=device,tree = Sl[0].tree,quad = Sl[0].quad)
-                Sprime_i.construct(rk,compute_ULV=True,fast=True)
-                
-            else:
-                Sprime_i = HBSnew.HBSMAT(Sprime_Linop(Sl[i-1],Sprime[i-1],Sr[i-1]),device=device,tree = Sl[i-1].tree,quad = Sl[i-1].quad)
-                Sprime_i.construct(rk,compute_ULV=True,fast=True)
-            Sprime.append(Sprime_i.to('cpu'))
-        self.A = Sl
-        self.B = Sprime
-        self.C = Sr
-    
-    def factorize_with_diag(self, AB_list,D_list):
+        self._factorize_core(Sl, Sr, None, I, {"device": device}, to_cpu=True)
+
+    def factorize_with_diag(self, AB_list, D_list):
         """
-    
         [ D0 ] [ B0 ] [ 00 ] [ 00 ]
         [ A0 ] [ D1 ] [ B1 ] [ 00 ]
         [ 00 ] [ A1 ] [ D2 ] [ B2 ]
         [ 00 ] [ 00 ] [ A2 ] [ D3 ]
 
-
+        AB_list[i][0] is block (i+1, i) and AB_list[i][-1] block (i, i+1).
         """
-        m = D_list[0].shape[0]
         n = len(D_list) - 1
-
-        # Thus we need three lists of block matrices: A, B, and C:
         A = [AB_list[_][0] for _ in range(n)]
-        B = [D_list[0]] # Set initial B_i to identity matrix LU factor (can specialize this to be just identity later)
-        C = [AB_list[_][-1] for _ in range(n)] # C is easy, unmodified from original matrix (last entry is F)
+        C = [AB_list[_][-1] for _ in range(n)]
+        self.D = D_list   # kept for diagnostics (exact rebuild)
+        self._factorize_core(A, C, D_list, D_list[0], {}, to_cpu=False)
 
-        ranks = self._rank_schedule(n, D_list[0], getattr(D_list[0], 'tree', None))
-        for i in range(1, n+1):
-            B_i = HBSnew.HBSMAT(Dprime_Linop(D_list[i], A[i-1], C[i-1], B[-1]),
-                                tree=D_list[i].tree, quad=D_list[i].quad)
-            B_i.construct(ranks[i-1],compute_ULV=True,fast=True)    # stage i-1 -> B_i
-            B.append(B_i)
-        
-        self.A = A
-        self.B = B
-        self.C = C
-        self.D = D_list   # kept for diagnostics (exact Dprime rebuild)
-    
-    def solve_helper(self,rhs,glob_target_dofs=None):
-        if self.solve_method=='id_diag':
-            return self.solve_id_diag(rhs,glob_target_dofs)
-        elif self.solve_method == 'diag':
-            return self.solve_with_diag(rhs,glob_target_dofs)
-        else:
-            raise ValueError('Factorization not set')
-    
-    def solve_id_diag(self, rhs,glob_target_dofs = None, Sprime=None):
-        # Sprime: optional override of the factored diagonals (diagnostics
-        # use this to splice exact blocks in after a given stage).
-        m       = self.m
-        Sl      = self.A
-        Sprime  = self.B if Sprime is None else Sprime
-        Sr      = self.C
-        n       = len(Sl)
-        d       = rhs.copy()
+    def _factorize_core(self, L, R, D, first, dev_kw, to_cpu):
+        """The recurrence shared by both entry points.  L[k] is block (k+1,k),
+        R[k] block (k,k+1), D the diagonals (None: identity), first = S_0."""
+        n = len(L)
+        ranks = self._rank_schedule(n, first, getattr(L[0], 'tree', None) if n else None)
+        ranks_off = self.rkScheduleOffdiag
+        form = self.form
+        P = [first]          # pivots S_k
+        O = []               # compressed off-diagonal blocks (C_k or Lam_k)
 
-        if rhs.ndim==1:
-            d = d[:,np.newaxis]
+        def compress(op, rank, like, ulv):
+            h = HBSnew.HBSMAT(op, tree=like.tree, quad=like.quad, **dev_kw)
+            h.construct(rank, compute_ULV=ulv, fast=True)
+            if to_cpu:
+                h2 = h.to('cpu')
+                h = h if h2 is None else h2
+            return h
 
-        if glob_target_dofs is None:
-            indices = [range(l*m, (l+1)*m) for l in range(len(Sprime))]
-        else:
-            indices = glob_target_dofs
-        
-        for i in range(1, n+1):
-            if i==1:
-                d[indices[i],:] = d[indices[i],:] - Sl[i-1]@d[indices[i-1],:]
-            else:
-                d[indices[i],:] = d[indices[i],:] - Sl[i-1]@(Sprime[i-1].solve(d[indices[i-1],:]))
+        for i in range(1, n + 1):
+            j = i - 1                                   # stage j
+            Di = None if D is None else D[i]
+            like = L[j] if D is None else D[i]
+            if form == 'unnormalized':
+                if D is None:
+                    op = Sprime_Linop(L[j], P[j], R[j], id=(i == 1))
+                else:
+                    op = Dprime_Linop(D[i], L[j], R[j], P[j])
+            elif form == 'normalized':
+                if _is_id(P[j]):
+                    Oj = R[j]                            # C = I^{-1} R, exact
+                else:
+                    Oj = compress(_inv_times_linop(P[j], R[j]), ranks_off[j], R[j], False)
+                O.append(Oj)
+                op = _diag_minus_product_linop(Di, L[j], Oj)
+            else:                                        # unnormalized_offdiag
+                if _is_id(P[j]):
+                    Oj = L[j]                            # Lam = L I^{-1}, exact
+                else:
+                    Oj = compress(_times_inv_linop(L[j], P[j]), ranks_off[j], L[j], False)
+                O.append(Oj)
+                op = _diag_minus_product_linop(Di, Oj, R[j])
+            P.append(compress(op, ranks[j], like, True))
 
-        x             = np.zeros(d.shape, dtype=d.dtype)
-        x[indices[n],:] = Sprime[n].solve(d[indices[n],:] )
-        for i in range(n-1, 0, -1):
-            x[indices[i],:] = Sprime[i].solve(d[indices[i],:] - Sr[i] @ x[indices[i+1],:] )
+        self.A = L
+        self.B = P
+        self.C = R
+        self.O = O if form != 'unnormalized' else None
 
-        x[indices[0],:] = d[indices[0],:] - Sr[0] @ x[indices[1],:]
-        if rhs.ndim==1:
-            x = x.flatten()
-        return x
-    
-    def solve_with_diag(self, rhs,glob_target_dofs = None, B=None):
-        # B: optional override of the factored diagonals (see solve_id_diag).
+    def solve_helper(self, rhs, glob_target_dofs=None):
+        if self.solve_method in ('id_diag', 'diag'):
+            return self._solve_factored(rhs, glob_target_dofs)
+        raise ValueError('Factorization not set')
+
+    def solve_id_diag(self, rhs, glob_target_dofs=None, Sprime=None, offdiag=None):
+        # Sprime / offdiag: optional overrides of the stored pivots and
+        # off-diagonal blocks (diagnostics splice exact blocks in with these).
+        return self._solve_factored(rhs, glob_target_dofs, Sprime, offdiag)
+
+    def solve_with_diag(self, rhs, glob_target_dofs=None, B=None, offdiag=None):
+        return self._solve_factored(rhs, glob_target_dofs, B, offdiag)
+
+    def _solve_factored(self, rhs, glob_target_dofs=None, pivots=None, offdiag=None):
+        """Forward and back substitution for the stored form.
+
+        unnormalized:          y_{i} = b_i - L_{i-1} S_{i-1}^{-1} y_{i-1};  x_i = S_i^{-1}(y_i - R_i x_{i+1})
+        unnormalized_offdiag:  y_{i} = b_i - Lam_{i-1} y_{i-1};             x_i = S_i^{-1}(y_i - R_i x_{i+1})
+        normalized:            y_i = S_i^{-1}(b_i - L_{i-1} y_{i-1});         x_i = y_i - C_i x_{i+1}
+        """
         m = self.m
-        A = self.A
-        B = self.B if B is None else B
-        C = self.C
-        n = len(A)
-        d = rhs.copy()
-
+        L, R = self.A, self.C
+        P = self.B if pivots is None else pivots
+        O = self.O if offdiag is None else offdiag
+        n = len(L)
+        form = self.form
+        d = np.array(rhs, copy=True)
+        one = d.ndim == 1
+        if one:
+            d = d[:, np.newaxis]
         if glob_target_dofs is None:
-            indices = [range(l*m, (l+1)*m) for l in range(len(B))]
+            idx = [range(l * m, (l + 1) * m) for l in range(n + 1)]
         else:
-            indices = glob_target_dofs
-        
-        for i in range(1, n+1):
-            d[indices[i]] = d[indices[i]] - A[i-1] @ B[i-1].solve( d[indices[i-1]])
+            idx = glob_target_dofs
 
-        x             = np.zeros(d.shape, dtype=d.dtype)
-        x[indices[n]] = B[n].solve( d[indices[n]])
-
-        for i in range(n-1, 0, -1):
-            x[indices[i]] = B[i].solve( d[indices[i]] - C[i] @ x[indices[i+1]])
-
-        x[indices[0]] = B[0].solve( d[indices[0]] - C[0] @ x[indices[1]])
-
-        return x
+        if form == 'normalized':
+            d[idx[0], :] = P[0].solve(d[idx[0], :])
+            for i in range(1, n + 1):
+                d[idx[i], :] = P[i].solve(d[idx[i], :] - L[i - 1] @ d[idx[i - 1], :])
+            x = np.zeros(d.shape, dtype=d.dtype)
+            x[idx[n], :] = d[idx[n], :]
+            for i in range(n - 1, -1, -1):
+                x[idx[i], :] = d[idx[i], :] - O[i] @ x[idx[i + 1], :]
+        else:
+            for i in range(1, n + 1):
+                if form == 'unnormalized_offdiag':
+                    d[idx[i], :] = d[idx[i], :] - O[i - 1] @ d[idx[i - 1], :]
+                else:
+                    d[idx[i], :] = d[idx[i], :] - L[i - 1] @ P[i - 1].solve(d[idx[i - 1], :])
+            x = np.zeros(d.shape, dtype=d.dtype)
+            x[idx[n], :] = P[n].solve(d[idx[n], :])
+            for i in range(n - 1, -1, -1):
+                x[idx[i], :] = P[i].solve(d[idx[i], :] - R[i] @ x[idx[i + 1], :])
+        return x[:, 0] if one else x
 
     def factorize(self, S_rk_list, T=None, S_exact=None, D_exact=None):
         """S_exact / D_exact are only read when diagnostics=True."""
@@ -872,12 +1106,14 @@ class RedBlackSolverHBS(DirectSolver):
     def __init__(self, m, rk, tree, quad, cyclic=False,
                  compress_diag=True, fused=True, device='cpu', fast=False,
                  seed=0, identity_diag=None, skip_unused_ulv=True,
-                 diagnostics=False, diagnostics_opts=None):
+                 diagnostics=False, diagnostics_opts=None,
+                 oversampling=10, sample_margin=0.5):
         """diagnostics=True runs hbs_diagnostics.diagnose_redblack after every
         factorize and stores the result in self.report.  diagnostics_opts is
         passed through to it (metrics, rhs, nprobe, seed, ...).  Off by
         default; when off, nothing extra is computed.  The diagnostics use
         their own random generator and do not touch the counters below."""
+        cyclic = _check_cyclic(cyclic, "RedBlackSolverHBS")
         super().__init__(m, cyclic)
         self.diagnostics = diagnostics
         self.diagnostics_opts = dict(diagnostics_opts or {})
@@ -889,15 +1125,26 @@ class RedBlackSolverHBS(DirectSolver):
         self.rkStrat = rkStrat.coerce(rk)
         self.rk   = self.rkStrat.rank(0)
         self.rkSchedule = None
+        self.rkScheduleOffdiag = None
         self.tree = tree
         self.quad = quad
         self.compress_diag = compress_diag
         self.fused  = fused
         self.device = device
         self.fast   = fast
+        # sample count, see _nsamples
+        self.oversampling  = int(oversampling)
+        self.sample_margin = float(sample_margin)
+        if self.oversampling < 0 or self.sample_margin < 0:
+            raise ValueError("oversampling and sample_margin must be >= 0")
         self.identity_diag = identity_diag
         self.skip_unused_ulv = skip_unused_ulv
         self._dtype = np.float64
+        # seed=None draws fresh OS entropy; the seed actually used is kept in
+        # self.seed so a run can be reproduced by passing it back in.
+        if seed is None:
+            seed = np.random.SeedSequence().entropy
+        self.seed   = seed
         self._rng   = np.random.default_rng(seed)
         self.nConstruct = 0
         self.nSolve     = 0     
@@ -917,16 +1164,30 @@ class RedBlackSolverHBS(DirectSolver):
         return _leaf_size(self.tree)
 
     def _nsamples(self, rk):
-        """Sample count, matching HBSMAT.construct's internal choice.
+        """Samples per compression at rank rk (Levitt & Martinsson 2024,
+        s >= max(r + m, 3r) and Remark 4.2):
+
+            s = max(n_max + rk + p,  ceil((1 + c) * n_max)),
+            n_max = max(nl, fac * rk)
+
+        n_max is the largest block the null-space step sees at any level: the
+        actual leaf size nl, or fac*rk at the interior levels (fac = 4 with
+        quadrature, else 2).  The first term is the hard requirement -- a
+        range finder with oversampling p = self.oversampling at the worst
+        level.  The second keeps every Omega_tau at least (1 + c) times as wide
+        as it is tall (c = self.sample_margin; 0.5 is the paper's s = 3r with
+        m = 2r), which bounds the amplification of truncation error in the
+        diagonal-block least squares by about sqrt(1/c).  With c = 0 and
+        p = rk this is HBSMAT.construct's own rule.
 
         Every operator sharing an Omega must use the same s.  All nodes share
         self.tree, so one value per level is consistent by construction.
         """
-        mls = getattr(self.tree, "_min_leaf_size", rk)
-        n_max = max(mls, 2*rk)
-        p = 10
-        s = max(n_max + rk + p , (int)(np.ceil(1.5 * n_max)) )
-        return s
+        fac = 4 if self.quad else 2
+        nl = self.nl or getattr(self.tree, "_min_leaf_size", None) or 0
+        n_max = max(int(nl), fac * rk)
+        return max(n_max + rk + self.oversampling,
+                   int(math.ceil((1.0 + self.sample_margin) * n_max)))
 
     def _want_ulv(self, compute_ULV):
         """Resolve a requested compute_ULV against the opt-out flag."""
@@ -1122,14 +1383,15 @@ class RedBlackSolverHBS(DirectSolver):
             strat = strat.copy(skip_first_level=False)
         self.rkSchedule = strat.validate(nstages, nl=self.nl,
                                          label='RedBlackSolverHBS')
+        self.rkScheduleOffdiag = strat.ranks_offdiag(nstages)
         print(" " + strat.describe(nstages))
 
         l = nSlabs
         j = 0
         while l > 1:
-            rk = self.rkSchedule[j]
+            rk, rk_off = self.rkSchedule[j], self.rkScheduleOffdiag[j]
             builder = self._build_level_fused if self.fused else self._build_level
-            RB.append(builder(m, l, RB[-1], rk))
+            RB.append(builder(m, l, RB[-1], rk, rk_off))
             j += 1
             l //= 2
 
@@ -1145,7 +1407,7 @@ class RedBlackSolverHBS(DirectSolver):
     # _build_level_fused  -- tier-2 shared solves
     # ------------------------------------------------------------------
 
-    def _build_level_fused(self, m, nSlabs, RB_level, rk):
+    def _build_level_fused(self, m, nSlabs, RB_level, rk, rk_off=None):
         SiM   = RB_level[0]
         T     = RB_level[1]
         T_hbs = RB_level[2]
@@ -1154,7 +1416,11 @@ class RedBlackSolverHBS(DirectSolver):
         cyclic = self.cyclic
         dtype  = self._dtype
 
-        s   = self._nsamples(rk)
+        # rk: diagonal blocks, rk_off: couplings.  One Omega is shared by every
+        # block of the level, so its width must serve the larger rank.
+        if rk_off is None:
+            rk_off = rk
+        s   = self._nsamples(max(rk, rk_off))
         Om  = self._rng.standard_normal(size=(m, s))
         Psi = self._rng.standard_normal(size=(m, s))
 
@@ -1305,11 +1571,11 @@ class RedBlackSolverHBS(DirectSolver):
             # A_i and C_i become SiM / SiP one level down and are only ever
             # applied, never solved with -- no ULV, unconditionally.
             A_i.append(zero_op(m, dtype) if (A_is_zero or fold)
-                       else self._hbs_from_samples(rk, Om, Psi, Y_A, Z_A,
+                       else self._hbs_from_samples(rk_off, Om, Psi, Y_A, Z_A,
                                                    compute_ULV=False,
                                                    label=f"A[{i}] (nSlabs={nSlabs})"))
             C_i.append(zero_op(m, dtype) if (C_is_zero or fold)
-                       else self._hbs_from_samples(rk, Om, Psi, Y_C, Z_C,
+                       else self._hbs_from_samples(rk_off, Om, Psi, Y_C, Z_C,
                                                    compute_ULV=False,
                                                    label=f"C[{i}] (nSlabs={nSlabs})"))
 
@@ -1319,7 +1585,9 @@ class RedBlackSolverHBS(DirectSolver):
     # _build_level  -- original one-operator-at-a-time path (fused=False)
     # ------------------------------------------------------------------
 
-    def _build_level(self, m, nSlabs, RB_level, rk):
+    def _build_level(self, m, nSlabs, RB_level, rk, rk_off=None):
+        if rk_off is None:
+            rk_off = rk          # couplings follow the schedule
         SiM   = RB_level[0]
         T     = RB_level[1]
         T_hbs = RB_level[2]
@@ -1363,7 +1631,7 @@ class RedBlackSolverHBS(DirectSolver):
             else:
                 A_i.append(self._hbs(
                     STS_linop(SiM[i], T_hbs[(i - 1) % nSlabs],
-                              SiM[(i - 1) % nSlabs]), rk,
+                              SiM[(i - 1) % nSlabs]), rk_off,
                     compute_ULV=False, label=f"A[{i}] (nSlabs={nSlabs})"))
 
         C_i = []
@@ -1373,7 +1641,7 @@ class RedBlackSolverHBS(DirectSolver):
             else:
                 C_i.append(self._hbs(
                     STS_linop(SiP[i], T_hbs[(i + 1) % nSlabs],
-                              SiP[(i + 1) % nSlabs]), rk,
+                              SiP[(i + 1) % nSlabs]), rk_off,
                     compute_ULV=False, label=f"C[{i}] (nSlabs={nSlabs})"))
 
         return (A_i, B_i, T_hbs_new, C_i)

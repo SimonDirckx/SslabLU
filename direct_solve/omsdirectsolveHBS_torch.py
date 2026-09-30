@@ -1042,7 +1042,7 @@ class RedBlackSolverHBS(DirectSolver):
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False,seed=None,
-                 compress_diag=True, fused=True, device='cpu', fast=False, identity_diag=None, skip_unused_ulv=True,compute_device=None,strict_residency=False,
+                 compress_diag=True, fused=True, device='cpu', fast=True, identity_diag=True, skip_unused_ulv=True,compute_device=None,strict_residency=False,
                  oversample=None,
                  debug_blocks=0, debug_inverse=True, debug_true_inverse=False,
                  debug_seed=1234,
