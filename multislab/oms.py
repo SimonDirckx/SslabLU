@@ -17,6 +17,13 @@ The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  in both cases,
 computed during construction.  Re-evaluating it for new boundary data
 (construct_rhstot) needs keepLU; keepLU also enables uX_full.
 
+Volumetric solution (reconstruct / interp): each double slab's Dirichlet
+trace is assembled from the neighbours' interface values in uhat plus the
+physical boundary data, solved against the kept factorization, lifted to the
+full grid by local leaf solves, and evaluated piecewise (each point by the
+slab whose centre is nearest in x).  No refactorization when keepLU (and
+keepInterp) are set.
+
 keepDense (default False): also form every block K_{i,i+-1} densely during
 construction, as the source-target map applied to the identity -- the exact,
 uncompressed counterpart of the HBS blocks (S_dense_list).  Costs one local
@@ -60,7 +67,7 @@ from solver.solver import stMap
 # OPT: dropped unused imports (sys, matplotlib.pyplot, scipy.sparse.linalg as
 #      splinalg) and the duplicated numpy / solver imports.
 
-__all__ = ["slab", "omsStats", "oms", "register_device_mover",
+__all__ = ["slab", "omsStats", "oms", "OMSSolution", "register_device_mover",
            "register_host_sizer"]
 
 # --------------------------------------------------------------------------- #
@@ -571,15 +578,153 @@ _LU_ATTRS = {
     "Dirichlet": ("opts", "solver_ii", "Ii", "Ib", "Aib"),
     "mixed": ("opts", "solver_ii", "Ii", "Ib", "E", "JD", "JN", "solver"),
 }
+# what volumetric reconstruction / interpolation additionally needs (the leaf
+# discretization and grid, not the stiffness matrix); order matters: reading
+# interp_state is what sets interp_unavailable
+_INTERP_ATTRS = ("interp_state", "interp_unavailable")
 
 
-def _slim_solver(solver):
+def _slim_solver(solver, keep_interp=True):
     ptype = getattr(solver.opts, "problem_type", "Dirichlet")
     ns = SimpleNamespace()
-    for a in _LU_ATTRS.get(ptype, _LU_ATTRS["Dirichlet"]):
+    attrs = _LU_ATTRS.get(ptype, _LU_ATTRS["Dirichlet"])
+    if keep_interp:
+        attrs = attrs + _INTERP_ATTRS
+    for a in attrs:
         if hasattr(solver, a):
             setattr(ns, a, getattr(solver, a))
     return ns
+
+
+# --------------------------------------------------------------------------- #
+# volumetric solution: ownership + piecewise evaluation
+# --------------------------------------------------------------------------- #
+
+_OWNER_CHUNK = 1 << 16
+
+
+def _slab_bounds(slabList):
+    """(lo, hi), each (nslabs, ndim): the bounding box of every slab."""
+    geoms = [np.asarray(g, dtype=np.float64) for g in slabList]
+    lo = np.stack([g.min(axis=0) for g in geoms])
+    hi = np.stack([g.max(axis=0) for g in geoms])
+    return lo, hi
+
+
+def _as_points(pts, ndim):
+    pts = np.asarray(_host_ndarray(pts), dtype=np.float64)
+    if pts.ndim == 1 and ndim == 1:
+        pts = pts[:, None]
+    if pts.ndim != 2 or pts.shape[1] != ndim:
+        raise ValueError("pts must have shape (npts, %d), got %r"
+                         % (ndim, pts.shape))
+    return pts
+
+
+def _owners(pts, lo, hi, candidates=None):
+    """
+    Owner slab of every point: among the candidate slabs whose box contains
+    the point, the one whose centre is closest in x (the stacking direction).
+    Owner regions are thus [xc_i - h/2, xc_i + h/2] away from the ends, and
+    every evaluation stays well inside its slab.  -1 = in no candidate slab.
+    """
+    idx = np.arange(lo.shape[0]) if candidates is None else \
+        np.asarray(candidates, dtype=np.int64)
+    owner = np.full(pts.shape[0], -1, dtype=np.int64)
+    if idx.size == 0 or pts.shape[0] == 0:
+        return owner
+    lo_c, hi_c = lo[idx], hi[idx]
+    xc = 0.5 * (lo_c[:, 0] + hi_c[:, 0])
+    scale = max(1.0, float(np.max(np.abs(lo_c))), float(np.max(np.abs(hi_c))))
+    tol = 1e-10 * scale
+    for s in range(0, pts.shape[0], _OWNER_CHUNK):
+        P = pts[s:s + _OWNER_CHUNK]
+        inside = np.all((P[:, None, :] >= lo_c[None] - tol)
+                        & (P[:, None, :] <= hi_c[None] + tol), axis=2)
+        dist = np.where(inside, np.abs(P[:, :1] - xc[None, :]), np.inf)
+        k = np.argmin(dist, axis=1)
+        ok = np.isfinite(dist[np.arange(P.shape[0]), k])
+        blk = owner[s:s + _OWNER_CHUNK]
+        blk[ok] = idx[k[ok]]
+    return owner
+
+
+def _evaluate(pts, owner, fields):
+    """
+    Fill out[owner == i] from the field of slab i, for (i, grid, offset,
+    values) in `fields`.  Points owned by no slab (or by a slab not in
+    `fields`) are NaN.
+    """
+    out = None
+    for i, grid, offset, values in fields:
+        I = np.flatnonzero(owner == i)
+        if I.size == 0:
+            continue
+        loc = pts[I] if offset is None else pts[I] - offset
+        vals = np.asarray(grid.interp(loc, values))
+        if out is None or not np.can_cast(vals.dtype, out.dtype, "same_kind"):
+            dt = vals.dtype if out is None else np.result_type(out, vals)
+            new = np.full(pts.shape[0], np.nan, dtype=np.result_type(dt, np.float64))
+            if out is not None:
+                new[:] = out
+            out = new
+        out[I] = vals
+    if out is None:
+        out = np.full(pts.shape[0], np.nan)
+    return out
+
+
+class OMSSolution:
+    """
+    Volumetric OMS solution, as returned by oms.reconstruct(): the local
+    full-grid field of every reconstructed double slab, evaluated piecewise.
+
+        u = sol(pts)                        # NaN outside the domain
+        u, owner = sol(pts, return_owner=True)
+        XX, ui = sol.slab(i)                # raw field of slab i (global coords)
+
+    Evaluation is cheap and repeatable (no solves).  Each point is evaluated
+    by the reconstructed slab whose centre is closest in x (see _owners); if
+    only some slabs were reconstructed, ownership is restricted to those.
+    """
+
+    def __init__(self, lo, hi):
+        self._lo, self._hi = lo, hi
+        self._fields = {}           # i -> (grid, offset | None, values)
+
+    def _add(self, i, grid, offset, values):
+        self._fields[int(i)] = (grid, offset, np.asarray(values))
+
+    @property
+    def ndim(self):
+        return self._lo.shape[1]
+
+    @property
+    def slabs(self):
+        """Indices of the reconstructed slabs."""
+        return sorted(self._fields)
+
+    def owner(self, pts):
+        pts = _as_points(pts, self.ndim)
+        return _owners(pts, self._lo, self._hi, candidates=self.slabs)
+
+    def slab(self, i):
+        """(full-grid coordinates in the global frame, values) of slab i."""
+        if i not in self._fields:
+            raise KeyError("slab %d was not reconstructed" % i)
+        grid, offset, values = self._fields[i]
+        XX = grid.XXfull if offset is None else grid.XXfull + offset
+        return XX, values
+
+    def __call__(self, pts, return_owner=False):
+        pts = _as_points(pts, self.ndim)
+        owner = _owners(pts, self._lo, self._hi, candidates=self.slabs)
+        out = _evaluate(pts, owner, ((i,) + self._fields[i]
+                                     for i in np.unique(owner[owner >= 0])))
+        return (out, owner) if return_owner else out
+
+    def host_nbytes(self):
+        return _host_nbytes([v for v in self._fields.values()])
 
 
 # --------------------------------------------------------------------------- #
@@ -617,12 +762,19 @@ class oms:
                    footprint and raise MemoryError if it will not fit.
     host_mem_fraction: fraction of the available host memory the projection
                    may use (default 0.9).
+    keepInterp:    with keepLU, also keep per slab what volumetric
+                   reconstruction needs besides the factors (leaf
+                   discretization and grid; no stiffness matrix), so that
+                   reconstruct() / interp() never refactorize.  Default True;
+                   set False to save that memory (reconstruct() then rebuilds
+                   slabs on demand).
     """
 
     def __init__(self, slabList: list, pdo, gb, solver_opts, connectivity,
                  constructHBS=True, keepLU=False, stiff_mat_const=False,
                  offload=None, pin_memory=False, keepDense=False,
-                 check_host_memory=True, host_mem_fraction=0.9):
+                 check_host_memory=True, host_mem_fraction=0.9,
+                 keepInterp=True):
         if not constructHBS and not keepLU:
             raise ValueError(
                 "oms(constructHBS=False, keepLU=False): you have asked for every "
@@ -639,6 +791,7 @@ class oms:
         self.constructHBS = bool(constructHBS)
         self.keepLU = bool(keepLU)
         self.keepDense = bool(keepDense)
+        self.keepInterp = bool(keepInterp)
 
         self.glob_target_dofs = []
         self.glob_source_dofs = []
@@ -1463,7 +1616,7 @@ class oms:
                 else:
                     # linop needs B / dtype from the resident solver, then
                     # the factorization itself moves off the device.
-                    handle = self._offload(_slim_solver(solver))
+                    handle = self._offload(_slim_solver(solver, self.keepInterp))
                     S_i = self._make_st_linop(Ic, J, solver, handle)
                     self._n_assembled += 1
                 self._S_lu.append(S_i)
@@ -1790,6 +1943,245 @@ class oms:
         uX[solver.JN] = w[len(b_C):]                  # lower block = u_N
 
         return uX
+
+    # ------------------------------------------------------------------ #
+    # volumetric reconstruction and interpolation
+    # ------------------------------------------------------------------ #
+
+    def _slab_offset(self, slabInd):
+        """Translation reference-solver frame -> global frame (stiff_mat_const),
+        None otherwise."""
+        if not self.stiff_mat_const:
+            return None
+        if self._offsets is None:
+            self._offsets = self._compute_offsets()
+        d = np.asarray(self._offsets[slabInd], dtype=np.float64)
+        return d if np.any(d) else None
+
+    def _fresh_solver(self, slabInd, dbg=0):
+        """A new local solver for slab `slabInd`, outside the statistics."""
+        solver = solverWrap.solverWrapper(self.opts)
+        solver.construct(np.array(self.slabList[slabInd]), self.pdo, verbose=dbg)
+        return solver
+
+    @staticmethod
+    def _interp_state_of(solver):
+        st = getattr(solver, "interp_state", None)
+        if st is None:
+            raise NotImplementedError(
+                getattr(solver, "interp_unavailable", None)
+                or "this local solver keeps no interpolation state")
+        return st
+
+    def _interp_solvers(self, slabs, refactor, dbg=0):
+        """
+        Yield (slabInd, local solver) for the requested slabs, one at a time.
+        Kept factorizations are reused (off-loaded ones come back one slab at
+        a time); otherwise, with refactor='auto', slabs are rebuilt on demand
+        (under stiff_mat_const: the reference slab, once).
+        """
+        if refactor not in ("auto", "never"):
+            raise ValueError("refactor must be 'auto' or 'never', got %r" % (refactor,))
+        if not slabs:
+            return
+        have_lu = self.keepLU and len(self._lu_handles) == len(self.slabList)
+        if have_lu and not self.stiff_mat_const and not self.keepInterp:
+            have_lu = False     # factors kept, but not the leaf/grid data
+        if not have_lu:
+            if refactor == "never":
+                raise RuntimeError(
+                    "reconstruct(): the local factorizations (or, with "
+                    "keepInterp=False, the interpolation data) were not kept; "
+                    "construct with keepLU=True, keepInterp=True, or pass "
+                    "refactor='auto' to rebuild slabs on demand")
+            warnings.warn(
+                "oms.reconstruct(): local solvers not kept -- rebuilding %s"
+                % ("the reference slab once" if self.stiff_mat_const
+                   else "each requested slab (one factorization per slab)"),
+                RuntimeWarning, stacklevel=3)
+
+        ref = None
+        for i in slabs:
+            if have_lu:
+                solver = self._lu_handles[i].get()
+            elif self.stiff_mat_const:
+                if ref is None:
+                    t0 = time.time()
+                    ref = self._fresh_solver(self._reference_index(), dbg)
+                    if dbg > 0:
+                        print("reconstruct: reference slab rebuilt in %5.2f s"
+                              % (time.time() - t0))
+                solver = ref
+            else:
+                t0 = time.time()
+                solver = self._fresh_solver(i, dbg)
+                if dbg > 1:
+                    print("reconstruct: slab %d rebuilt in %5.2f s"
+                          % (i, time.time() - t0))
+            yield i, solver
+            del solver
+
+    def _local_skeleton(self, solver, slabInd, uhat, bc, reduced_load):
+        """
+        Full Dirichlet data of double slab `slabInd` from the global interface
+        solution, and the resulting local solve against the kept factors.
+        Returns (u_i on Ii, u_b on Ib).
+        """
+        info = self._slab_info[slabInd]
+        L, R = self.connectivity[slabInd][0], self.connectivity[slabInd][1]
+        ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+
+        def trace(nb, faces, dtype):
+            u = np.zeros(nb, dtype=dtype)
+            done = np.zeros(nb, dtype=bool)
+            for nbr, J, side in faces:
+                if nbr < 0:
+                    continue
+                v = uhat[_as_index(self.glob_target_dofs[nbr])]
+                if len(v) != len(J):
+                    raise ValueError(
+                        "slab %d: %s face has %d dofs but neighbour %d's "
+                        "interface has %d" % (slabInd, side, len(J), nbr, len(v)))
+                u[J] = v
+                done[J] = True
+            return u, done
+
+        faces = ((L, info.Il, "left"), (R, info.Ir, "right"))
+
+        if ptype == "Dirichlet":
+            nb = len(solver.Ib)
+            g = np.asarray(_host_ndarray(bc(info.pts_gb))).reshape(-1) \
+                if len(info.Igb) else np.zeros(0)
+            dt = np.result_type(uhat.dtype, g.dtype, np.float64)
+            u_b, done = trace(nb, faces, dt)
+            u_b[info.Igb] = g
+            done[info.Igb] = True
+            if not done.all():
+                raise ValueError(
+                    "slab %d: %d of %d boundary dofs have neither a neighbour "
+                    "trace nor physical boundary data (check gb / connectivity)"
+                    % (slabInd, int((~done).sum()), nb))
+            u_i = -np.asarray(solver.solver_ii @ (solver.Aib @ u_b)).reshape(-1)
+            return u_i, u_b
+
+        if ptype == "mixed":
+            JD, JN = np.asarray(solver.JD), np.asarray(solver.JN)
+            b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
+            g_N = np.asarray(_host_ndarray(bc(info.pts_N))).reshape(-1)
+            dt = np.result_type(uhat.dtype, g_N.dtype, b_C.dtype, np.float64)
+            u_D, done = trace(len(JD), faces, dt)
+            if not done.all():
+                raise ValueError(
+                    "slab %d: %d Dirichlet dofs are not covered by a neighbour "
+                    "interface (physical Dirichlet faces are not supported for "
+                    "problem_type='mixed')" % (slabInd, int((~done).sum())))
+            # same convention as _local_rhs:  M w = [b_C; g_N + b_N] - E u_D
+            rhs = np.concatenate([b_C.reshape(-1), g_N + b_X.reshape(-1)[JN]]) \
+                - np.asarray(solver.E @ u_D).reshape(-1)
+            w = np.asarray(solver.solver_ii @ rhs).reshape(-1)
+            nC = len(solver.Ii)
+            u_b = np.zeros(len(solver.Ib), dtype=np.result_type(dt, w.dtype))
+            u_b[JD] = u_D
+            u_b[JN] = w[nC:]
+            return w[:nC], u_b
+
+        raise NameError(
+            "solver problem type not recognized, must be 'Dirichlet' or 'mixed'")
+
+    def _slab_fields(self, uhat, slabs, bc=None, reduced_load=None,
+                     body_load=None, refactor="auto", dbg=0):
+        """Yield (slabInd, grid, offset, values on grid.XXfull) per slab."""
+        if not self._built:
+            raise RuntimeError("reconstruct() called before construct_Stot_helper()")
+        cache_bc, cache_rl, _ = self._rhs_cache
+        bc = cache_bc if bc is None else bc
+        reduced_load = cache_rl if reduced_load is None else reduced_load
+        if body_load is not None and \
+                getattr(self.opts, "problem_type", "Dirichlet") != "mixed":
+            raise ValueError(
+                "body_load: the Dirichlet OMS system carries no body load, so "
+                "the volumetric field cannot either")
+
+        uhat = np.asarray(_host_ndarray(uhat))
+        if uhat.ndim == 2 and uhat.shape[1] == 1:
+            uhat = uhat[:, 0]
+        if uhat.ndim != 1 or uhat.shape[0] != self.Ntot:
+            raise ValueError("uhat must have length Ntot = %d, got shape %r"
+                             % (self.Ntot, uhat.shape))
+
+        for i, solver in self._interp_solvers(slabs, refactor, dbg):
+            t0 = time.time()
+            st = self._interp_state_of(solver)
+            u_i, u_b = self._local_skeleton(solver, i, uhat, bc, reduced_load)
+            offset = self._slab_offset(i)
+            values = st.full_solution(u_i, u_b, body_load=body_load, offset=offset)
+            if dbg > 1:
+                print("reconstruct: slab %d done in %5.2f s" % (i, time.time() - t0))
+            yield i, st.grid, offset, values
+            del solver, st
+
+    def _check_slabs(self, slabs):
+        n = len(self.slabList)
+        if slabs is None:
+            return list(range(n))
+        slabs = sorted(set(int(i) for i in np.atleast_1d(slabs)))
+        if slabs and (slabs[0] < 0 or slabs[-1] >= n):
+            raise IndexError("slab indices must lie in [0, %d)" % n)
+        return slabs
+
+    def reconstruct(self, uhat, bc=None, reduced_load=None, body_load=None,
+                    slabs=None, refactor="auto", dbg=0):
+        """
+        Volumetric solution from the reduced solution `uhat` (length Ntot).
+
+        For every requested double slab, its Dirichlet trace is assembled from
+        the neighbours' interface values in `uhat` and the physical boundary
+        data, the local problem is solved against the KEPT factorization
+        (keepLU=True; no refactorization), and the skeleton solution is lifted
+        to the full grid by local leaf solves.  Returns an OMSSolution, which
+        evaluates the result at arbitrary points.
+
+        bc, reduced_load : default to those the decomposition was built with.
+        body_load        : problem_type='mixed' only -- the (unreduced) body
+                           load behind reduced_load, callable on torch points
+                           in global coordinates; needed for the leaf
+                           interiors.
+        slabs            : subset of slab indices (default: all).
+        refactor         : 'auto' -> if the local solvers were not kept,
+                                     rebuild them on demand (warns);
+                           'never' -> raise instead.
+
+        Memory: one full-grid field per slab (about twice the number of grid
+        points, because the double slabs overlap).  Use interp() to stream
+        instead.
+        """
+        slabs = self._check_slabs(slabs)
+        lo, hi = _slab_bounds(self.slabList)
+        sol = OMSSolution(lo, hi)
+        t0 = time.time()
+        for i, grid, offset, values in self._slab_fields(
+                uhat, slabs, bc, reduced_load, body_load, refactor, dbg):
+            sol._add(i, grid, offset, values)
+        if dbg > 0:
+            print("reconstruct: %d slabs in %5.2f s" % (len(slabs), time.time() - t0))
+        return sol
+
+    def interp(self, pts, uhat, bc=None, reduced_load=None, body_load=None,
+               refactor="auto", return_owner=False, dbg=0):
+        """
+        Evaluate the volumetric solution at `pts` (npts, ndim) in one pass,
+        without storing the per-slab fields: only slabs that own at least one
+        point are reconstructed, one at a time.  NaN outside the domain.
+        Same arguments as reconstruct().  For repeated evaluation, use
+        reconstruct() once and call the result instead.
+        """
+        lo, hi = _slab_bounds(self.slabList)
+        pts = _as_points(pts, lo.shape[1])
+        owner = _owners(pts, lo, hi)
+        needed = np.unique(owner[owner >= 0]).tolist()
+        out = _evaluate(pts, owner, self._slab_fields(
+            uhat, needed, bc, reduced_load, body_load, refactor, dbg))
+        return (out, owner) if return_owner else out
 
     # ------------------------------------------------------------------ #
 

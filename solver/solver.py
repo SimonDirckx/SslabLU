@@ -5,7 +5,7 @@ from solver.stencil.stencilSolver import stencilSolver as stencil
 from solver.spectral.spectralSolver import spectralSolver as spectral
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
-#import solver.HPSInterp as interp
+import solver.HPSInterp as interp
 import mumps
 
 # Things we need to add:
@@ -235,6 +235,122 @@ class stMap:
         self.n_large = n_large
 
 
+# =========================================================================== #
+#  Interpolation / reconstruction state
+#
+#  What a local solver must keep, beyond its factorization, so that a
+#  boundary trace can be turned into a volumetric field and that field be
+#  interpolated -- after the solver itself has been slimmed down or
+#  off-loaded by oms.  Two layers:
+#
+#    HPSInterpGrid     : evaluation only (grid + panel layout).  Light; what an
+#                        OMSSolution keeps per slab.
+#    HPSaltInterpState : + leaf reconstruction (skeleton -> full grid).  Holds
+#                        the leaf discretization (HPS_Multidomain), not the
+#                        sparse matrix and not the factorization.
+#
+#  The two hooks the OMS layer relies on are
+#      state.full_solution(u_i, u_b, ...)  -> values on grid._XXfull
+#      state.grid.interp(pts, f)           -> values at pts
+#  Supporting another discretization means providing an object with these.
+# =========================================================================== #
+
+def _to_numpy(x):
+    """torch tensor (any device) or array-like -> numpy array."""
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+class HPSInterpGrid:
+    """
+    Duck-types the attributes HPSInterp.interp reads from a solver:
+    ndim, npan_dim, p, geom (with .box_geom), _XXfull.
+    """
+    def __init__(self, typestr, ndim, npan_dim, p, geom, XXfull):
+        self.typestr  = typestr
+        self.ndim     = int(ndim)
+        self.npan_dim = np.asarray(_to_numpy(npan_dim)).astype(np.int64)
+        self.p        = np.asarray(_to_numpy(p)).astype(np.int64)
+        self.geom     = geom
+        self._XXfull  = np.asarray(_to_numpy(XXfull), dtype=np.float64)
+
+    @property
+    def XXfull(self):
+        return self._XXfull
+
+    def interp(self, pts, f):
+        """Values f on _XXfull -> values at pts (points inside this grid)."""
+        return interp.interp(self, np.asarray(pts, dtype=np.float64),
+                             np.asarray(f), self.typestr)
+
+
+class HPSaltInterpState:
+    """
+    Reconstruction + interpolation state of one hpsalt (Domain_Driver) slab.
+
+    Coded against the statically condensed DtN path of hpslib/hpsmultidomain:
+    the skeleton solution (on XX = xx_active, split into Ji / Jx) is lifted to
+    the leaf interiors by HPS_Multidomain.solve, i.e. batched local leaf
+    solves.  That step does NOT touch the slab-level sparse factorization.
+    """
+    typestr = "hpsalt"
+
+    def __init__(self, driver, sparse_assembly):
+        if getattr(driver, "use_iti_maps", False):
+            raise NotImplementedError(
+                "interpolation: ItI leaf maps are not supported")
+        if not getattr(driver, "statically_condense", True):
+            raise NotImplementedError(
+                "interpolation: statically_condense=False is not supported")
+        hps = driver.hps
+        self.hps      = hps
+        self.n_active = int(len(hps.I_unique))
+        self.Ii       = np.asarray(_to_numpy(driver._Ji)).astype(np.int64)
+        self.Ib       = np.asarray(_to_numpy(driver._Jx)).astype(np.int64)
+        self.device   = "cuda" if sparse_assembly == "reduced_gpu" else "cpu"
+        self.grid     = HPSInterpGrid(self.typestr, hps.d, hps.n, hps.p,
+                                      driver.geom, driver._XXfull)
+
+    def interp(self, pts, f):
+        return self.grid.interp(pts, f)
+
+    def full_solution(self, u_i, u_b, body_load=None, offset=None):
+        """
+        Skeleton values (u_i on Ii, u_b on Ib) -> values on grid._XXfull.
+
+        body_load : optional callable f(xx) (torch, global coordinates), the
+                    body load the local problem was solved with.
+        offset    : translation from this solver's own coordinates to the
+                    global ones (stiff_mat_const); body_load is evaluated at
+                    the shifted points.
+        """
+        import torch
+
+        u_i = np.ascontiguousarray(np.asarray(u_i).reshape(-1))
+        u_b = np.ascontiguousarray(np.asarray(u_b).reshape(-1))
+        if len(u_i) != len(self.Ii) or len(u_b) != len(self.Ib):
+            raise ValueError(
+                "full_solution: got %d interior / %d boundary values, expected "
+                "%d / %d" % (len(u_i), len(u_b), len(self.Ii), len(self.Ib)))
+        dt = np.result_type(u_i.dtype, u_b.dtype, np.float64)
+        uu = torch.zeros((self.n_active, 1),
+                         dtype=torch.from_numpy(np.zeros(0, dtype=dt)).dtype)
+        uu[torch.from_numpy(self.Ii), 0] = torch.from_numpy(u_i.astype(dt))
+        uu[torch.from_numpy(self.Ib), 0] = torch.from_numpy(u_b.astype(dt))
+
+        ff = body_load
+        if body_load is not None and offset is not None and np.any(offset):
+            shift = torch.as_tensor(np.asarray(offset, dtype=np.float64))
+
+            def ff(xx, _f=body_load, _s=shift):
+                return _f(xx + _s.to(device=xx.device, dtype=xx.dtype))
+
+        sol, _ = self.hps.solve(torch.device(self.device), uu,
+                                ff_body_func=ff)
+        return _to_numpy(sol[:, 0])
+
+
 class solverOptions:
     """
     Class that encodes the options for a local slab Solver
@@ -456,6 +572,32 @@ class solverWrapper:
         """Adjoint-consistency check on this slab's solve operator."""
         return check_adjoint_consistency(self.solver_ii, k=k, seed=seed,
                                          verbose=verbose, name="Aii^-1")
+
+    @property
+    def interp_state(self):
+        """
+        Reconstruction + interpolation state (see HPSaltInterpState), built
+        on first access and cached.  None if this solver type does not support
+        it yet; the reason is then in `interp_unavailable`.  Never raises, so
+        it is safe to probe with getattr / hasattr.
+        """
+        st = self.__dict__.get("_interp_state")
+        if st is not None or not self.constructed:
+            return st
+        if self.type == "hpsalt":
+            try:
+                st = HPSaltInterpState(
+                    self.solver,
+                    "reduced_gpu" if self.opts.reduced_gpu else "reduced_cpu")
+            except NotImplementedError as exc:
+                self.interp_unavailable = str(exc)
+                return None
+            self._interp_state = st
+            return st
+        self.interp_unavailable = (
+            "volumetric reconstruction is not implemented for solver type %r"
+            % (self.type,))
+        return None
 
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):
