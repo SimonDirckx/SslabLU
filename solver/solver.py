@@ -351,6 +351,103 @@ class HPSaltInterpState:
         return _to_numpy(sol[:, 0])
 
 
+# =========================================================================== #
+#  Body-load reduction
+#
+#  A local slab problem with body load f reads, after the discretization has
+#  eliminated whatever it eliminates,
+#
+#      Aii u_i + Aib u_b = f_i        (rows Ii)
+#      Abi u_i + Abb u_b = f_b        (rows Ib; used by flux / Neumann rows)
+#
+#  (f_i, f_b) is the REDUCED load: in the row convention of Aii / Aib, and in
+#  general not the body load sampled at points.  How it is obtained depends on
+#  the discretization (static condensation for HPS; plain sampling for a
+#  collocation scheme that keeps every point), so it lives here, next to the
+#  discretization, behind one interface:
+#
+#      reducer.reduce(body_load, offset=None) -> (f_i on Ii, f_b on Ib)
+#
+#  body_load : callable f(xx), torch points in GLOBAL coordinates, f of the
+#              same PDO the slab was built with (L u = f).
+#  offset    : translation from the solver's own coordinates to the global
+#              ones (stiff_mat_const), as in full_solution.
+#  Returns host numpy arrays; real when the load is real.
+#
+#  Supporting another discretization means one BodyLoadReducer subclass and
+#  one dispatch line in solverWrapper.body_reducer.
+# =========================================================================== #
+
+def _shifted(body_load, offset):
+    """body_load evaluated at xx + offset (torch points); body_load if no shift."""
+    if offset is None or not np.any(offset):
+        return body_load
+    import torch
+    shift = torch.as_tensor(np.asarray(offset, dtype=np.float64))
+
+    def ff(xx, _f=body_load, _s=shift):
+        return _f(xx + _s.to(device=xx.device, dtype=xx.dtype))
+    return ff
+
+
+class BodyLoadReducer:
+    """Interface: reduce(body_load, offset=None) -> (f_i on Ii, f_b on Ib)."""
+    typestr = None
+
+    def reduce(self, body_load, offset=None):
+        raise NotImplementedError
+
+
+class HPSaltBodyReducer(BodyLoadReducer):
+    """
+    Static condensation of a body load for one hpsalt (Domain_Driver) slab.
+
+    Uses HPS_Multidomain.reduce_body -- batched leaf solves, duplicated face
+    copies summed -- which returns the condensed load on the active
+    (I_unique) ordering, the ordering XX / Ji / Jx index into.  Same
+    convention as Domain_Driver.get_rhs:
+        A_CC u_i = -A_CX u_b + reduce_body(...)[Ji].
+    Holds only the leaf discretization (shared with HPSaltInterpState), not
+    the sparse matrix and not the factorization.
+    """
+    typestr = "hpsalt"
+
+    def __init__(self, driver, sparse_assembly):
+        if getattr(driver, "use_iti_maps", False):
+            raise NotImplementedError(
+                "body load reduction: ItI leaf maps are not supported")
+        if not getattr(driver, "statically_condense", True):
+            raise NotImplementedError(
+                "body load reduction: statically_condense=False is not "
+                "supported (the uncondensed driver takes no body load)")
+        hps = driver.hps
+        self.hps      = hps
+        self.n_active = int(len(hps.I_unique))
+        self.Ii       = np.asarray(_to_numpy(driver._Ji)).astype(np.int64)
+        self.Ib       = np.asarray(_to_numpy(driver._Jx)).astype(np.int64)
+        self.device   = "cuda" if sparse_assembly == "reduced_gpu" else "cpu"
+
+    def reduce(self, body_load, offset=None):
+        import torch
+        if not callable(body_load):
+            raise TypeError(
+                "body_load must be a callable f(xx) on torch points in global "
+                "coordinates; vector body loads are not supported yet")
+        red = self.hps.reduce_body(torch.device(self.device),
+                                   _shifted(body_load, offset), None)
+        red = _to_numpy(red).reshape(-1)
+        if red.shape[0] != self.n_active:
+            raise ValueError(
+                "reduce_body returned %d values, expected %d (one per active "
+                "dof); is body_load returning one value per point?"
+                % (red.shape[0], self.n_active))
+        # reduce_body allocates a complex buffer for function loads; keep a
+        # real problem real
+        if np.iscomplexobj(red) and not np.any(red.imag):
+            red = np.ascontiguousarray(red.real)
+        return red[self.Ii], red[self.Ib]
+
+
 class solverOptions:
     """
     Class that encodes the options for a local slab Solver
@@ -360,6 +457,8 @@ class solverOptions:
     a:          characteristic scale in case of HPS
     problem_type: 'Dirichlet' or 'mixed'
                     for mixed, the assumption (for now) is  that we have Dirichlet on vertical bdry sections, Neumann on rest
+    MUMPS options below apply to the local factorization of both problem
+    types (Dirichlet: Aii; mixed: M) for type 'hpsalt'.
     mumps_ordering: analysis ordering ('metis', 'auto', 'amd', 'scotch', ...)
     blr_tol:    if > 0, BLR-compressed factorization with this tolerance
     use_ctxT:   factor A^T into a second context instead of reusing the A
@@ -478,11 +577,20 @@ class solverWrapper:
             self.Aii = solver.Aii
             if compute_inverse:
                 if self.opts.problem_type == 'Dirichlet':
+                    # OPT: factor Aii through the same tuned MUMPS layer as
+                    #      the mixed path (ordering, BLR, reuse_analysis,
+                    #      block size, A^{-T} on the same factors, blocked
+                    #      matmat/rmatmat).  It used to go through the driver's
+                    #      SparseSolver, which ignored all of those options.
                     tic      = time()
-                    solver.setup_solver_Aii()
-                    self.solver_ii = solver.solver_Aii
+                    self.solver_ii = self._factor_mumps(self.Aii, verbose)
+                    # hand the same operator to the driver, so its own solve
+                    # paths never trigger a second (lazy) factorization
+                    solver.setup_solver_Aii(solve_op=self.solver_ii)
                     toc      = time() - tic
-                    print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+                    print("\t Toc construct Aii inverse %5.2f s "
+                          "(analysis %5.2f s, factor %5.2f s)"
+                          % (toc, self.time_analysis, self.time_factor)) if verbose else None
                 elif self.opts.problem_type == 'mixed':
                     tic      = time()
                     # scale the face-detection tolerance with the geometry;
@@ -505,38 +613,8 @@ class solverWrapper:
                     self.JD = JD
                     self.JN = JN
 
-                    # ---- one factorization; A^{-T} reuses it -------------- #
-                    ctx, t_an, t_fa = setup_mumps(
-                        M,
-                        ordering=self.opts.mumps_ordering,
-                        blr_tol=self.opts.blr_tol,
-                        block_size=self.opts.mumps_block_size,
-                        verbose=2 if verbose else 0,
-                    )
-                    self.ctx = ctx
-                    self.time_analysis = t_an
-                    self.time_factor   = t_fa
-
-                    if self.opts.use_ctxT:
-                        ctxT, t_anT, t_faT = setup_mumps_transpose(
-                            M,
-                            ordering=self.opts.mumps_ordering,
-                            blr_tol=self.opts.blr_tol,
-                            block_size=self.opts.mumps_block_size,
-                            verbose=2 if verbose else 0,
-                        )
-                        self.ctxT = ctxT
-                        self.time_analysis += t_anT
-                        self.time_factor   += t_faT
-                        print("\t A^-T applies: dedicated A^T factorization "
-                              "(use_ctxT)") if verbose else None
-                    else:
-                        self.ctxT = None
-                        print("\t A^-T applies: reusing A factorization with "
-                              "ICNTL(9)=0") if verbose else None
-
-                    self.solver_ii = setup_solver_Aii_local(
-                        ctx, M.shape[0], M.dtype, ctxT=self.ctxT)
+                    # one factorization; A^{-T} reuses it
+                    self.solver_ii = self._factor_mumps(M, verbose)
                     toc      = time() - tic
                     print("\t Toc construct Aii inverse %5.2f s "
                           "(analysis %5.2f s, factor %5.2f s)"
@@ -568,6 +646,47 @@ class solverWrapper:
         self.XXb = solver.XX[self.Ib,:]
         self.ndofs = solver.XX.shape[0]
 
+    def _factor_mumps(self, A, verbose=False):
+        """
+        Factor the local system matrix A with the tuned MUMPS layer and
+        return the LinearOperator applying A^{-1} (matvec / matmat) and
+        A^{-T} (rmatvec / rmatmat, on the same factors via ICNTL(9) unless
+        opts.use_ctxT).  Honours opts.mumps_ordering, blr_tol,
+        mumps_block_size.  Sets self.ctx / ctxT / time_analysis / time_factor.
+        Used by both the Dirichlet (A = Aii) and the mixed (A = M) path.
+        """
+        A = A.tocsc() if sp.issparse(A) else A
+        ctx, t_an, t_fa = setup_mumps(
+            A,
+            ordering=self.opts.mumps_ordering,
+            blr_tol=self.opts.blr_tol,
+            block_size=self.opts.mumps_block_size,
+            verbose=2 if verbose else 0,
+        )
+        self.ctx = ctx
+        self.time_analysis = t_an
+        self.time_factor   = t_fa
+
+        if self.opts.use_ctxT:
+            ctxT, t_anT, t_faT = setup_mumps_transpose(
+                A,
+                ordering=self.opts.mumps_ordering,
+                blr_tol=self.opts.blr_tol,
+                block_size=self.opts.mumps_block_size,
+                verbose=2 if verbose else 0,
+            )
+            self.ctxT = ctxT
+            self.time_analysis += t_anT
+            self.time_factor   += t_faT
+            print("\t A^-T applies: dedicated A^T factorization "
+                  "(use_ctxT)") if verbose else None
+        else:
+            self.ctxT = None
+            print("\t A^-T applies: reusing A factorization with "
+                  "ICNTL(9)=0") if verbose else None
+
+        return setup_solver_Aii_local(ctx, A.shape[0], A.dtype, ctxT=self.ctxT)
+
     def check_adjoint(self, k=4, seed=0, verbose=True):
         """Adjoint-consistency check on this slab's solve operator."""
         return check_adjoint_consistency(self.solver_ii, k=k, seed=seed,
@@ -598,6 +717,76 @@ class solverWrapper:
             "volumetric reconstruction is not implemented for solver type %r"
             % (self.type,))
         return None
+
+    @property
+    def body_reducer(self):
+        """
+        Body-load reducer (see BodyLoadReducer), built on first access and
+        cached.  None if this solver type does not support it yet; the reason
+        is then in `body_reduce_unavailable`.  Never raises, so it is safe to
+        probe with getattr / hasattr (oms keeps it on slimmed solvers).
+        """
+        red = self.__dict__.get("_body_reducer")
+        if red is not None or not self.constructed:
+            return red
+        if self.type == "hpsalt":
+            try:
+                red = HPSaltBodyReducer(
+                    self.solver,
+                    "reduced_gpu" if self.opts.reduced_gpu else "reduced_cpu")
+            except NotImplementedError as exc:
+                self.body_reduce_unavailable = str(exc)
+                return None
+            self._body_reducer = red
+            return red
+        self.body_reduce_unavailable = (
+            "body load reduction is not implemented for solver type %r"
+            % (self.type,))
+        return None
+
+    def reduce_body_load(self, body_load, offset=None):
+        """
+        Reduced load (f_i on Ii, f_b on Ib) of `body_load` for this slab, in
+        the row convention of Aii / Aib:  Aii u_i + Aib u_b = f_i.
+
+        body_load : callable f(xx), torch points in global coordinates.
+        offset    : solver -> global translation (stiff_mat_const), or None.
+        """
+        red = self.body_reducer
+        if red is None:
+            raise NotImplementedError(
+                getattr(self, "body_reduce_unavailable", None)
+                or "body load reduction is not available for this solver")
+        return red.reduce(body_load, offset)
+
+    def check_body_reduction(self, v, Lv, offset=None, verbose=True):
+        """
+        Self-test of reduce_body_load on this slab.  For a smooth v and its
+        image under the PDO, Lv = L v (both callables on torch points in global
+        coordinates), static condensation gives exactly
+
+            f_i = Aii v_i + Aib v_b      on Ii
+
+        up to the spectral differentiation error of v.  Returns the relative
+        error.  A sign or scaling mismatch shows up as O(1).
+        """
+        import torch
+        f_i, _ = self.reduce_body_load(Lv, offset)
+        XX = self.XX if hasattr(self.XX, "detach") else torch.as_tensor(np.asarray(self.XX))
+        if offset is not None and np.any(offset):
+            XX = XX + torch.as_tensor(np.asarray(offset, dtype=np.float64)).to(
+                device=XX.device, dtype=XX.dtype)
+        vv = _to_numpy(v(XX)).reshape(-1)
+        Ii = np.asarray(_to_numpy(self.Ii)).astype(np.int64)
+        Ib = np.asarray(_to_numpy(self.Ib)).astype(np.int64)
+        ref = np.asarray(self.Aii @ vv[Ii]).reshape(-1) \
+            + np.asarray(self.Aib @ vv[Ib]).reshape(-1)
+        nrm = np.linalg.norm(ref)
+        err = np.linalg.norm(f_i - ref) / (nrm if nrm > 0 else 1.0)
+        if verbose:
+            print("check_body_reduction: ||f_i - (Aii v_i + Aib v_b)|| / ||.|| "
+                  "= %.3e" % err)
+        return err
 
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):

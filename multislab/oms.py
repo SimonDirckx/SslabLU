@@ -17,6 +17,20 @@ The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  in both cases,
 computed during construction.  Re-evaluating it for new boundary data
 (construct_rhstot) needs keepLU; keepLU also enables uX_full.
 
+Body loads (body_load=f, both problem types): f is reduced per slab by the
+local solver (solverWrapper.reduce_body_load -- static condensation for HPS),
+giving (f_i on Ii, f_b on Ib) in the row convention of A_ii / A_ib:
+    Dirichlet:  A_ii u_i = f_i - A_ib u_b
+    mixed:      M w = [f_i; g_N + f_b[JN]] - E u_D
+The reduced load is computed ONCE per slab during construction and kept
+(|Ii| (+|JN|) values per slab); a new bc, the HBS-side rhs and reconstruct()
+reuse it without touching the leaves again.  Only a NEW body load after
+construction needs the reducer, which is kept with keepInterp (it shares the
+leaf discretization with the interpolation state, so it costs nothing extra).
+`reduced_load` (already-reduced loads, the previous interface) is still
+accepted: a sequence of per-slab (b_C, b_X), or a callable on the local driver
+(construction time only -- slimmed solvers no longer keep the driver).
+
 Volumetric solution (reconstruct / interp): each double slab's Dirichlet
 trace is assembled from the neighbours' interface values in uhat plus the
 physical boundary data, solved against the kept factorization, lifted to the
@@ -119,11 +133,67 @@ def _eval_reduced_load(reduced_load, solver, slabInd):
             "indexed by slab, or a callable taking the local solver."
         )
     if callable(reduced_load):
-        out = reduced_load(solver.solver)
+        drv = getattr(solver, "solver", None)
+        if drv is None:
+            raise RuntimeError(
+                "a callable reduced_load needs the local driver (solver.solver), "
+                "which kept solvers no longer carry; pass body_load= instead "
+                "(reduced by the solver itself), or a per-slab sequence")
+        out = reduced_load(drv)
     else:
         out = reduced_load[slabInd]
     b_C, b_X = out
     return np.asarray(b_C), np.asarray(b_X)
+
+
+def _check_load_args(reduced_load, body_load):
+    if reduced_load is not None and body_load is not None:
+        raise ValueError(
+            "pass either body_load (reduced by the local solver) or "
+            "reduced_load (already reduced), not both")
+
+
+def _reducer_of(solver):
+    """The local solver's body-load reducer, or a clear error."""
+    if not hasattr(solver, "body_reducer"):
+        raise RuntimeError(
+            "this kept local solver has no body-load reducer: reducing a NEW "
+            "body load after construction needs keepInterp=True (or pass the "
+            "body load at construction)")
+    red = solver.body_reducer
+    if red is None:
+        raise NotImplementedError(
+            getattr(solver, "body_reduce_unavailable", None)
+            or "body load reduction is not available for this solver")
+    return red
+
+
+def _slab_load(solver, slabInd, body_load, reduced_load, offset):
+    """
+    Reduced load of one slab, in the form the local solves use:
+        None               no load
+        (b_C, None)        Dirichlet: b_C on Ii
+        (b_C, b_N)         mixed:     b_C on Ii, b_N on the Neumann rows JN
+    Host numpy arrays.  body_load is reduced by the solver (one leaf pass);
+    reduced_load is the previous, already-reduced interface.
+    """
+    if body_load is not None:
+        b_C, b_X = _reducer_of(solver).reduce(body_load, offset)
+    elif reduced_load is not None:
+        b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
+    else:
+        return None
+    b_C = np.ascontiguousarray(np.asarray(_host_ndarray(b_C)).reshape(-1))
+    if b_C.shape[0] != len(solver.Ii):
+        raise ValueError("slab %d: reduced load has %d interior values, expected %d"
+                         % (slabInd, b_C.shape[0], len(solver.Ii)))
+    if getattr(solver.opts, "problem_type", "Dirichlet") != "mixed":
+        return (b_C, None)
+    b_X = np.asarray(_host_ndarray(b_X)).reshape(-1)
+    if b_X.shape[0] != len(solver.Ib):
+        raise ValueError("slab %d: reduced load has %d boundary values, expected %d"
+                         % (slabInd, b_X.shape[0], len(solver.Ib)))
+    return (b_C, np.ascontiguousarray(b_X[np.asarray(solver.JN)]))
 
 
 # --------------------------------------------------------------------------- #
@@ -576,12 +646,18 @@ def _fmt_bytes(n):
 # coordinates and the full stiffness matrix are deliberately left behind.
 _LU_ATTRS = {
     "Dirichlet": ("opts", "solver_ii", "Ii", "Ib", "Aib"),
-    "mixed": ("opts", "solver_ii", "Ii", "Ib", "E", "JD", "JN", "solver"),
+    # OPT: the driver ("solver") is no longer kept: it holds the assembled
+    #      sparse matrices (A, A_CC, A_CX, A_XC, A_XX) and was only needed by
+    #      the callable reduced_load; body loads now go through body_reducer.
+    "mixed": ("opts", "solver_ii", "Ii", "Ib", "E", "JD", "JN"),
 }
 # what volumetric reconstruction / interpolation additionally needs (the leaf
 # discretization and grid, not the stiffness matrix); order matters: reading
 # interp_state is what sets interp_unavailable
 _INTERP_ATTRS = ("interp_state", "interp_unavailable")
+# body-load reducer: shares the leaf discretization with interp_state, so it
+# is kept together with it at no extra memory cost
+_REDUCER_ATTRS = ("body_reducer", "body_reduce_unavailable")
 
 
 def _slim_solver(solver, keep_interp=True):
@@ -589,7 +665,7 @@ def _slim_solver(solver, keep_interp=True):
     ns = SimpleNamespace()
     attrs = _LU_ATTRS.get(ptype, _LU_ATTRS["Dirichlet"])
     if keep_interp:
-        attrs = attrs + _INTERP_ATTRS
+        attrs = attrs + _INTERP_ATTRS + _REDUCER_ATTRS
     for a in attrs:
         if hasattr(solver, a):
             setattr(ns, a, getattr(solver, a))
@@ -835,7 +911,8 @@ class oms:
         self._S_hbs = []          # per slab: handle -> [blocks] (src order)
         self._S_dense = []        # per slab: [dense blocks] (src order), keepDense
         self._dense_cache = {}    # stiff_mat_const: (side, I, J) -> dense block
-        self._rhs_cache = None    # (bc, reduced_load, rhs_list) from construction
+        self._rhs_cache = None    # bc, reduced_load, body_load, rhs_list of the
+                                  # most recent rhs (construction or construct_rhstot)
         self._built = False
         self._S_lu = []           # per slab: fused LinearOperator
         self._lu_handles = []     # per slab: handle -> slim local solver
@@ -1432,18 +1509,28 @@ class oms:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _local_rhs(solver, bc, info, reduced_load, slabInd):
+    def _local_rhs(solver, bc, info, load):
+        """
+        Local rhs with zero neighbour data; `load` from _slab_load (None = no
+        body load).
+        """
         Ic = info.Ic
         ptype = getattr(solver.opts, "problem_type", "Dirichlet")
         if ptype == "Dirichlet":
             fgb = bc(info.pts_gb)
-            return -(solver.solver_ii @ (solver.Aib[:, info.Igb] @ fgb))[Ic]
+            if load is None:
+                return -(solver.solver_ii @ (solver.Aib[:, info.Igb] @ fgb))[Ic]
+            # A_ii u_i = f_i - A_ib g
+            g = np.asarray(_host_ndarray(solver.Aib[:, info.Igb] @ fgb)).reshape(-1)
+            return np.asarray(_host_ndarray(
+                solver.solver_ii @ (load[0] - g))).reshape(-1)[Ic]
         if ptype == "mixed":
-            # composition returns (b_C on C-space, b_X on X-space)
-            b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
-            b_N = b_X[solver.JN]                  # X-space load on Neumann rows
-            fgb = bc(info.pts_N)                  # g_N
-            rhs = solver.solver_ii @ np.concatenate([b_C, fgb + b_N])
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(solver.JN))
+            else:
+                b_C, b_N = load
+            g_N = np.asarray(_host_ndarray(bc(info.pts_N))).reshape(-1)
+            rhs = solver.solver_ii @ np.concatenate([b_C, g_N + b_N])
             return rhs[Ic]
         raise NameError(
             "solver problem type not recognized, must be 'Dirichlet' or 'mixed'"
@@ -1453,14 +1540,20 @@ class oms:
     # construction
     # ------------------------------------------------------------------ #
 
-    def construct_Stot_helper(self, bc, assembler=None, reduced_load=None, dbg=0):
+    def construct_Stot_helper(self, bc, assembler=None, reduced_load=None, dbg=0,
+                              body_load=None):
         """
         Build the per-slab interface operators and local right-hand sides.
         Returns (rhs_list, Ntot).  The operators are kept on the object and
         combined into I - K by global_operator().
+
+        body_load : optional callable f(xx) (torch points, global coordinates),
+                    the body load of L u = f; reduced per slab by the local
+                    solver and kept.  Mutually exclusive with reduced_load.
         """
         if self.constructHBS and assembler is None:
             raise ValueError("constructHBS=True needs an `assembler`")
+        _check_load_args(reduced_load, body_load)
 
         # OPT: calling this twice used to keep a second full set of local
         #      solvers alive; everything from a previous call is dropped.
@@ -1536,7 +1629,12 @@ class oms:
             #      map was briefly built here; its source set (the slab's
             #      physical walls) is not a planar interface, so the HBS tree
             #      cannot be built on it.
-            rhs = self._local_rhs(solver, bc, info, reduced_load, slabInd)
+            # reduced body load: one leaf pass per slab, kept for later rhs /
+            # reconstruction (per-slab offset: the load is not translation
+            # invariant even when the operator is)
+            info.load = _slab_load(solver, slabInd, body_load, reduced_load,
+                                   self._slab_offset(slabInd))
+            rhs = self._local_rhs(solver, bc, info, info.load)
             rhs_list.append(rhs)
             dtypes.append(_dtype_of(np.asarray(rhs)))
 
@@ -1631,8 +1729,8 @@ class oms:
             if not self.stiff_mat_const:
                 del solver        # its factorization is on disk or discarded
 
-            if dbg > 0:
-                print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
+            #if dbg > 0:
+            print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
 
         # Without keepLU nothing needs the reference factorization any more.
         if self.stiff_mat_const and not self.keepLU:
@@ -1665,7 +1763,8 @@ class oms:
 
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
-        self._rhs_cache = (bc, reduced_load, rhs_list)
+        self._rhs_cache = SimpleNamespace(bc=bc, reduced_load=reduced_load,
+                                          body_load=body_load, rhs_list=rhs_list)
         self._built = True
         return rhs_list, Ntot
 
@@ -1795,7 +1894,7 @@ class oms:
         return rhstot
 
     def construct_Stot_and_rhstot(self, bc, assembler=None, reduced_load=None,
-                                  dbg=0, rhsHBS=None):
+                                  dbg=0, rhsHBS=None, body_load=None):
         """
         Return (I + S as LinearOperator, global rhs), both from the same side:
 
@@ -1804,8 +1903,11 @@ class oms:
             rhsHBS=None  : LU if keepLU, else HBS
 
         The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  on both
-        sides (as in the original oms and oms_lu).  It is computed during
-        construction; for different boundary data it needs keepLU.
+        sides (as in the original oms and oms_lu), plus the body-load term
+        (A^{-1} f_i)[Ic] when body_load is given (see construct_Stot_helper).
+        It is computed during construction; for different boundary data it
+        needs keepLU.  Pass the same bc / body_load objects to every call: the
+        cached rhs is matched by identity.
 
         The decomposition (factorizations, compression) is built on the first
         call only; later calls reuse it.  Call construct_Stot_helper() to
@@ -1813,9 +1915,11 @@ class oms:
         """
         hbs = self._resolve_hbs(rhsHBS)          # fail fast, before any work
         if not self._built:
-            self.construct_Stot_helper(bc, assembler, reduced_load, dbg)
+            self.construct_Stot_helper(bc, assembler, reduced_load, dbg,
+                                       body_load=body_load)
         return (self.global_operator("hbs" if hbs else "lu"),
-                self.construct_rhstot(bc, reduced_load, rhsHBS=hbs))
+                self.construct_rhstot(bc, reduced_load, rhsHBS=hbs,
+                                      body_load=body_load))
 
     # ------------------------------------------------------------------ #
     # things that need the kept factorizations
@@ -1883,35 +1987,55 @@ class oms:
         trees = [h.host_tree() for h in self._S_hbs + self._lu_handles]
         return _host_nbytes([trees, self._slab_info, self._ref_hbs, self._S_dense])
 
-    def construct_rhstot(self, bc, reduced_load=None, dbg=0, rhsHBS=None):
+    def construct_rhstot(self, bc, reduced_load=None, dbg=0, rhsHBS=None,
+                         body_load=None):
         """
-        Global (exact) rhs for boundary data `bc`.  `rhsHBS` is accepted for
-        symmetry with construct_Stot_and_rhstot and only validated: the rhs
-        does not depend on the operator choice.
+        Global (exact) rhs for boundary data `bc` and body load `body_load`
+        (or already-reduced `reduced_load`; None = no load).  `rhsHBS` is
+        accepted for symmetry with construct_Stot_and_rhstot and only
+        validated: the rhs does not depend on the operator choice.
 
-        For the `bc` the decomposition was built with, the rhs computed during
-        construction is returned (no local solves).  Other `bc` need the kept
-        factorizations (keepLU=True).
+        Same bc and load objects as the most recent rhs: returned from the
+        cache (no local solves).  Same load, new bc: the kept reduced loads are
+        reused (local solves only, no leaf work).  A new body load is reduced
+        per slab (needs keepInterp for the reducer).  Anything new needs the
+        kept factorizations (keepLU=True).  The result becomes the default for
+        reconstruct() / interp().
         """
         self._resolve_hbs(rhsHBS)
         if not self._built:
             raise RuntimeError("construct_rhstot() called before construct_Stot_helper()")
+        _check_load_args(reduced_load, body_load)
         cache = self._rhs_cache
-        if cache is not None and cache[0] is bc and cache[1] is reduced_load:
-            return self._assemble_rhs(cache[2])
+        same_load = cache is not None and cache.reduced_load is reduced_load \
+            and cache.body_load is body_load
+        if same_load and cache.bc is bc:
+            return self._assemble_rhs(cache.rhs_list)
         if not self.keepLU:
             raise RuntimeError(
-                "construct_rhstot() for new boundary data needs the local "
-                "factorizations; construct with keepLU=True")
+                "construct_rhstot() for new boundary data or loads needs the "
+                "local factorizations; construct with keepLU=True")
         self._require_lu("construct_rhstot()")
-        rhs_list = []
+        rhs_list, loads = [], []
         for slabInd, (h, info) in enumerate(zip(self._lu_handles, self._slab_info)):
             solver = h.get()
-            rhs_list.append(self._local_rhs(solver, bc, info, reduced_load, slabInd))
+            load = info.load if same_load else _slab_load(
+                solver, slabInd, body_load, reduced_load, self._slab_offset(slabInd))
+            loads.append(load)
+            rhs_list.append(self._local_rhs(solver, bc, info, load))
             del solver
+        # commit only once every slab succeeded
+        for info, load in zip(self._slab_info, loads):
+            info.load = load
+        self._rhs_cache = SimpleNamespace(bc=bc, reduced_load=reduced_load,
+                                          body_load=body_load, rhs_list=rhs_list)
         return self._assemble_rhs(rhs_list)
 
-    def uX_full(self, uhat, i, b_C, b_X):
+    def uX_full(self, uhat, i, b_C=None, b_X=None):
+        """
+        Exterior trace of slab i (mixed).  b_C / b_X default to the kept
+        reduced load of the most recent rhs (zero if there was none).
+        """
         self._require_lu("uX_full()")
         solver = self._lu_handles[i].get()
         if solver.opts.problem_type != "mixed":
@@ -1919,6 +2043,15 @@ class oms:
 
         info = self._slab_info[i]
         Il, Ir = info.Il, info.Ir
+        if b_C is None and b_X is None:
+            load = getattr(info, "load", None)
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(solver.JN))
+            else:
+                b_C, b_N = load
+        else:
+            b_C = np.asarray(b_C)
+            b_N = np.asarray(b_X)[solver.JN]
 
         # ---- exterior trace, length nX, in I_Xtot ordering ----
         uX = np.zeros(len(solver.Ib), dtype=np.result_type(np.asarray(uhat).dtype,
@@ -1935,7 +2068,6 @@ class oms:
             uX[solver.JD[Ir]] = uhat[_as_index(self.glob_target_dofs[iR])]
 
         # Source 2: physical walls <- solved Neumann values from the local solve
-        b_N = np.asarray(b_X)[solver.JN]
         g_N = np.zeros(len(solver.JN))                # homogeneous Neumann data
         u_D = uX[solver.JD]                           # artificial-face data
         rhs = np.concatenate([b_C, g_N + b_N]) - solver.E @ u_D
@@ -2021,10 +2153,11 @@ class oms:
             yield i, solver
             del solver
 
-    def _local_skeleton(self, solver, slabInd, uhat, bc, reduced_load):
+    def _local_skeleton(self, solver, slabInd, uhat, bc, load):
         """
         Full Dirichlet data of double slab `slabInd` from the global interface
         solution, and the resulting local solve against the kept factors.
+        `load` as from _slab_load (None = no body load).
         Returns (u_i on Ii, u_b on Ib).
         """
         info = self._slab_info[slabInd]
@@ -2052,7 +2185,8 @@ class oms:
             nb = len(solver.Ib)
             g = np.asarray(_host_ndarray(bc(info.pts_gb))).reshape(-1) \
                 if len(info.Igb) else np.zeros(0)
-            dt = np.result_type(uhat.dtype, g.dtype, np.float64)
+            dt = np.result_type(uhat.dtype, g.dtype, np.float64,
+                                *(() if load is None else (load[0].dtype,)))
             u_b, done = trace(nb, faces, dt)
             u_b[info.Igb] = g
             done[info.Igb] = True
@@ -2061,12 +2195,20 @@ class oms:
                     "slab %d: %d of %d boundary dofs have neither a neighbour "
                     "trace nor physical boundary data (check gb / connectivity)"
                     % (slabInd, int((~done).sum()), nb))
-            u_i = -np.asarray(solver.solver_ii @ (solver.Aib @ u_b)).reshape(-1)
+            if load is None:
+                u_i = -np.asarray(solver.solver_ii @ (solver.Aib @ u_b)).reshape(-1)
+            else:
+                # A_ii u_i = f_i - A_ib u_b
+                v = load[0] - np.asarray(_host_ndarray(solver.Aib @ u_b)).reshape(-1)
+                u_i = np.asarray(_host_ndarray(solver.solver_ii @ v)).reshape(-1)
             return u_i, u_b
 
         if ptype == "mixed":
             JD, JN = np.asarray(solver.JD), np.asarray(solver.JN)
-            b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(JN))
+            else:
+                b_C, b_N = load
             g_N = np.asarray(_host_ndarray(bc(info.pts_N))).reshape(-1)
             dt = np.result_type(uhat.dtype, g_N.dtype, b_C.dtype, np.float64)
             u_D, done = trace(len(JD), faces, dt)
@@ -2076,7 +2218,7 @@ class oms:
                     "interface (physical Dirichlet faces are not supported for "
                     "problem_type='mixed')" % (slabInd, int((~done).sum())))
             # same convention as _local_rhs:  M w = [b_C; g_N + b_N] - E u_D
-            rhs = np.concatenate([b_C.reshape(-1), g_N + b_X.reshape(-1)[JN]]) \
+            rhs = np.concatenate([b_C, g_N + b_N]) \
                 - np.asarray(solver.E @ u_D).reshape(-1)
             w = np.asarray(solver.solver_ii @ rhs).reshape(-1)
             nC = len(solver.Ii)
@@ -2093,14 +2235,26 @@ class oms:
         """Yield (slabInd, grid, offset, values on grid.XXfull) per slab."""
         if not self._built:
             raise RuntimeError("reconstruct() called before construct_Stot_helper()")
-        cache_bc, cache_rl, _ = self._rhs_cache
-        bc = cache_bc if bc is None else bc
-        reduced_load = cache_rl if reduced_load is None else reduced_load
-        if body_load is not None and \
-                getattr(self.opts, "problem_type", "Dirichlet") != "mixed":
-            raise ValueError(
-                "body_load: the Dirichlet OMS system carries no body load, so "
-                "the volumetric field cannot either")
+        cache = self._rhs_cache
+        bc = cache.bc if bc is None else bc
+        # Skeleton load (which reduced load the local solves use) and leaf
+        # load (the body load full_solution lifts the leaf interiors with):
+        #   reduced_load given          -> it, on the skeleton; body_load (if
+        #                                  any) in the leaves  [previous API]
+        #   body_load given             -> kept reduced loads if it is the
+        #                                  load of the most recent rhs (or if
+        #                                  that rhs used a reduced_load, whose
+        #                                  leaf load this is); else reduced
+        #                                  anew per slab
+        #   neither                     -> kept reduced loads; the most recent
+        #                                  rhs's body_load in the leaves
+        if reduced_load is not None:
+            skel, leaf_load = "given", body_load
+        elif body_load is not None:
+            kept = cache.reduced_load is not None or body_load is cache.body_load
+            skel, leaf_load = ("kept" if kept else "reduce"), body_load
+        else:
+            skel, leaf_load = "kept", cache.body_load
 
         uhat = np.asarray(_host_ndarray(uhat))
         if uhat.ndim == 2 and uhat.shape[1] == 1:
@@ -2112,9 +2266,15 @@ class oms:
         for i, solver in self._interp_solvers(slabs, refactor, dbg):
             t0 = time.time()
             st = self._interp_state_of(solver)
-            u_i, u_b = self._local_skeleton(solver, i, uhat, bc, reduced_load)
             offset = self._slab_offset(i)
-            values = st.full_solution(u_i, u_b, body_load=body_load, offset=offset)
+            if skel == "kept":
+                load = getattr(self._slab_info[i], "load", None)
+            elif skel == "reduce":
+                load = _slab_load(solver, i, body_load, None, offset)
+            else:
+                load = _slab_load(solver, i, None, reduced_load, offset)
+            u_i, u_b = self._local_skeleton(solver, i, uhat, bc, load)
+            values = st.full_solution(u_i, u_b, body_load=leaf_load, offset=offset)
             if dbg > 1:
                 print("reconstruct: slab %d done in %5.2f s" % (i, time.time() - t0))
             yield i, st.grid, offset, values
@@ -2141,11 +2301,13 @@ class oms:
         to the full grid by local leaf solves.  Returns an OMSSolution, which
         evaluates the result at arbitrary points.
 
-        bc, reduced_load : default to those the decomposition was built with.
-        body_load        : problem_type='mixed' only -- the (unreduced) body
-                           load behind reduced_load, callable on torch points
-                           in global coordinates; needed for the leaf
-                           interiors.
+        bc               : defaults to that of the most recent rhs.
+        body_load        : defaults to that of the most recent rhs; its kept
+                           reduced loads are reused, and full_solution lifts
+                           the leaf interiors with it.  A different body_load
+                           is reduced anew per slab.  Both problem types.
+        reduced_load     : previous interface -- an already-reduced load for
+                           the skeleton; body_load is then only the leaf load.
         slabs            : subset of slab indices (default: all).
         refactor         : 'auto' -> if the local solvers were not kept,
                                      rebuild them on demand (warns);
