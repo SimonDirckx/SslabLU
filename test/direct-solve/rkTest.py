@@ -110,13 +110,13 @@ for indp in range(len(pvec)):
     S_rk_list = OMS.hbs_blocks
     S_dense_list = OMS.S_dense_list
     step = 10
-    strat = rkStrat.linear(rk0+step,step,skip_first_level=False)
-    #strat = rkStrat.logarithmic(rk0+step,80,skip_first_level=False)
+    #strat = rkStrat.linear(rk0+step,step,skip_first_level=False)
+    strat = rkStrat.logarithmic(rk0+step,90,skip_first_level=False)
     #strat = rkStrat.constant(rk0)
     #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=True,fast=True,identity_diag=True,seed=None)
     diagnostics = False
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=True,fast=True,identity_diag=True,seed=None)
-    #rb_solver = omsdirectHBS.ThomasSolverHBS(nc,strat,diagnostics=diagnostics)
+    #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=diagnostics,fast=True,identity_diag=True,seed=None)
+    rb_solver = omsdirectHBS.ThomasSolverHBS(nc,strat,diagnostics=diagnostics)
     
     if diagnostics:
         rb_solver.factorize(S_rk_list,S_exact=S_dense_list)
