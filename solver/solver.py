@@ -6,7 +6,12 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
 import solver.HPSInterp as interp
-import mumps
+import warnings
+
+try:
+    import mumps
+except ImportError:
+    mumps = None
 
 # Things we need to add:
 from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
@@ -79,6 +84,8 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
         BLAS-3 block per chunk.
     verbose : >1 leaves MUMPS' own diagnostics on.
     """
+    if mumps is None:
+        raise ImportError("setup_mumps requires the python-mumps package")
     ctx = mumps.Context(verbose=bool(verbose > 1))
     # symmetric=False throughout: the symmetric/Cholesky path is deliberately
     # not used here.
@@ -654,7 +661,35 @@ class solverWrapper:
         opts.use_ctxT).  Honours opts.mumps_ordering, blr_tol,
         mumps_block_size.  Sets self.ctx / ctxT / time_analysis / time_factor.
         Used by both the Dirichlet (A = Aii) and the mixed (A = M) path.
+
+        Without python-mumps, use the existing SparseSolver backend with
+        default options.  Its total build time is reported as time_factor;
+        analysis and numerical factorization are not timed separately.
         """
+        if mumps is None:
+            nondefaults = [
+                name for name, default in (
+                    ("mumps_ordering", "metis"), ("blr_tol", 0.0),
+                    ("use_ctxT", False), ("mumps_block_size", None),
+                ) if getattr(self.opts, name) != default
+            ]
+            if nondefaults:
+                raise ValueError(
+                    "python-mumps is unavailable; the fallback cannot honor "
+                    "non-default options: " + ", ".join(nondefaults))
+            from solver.hpsmultidomain.hpsmultidomain.sparse_utils import SparseSolver
+
+            backend = SparseSolver(sp.csr_matrix(A))
+            self.ctx = self.ctxT = None
+            self.time_analysis = 0.0
+            self.time_factor = backend.build_time
+            warnings.warn(
+                f"python-mumps is unavailable; using SparseSolver's {backend.backend} backend.",
+                RuntimeWarning, stacklevel=2)
+            # solve_op's closures own the backend, including its factors.
+            # OMS retains solver_ii when it discards the rest of this wrapper.
+            return backend.solve_op
+
         A = A.tocsc() if sp.issparse(A) else A
         ctx, t_an, t_fa = setup_mumps(
             A,

@@ -1,8 +1,7 @@
 import numpy as np
-import jax.numpy as jnp
 import torch
 import scipy
-from packaging.version import Version
+from inspect import signature
 import matplotlib.tri as tri
 
 # oms packages
@@ -10,11 +9,10 @@ import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
 import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
-import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
-import solver.HPSInterp3D as interp
+gmres_tol_keyword = 'rtol' if 'rtol' in signature(gmres).parameters else 'tol'
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
@@ -61,6 +59,9 @@ torch_avail = not jax_avail
 hpsalt      = torch_avail
 kh = 25.
 if jax_avail:
+    import jax.numpy as jnp
+    import solver.spectralmultidomain.hps.pdo as pdo
+    import solver.HPSInterp3D as interp
     def c11(p):
         return jnp.ones_like(p[...,0])
     def c22(p):
@@ -84,6 +85,7 @@ elif torch_avail:
     Helm=pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
 else:
+    import solver.spectralmultidomain.hps.pdo as pdo
     def c11(p):
         return np.ones_like(p[:,0])
     def c22(p):
@@ -121,21 +123,20 @@ for indp in range(len(pvec)):
     a = np.array([H/8,1/8,1/8])
     assembler = mA.rkHMatAssembler(p*p,200,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a)
-    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity)
+    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,
+                  stiff_mat_const=True,keepLU=True)
     print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+    rhs_list, Ntot = OMS.construct_Stot_helper(bc, assembler, dbg=2)
+    S_rk_list, nc = OMS.hbs_blocks, OMS.nc
     print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+    Stot,rhstot  = OMS.construct_Stot_and_rhstot(bc,assembler,dbg=2)
     niter = 0
     if solve_method == 'iterative':
-        Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=2)
+        Stot,rhstot  = OMS.construct_Stot_and_rhstot(bc,assembler,dbg=2)
         gInfo = gmres_info()
         stol = 1e-10*H*H
 
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
-        else:
-            uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        uhat,info   = gmres(Stot,rhstot,callback=gInfo,maxiter=500,restart=500,**{gmres_tol_keyword: stol})
         niter = gInfo.niter
     elif solve_method == 'direct':
         rhstot = np.zeros(shape = (Ntot,))
@@ -171,19 +172,10 @@ for indp in range(len(pvec)):
         ptgInfo = gmres_info()
         prbgInfo = gmres_info()
         stol = 1e-11*H*H
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat,_   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=500,restart=500)
-        else:
-            uhat,_   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=500,restart=500)
+        uhat,_   = gmres(Stot,rhstot,callback=gInfo,maxiter=500,restart=500,**{gmres_tol_keyword: stol})
         
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat_thomas,_   = gmres(Stot,rhstot,rtol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_thomas)
-        else:
-            uhat_thomas,_   = gmres(Stot,rhstot,tol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_thomas)
-        if Version(scipy.__version__)>=Version("1.14"):
-            uhat_rb,_   = gmres(Stot,rhstot,rtol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_rb)
-        else:
-            uhat_rb,_   = gmres(Stot,rhstot,tol=stol,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_rb)
+        uhat_thomas,_   = gmres(Stot,rhstot,callback=ptgInfo,maxiter=500,restart=500,M=Sinv_HBS_thomas,**{gmres_tol_keyword: stol})
+        uhat_rb,_   = gmres(Stot,rhstot,callback=prbgInfo,maxiter=500,restart=500,M=Sinv_HBS_rb,**{gmres_tol_keyword: stol})
         niter = gInfo.niter
     res_thomas = Stot@uhat_thomas-rhstot
     res_rb = Stot@uhat_rb-rhstot

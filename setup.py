@@ -10,6 +10,6 @@ setup(
     author_email='simon.dirckx@austin.utexas.edu',
     url='https://github.com/SimonDirckx/SslabLU',
     install_requires=[
-        'numpy','matplotlib','scipy', 'jax', 'pytest'
+        'numpy','matplotlib','scipy', 'torch', 'tensorly', 'packaging', 'pytest'
     ],
 )
