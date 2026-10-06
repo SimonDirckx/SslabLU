@@ -130,6 +130,11 @@ class slab:
         Indices needed for the source-target maps (left, center, right,
         boundary, interior).
 
+        Igb lists the global-boundary *Dirichlet* points among the solver's
+        boundary points. Faces the local solver treats as Neumann (hpsalt with
+        solverOptions(bc_types=...)) are unknowns in Ii instead, so their points
+        never appear here.
+
         `XX` (or, cheaper, `XXb` / `XXi` directly) may be supplied to override
         the solver's own coordinates -- needed when a single reference solver
         is reused for several translated slabs under stiff_mat_const.
@@ -623,8 +628,13 @@ class oms(_omsBase):
             fgb = bc(XXb[Igb, :])
             st_l, st_r = self.compute_stmaps(Il, Ic, Ir, XXi, XXb, solver)
 
-            rhs = solver.solver_ii @ (solver.Aib[:, Igb] @ fgb)
-            rhs = -rhs[Ic]
+            if len(Igb) > 0:
+                rhs = solver.solver_ii @ (solver.Aib[:, Igb] @ fgb)
+                rhs = -rhs[Ic]
+            else:
+                # no global-boundary Dirichlet data (e.g. Neumann walls): skip
+                # a local solve of a zero vector
+                rhs = np.zeros(len(Ic))
             rhs_list.append(rhs)
 
             bool_l = len(Il) > 0
@@ -818,6 +828,8 @@ class oms_lu(_omsBase):
     def _local_rhs(self, solver, bc, Ic, Igb, XXb, reduced_load, slabInd):
         ptype = solver.opts.problem_type
         if ptype == "Dirichlet":
+            if len(Igb) == 0:   # no global-boundary Dirichlet data: skip a solve of zeros
+                return np.zeros(len(Ic))
             fgb = bc(XXb[Igb, :])
             return -(solver.solver_ii @ (solver.Aib[:, Igb] @ fgb))[Ic]
         if ptype == "mixed":

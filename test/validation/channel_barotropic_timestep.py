@@ -25,8 +25,10 @@
 # block-tridiagonal interface system serve every timestep; the per-step cost
 # is a body-load rhs rebuild plus a block solve. The factorization is dense
 # cyclic red-black (cyclic reduction; the periodic corners are handled by the
-# reduction itself) by default, or cyclic block-Thomas with the SMW corner
-# correction (SSLABLU_SOLVER=thomas).
+# reduction itself) by default; cyclic red-black in HBS arithmetic
+# (SSLABLU_SOLVER=rbhbs: every Schur complement and fill-in block compressed at
+# rank SSLABLU_RB_RK); or cyclic block-Thomas with the SMW corner correction
+# (SSLABLU_SOLVER=thomas).
 # (Compare manuscript Sec. 6.1, which reused the S reduction but ran GMRES at
 # every IMEX step; and Sec. 5.3, which deferred the direct solver.)
 #
@@ -51,14 +53,29 @@
 #
 # BOUNDARY CONDITIONS. Periodic in x (cyclic slabs, seam slab on fictitious
 # [-H, +H] -- all coefficient/IC/BC callables are 1-periodic in x). The y-walls
-# carry Dirichlet SSH data (default 0: "clamped" walls, an open boundary to a
-# reservoir at rest; set SSLABLU_WALL_AMP for a time-periodic "tidal" wall
-# driver). NOTE: these are NOT solid walls -- no-normal-flow walls would need a
-# Neumann/mixed problem_type through the oms path, which convdiv only did by
-# hand in its own RefSlab. Consequence: total mass is conserved only up to the
-# (physical) wall flux, so the conservation diagnostic below compares the
-# divergence form against the non-conservative form, where the NON-conservative
-# form adds a spurious volume term on top of the shared wall flux.
+# are set by SSLABLU_WALLS:
+#   neumann   (default) solid, no-normal-flow walls. Every slab solver carries
+#             the walls as Neumann faces (solverOptions bc_types), so the wall
+#             values are unknowns of the local solves. With v^{n+1} = v* -
+#             (g dt/L) d eta/dy, the wall data
+#                 d eta/dn = n_y v* L / (g dt)        (outward normal, n_y = -/+1)
+#             makes v^{n+1} vanish on the wall nodes, to round-off: the
+#             reconstructed field's discrete d eta/dn equals the data, and the
+#             velocity update uses the same leaf d/dy. The wall flux D d eta/dn
+#             = (H dt/L) v*.n cancels the wall flux inside R^n, so mass changes
+#             only by the steric source, to spectral accuracy. v* is NOT zeroed
+#             at the walls: the explicit Coriolis term makes it nonzero there,
+#             and the data accounts for it.
+#   emulated  the earlier closed-wall emulation in the all-Dirichlet path
+#             (zero-gradient wall data from the lagged adjacent eta, plus a taper
+#             of v* to 0 at the walls). Leaks O(dt^2/delta) and needed the sponge
+#             stabilizers below; kept for comparison with neumann, to be removed.
+#   dirichlet Dirichlet SSH on the walls: steric-held (FORCED, WALL_STERIC),
+#             clamped 0 (an open boundary to a reservoir at rest), or a
+#             time-periodic "tidal" driver (SSLABLU_WALL_AMP). Not solid walls:
+#             mass is conserved only up to the physical wall flux.
+# In every mode the conservation diagnostics compare the divergence form with
+# the non-conservative form, which adds a spurious volume term.
 #
 # SCENARIO (default): geostrophic adjustment. eta(0) is a periodic-in-x bump
 # (von-Mises in x, Gaussian in y), u = v = 0. Gravity waves radiate around the
@@ -69,20 +86,25 @@
 # (stability check), and rhs/solve/reconstruction timings.
 #
 # Tests / outputs:
-#   GATE    manufactured cubic on one all-Dirichlet double slab: derivative
-#           matrices, skeleton body-rhs sign, body-load reconstruction.
+#   GATE    manufactured cubic on one double slab (x faces Dirichlet, y-walls
+#           as configured): derivative matrices, skeleton body-rhs sign,
+#           body-load reconstruction; with Neumann walls also the wall rows
+#           and the discrete wall flux.
 #   RUN     NSTEPS of backward-Euler IMEX, both PDO forms (mass comparison).
 #   OPTIONAL SSLABLU_DTCONV=1: dt-convergence ratios (~2.0 for backward Euler);
 #           rebuilds the operator per dt, so this is slow and off by default.
 #
 #   All outputs go to one directory per configuration (created as needed;
 #   rerunning identical settings overwrites):
-#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb]_dt<dt>s_nsteps<NSTEPS>[_ridgectr]/
+#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb|_rbhbs_rbrk<RB_RK>]_dt<dt>s_nsteps<NSTEPS>[_neumann][_ridgectr][_rng<SEED>]/
 #   dt in seconds, %g-formatted exactly as reentrant_channel_sslablu.jl formats
 #   its Δt, so paired runs share the dt/nsteps tokens; _rk<RK> marks HBS-
-#   compressed S-maps, _rb the red-black solver (no token = cyclic Thomas,
-#   as in runs made before red-black existed), _ridgectr marks
-#   SSLABLU_RIDGE_MIDPANEL=0.
+#   compressed S-maps, _rb the dense red-black solver and _rbhbs_rbrk<RB_RK>
+#   the HBS one (no token = cyclic Thomas, as in runs made before red-black
+#   existed), _neumann the true Neumann walls (no token = the emulated or
+#   Dirichlet walls, as in runs made before Neumann walls existed), _ridgectr
+#   marks SSLABLU_RIDGE_MIDPANEL=0, _rng<SEED> a non-zero SSLABLU_RNG_SEED
+#   (randomized runs only, i.e. RK > 0).
 #   channel_timestep_diag.csv        per-step diagnostics
 #   channel_timestep_ssh.npz         eta/u/v samples for channel_ssh_compare.py
 #   channel_timestep_fields.png      eta snapshots at t = 0, T/2, T
@@ -96,16 +118,26 @@
 #   SSLABLU_DT_H       timestep in hours               (default 0.25)
 #   SSLABLU_NSTEPS     number of steps                 (default 48)
 #   SSLABLU_RK         HBS rank for S-maps; 0 = dense  (default 0)
-#   SSLABLU_SOLVER     rb (red-black; N must be a power of 2) | thomas  (default rb)
+#   SSLABLU_SOLVER     rb | rbhbs (red-black; N must be a power of 2) | thomas
+#                      (default rb). rbhbs needs SSLABLU_RK > 0.
+#   SSLABLU_RB_RK      rbhbs SOLVER rank for pivots and fill-in (default p, half
+#                      the HBS leaf size). Independent of SSLABLU_RK, the
+#                      ASSEMBLER rank: two separate knobs.
+#   SSLABLU_RNG_SEED   seed for the randomized HBS sketches     (default 0)
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
-#   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m]             (default 0)
+#   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
+#   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
+#   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
+#   SSLABLU_SPONGE_RATE  Rayleigh rate in the band [1/s]; 0 = off   (default 0)
+#   SSLABLU_WALL_RELAX under-relaxation of the emulated wall copy   (default 1)
 # =============================================================================
 
 import io
 import os
 import sys
 import time
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -165,33 +197,47 @@ TAU0       = float(os.environ.get("SSLABLU_TAU0",   "0.15"))   # wind stress amp
 RDRAG      = float(os.environ.get("SSLABLU_RDRAG",  "1.0e-5")) # linear bottom drag [1/s] default was 1e-5, successful (with dirichlet BC) was 5e-5
 STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "0.0"))    # steric SSH half-range [m], default 0.5
 GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","0.0")) # steric relaxation rate [1/s], default 1.0e-5
-# y-wall Dirichlet data in FORCED: 1 = hold walls at the steric height eta_s
-# (tilt is BC-driven, establishes fast); 0 = zero walls, so the meridional tilt
-# must emerge purely from the interior GAMMA_S buoyancy relaxation (slower,
-# fully "inductive"). See the wall_eta method.
+# y-wall treatment (see BOUNDARY CONDITIONS in the header):
+#   neumann   true no-normal-flow walls: Neumann faces in every slab solver, with
+#             data d eta/dn = n_y v* L/(g dt) (SlabSolve.wall_flux_data)
+#   emulated  the earlier emulation in the all-Dirichlet path: (1) zero-gradient
+#             wall data -- each wall node gets the adjacent inward eta^n, so
+#             d eta/dn ~ 0; (2) v* tapered to 0 at the walls before div(H u*).
+#             Kept for comparison with neumann; to be removed.
+#   dirichlet Dirichlet SSH on the walls (wall_eta): open, not solid, walls
+WALLS = os.environ.get("SSLABLU_WALLS", "neumann").lower()
+if WALLS not in ("neumann", "emulated", "dirichlet"):
+    raise ValueError("SSLABLU_WALLS must be 'neumann', 'emulated' or 'dirichlet', got %r" % WALLS)
+if "SSLABLU_WALL_NOFLUX" in os.environ:
+    # replaced by SSLABLU_WALLS: 1 was the emulated closed walls, 0 the Dirichlet walls
+    raise ValueError("SSLABLU_WALL_NOFLUX is replaced by SSLABLU_WALLS (neumann | emulated "
+                     "| dirichlet); WALL_NOFLUX=1 was 'emulated', 0 was 'dirichlet'")
+WALL_NOFLUX = WALLS != "dirichlet"     # closed walls: mass budget, wall |v| diagnostics
+# Neumann wall faces for every slab solver (x faces: the slab interfaces)
+NEUMANN_WALLS = {"x": "dirichlet", "y": "neumann"}
+# y-wall Dirichlet data in FORCED (dirichlet walls only): 1 = hold walls at the
+# steric height eta_s (tilt is BC-driven, establishes fast); 0 = zero walls, so
+# the meridional tilt must emerge purely from the interior GAMMA_S buoyancy
+# relaxation (slower, fully "inductive"). See the wall_eta method.
 WALL_STERIC = os.environ.get("SSLABLU_WALL_STERIC", "1") != "0" # Default 1
-# Closed (no-flux) y-walls, emulated in the Dirichlet oms path: (1) zero-gradient
-# wall data -- feed each wall node the adjacent inward eta so d eta/dn ~ 0; (2)
-# zero the predictor's wall-normal velocity v* before div(H u*). Together these
-# give H u.n ~ 0 (a closed basin) without the mixed-BC solver plumbing. The wall
-# leakage is diagnosed by max|v| at the walls and by the mass residual vs the
-# steric-relaxation source (see the conservation figure). Overrides WALL_STERIC.
-WALL_NOFLUX = os.environ.get("SSLABLU_WALL_NOFLUX", "1") != "0"
-# The bare no-flux cheat is weakly UNSTABLE on long runs: the lagged zero-grad
-# copy closes a feedback loop with |G| slightly > 1 for a wall-trapped, grid-
-# scale mode, and the hard single-row v*=0 mask injects a Gibbs seed for it.
-# Three script-local stabilizers, all confined to a thin band of width SPONGE_W
-# next to the y-walls (dist = min(y, 1-y)):
-#   SPONGE_W    band width [y-units]; 0 => revert to the hard v* mask (baseline)
+# Wall-band stabilizers, confined to a band of width SPONGE_W next to the y-walls
+# (dist = min(y, 1-y)). Built for the emulated walls, which are weakly UNSTABLE on
+# long runs: the lagged zero-grad copy closes a feedback loop with |G| slightly
+# > 1 for a wall-trapped, grid-scale mode, and a hard single-row v*=0 mask
+# injects a Gibbs seed for it.
+#   SPONGE_W    band width [y-units]: the sponge band and, for emulated walls, the
+#               smooth taper of v* to 0 at the wall (0 => the hard v* mask)
 #   SPONGE_RATE Rayleigh friction rate [1/s] in the band (absorbs the mode),
 #               smoothly ramped to 0 at the band edge (a too-abrupt sponge
-#               reflects). Applied to both u and v -> a frictional wall layer.
-#   WALL_RELAX  under-relaxation of the zero-grad wall copy (1 = full copy,
-#               <1 lowers the feedback-loop gain).
+#               reflects). Applied to both u and v -> a frictional wall layer,
+#               for closed walls (neumann, emulated). 0 = off (default); the
+#               earlier emulated runs used 1e-3.
+#   WALL_RELAX  under-relaxation of the emulated zero-grad wall copy (1 = full
+#               copy, <1 lowers the feedback-loop gain).
 # These do NOT touch the operator/gate; they only reshape the explicit predictor
-# and wall data. They mitigate, not cure -- the exact fix is the mixed-BC solve.
+# and wall data. For emulated walls they mitigate, not cure.
 SPONGE_W    = float(os.environ.get("SSLABLU_SPONGE_W",    "0.1"))
-SPONGE_RATE = float(os.environ.get("SSLABLU_SPONGE_RATE", "1.0e-3"))
+SPONGE_RATE = float(os.environ.get("SSLABLU_SPONGE_RATE", "0.0"))
 WALL_RELAX  = float(os.environ.get("SSLABLU_WALL_RELAX",  "1.0"))
 # Diagnostic: seed a finite grid-scale wall perturbation in the IC (0 = off) so
 # the wall-mode growth factor |G| can be read off a short run.
@@ -335,7 +381,9 @@ def channel_dSlabs(N):
 
 
 def gb(p):
-    """Global boundary = the y-walls only. x has no boundary (periodic)."""
+    """Global boundary = the y-walls only. x has no boundary (periodic).
+    With Neumann walls the wall points are unknowns of the slab solvers, not
+    boundary points, so nothing matches and Igb is empty."""
     lib = torch if torch.is_tensor(p) else np
     return ((lib.abs(p[:, 1] - BNDS[0][1]) < 1e-14) |
             (lib.abs(p[:, 1] - BNDS[1][1]) < 1e-14))
@@ -381,7 +429,9 @@ def cheb_quad_weights(nodes):
 
 class SlabSolve:
     """Everything needed per double slab to (a) rebuild the interface rhs from
-    a body load and (b) reconstruct the full leaf field, every timestep.
+    a body load and the wall data and (b) reconstruct the full leaf field, every
+    timestep. With Neumann walls (opts.bc_types) the wall points are rows and
+    columns of Aii: Ii is the interior skeleton followed by the Neumann points.
 
     oms.construct_Stot_helper discards its slab solvers after assembling S
     (`del ... solver`), so each slab is discretized a second time here and
@@ -413,6 +463,24 @@ class SlabSolve:
         # the leaf-grid flattening must match solve_dir_full's output ordering
         assert np.allclose(np.asarray(self.sv.XXfull), self.gx.reshape(-1, 2)), \
             "grid_xx flattening does not match XXfull ordering"
+
+        # Neumann walls (SSLABLU_WALLS=neumann): the leaf grid node of each
+        # Neumann point, in the solver's I_Ntot order, and the y-component of its
+        # outward normal (-1 on y = 0, +1 on y = 1). This operator has no c12, so
+        # the leaf faces are Chebyshev and every Neumann point is a grid node.
+        self.neumann = dd.has_neumann
+        if self.neumann:
+            if dd.hps.interpolate:
+                raise RuntimeError("Neumann walls here assume Chebyshev leaf faces "
+                                   "(an operator without c12)")
+            size_ext = len(dd.hps.H.JJ.Jx)
+            Jx = np.asarray(dd.hps.H.JJ.Jx)
+            single = dd.hps.I_single.detach().cpu().numpy()
+            self.neu_box, self.neu_node = single // size_ext, Jx[single % size_ext]
+            self.neu_ny = dd.normals_Ntot[:, 1].detach().cpu().numpy()
+            assert np.allclose(self.gx[self.neu_box, self.neu_node],
+                               dd.XX_active[dd.I_Ntot].detach().cpu().numpy()), \
+                "Neumann points are not the leaf wall nodes"
 
         # "own" boxes: the left half [c-H, c) of each double slab tiles the
         # channel exactly once (union over slabs = [-H, 1-H) == [0,1) mod 1)
@@ -452,15 +520,21 @@ class SlabSolve:
             self.cfix.append(fixes)
 
         # --- closed-wall (no-flux) support -----------------------------------
-        # leaf points on the y-walls (for zeroing v* and measuring wall flux)
+        # leaf points on the y-walls (for the emulated v* mask and the IC seed)
         yy = self.gx[:, :, 1]
         self.wall_mask = ((np.abs(yy - BNDS[0][1]) < 1e-12)
                           | (np.abs(yy - BNDS[1][1]) < 1e-12))
         own_set = np.zeros(self.nb, dtype=bool)
         own_set[self.own] = True
-        self.wall_mask_own = self.wall_mask & own_set[:, None]
+        # wall-flux diagnostic: own boxes, leaf corners left out (they are not
+        # dofs: their values are extrapolated, so their v is not constrained)
+        corner = np.zeros_like(self.wall_mask)
+        for b, (uxn, uyn, ix, iy) in enumerate(self.box_meta):
+            corner[b] = (((ix == 0) | (ix == len(uxn) - 1))
+                         & ((iy == 0) | (iy == len(uyn) - 1)))
+        self.wall_mask_own = self.wall_mask & ~corner & own_set[:, None]
 
-        # zero-gradient map: each y-wall boundary node (in Igb, indexing XXb) ->
+        # emulated walls: zero-gradient map: each y-wall boundary node (in Igb, indexing XXb) ->
         # its adjacent inward leaf node (same box + x-node, one y-node inward).
         # Setting eta_wall = eta there makes the discrete normal gradient ~ 0.
         coord2leaf = {}
@@ -494,9 +568,15 @@ class SlabSolve:
         self.sponge = SPONGE_RATE * (1.0 - smoothstep)   # Rayleigh rate (max at wall)
 
     def wall_zero_grad(self, eta_field):
-        """Zero-gradient Dirichlet data on the y-walls: value at the adjacent
-        inward leaf node (eta_wall = eta_first-interior => d eta/dn ~ 0)."""
+        """Emulated walls: zero-gradient Dirichlet data on the y-walls: value at
+        the adjacent inward leaf node (eta_wall = eta_first-interior => d eta/dn ~ 0)."""
         return eta_field[self.wall_in_b, self.wall_in_j]
+
+    def wall_flux_data(self, vstar, gdtL):
+        """Neumann walls: the data d eta/dn = n_y v* / gdtL at the Neumann points,
+        (n_N, 1). The velocity update v = v* - gdtL d eta/dy then vanishes on the
+        wall nodes, since the reconstructed eta's d/dy there is this data."""
+        return (self.neu_ny * vstar[self.neu_box, self.neu_node] / gdtL)[:, None]
 
     def gradx(self, F):
         return np.einsum('ij,bj->bi', self.D1, F)
@@ -504,28 +584,37 @@ class SlabSolve:
     def grady(self, F):
         return np.einsum('ij,bj->bi', self.D2, F)
 
-    def reduced_body(self, fvec):
-        """b_C: statically-condensed body load on the interior skeleton dofs
-        (rows of Aii), exactly as domain_driver.get_rhs forms it."""
-        bC = self.dd.hps.reduce_body(CPU, None, fvec)[self.dd.I_Ctot]
-        return bC.detach().cpu().numpy().real.ravel()
+    def skeleton_load(self, fvec, gN=None):
+        """b: the statically-condensed body load on the rows of Aii, in the order
+        Ii (domain_driver.get_rhs with zero Dirichlet data): b_C on the interior
+        skeleton, then -- Neumann walls -- g_N + the single-copy load on the wall
+        points."""
+        zero_dir = torch.zeros(len(self.dd.I_Xtot), 1)
+        b = self.dd.get_rhs(None, uu_dir_vec=zero_dir, ff_body_vec=fvec, uu_neu_vec=gN)
+        return b.detach().cpu().numpy().real.ravel()
 
-    def body_rhs(self, fvec, fgb):
-        """Interface-system rhs of this slab (central-interface restriction):
-        rhs = ( Aii^{-1} ( b_C - Aib[:,Igb] fgb ) )[Ic]."""
-        w = self.sv.solver_ii @ (self.reduced_body(fvec)
+    def local_solve(self, fvec, fgb, gN=None):
+        """u_i = Aii^{-1} ( b - Aib[:,Igb] fgb ) on all of Ii, with zero data on
+        the slab interfaces (Il, Ir)."""
+        w = self.sv.solver_ii @ (self.skeleton_load(fvec, gN)
                                  - self.sv.Aib[:, self.Igb] @ fgb)
-        return np.asarray(w).ravel()[self.Ic]
+        return np.asarray(w).ravel()
 
-    def reconstruct(self, ul, ur, fgb, fvec):
-        """Full leaf field from solved neighbor traces + wall data + body load."""
+    def body_rhs(self, fvec, fgb, gN=None):
+        """Interface-system rhs of this slab (central-interface restriction):
+        rhs = ( Aii^{-1} ( b - Aib[:,Igb] fgb ) )[Ic]."""
+        return self.local_solve(fvec, fgb, gN)[self.Ic]
+
+    def reconstruct(self, ul, ur, fgb, fvec, gN=None):
+        """Full leaf field from solved neighbor traces + wall data (Dirichlet fgb
+        or Neumann gN) + body load."""
         g = np.zeros(self.XXb.shape[0])
         g[self.Il] = ul
         g[self.Ir] = ur
         g[self.Igb] = fgb
         g = torch.from_numpy(g[:, np.newaxis])
         with redirect_stdout(io.StringIO()):   # mute per-solve residual prints
-            uu = self.sv.solver.solve_dir_full(g, ff_body=fvec)
+            uu = self.sv.solver.solve_dir_full(g, ff_body=fvec, uu_neu=gN)
         uu = uu.detach().numpy() if torch.is_tensor(uu) else np.asarray(uu)
         uu = uu.real.reshape(self.nb, self.pp2)
         for b in range(self.nb):               # repair the non-dof leaf corners
@@ -550,12 +639,18 @@ class SlabSolve:
 
 ################################################################
 #
-#   GATE: manufactured cubic on ONE all-Dirichlet double slab
+#   GATE: manufactured cubic on ONE double slab
 #
-#   u_ex = x^3 + y^3 (collocation-exact for p_disc >= 4). Validates, in order:
+#   u_ex = x^3 + y^3 (collocation-exact for p_disc >= 4). The slab's x faces get
+#   exact Dirichlet data, its y-walls exact data of the configured kind (values
+#   for Dirichlet walls, the outward du/dn for Neumann walls). Validates, in
+#   order:
 #     (a) leaf derivative matrices Ds[3]/Ds[4] (orientation + physical scaling)
-#     (b) sign/indexing of the skeleton-reduced body rhs
+#     (b) sign/indexing of the skeleton-reduced body rhs (with Neumann walls,
+#         also the wall rows and their data)
 #     (c) body-load reconstruction through solve_dir_full
+#     (d) Neumann walls: the reconstructed field's discrete du/dn on the wall
+#         nodes equals the data -- what makes v = 0 on the walls exact
 #
 ################################################################
 
@@ -585,29 +680,43 @@ def gate(ell2, geom, opts):
     err_dy = np.max(np.abs(ss.grady(Ue) - 3.0 * yg ** 2)) / np.max(3.0 * yg ** 2)
 
     fvec = torch.from_numpy(f_ex(xg, yg).reshape(-1, 1).copy())
-    fgb = u_ex(ss.XXb[ss.Igb, :])
+    fgb = u_ex(ss.XXb[ss.Igb, :])          # x faces (and Dirichlet walls)
+    gN = None
+    if ss.neumann:                         # outward du/dn = n_y u_y on the walls
+        yN = ss.gx[ss.neu_box, ss.neu_node][:, 1]
+        gN = (ss.neu_ny * 3.0 * yN ** 2)[:, None]
 
-    # (b) skeleton body rhs: with all edges Dirichlet, Il = Ir = [] and the
-    # interface identity reduces to u_i = Aii^{-1}(b_C - Aib fgb) on ALL of Ii
-    ui = np.asarray(ss.sv.solver_ii @ (ss.reduced_body(fvec)
-                                       - ss.sv.Aib[:, ss.Igb] @ fgb)).ravel()
+    # (b) skeleton body rhs: with every slab boundary point given exact data,
+    # Il = Ir = [] and the interface identity reduces to
+    # u_i = Aii^{-1}(b - Aib fgb) on ALL of Ii (wall points included if Neumann)
+    ui = ss.local_solve(fvec, fgb, gN)
     ue_i = u_ex(ss.XXi)
     err_skel = np.linalg.norm(ui - ue_i) / np.linalg.norm(ue_i)
 
     # (c) body-load reconstruction on the full leaf grids
-    uu = ss.reconstruct(np.zeros(0), np.zeros(0), fgb, fvec)
+    uu = ss.reconstruct(np.zeros(0), np.zeros(0), fgb, fvec, gN)
     err_rec = np.linalg.norm(uu - Ue) / np.linalg.norm(Ue)
 
+    # (d) Neumann walls: discrete du/dn of the reconstruction = the data
+    err_flux = 0.0
+    if ss.neumann:
+        dudn = ss.neu_ny * ss.grady(uu)[ss.neu_box, ss.neu_node]
+        err_flux = np.linalg.norm(dudn - gN[:, 0]) / np.linalg.norm(gN)
+
     print("=============GATE (manufactured cubic, one slab)=============")
+    print("y-walls                      =  %s" % ("Neumann (du/dn data)" if ss.neumann
+                                                  else "Dirichlet (values)"))
     print("leaf d/dx matrix rel. err    = ", '%10.3E' % err_dx)
     print("leaf d/dy matrix rel. err    = ", '%10.3E' % err_dy)
     print("skeleton body-rhs rel. err   = ", '%10.3E' % err_skel)
     print("reconstruction rel. err      = ", '%10.3E' % err_rec)
+    if ss.neumann:
+        print("wall du/dn vs data rel. err  = ", '%10.3E' % err_flux)
     print("=============================================================")
-    worst = max(err_dx, err_dy, err_skel, err_rec)
+    worst = max(err_dx, err_dy, err_skel, err_rec, err_flux)
     if worst > GATE_TOL:
         raise RuntimeError("GATE FAILED: worst rel. err %.3E > %.1E -- "
-                           "body-load sign/indexing or Ds scaling is wrong"
+                           "body-load sign/indexing, wall data or Ds scaling is wrong"
                            % (worst, GATE_TOL))
 
 
@@ -619,8 +728,8 @@ def gate(ell2, geom, opts):
 
 class ChannelModel:
     """Backward-Euler IMEX barotropic channel. Fixed dt -> the elliptic
-    operator is fixed -> S assembly + cyclic red-black (or Thomas)
-    factorization happen ONCE (in __init__); step() rebuilds only the
+    operator is fixed -> S assembly + cyclic red-black (dense or HBS) or
+    Thomas factorization happen ONCE (in __init__); step() rebuilds only the
     body-load rhs and solves with the stored factors.
     State eta [m], u, v [m/s] live on the per-slab leaf grids (nboxes, p^2);
     overlapping slabs each carry their own consistent copy, convdiv-style."""
@@ -648,33 +757,60 @@ class ChannelModel:
                    for i, d in enumerate(self.OMS.glob_target_dofs)), \
             "interface dofs are not contiguous per slab"
 
+        I_nc = np.eye(self.nc)
         tic = time.perf_counter()
         if SOLVER == "rb":
             # identity diagonal (Stot = I + S); cyclic=True: the wrap-around
-            # couplings S_list[0][0] and S_list[-1][1] are reduced like any other
-            # HBS-compressed S-maps (SSLABLU_RK > 0) are densified first, as
-            # the Thomas path does implicitly: RK compresses the S-maps only,
-            # the factorization stays dense (RedBlackSolver can't negate HBSMAT)
-            I_nc = np.eye(self.nc)
+            # couplings S_list[0][0] and S_list[-1][1] are reduced like any
+            # other. HBS-compressed S-maps (SSLABLU_RK > 0) are densified
+            # first, as the Thomas path does implicitly: RK compresses the
+            # S-maps only, the factorization stays dense (RedBlackSolver can't
+            # negate HBSMAT)
             S_rb = [[b if isinstance(b, np.ndarray) else np.asarray(b @ I_nc)
                      for b in blocks] for blocks in S_list]
             self.rb = RedBlackSolver(self.nc, cyclic=True)
             self.rb.factorize(S_rb, [I_nc] * self.N)
+        elif SOLVER == "rbhbs":
+            # HBS arithmetic throughout: the S-blocks stay compressed (rank
+            # RK) and every Schur complement / fill-in block is compressed at
+            # the solver's own rank RB_RK. One cluster tree serves every block,
+            # which is valid because every interface carries the same y-points;
+            # the tree structures are checked rather than assumed.
+            tree0 = S_list[0][0].tree
+            if not all(np.array_equal(b.tree.perm_leaf, tree0.perm_leaf)
+                       and b.tree.nleaves == tree0.nleaves
+                       for blocks in S_list for b in blocks):
+                raise RuntimeError("HBS cluster trees differ between interfaces, so "
+                                   "slab 0's tree cannot serve every block")
+            self.rbhbs = omsdirectsolveHBS.RedBlackSolverHBS(
+                self.nc, RB_RK, tree0, S_list[0][0].quad, cyclic=True, seed=RNG_SEED)
+            self.rbhbs.factorize(S_list)     # T=None: identity-diagonal fast paths
         else:
             self.T, self.smw = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
                 self.OMS, S_list, rhs0, self.Ntot, self.nc)
         self.t_fac = time.perf_counter() - tic
 
-        # red-black cross-check: one solve against cyclic Thomas on a random rhs
-        # (Thomas factors are cheap at this size and are discarded afterwards)
-        self.rb_vs_thomas = np.nan
+        # per-run solver check on one random rhs (reference factors discarded):
+        #   rb    -- against cyclic Thomas + SMW; both dense, expect ~1e-15
+        #   rbhbs -- against dense cyclic red-black on the SAME S-blocks,
+        #            densified: the solver's own compression error at rank
+        #            RB_RK (the S-map compression at rank RK is common to both)
+        self.solver_check, self.solver_check_label = np.nan, ""
+        r = np.random.default_rng(0).standard_normal(self.Ntot)
         if SOLVER == "rb":
             T_, smw_ = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
                 self.OMS, S_list, rhs0, self.Ntot, self.nc)
-            r = np.random.default_rng(0).standard_normal(self.Ntot)
-            x_th = omsdirectsolve.block_cyclic_tridiagonal_solve(self.OMS, T_, smw_, r)
-            self.rb_vs_thomas = (np.linalg.norm(self.solve(r) - x_th)
-                                 / np.linalg.norm(x_th))
+            x_ref = omsdirectsolve.block_cyclic_tridiagonal_solve(self.OMS, T_, smw_, r)
+            self.solver_check_label = "red-black vs Thomas"
+        elif SOLVER == "rbhbs":
+            ref_ = RedBlackSolver(self.nc, cyclic=True)
+            ref_.factorize([[np.asarray(b @ I_nc) for b in blocks] for blocks in S_list])
+            x_ref = np.asarray(ref_.solve(r)).ravel()
+            self.solver_check_label = ("HBS red-black (rank %d) vs dense red-black"
+                                       % RB_RK)
+        if SOLVER in ("rb", "rbhbs"):
+            self.solver_check = (np.linalg.norm(self.solve(r) - x_ref)
+                                 / np.linalg.norm(x_ref))
 
         tic = time.perf_counter()
         self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
@@ -725,6 +861,8 @@ class ChannelModel:
         if SOLVER == "rb":
             with redirect_stdout(io.StringIO()):   # RedBlackSolver.solve prints
                 return np.asarray(self.rb.solve(rhs)).ravel()
+        if SOLVER == "rbhbs":
+            return np.asarray(self.rbhbs.solve(rhs)).ravel()
         return omsdirectsolve.block_cyclic_tridiagonal_solve(
             self.OMS, self.T, self.smw, rhs)
 
@@ -764,6 +902,10 @@ class ChannelModel:
     def mass(self):
         return sum(s.integrate_own(self.eta[i]) for i, s in enumerate(self.sl))
 
+    def abs_mass(self):
+        """int |eta|: a scale for mass residuals when M0 = 0 (FORCED starts at rest)."""
+        return sum(s.integrate_own(np.abs(self.eta[i])) for i, s in enumerate(self.sl))
+
     def relax_integral(self):
         """int (eta - eta_s) over the domain: the steric-relaxation mass source
         is -GAMMA_S times this, the ONLY term that should change total mass once
@@ -773,8 +915,9 @@ class ChannelModel:
 
     def wall_vn(self):
         """Max and area-mean |v| (wall-normal velocity) on the y-walls, over the
-        tiling boxes. The closed-wall target is 0; this is the direct measure of
-        residual transport through the walls."""
+        tiling boxes' wall nodes, leaf corners left out (not dofs). The closed-wall
+        target is 0; this is the direct measure of residual transport through the
+        walls. Neumann walls: 0 to round-off by construction."""
         vmax = num = den = 0.0
         for i, s in enumerate(self.sl):
             m = s.wall_mask_own
@@ -806,7 +949,7 @@ class ChannelModel:
 
         # ---- explicit predictor + body load R^n, per slab -----------------
         tic = time.perf_counter()
-        fgbs, fvecs, ustars, vstars = [], [], [], []
+        fgbs, gNs, fvecs, ustars, vstars = [], [], [], [], []
         rhstot = np.zeros(self.Ntot)
         for i, s in enumerate(self.sl):
             xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
@@ -825,13 +968,16 @@ class ChannelModel:
                 vs = self.v[i] - dt * (FCOR * self.u[i])
 
             if WALL_NOFLUX:
-                # (i) sponge: Rayleigh friction absorbing layer near the walls,
-                # damping the wall-trapped instability (both components)
+                # (i) sponge (closed walls; off unless SPONGE_RATE > 0): Rayleigh
+                # friction absorbing layer near the walls, damping the
+                # wall-trapped instability of the emulated walls (both components)
                 if SPONGE_RATE > 0.0:
                     us = us - dt * s.sponge * self.u[i]
                     vs = vs - dt * s.sponge * self.v[i]
+            if WALLS == "emulated":
                 # (ii) smooth taper of the wall-normal velocity: 0 at the wall
-                # (no transport into it) but ramped, so no Gibbs seed
+                # (no transport into it) but ramped, so no Gibbs seed. Neumann
+                # walls keep v* -- the wall data accounts for it.
                 vs = vs * s.vtaper
 
             # div(H u*) = H (u*_x + v*_y) + H_x u* + H_y v*
@@ -844,7 +990,13 @@ class ChannelModel:
                 # GAMMA_S*dt << 1.
                 R = R - dt * GAMMA_S * (self.eta[i] - self.eta_s[i])
 
-            if WALL_NOFLUX:
+            gN = None
+            if WALLS == "neumann":
+                # no-normal-flow data d eta/dn = n_y v*/gdtL; the walls are
+                # unknowns of the slab solves, so there is no Dirichlet wall data
+                fgb = np.zeros(0)
+                gN = s.wall_flux_data(vs, gdtL)
+            elif WALLS == "emulated":
                 # zero-gradient Dirichlet: eta_wall = adjacent inward eta^n so
                 # d eta/dn ~ 0 (a discrete Neumann / no-flux wall), optionally
                 # under-relaxed against last step's value to lower the loop gain
@@ -857,8 +1009,8 @@ class ChannelModel:
                 fgb = self.wall_eta(s.XXb[s.Igb, :], tnew)   # Dirichlet wall data
             fvec = torch.from_numpy(R.reshape(-1, 1).copy())
 
-            rhstot[i * self.nc:(i + 1) * self.nc] = s.body_rhs(fvec, fgb)
-            fgbs.append(fgb); fvecs.append(fvec)
+            rhstot[i * self.nc:(i + 1) * self.nc] = s.body_rhs(fvec, fgb, gN)
+            fgbs.append(fgb); gNs.append(gN); fvecs.append(fvec)
             ustars.append(us); vstars.append(vs)
         t_rhs = time.perf_counter() - tic
 
@@ -873,7 +1025,7 @@ class ChannelModel:
             kl, kr = self.connectivity[i]
             ul = uhat[kl * self.nc:(kl + 1) * self.nc]
             ur = uhat[kr * self.nc:(kr + 1) * self.nc]
-            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i])
+            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i])
             self.u[i] = ustars[i] - gdtL * s.gradx(eta_new)
             self.v[i] = vstars[i] - gdtL * s.grady(eta_new)
             self.eta[i] = eta_new
@@ -960,16 +1112,34 @@ N        = int(os.environ.get("SSLABLU_N", "8"))
 p        = int(os.environ.get("SSLABLU_P", "12"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
-dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.0625"))
-NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "1600")) # Default 48, longest was 19200
-RK       = int(os.environ.get("SSLABLU_RK", "0"))       # 0 = dense S-maps
-SOLVER   = os.environ.get("SSLABLU_SOLVER", "rb").lower()  # rb | thomas
-if SOLVER not in ("rb", "thomas"):
-    raise ValueError("SSLABLU_SOLVER must be 'rb' or 'thomas', got %r" % SOLVER)
-if SOLVER == "rb" and (N < 2 or N & (N - 1)):
-    # RedBlackSolver.factorize builds this error but never raises it
+dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.125"))
+NSTEPS   = int(os.environ.get("SSLABLU_NSTEPS", "800")) # Default 48, longest was 19200
+RK       = int(os.environ.get("SSLABLU_RK", "0"))       # ASSEMBLER rank; 0 = dense S-maps
+SOLVER   = os.environ.get("SSLABLU_SOLVER", "rb").lower()  # rb | rbhbs | thomas
+RB_RK    = int(os.environ.get("SSLABLU_RB_RK", str(p)))  # rbhbs SOLVER rank (not RK)
+RNG_SEED = int(os.environ.get("SSLABLU_RNG_SEED", "0"))
+if SOLVER not in ("rb", "rbhbs", "thomas"):
+    raise ValueError("SSLABLU_SOLVER must be 'rb', 'rbhbs' or 'thomas', got %r" % SOLVER)
+if SOLVER in ("rb", "rbhbs") and (N < 2 or N & (N - 1)):
+    # fail here with the fix in the message, not deep inside factorize
     raise ValueError("red-black needs N = power of 2 slabs, got N = %d "
                      "(or set SSLABLU_SOLVER=thomas)" % N)
+if SOLVER == "rbhbs" and RK <= 0:
+    # RedBlackSolverHBS.factorize calls .to('cpu') on every S-block
+    raise ValueError("SSLABLU_SOLVER=rbhbs needs HBS-compressed S-maps: set "
+                     "SSLABLU_RK > 0 (dense numpy S-blocks are not accepted)")
+if SOLVER == "rbhbs" and RB_RK <= 0:
+    raise ValueError("SSLABLU_RB_RK must be positive, got %d" % RB_RK)
+# seed the randomized sketches: rkHMatAssembler draws from the global numpy
+# RNG, RedBlackSolverHBS takes RNG_SEED explicitly
+np.random.seed(RNG_SEED)
+torch.manual_seed(RNG_SEED)
+if SOLVER == "rbhbs":
+    # imported only when selected (it pulls in jax); a docstring in it holds an
+    # invalid escape sequence, which warns whenever the module is recompiled
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        import direct_solve.omsdirectsolveHBS as omsdirectsolveHBS
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 WALL_AMP = float(os.environ.get("SSLABLU_WALL_AMP", "0.0"))
@@ -992,7 +1162,9 @@ if RIDGE_MIDPANEL and abs(crest_frac - 0.5) > 0.25:
     print("WARNING: SSLABLU_RIDGE_MIDPANEL=1 but the crest x = %.5f is at panel "
           "fraction %.2f for N = %d, npan_x = %d (not mid-panel)"
           % (RIDGE_XC, crest_frac, N, npan_x))
-opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a)
+# Neumann walls are faces of every slab solver (S-map assembly, kept slabs, gate)
+opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a,
+                                bc_types=NEUMANN_WALLS if WALLS == "neumann" else None)
 
 dt   = 3600.0 * dt_hours
 ell  = np.sqrt(GRAV * H0) * dt / LCHAN
@@ -1000,10 +1172,13 @@ ell2 = ell * ell
 
 # one output directory per configuration (see the header), so runs don't
 # overwrite each other
-graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s" % (
-    p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "",
-    "_rb" if SOLVER == "rb" else "",
-    dt, NSTEPS, "" if RIDGE_MIDPANEL else "_ridgectr")
+SOLVER_TOKEN = {"rb": "_rb", "rbhbs": "_rbhbs_rbrk%d" % RB_RK, "thomas": ""}[SOLVER]
+SOLVER_NAME  = {"rb": "red-black", "rbhbs": "HBS red-black", "thomas": "Thomas"}[SOLVER]
+graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s" % (
+    p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "", SOLVER_TOKEN,
+    dt, NSTEPS, "_neumann" if WALLS == "neumann" else "",
+    "" if RIDGE_MIDPANEL else "_ridgectr",
+    ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "")
 SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
 
 
@@ -1029,10 +1204,24 @@ print("dt                       = ", '%6.3f h' % dt_hours,
 print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
 print("f*dt (explicit Coriolis) = ", '%6.3f' % (FCOR * dt))
 print("S-map assembler          = ",
-      ("HBS rk = %d" % RK) if RK > 0 else "dense")
-print("interface solver         = ",
-      "cyclic red-black (dense)" if SOLVER == "rb" else "cyclic block-Thomas + SMW (dense)")
+      ("HBS rk = %d  (SSLABLU_RK)" % RK) if RK > 0 else "dense")
+print("interface solver         = ", {
+      "rb":     "cyclic red-black (dense)",
+      "rbhbs":  "cyclic red-black, HBS rk = %d  (SSLABLU_RB_RK)" % RB_RK,
+      "thomas": "cyclic block-Thomas + SMW (dense)"}[SOLVER])
+if RK > 0:
+    print("random-sketch seed       = ", RNG_SEED)
 print("output directory         = ", graph_directory)
+if WALLS == "neumann":
+    wtxt = "closed / no-normal-flow: Neumann walls, d eta/dn = n_y v* L/(g dt)"
+elif WALLS == "emulated":
+    wtxt = "closed / no-flux, emulated (zero-grad + v* taper)"
+elif FORCED:
+    wtxt = ("steric-held Dirichlet" if WALL_STERIC
+            else "zero Dirichlet (open reservoir)")
+else:
+    wtxt = (("tidal Dirichlet, amplitude %g m" % WALL_AMP) if WALL_AMP != 0.0
+            else "zero Dirichlet (clamped)")
 if FORCED:
     print("scenario                 =  FORCED (wind + drag + steric)")
     print("wind stress amp TAU0     = ", '%6.3f N/m^2' % TAU0)
@@ -1041,17 +1230,15 @@ if FORCED:
     print("steric half-range        = ", '%6.3f m' % STERIC_AMP)
     print("steric relax GAMMA_S     = ", '%8.2E /s  (1/g = %5.1f h)'
           % (GAMMA_S, 0.0)) #1.0 / GAMMA_S / 3600.0))
-    wtxt = ("closed / no-flux (zero-grad + v*=0)" if WALL_NOFLUX
-            else ("steric-held Dirichlet" if WALL_STERIC
-                  else "zero Dirichlet (open reservoir)"))
-    print("y-walls                  = ", wtxt)
-    if WALL_NOFLUX:
-        print("  sponge band / rate     =  %.3f / %.2E /s  taper=%s relax=%.2f"
-              % (SPONGE_W, SPONGE_RATE, "smooth" if SPONGE_W > 0 else "hard",
-                 WALL_RELAX))
 else:
     print("scenario                 =  bump (geostrophic adjustment)")
-    print("wall forcing amplitude   = ", WALL_AMP, "m")
+print("y-walls                  = ", wtxt, " (SSLABLU_WALLS=%s)" % WALLS)
+if WALL_NOFLUX:
+    print("  sponge band / rate     =  %.3f / %.2E /s%s"
+          % (SPONGE_W, SPONGE_RATE, "" if SPONGE_RATE > 0.0 else "  (off)"))
+if WALLS == "emulated":
+    print("  v* taper / wall relax  =  %s / %.2f"
+          % ("smooth" if SPONGE_W > 0 else "hard", WALL_RELAX))
 print("================================================")
 
 # ---- GATE first: nothing runs unless signs and scalings check out ----------
@@ -1063,9 +1250,9 @@ modC = ChannelModel(dt, True, make_assembler(), dSlabs, connectivity, H, opts,
                     label="divergence form")
 print("[divergence form]     assemble/factor/keep-slabs = "
       "%.2f / %.2f / %.2f s" % (modC.t_asm, modC.t_fac, modC.t_keep))
-if SOLVER == "rb":
-    print("[divergence form]     red-black vs Thomas, one random-rhs solve: "
-          "rel. diff = %.3E" % modC.rb_vs_thomas)
+if SOLVER in ("rb", "rbhbs"):
+    print("[divergence form]     %s, one random-rhs solve: rel. diff = %.3E"
+          % (modC.solver_check_label, modC.solver_check))
 modN = None
 if CMP_FORM:
     modN = ChannelModel(dt, False, make_assembler(), dSlabs, connectivity, H,
@@ -1164,9 +1351,12 @@ if FORCED:
           % (1.0 / RDRAG / 3600.0, NSTEPS * dt_hours))
     print("final energy             = ", '%10.3E J/rho0' % hist["E"][-1])
     # conservation / wall closure
-    Mscale = max(abs(M0C), STERIC_AMP, 1e-30)
+    # relative to the larger of |M0|, the steric range and int |eta| (the FORCED
+    # run starts at rest, M0 = 0, and STERIC_AMP may be 0 too)
+    Mscale = max(abs(M0C), STERIC_AMP, modC.abs_mass(), 1e-30)
     print("wall closure (y-walls    = ", wtxt, ")")
-    print("  final max|v| at walls  = ", '%10.3E m/s' % hist["wvmax"][-1])
+    print("  final max|v| at walls  = ", '%10.3E m/s  (wall nodes, leaf corners excluded)'
+          % hist["wvmax"][-1])
     print("  total mass drift       = ", '%10.3E  (%.2E rel)'
           % (hist["mass"][-1] - M0C, (hist["mass"][-1] - M0C) / Mscale))
     print("  drift from steric src  = ", '%10.3E  (expected, physical)'
@@ -1177,8 +1367,13 @@ else:
     print("final |M-M0| divergence  = ", '%10.3E' % hist["dMC"][-1])
     if modN is not None:
         print("final |M-M0| non-cons    = ", '%10.3E' % hist["dMN"][-1])
-        print("  (walls are clamped-SSH, not solid: both forms share the physical")
-        print("   wall flux; the non-conservative excess is the spurious part)")
+        if WALLS == "dirichlet":
+            print("  (walls are Dirichlet SSH, not solid: both forms share the physical")
+            print("   wall flux; the non-conservative excess is the spurious part)")
+        else:
+            print("  (closed walls: only the non-conservative form's spurious volume")
+            print("   term%s should change the mass)"
+                  % ("" if WALLS == "neumann" else " and the emulated walls' leakage"))
     print("final E/E0               = ", '%8.4f' % (hist["E"][-1] / E0safe))
 print("=========================================================")
 
@@ -1193,11 +1388,22 @@ with open(csv_name, 'w') as f:
 print("Wrote %s  (%d rows)" % (csv_name, rows.shape[0]))
 
 # ---- SSH comparison export (channel_ssh_compare.py) --------------------------
+# wall_band: width of the near-wall band where this model's wall treatment
+# differs from Oceananigans' closed walls by construction (the emulated walls'
+# v* taper; the sponge, if on); channel_ssh_compare.py hatches it and leaves it
+# out of the interior statistics
+if WALLS == "emulated":
+    wall_band = SPONGE_W
+elif WALLS == "neumann" and SPONGE_RATE > 0.0:
+    wall_band = SPONGE_W
+else:
+    wall_band = 0.0
 np.savez(SSH_OUT, ns=np.array(SSH_NS), dt=dt, nsteps=NSTEPS, nmid=NSTEPS // 2,
          L=LCHAN, H0=H0, p=p, N=N, npan_x=npan_x, npan_y=npan_y, ridge_xc=RIDGE_XC,
          forced=FORCED, steric_amp=STERIC_AMP, gamma_s=GAMMA_S, tau0=TAU0,
-         rdrag=RDRAG, wall_noflux=WALL_NOFLUX, sponge_w=SPONGE_W,
-         sponge_rate=SPONGE_RATE, **ssh_export)
+         rdrag=RDRAG, walls=WALLS, wall_band=wall_band, wall_noflux=WALL_NOFLUX,
+         sponge_w=SPONGE_W, sponge_rate=SPONGE_RATE, solver=SOLVER, rk=RK, rb_rk=RB_RK,
+         rng_seed=RNG_SEED, solver_check=modC.solver_check, **ssh_export)
 print("Wrote %s  (eta/u/v at %s-squared cell centers)" % (SSH_OUT, SSH_NS))
 
 # ---- optional dt-convergence (rebuilds the operator per dt: slow) ----------
@@ -1299,7 +1505,9 @@ try:
             axD[0, 0].semilogy(tt, np.maximum(hist["dMN"], 1e-18), 's--',
                                label='non-conservative')
         axD[0, 0].set_xlabel('t [h]'); axD[0, 0].set_ylabel(r'|M(t) - M$_0$|')
-        axD[0, 0].set_title('mass drift (shared wall flux + spurious part)')
+        axD[0, 0].set_title('mass drift (%s)'
+                            % ("shared wall flux + spurious part" if WALLS == "dirichlet"
+                               else "closed walls: spurious part only"))
         axD[0, 0].grid(True, which='both', alpha=0.3); axD[0, 0].legend(fontsize=8)
 
         axD[0, 1].plot(tt, np.array(hist["E"]) / E0safe, 'o-')
@@ -1314,7 +1522,7 @@ try:
 
     steps_ax = np.arange(1, NSTEPS + 1)
     axD[1, 1].plot(steps_ax, hist["t_rhs"], 'o-', label='body-load rhs')
-    axD[1, 1].plot(steps_ax, hist["t_slv"], 's-', label='cyclic %s solve' % ("red-black" if SOLVER == "rb" else "Thomas"))
+    axD[1, 1].plot(steps_ax, hist["t_slv"], 's-', label='cyclic %s solve' % SOLVER_NAME)
     axD[1, 1].plot(steps_ax, hist["t_rec"], '^-', label='reconstruction')
     axD[1, 1].set_xlabel('step'); axD[1, 1].set_ylabel('time [s]')
     axD[1, 1].set_title('per-step cost (factorization amortized: %.2f s once)'
@@ -1322,8 +1530,7 @@ try:
     axD[1, 1].grid(True, alpha=0.3); axD[1, 1].legend(fontsize=8)
 
     figD.suptitle('Channel barotropic timestepping: backward-Euler IMEX, '
-                  'reused cyclic %s factorization'
-                  % ("red-black" if SOLVER == "rb" else "Thomas"), fontsize=12)
+                  'reused cyclic %s factorization' % SOLVER_NAME, fontsize=12)
     figD.tight_layout(rect=[0, 0, 1, 0.96])
     figD.savefig(outpath('channel_timestep_diagnostics.png'), dpi=200)
 
@@ -1373,7 +1580,7 @@ try:
         axC[0].plot(tt, np.array(hist["massexp"]) - M0C, 'k--',
                     label='steric source (expected)')
         axC[0].plot(tt, hist["massres"], 's-', ms=3,
-                    label='residual = wall leakage')
+                    label='residual = wall leakage (Neumann walls: ~0)')
         axC[0].set_xlabel('t [h]'); axC[0].set_ylabel(r'mass change [m$\cdot$area]')
         axC[0].set_title('mass budget: physical source vs spurious wall flux\n'
                          '(y-walls: %s)' % wtxt)
@@ -1381,8 +1588,9 @@ try:
 
         axC[1].semilogy(tt, np.maximum(np.abs(hist["wvmax"]), 1e-18), 'o-', ms=3)
         axC[1].set_xlabel('t [h]')
-        axC[1].set_ylabel(r'max $|v|$ at y-walls [m/s]')
-        axC[1].set_title('wall-normal velocity (closed wall -> 0)')
+        axC[1].set_ylabel(r'max $|v|$ at y-wall nodes [m/s]')
+        axC[1].set_title('wall-normal velocity (closed wall -> 0;\n'
+                         'leaf corners excluded: not dofs)')
         axC[1].grid(True, which='both', alpha=0.3)
 
         figC.suptitle('Closed-wall diagnostics: is H u·n = 0 at the y-walls?',

@@ -13,11 +13,14 @@
 #
 # Fairness adjustments (see the conversation notes / header of each model):
 #   * both fields are DE-MEANED before differencing; the means are reported
-#     separately (Oceananigans conserves volume exactly, SslabLU's emulated
-#     no-flux walls leak slightly -- its mass_resid diagnostic)
+#     separately (Oceananigans conserves volume exactly; SslabLU's Neumann
+#     walls conserve it to spectral accuracy, its emulated no-flux walls leak
+#     slightly -- its mass_resid diagnostic)
 #   * norms are reported both over the full domain and over the INTERIOR band
-#     outside SslabLU's wall sponge/taper (dist to wall >= SPONGE_W), where the
-#     two wall treatments differ by construction; the band is hatched on maps
+#     outside SslabLU's near-wall band (the emulated walls' v* taper, or the
+#     sponge if on: npz wall_band), where the two wall treatments differ by
+#     construction; the band is hatched on maps. Neumann walls without a
+#     sponge have no such band.
 #   * H_Oceananigans - H_analytic at the u-faces is plotted: the face depth
 #     min(H[i-1], H[i]) that the momentum/continuity terms use, plus
 #     cell-center sampling of the narrow crest, is the prime suspect for
@@ -120,7 +123,14 @@ out_dir = os.path.dirname(npz_path) or "."   # comparison outputs go with the Ss
 S = np.load(npz_path)
 nsteps = int(S["nsteps"])
 L, H0, dt = float(S["L"]), float(S["H0"]), float(S["dt"])
-sponge_w = float(S["sponge_w"]) if bool(S["wall_noflux"]) else 0.0
+# near-wall band where the two wall treatments differ by construction; npz
+# files from before SSLABLU_WALLS carry no wall_band (their closed walls were
+# the emulated ones, whose taper band is sponge_w)
+if "wall_band" in S:
+    sponge_w = float(S["wall_band"])
+else:
+    sponge_w = float(S["sponge_w"]) if bool(S["wall_noflux"]) else 0.0
+walls = str(S["walls"]) if "walls" in S else ("emulated" if bool(S["wall_noflux"]) else "dirichlet")
 ridge_xc = float(S["ridge_xc"]) if "ridge_xc" in S else 0.5   # pre-shift npz files
 
 if not jl_paths:
@@ -137,7 +147,8 @@ print("SslabLU  : %s  (NSTEPS = %d, dt = %g s, p = %d, N = %d, samples at n = %s
 print("  forcing: tau0 = %.3f, rdrag = %.1e, steric = %.2f m, gamma_s = %.1e"
       % (float(S["tau0"]), float(S["rdrag"]), float(S["steric_amp"]), float(S["gamma_s"])))
 print("  ridge crest x/L = %.5f" % ridge_xc)
-print("  interior band (outside wall sponge): %.3f <= y/L <= %.3f"
+print("  y-walls: %s" % walls)
+print("  interior band (outside the near-wall band): %.3f <= y/L <= %.3f"
       % (sponge_w, 1.0 - sponge_w))
 
 rows = []          # CSV

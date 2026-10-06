@@ -250,10 +250,21 @@ class solverOptions:
                 factors via ICNTL(9)=0.  ~2x memory and factor time; only for
                 cross-checking the transposed-solve path.
     mumps_block_size: ICNTL(27) blocking size for multiple right-hand sides
+    bc_types:   hpsalt only (2D). Boundary type per face of every local slab, passed
+                to Domain_Driver, e.g. {'x': 'dirichlet', 'y': 'neumann'} for slabs
+                whose x faces are the slab interfaces and whose y faces are walls.
+                Neumann faces are then part of the local solve: Ii holds the interior
+                skeleton followed by the Neumann points (Aii is bordered by their
+                rows and columns), and Ib holds the Dirichlet faces only, so no
+                Neumann point is a global-boundary point (Igb). The Neumann data, the
+                outward du/dn, enters through the local right-hand side
+                (Domain_Driver.get_rhs / solve_dir_full). The x faces must stay
+                Dirichlet: they are the slab interfaces. One alternative to
+                problem_type='mixed', not to be combined with it.
     """
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
                  mumps_ordering='metis',blr_tol=0.0,use_ctxT=False,
-                 mumps_block_size=None,reduced_gpu=False):
+                 mumps_block_size=None,reduced_gpu=False,bc_types=None):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
@@ -263,6 +274,14 @@ class solverOptions:
         self.use_ctxT         = use_ctxT
         self.mumps_block_size = mumps_block_size
         self.reduced_gpu        = reduced_gpu
+        self.bc_types         = bc_types
+        if bc_types is not None:
+            if type != 'hpsalt':
+                raise ValueError("bc_types is supported only for type='hpsalt', got %r" % (type,))
+            if problem_type != 'Dirichlet':
+                raise ValueError("bc_types (Neumann faces in the local solver) and "
+                                 "problem_type=%r are two ways of imposing Neumann data; "
+                                 "use one" % (problem_type,))
 
 def convertGeom(opts,geom):
     if opts.type=='hpsalt':
@@ -342,7 +361,8 @@ class solverWrapper:
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         elif self.type=='hpsalt':
             geomHPS = convertGeom(self.opts,geom)
-            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord)) #verbose=verbose)
+            solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord),
+                                          bc_types=self.opts.bc_types) #verbose=verbose)
             self.solver=solver
             if self.opts.reduced_gpu:
                 self.solver.build("reduced_gpu", "MUMPS", verbose=verbose)
