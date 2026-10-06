@@ -89,14 +89,14 @@ def bc(p):
 
 N = 33
 dSlabs,connectivity,H = square.dSlabs(N)
-pvec = np.array([22],dtype = np.int64)
+pvec = np.array([20],dtype = np.int64)
 for indp in range(len(pvec)):
     p = pvec[indp]
     p_disc = p
     formulation = "hpsalt"
     p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/128])
-    rk0 = 40
+    a = np.array([H/4,1/64])
+    rk0 = 50
     assembler = mA.rkHMatAssembler(4*p,rk0,ndim=2)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc],a,reduced_gpu=False)
     tic_sys = time.time()
@@ -111,10 +111,10 @@ for indp in range(len(pvec)):
     S_dense_list = OMS.S_dense_list
     step = 10
     #strat = rkStrat.linear(rk0+step,step,skip_first_level=False)
-    strat = rkStrat.logarithmic(rk0+step,90,skip_first_level=False)
+    strat = rkStrat.logarithmic(rk0+step,80,skip_first_level=False)
     #strat = rkStrat.constant(rk0)
     #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=True,fast=True,identity_diag=True,seed=None)
-    diagnostics = False
+    diagnostics = True
     #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,diagnostics=diagnostics,fast=True,identity_diag=True,seed=None)
     rb_solver = omsdirectHBS.ThomasSolverHBS(nc,strat,diagnostics=diagnostics)
     
