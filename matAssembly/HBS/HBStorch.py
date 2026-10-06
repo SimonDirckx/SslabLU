@@ -178,7 +178,9 @@ def _svd_worker_init():
 
 
 def _svd_pool():
-    nw = _SVD_WORKERS[0] or len(os.sched_getaffinity(0))
+    nw = _SVD_WORKERS[0] or (
+        len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity')
+        else (os.cpu_count() or 1))
     if _SVD_POOL[0] is None or _SVD_POOL[1] != nw:
         if _SVD_POOL[0] is not None:
             _SVD_POOL[0].shutdown(wait=True)
@@ -320,7 +322,8 @@ def _cholqr2(X, need_q=True):
             # the caller's X there, and for the A side that is Om or Psi,
             # which the rest of the level reads.
             Q = torch.linalg.solve_triangular(
-                Ri.mT, Q, upper=False, left=True)
+                Ri.mT, Q, upper=False, left=True,
+                out=Q if p > 1 and not Q.requires_grad else None)
         R = Ri if R is None else torch.bmm(Ri, R)
     return Q, R
 
@@ -477,7 +480,8 @@ def compute_UV_pair(Om, Y, Psi, Z, rk, device=None, fast=False):
             Lk, info = torch.linalg.cholesky_ex(Gk)   # symmetric by construction
             if not bool(info.any()):
                 UU = torch.linalg.solve_triangular(Lk.mT, UU, upper=True,
-                                                   left=False)
+                                                   left=False,
+                                                   out=UU if not UU.requires_grad else None)
             del Gk, Lk
             UU = UU.contiguous()
             _uv_sync(dev); _UV_TBASIS[0] += time.time() - _t
@@ -1007,8 +1011,13 @@ class HBSMAT:
         for g in need:
             rec = self._host[g]
             if rec is not None:
+                # The host master is already packed by dtype. Upload each
+                # buffer once and retain its layout through device views.
+                packed = {dt: buf.t.to(dev, non_blocking=non_blocking)
+                          for dt, buf in rec['bufs'].items()}
                 for (name, i), hv in zip(rec['ents'], rec['views']):
-                    getattr(self, name)[i] = hv.to(dev, non_blocking=non_blocking)
+                    getattr(self, name)[i] = packed[hv.dtype].narrow(
+                        0, hv.storage_offset(), hv.numel()).view(hv.shape)
                     n += hv.nbytes
             else:
                 for name, i in self._entries(g):
