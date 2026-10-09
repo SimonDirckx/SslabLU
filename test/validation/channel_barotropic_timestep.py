@@ -93,6 +93,21 @@
 #   RUN     NSTEPS of backward-Euler IMEX, both PDO forms (mass comparison).
 #   OPTIONAL SSLABLU_DTCONV=1: dt-convergence ratios (~2.0 for backward Euler);
 #           rebuilds the operator per dt, so this is slow and off by default.
+#   OPTIONAL SSLABLU_FLUXBUDGET=1: per-step volume budget of the divergence
+#           form (ChannelModel.flux_budget): splits each step's volume change
+#           exactly into the pointwise continuity residual by leaf-node class,
+#           the product-rule div(H u) vs the collocation derivative of the nodal
+#           product H u, the wall flux, and the normal-flux jumps across
+#           internal leaf edges (each box carries its own copy of the edge
+#           velocities). The interior residual and the wall flux / edge jumps at
+#           non-corner nodes use no leaf-corner velocity; the other terms do,
+#           and the discretization never defines one (corners are not dofs;
+#           their u, v never reach eta), so only their SUM is meaningful. Writes
+#           channel_timestep_fluxbudget.csv / .png and a VOLUME BUDGET summary
+#           (with the edges carrying the largest jumps) into
+#           run_sslablu_fluxbudget_... instead of run_sslablu_channel_... (same
+#           solution, so the regular run directories are not overwritten or
+#           picked up twice by the comparison scripts).
 #
 #   All outputs go to one directory per configuration (created as needed;
 #   rerunning identical settings overwrites):
@@ -126,6 +141,7 @@
 #   SSLABLU_RNG_SEED   seed for the randomized HBS sketches     (default 0)
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
+#   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
 #   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
 #   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
@@ -625,6 +641,41 @@ class SlabSolve:
     def integrate_own(self, F):
         return float((self.W[self.own] * F[self.own]).sum())
 
+    def budget_geom(self):
+        """Bookkeeping for ChannelModel.flux_budget (built once). Per own box,
+        its four edges as (key, node idx, 1D quadrature weights along the edge,
+        normal axis, outward normal sign, leaf-corner mask); the key is the
+        edge's position with x taken mod 1, so the two sides of an internal edge
+        -- in this slab or the neighbor's own region -- meet under one key and a
+        wall edge appears once. Plus a class per leaf node for the pointwise
+        residual: 0 interior, 1 leaf edge, 2 wall (non-corner), 3 leaf corner."""
+        if getattr(self, "_bg", None) is not None:
+            return self._bg
+        r9 = lambda v: round(float(v), 9)
+        xm = lambda v: r9(r9(v) % 1.0)
+        cls = np.zeros((self.nb, self.pp2), dtype=int)
+        edges = []
+        for b in self.own:
+            uxn, uyn, ix, iy = self.box_meta[b]
+            nx, ny = len(uxn), len(uyn)
+            onx, ony = (ix == 0) | (ix == nx - 1), (iy == 0) | (iy == ny - 1)
+            cls[b] = np.where(onx & ony, 3, np.where(self.wall_mask[b], 2,
+                                                     np.where(onx | ony, 1, 0)))
+            wx, wy = cheb_quad_weights(uxn), cheb_quad_weights(uyn)
+            box = []
+            for sel, axis, sgn, key in (
+                    (ix == 0, 0, -1.0, ("v", xm(uxn[0]), r9(uyn[0]))),
+                    (ix == nx - 1, 0, 1.0, ("v", xm(uxn[-1]), r9(uyn[0]))),
+                    (iy == 0, 1, -1.0, ("h", r9(uyn[0]), xm(uxn[0]))),
+                    (iy == ny - 1, 1, 1.0, ("h", r9(uyn[-1]), xm(uxn[0])))):
+                idx = np.where(sel)[0]
+                along, w1 = (iy[idx], wy) if axis == 0 else (ix[idx], wx)
+                box.append((key, idx, w1[along], axis, sgn,
+                            (along == 0) | (along == len(w1) - 1)))
+            edges.append(box)
+        self._bg = {"cls": cls, "edges": edges}
+        return self._bg
+
     def interp_mats(self, nx, ny):
         """Cached barycentric leaf-to-uniform-subgrid matrices (all boxes are
         congruent, so one pair serves every box)."""
@@ -1041,6 +1092,88 @@ class ChannelModel:
                 "wall_vn_max": wvmax, "wall_vn_mean": wvmean,
                 "t_rhs": t_rhs, "t_slv": t_slv, "t_rec": t_rec}
 
+    def flux_budget(self, eta_old):
+        """Volume budget of the step just taken (SSLABLU_FLUXBUDGET), from
+        eta^n = eta_old and the current eta, u, v. With k = dt/L, step()'s
+        product-rule divergence div(H u) = H (u_x + v_y) + H_x u + H_y v, and
+        div_c(H u) the collocation derivative of the nodal product H u,
+            r = eta^{n+1} - eta^n + k div(H u^{n+1}) - steric source
+        is the pointwise residual of the discrete continuity equation, and
+            dM = steric + int r - k int [div - div_c](H u) - k sum_leaves oint H u.n
+        exactly: the leaf quadrature integrates div_c of the nodal interpolant
+        exactly (a discrete divergence theorem per leaf, checked as divthm_err).
+        int r is split by node class -- interior (the PDE is collocated there,
+        so ~0), leaf edges (HPS imposes flux continuity there instead), Neumann
+        wall nodes, leaf corners (not dofs: interpolated) -- and the summed leaf
+        boundary fluxes into the wall flux and the normal-flux jumps across
+        internal leaf edges (within a slab or between the own regions of two
+        slabs; x-normal and y-normal edges apart), each with its leaf-corner
+        part. The identity holds for any velocity at the leaf corners; the
+        model's own corner u, v never reach eta (corners are not dofs, and
+        step() repairs only eta there), so they drift freely -- by up to ~2x
+        near the ridge -- and would swamp the individual terms with pieces that
+        cancel in the total. The budget therefore repairs them like eta's
+        corners (cfix). That is a convention: it moves volume among res_edge,
+        res_wall, res_corner, product_rule, wall_corner and jump_corner, whose
+        SUM is convention-free; res_interior, wall_noncorner and the
+        jump_noncorner terms use no corner value at all. The non-corner jumps
+        are also accumulated per edge in self.jump_acc. Returns BUDGET_COLS: the
+        terms as contributions to dM [m], the closure dM - sum(terms) and the
+        worst per-leaf divergence-theorem error, both in m and both round-off
+        when the bookkeeping is right."""
+        k = self.dt / LCHAN
+        res = np.zeros(4)
+        dM = steric = prod = dthm = 0.0
+        edge = {}                        # edge key -> [(slab, outward flux, corner part)]
+        for i, s in enumerate(self.sl):
+            bg, o = s.budget_geom(), s.own
+            xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
+            Hp = H0 * depth_frac(xg, yg)
+            u, v = self.u[i].copy(), self.v[i].copy()
+            for b in o:
+                for corner, row, w in s.cfix[b]:
+                    u[b, corner] = w @ u[b, row]
+                    v[b, corner] = w @ v[b, row]
+            div = (Hp * (s.gradx(u) + s.grady(v)) + H0 * ddepth_frac_dx(xg, yg) * u
+                   + H0 * ddepth_frac_dy(xg, yg) * v)
+            Fx, Fy = Hp * u, Hp * v
+            divc = s.gradx(Fx) + s.grady(Fy)
+            src = (-self.dt * GAMMA_S * (eta_old[i] - self.eta_s[i]) if FORCED
+                   else np.zeros_like(u))
+            deta = self.eta[i] - eta_old[i]
+            r = deta + k * div - src
+            W = s.W[o]
+            dM += float((W * deta[o]).sum())
+            steric += float((W * src[o]).sum())
+            for c in range(4):
+                res[c] += float((W * np.where(bg["cls"][o] == c, r[o], 0.0)).sum())
+            prod -= k * float((W * (div[o] - divc[o])).sum())
+            for b, box in zip(o, bg["edges"]):
+                out = 0.0
+                for key, idx, w1, axis, sgn, cm in box:
+                    f = sgn * w1 * (Fx if axis == 0 else Fy)[b, idx]
+                    edge.setdefault(key, []).append((i, f.sum(), f[cm].sum()))
+                    out += f.sum()
+                dthm = max(dthm, k * abs(float((s.W[b] * divc[b]).sum()) - out))
+        # (total, corner part) of the summed outward fluxes: walls, and the
+        # internal edges by orientation ("v": x-normal, "h": y-normal)
+        flux = {"wall": np.zeros(2), "v": np.zeros(2), "h": np.zeros(2)}
+        if not hasattr(self, "jump_acc"):
+            self.jump_acc = {}           # edge key -> cumulative non-corner jump [m]
+        for key, sides in edge.items():
+            tot = np.array([[fs, fc] for _, fs, fc in sides]).sum(axis=0)
+            if len(sides) == 1 and key[0] == "h" and key[1] in (0.0, 1.0):
+                flux["wall"] += tot
+            elif len(sides) == 2:
+                flux[key[0]] += tot
+                self.jump_acc[key] = self.jump_acc.get(key, 0.0) - k * (tot[0] - tot[1])
+            else:
+                raise RuntimeError("flux budget: edge %s has %d sides" % (key, len(sides)))
+        nc = lambda g: -k * (flux[g][0] - flux[g][1])
+        terms = [steric] + list(res) + [prod, nc("wall"), -k * flux["wall"][1],
+                                         nc("v"), nc("h"), -k * (flux["v"][1] + flux["h"][1])]
+        return [dM] + terms + [dM - sum(terms), dthm]
+
     def _resample(self, field, nx=8, ny=8):
         """Global uniform image of a per-slab leaf field: per-leaf barycentric
         resampling of the tiling ('own') boxes (IMEXconvdiv's plot_field
@@ -1142,6 +1275,11 @@ if SOLVER == "rbhbs":
         import direct_solve.omsdirectsolveHBS as omsdirectsolveHBS
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
+FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
+# flux_budget() return order, as contributions to the step's volume change dM [m]
+BUDGET_COLS = ["dM", "steric", "res_interior", "res_edge", "res_wall", "res_corner",
+               "product_rule", "wall_noncorner", "wall_corner", "jump_noncorner_x",
+               "jump_noncorner_y", "jump_corner", "closure", "divthm_err"]
 WALL_AMP = float(os.environ.get("SSLABLU_WALL_AMP", "0.0"))
 WALL_PERIOD = 12.42 * 3600.0                             # M2-ish tide [s]
 # SSH comparison export (channel_ssh_compare.py): eta/u/v sampled at the
@@ -1174,7 +1312,8 @@ ell2 = ell * ell
 # overwrite each other
 SOLVER_TOKEN = {"rb": "_rb", "rbhbs": "_rbhbs_rbrk%d" % RB_RK, "thomas": ""}[SOLVER]
 SOLVER_NAME  = {"rb": "red-black", "rbhbs": "HBS red-black", "thomas": "Thomas"}[SOLVER]
-graph_directory = "run_sslablu_channel_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s" % (
+graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s" % (
+    "fluxbudget" if FLUXBUDGET else "channel",
     p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "", SOLVER_TOKEN,
     dt, NSTEPS, "_neumann" if WALLS == "neumann" else "",
     "" if RIDGE_MIDPANEL else "_ridgectr",
@@ -1275,6 +1414,7 @@ hist = {"t": [0.0], "dMC": [0.0], "dMN": [0.0], "E": [E0],
         "t_slv": [], "t_rhs": [], "t_rec": []}
 cum_relax = 0.0     # running sum of the steric-relaxation mass source
 ssh_export = {}     # samples for channel_ssh_compare.py
+budget = []         # SSLABLU_FLUXBUDGET: per-step volume budget, divergence form
 
 print("")
 if FORCED:
@@ -1284,7 +1424,10 @@ else:
     print(" step   t[h]    |M-M0| div-form   |M-M0| non-cons    E/E0     max|eta|"
           "   t_rhs   t_slv   t_rec")
 for n in range(1, NSTEPS + 1):
+    eta_old = [e.copy() for e in modC.eta] if FLUXBUDGET else None
     dC = modC.step()
+    if FLUXBUDGET:
+        budget.append([n, n * dt_hours] + modC.flux_budget(eta_old))
     dN = modN.step() if modN is not None else None
 
     dMC = abs(dC["mass"] - M0C)
@@ -1386,6 +1529,44 @@ with open(csv_name, 'w') as f:
             "energy,max_eta,t_rhs,t_solve,t_recon\n")
     np.savetxt(f, rows, fmt='%.16e', delimiter=',')
 print("Wrote %s  (%d rows)" % (csv_name, rows.shape[0]))
+
+if FLUXBUDGET:
+    budget = np.array(budget)
+    bname = outpath("channel_timestep_fluxbudget.csv")
+    with open(bname, 'w') as f:
+        f.write("step,t_hours," + ",".join(BUDGET_COLS) + "\n")
+        np.savetxt(f, budget, fmt='%.16e', delimiter=',')
+    print("Wrote %s  (%d rows)" % (bname, budget.shape[0]))
+    cum = budget[:, 2:-2].sum(axis=0)              # dM and the terms, summed over the run
+    pct = lambda c: 100.0 * c / cum[0] if cum[0] != 0.0 else np.nan
+    print("")
+    print("=============VOLUME BUDGET (divergence form, %d steps)=============" % NSTEPS)
+    print("sum of dM                       = %11.3E m   (M(T) - M0 = %.3E m)"
+          % (cum[0], hist["mass"][-1] - M0C))
+    # cum indices follow BUDGET_COLS[:-2]; first the groups that use no
+    # leaf-corner velocity, then the split of the rest (which does)
+    for name, cols in (("steric source", (1,)),
+                       ("wall flux, non-corner nodes", (7,)),
+                       ("interior PDE residual", (2,)),
+                       ("edge-flux jumps, x-normal", (9,)),
+                       ("edge-flux jumps, y-normal", (10,)),
+                       ("leaf-bdry eqs + corners", (3, 4, 5, 6, 8, 11))):
+        c = cum[list(cols)].sum()
+        print("  %-28s  = %11.3E m   %7.1f %% of sum dM" % (name, c, pct(c)))
+    print("  leaf-bdry eqs + corners, split (depends on the corner-velocity convention):")
+    for col in (3, 4, 5, 6, 8, 11):
+        print("    %-26s  = %11.3E m   %7.1f %%" % (BUDGET_COLS[col], cum[col], pct(cum[col])))
+    print("  largest non-corner edge-flux jumps, cumulative per edge:")
+    for key, c in sorted(modC.jump_acc.items(), key=lambda kv: -abs(kv[1]))[:6]:
+        if key[0] == "v":
+            where = "x-normal edge x = %.4f, y in [%.4f, %.4f]" % (key[1], key[2], key[2] + 1.0 / npan_y)
+        else:
+            where = "y-normal edge y = %.4f, x in [%.4f, %.4f]" % (key[1], key[2], key[2] + 2.0 * H / npan_x)
+        print("    %-46s  %11.3E m   %7.1f %%" % (where, c, pct(c)))
+    print("max |closure| per step          = %10.3E m  (dM - sum of terms: want round-off)"
+          % np.abs(budget[:, -2]).max())
+    print("max per-leaf div. theorem error = %10.3E m  (want round-off)" % budget[:, -1].max())
+    print("=========================================================")
 
 # ---- SSH comparison export (channel_ssh_compare.py) --------------------------
 # wall_band: width of the near-wall band where this model's wall treatment
@@ -1598,6 +1779,43 @@ try:
         figC.tight_layout(rect=[0, 0, 1, 0.93])
         figC.savefig(outpath('channel_timestep_conservation.png'), dpi=200)
         outnames += ", channel_timestep_conservation.png"
+
+    # ---- volume budget (SSLABLU_FLUXBUDGET) ----------------------------------
+    if FLUXBUDGET:
+        tt = budget[:, 1]
+        cs = np.cumsum(budget[:, 2:-2], axis=0)      # columns follow BUDGET_COLS[:-2]
+        figB, axB = plt.subplots(1, 2, figsize=(13, 6.0), sharey=True)
+        panels = (
+            (axB[0], "terms that use no leaf-corner velocity",
+             (((7,), "wall flux, non-corner nodes"),
+              ((2,), "interior PDE residual (collocated)"),
+              ((9,), "edge-flux jumps, x-normal edges"),
+              ((10,), "edge-flux jumps, y-normal edges"),
+              ((3, 4, 5, 6, 8, 11), "leaf-boundary equations + corners (sum)")) +
+             ((((1,), "steric source"),) if FORCED and GAMMA_S != 0.0 else ())),
+            (axB[1], "leaf-boundary equations + corners, split\n"
+                     "(depends on the velocity assumed at leaf corners)",
+             (((3,), "leaf-edge node residual (flux continuity, not the PDE)"),
+              ((4,), "Neumann wall-node residual"),
+              ((5,), "leaf-corner residual (interpolated)"),
+              ((6,), r"product-rule div($Hu$) vs collocation"),
+              ((8,), "wall flux, leaf corners"),
+              ((11,), "edge-flux jumps, leaf corners"))))
+        for a, ttl, series in panels:
+            a.plot(tt, cs[:, 0], 'k-', lw=2.2, label=r'total $M(t) - M_0$')
+            for cols, lab in series:
+                a.plot(tt, cs[:, list(cols)].sum(axis=1), '-', lw=1.4, label=lab)
+            a.axhline(0.0, color='0.6', lw=0.6)
+            a.set_xlabel('t [h]'); a.set_title(ttl)
+            a.grid(True, alpha=0.3)
+            a.legend(fontsize=8, loc='upper center', bbox_to_anchor=(0.5, -0.13),
+                     ncol=2, frameon=False)      # below the panel, off the curves
+        axB[0].set_ylabel('cumulative contribution to the volume [m]')
+        figB.suptitle('Volume budget (divergence form): where M(t) - M$_0$ comes from'
+                      '  (max |closure| %.1e m)' % np.abs(budget[:, -2]).max(), fontsize=12)
+        figB.tight_layout(rect=[0, 0, 1, 0.94])
+        figB.savefig(outpath('channel_timestep_fluxbudget.png'), dpi=200)
+        outnames += ", channel_timestep_fluxbudget.png"
 
     print("wrote %s  (in %s/)" % (outnames, graph_directory))
 except Exception as e:
