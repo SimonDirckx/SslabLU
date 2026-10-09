@@ -111,7 +111,8 @@
 #
 #   All outputs go to one directory per configuration (created as needed;
 #   rerunning identical settings overwrites):
-#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb|_rbhbs_rbrk<RB_RK>]_dt<dt>s_nsteps<NSTEPS>[_neumann][_ridgectr][_rng<SEED>]/
+#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb|_rbhbs_rbrk<RB_RK>]_dt<dt>s_nsteps<NSTEPS>[_neumann][_ridgectr][_rng<SEED>][_vtx][_dss]/
+#   (_vtx / _dss: the SSLABLU_VERTEX_ETA / SSLABLU_EDGE_DSS conservation tests)
 #   dt in seconds, %g-formatted exactly as reentrant_channel_sslablu.jl formats
 #   its Δt, so paired runs share the dt/nsteps tokens; _rk<RK> marks HBS-
 #   compressed S-maps, _rb the dense red-black solver and _rbhbs_rbrk<RB_RK>
@@ -142,6 +143,12 @@
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
+#   Conservation tests (change the solution; directory tokens _vtx / _dss):
+#   SSLABLU_VERTEX_ETA 1 = one eta per leaf vertex: every copy (all leaves and
+#                      overlapping slabs sharing it) gets the mean of the
+#                      leaves' corner extrapolations              (default 0)
+#   SSLABLU_EDGE_DSS   1 = after every update, each leaf-boundary node's u, v
+#                      copies get their mean (spectral-element DSS) (default 0)
 #   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
 #   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
@@ -868,6 +875,10 @@ class ChannelModel:
                              own_split=n * H) for n in range(self.N)]
         self.t_keep = time.perf_counter() - tic
 
+        # conservation tests: copies of the same physical node, built once
+        self.vtx_groups = self.copy_groups(corners_only=True) if VERTEX_ETA else None
+        self.dss_groups = self.copy_groups(corners_only=False) if EDGE_DSS else None
+
         # steady forcing fields, precomputed once per slab (leaf grids)
         self.a_wind = []      # eastward wind acceleration tau^x/(rho0 H)
         self.eta_s = []       # steric relaxation target eta_s(y)
@@ -906,6 +917,40 @@ class ChannelModel:
         # previous-step wall data, for the under-relaxed zero-grad copy
         self.fgb_prev = [np.zeros(len(s.Igb)) for s in self.sl]
         self.t = 0.0
+
+    def copy_groups(self, corners_only):
+        """Every copy of the same physical leaf node, over all boxes of all
+        slabs (side-by-side leaves, and the two overlapping slabs), matched by
+        (x mod 1, y): leaf corners only (SSLABLU_VERTEX_ETA) or every
+        leaf-boundary node (SSLABLU_EDGE_DSS). Returns per-slab (box, node)
+        index arrays, their group ids, and the group sizes."""
+        r9 = lambda v: round(float(v), 9)
+        key2g, out = {}, []
+        for s in self.sl:
+            bb, jj, gg = [], [], []
+            for b, (uxn, uyn, ix, iy) in enumerate(s.box_meta):
+                onx = (ix == 0) | (ix == len(uxn) - 1)
+                ony = (iy == 0) | (iy == len(uyn) - 1)
+                for j in np.where((onx & ony) if corners_only else (onx | ony))[0]:
+                    key = (r9(r9(s.gx[b, j, 0]) % 1.0), r9(s.gx[b, j, 1]))
+                    gg.append(key2g.setdefault(key, len(key2g)))
+                    bb.append(b); jj.append(j)
+            out.append((np.array(bb), np.array(jj), np.array(gg)))
+        cnt = np.bincount(np.concatenate([g for _, _, g in out]), minlength=len(key2g))
+        return out, cnt.astype(float)
+
+    @staticmethod
+    def average_copies(fields, groups):
+        """In place: every copy of a node (copy_groups) gets the mean over its
+        copies. Equal weights: each node has as many copies on either side of a
+        leaf edge (the slab overlap doubles both sides alike)."""
+        per_slab, cnt = groups
+        tot = np.zeros(len(cnt))
+        for F, (bb, jj, gg) in zip(fields, per_slab):
+            np.add.at(tot, gg, F[bb, jj])
+        mean = tot / cnt
+        for F, (bb, jj, gg) in zip(fields, per_slab):
+            F[bb, jj] = mean[gg]
 
     def solve(self, rhs):
         """Interface system (I + S) u = rhs with the stored factorization."""
@@ -1072,14 +1117,21 @@ class ChannelModel:
 
         # ---- reconstruction + velocity update -----------------------------
         tic = time.perf_counter()
+        etas = []
         for i, s in enumerate(self.sl):
             kl, kr = self.connectivity[i]
             ul = uhat[kl * self.nc:(kl + 1) * self.nc]
             ur = uhat[kr * self.nc:(kr + 1) * self.nc]
-            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i])
-            self.u[i] = ustars[i] - gdtL * s.gradx(eta_new)
-            self.v[i] = vstars[i] - gdtL * s.grady(eta_new)
-            self.eta[i] = eta_new
+            etas.append(s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i]))
+        if VERTEX_ETA:      # one eta per leaf vertex, before it enters the gradients
+            self.average_copies(etas, self.vtx_groups)
+        for i, s in enumerate(self.sl):
+            self.u[i] = ustars[i] - gdtL * s.gradx(etas[i])
+            self.v[i] = vstars[i] - gdtL * s.grady(etas[i])
+            self.eta[i] = etas[i]
+        if EDGE_DSS:        # one u, v per leaf-boundary node
+            self.average_copies(self.u, self.dss_groups)
+            self.average_copies(self.v, self.dss_groups)
         t_rec = time.perf_counter() - tic
 
         self.t = tnew
@@ -1276,6 +1328,12 @@ if SOLVER == "rbhbs":
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
+# conservation tests: leaf corners are not dofs, so each leaf extrapolates its
+# corner eta along its own x-row (SlabSolve.cfix) and a vertex shared by
+# side-by-side leaves gets two values; and every leaf carries its own copy of
+# the velocity on its edges. Each switch removes one of the two.
+VERTEX_ETA = os.environ.get("SSLABLU_VERTEX_ETA", "0") != "0"
+EDGE_DSS   = os.environ.get("SSLABLU_EDGE_DSS", "0") != "0"
 # flux_budget() return order, as contributions to the step's volume change dM [m]
 BUDGET_COLS = ["dM", "steric", "res_interior", "res_edge", "res_wall", "res_corner",
                "product_rule", "wall_noncorner", "wall_corner", "jump_noncorner_x",
@@ -1312,12 +1370,13 @@ ell2 = ell * ell
 # overwrite each other
 SOLVER_TOKEN = {"rb": "_rb", "rbhbs": "_rbhbs_rbrk%d" % RB_RK, "thomas": ""}[SOLVER]
 SOLVER_NAME  = {"rb": "red-black", "rbhbs": "HBS red-black", "thomas": "Thomas"}[SOLVER]
-graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s" % (
+graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s%s%s" % (
     "fluxbudget" if FLUXBUDGET else "channel",
     p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "", SOLVER_TOKEN,
     dt, NSTEPS, "_neumann" if WALLS == "neumann" else "",
     "" if RIDGE_MIDPANEL else "_ridgectr",
-    ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "")
+    ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "",
+    "_vtx" if VERTEX_ETA else "", "_dss" if EDGE_DSS else "")
 SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
 
 
@@ -1351,6 +1410,10 @@ print("interface solver         = ", {
 if RK > 0:
     print("random-sketch seed       = ", RNG_SEED)
 print("output directory         = ", graph_directory)
+if VERTEX_ETA or EDGE_DSS:
+    print("conservation tests       = ", ", ".join(
+        t for t, on in (("one eta per leaf vertex (SSLABLU_VERTEX_ETA)", VERTEX_ETA),
+                        ("edge u, v copies averaged (SSLABLU_EDGE_DSS)", EDGE_DSS)) if on))
 if WALLS == "neumann":
     wtxt = "closed / no-normal-flow: Neumann walls, d eta/dn = n_y v* L/(g dt)"
 elif WALLS == "emulated":
