@@ -205,7 +205,7 @@ GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","0.0")) # steric relaxation 
 #             d eta/dn ~ 0; (2) v* tapered to 0 at the walls before div(H u*).
 #             Kept for comparison with neumann; to be removed.
 #   dirichlet Dirichlet SSH on the walls (wall_eta): open, not solid, walls
-WALLS = os.environ.get("SSLABLU_WALLS", "neumann").lower()
+WALLS = os.environ.get("SSLABLU_WALLS", "neumann").lower() # want "neumann"
 if WALLS not in ("neumann", "emulated", "dirichlet"):
     raise ValueError("SSLABLU_WALLS must be 'neumann', 'emulated' or 'dirichlet', got %r" % WALLS)
 if "SSLABLU_WALL_NOFLUX" in os.environ:
@@ -237,7 +237,7 @@ WALL_STERIC = os.environ.get("SSLABLU_WALL_STERIC", "1") != "0" # Default 1
 # These do NOT touch the operator/gate; they only reshape the explicit predictor
 # and wall data. For emulated walls they mitigate, not cure.
 SPONGE_W    = float(os.environ.get("SSLABLU_SPONGE_W",    "0.1"))
-SPONGE_RATE = float(os.environ.get("SSLABLU_SPONGE_RATE", "0.0"))
+SPONGE_RATE = float(os.environ.get("SSLABLU_SPONGE_RATE", "0.0")) #"0.0 default for neumann"
 WALL_RELAX  = float(os.environ.get("SSLABLU_WALL_RELAX",  "1.0"))
 # Diagnostic: seed a finite grid-scale wall perturbation in the IC (0 = off) so
 # the wall-mode growth factor |G| can be read off a short run.
@@ -1109,7 +1109,7 @@ class ChannelModel:
 ################################################################
 
 N        = int(os.environ.get("SSLABLU_N", "8"))
-p        = int(os.environ.get("SSLABLU_P", "12"))
+p        = int(os.environ.get("SSLABLU_P", "16"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
 dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.125"))

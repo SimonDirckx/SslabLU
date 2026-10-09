@@ -184,7 +184,7 @@ end
 
 # ---- run --------------------------------------------------------------------
 arch = CPU()
-Δt   = 225            # 900 s (SslabLU dt = 0.25 h); the implicit free
+Δt   = 112.5            # 900 s (SslabLU dt = 0.25 h); the implicit free
                             # surface removes the fast-gravity-wave CFL limit
 
 # one output directory per configuration (see the header), so runs don't
