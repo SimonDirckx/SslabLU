@@ -139,6 +139,17 @@
 #                      the HBS leaf size). Independent of SSLABLU_RK, the
 #                      ASSEMBLER rank: two separate knobs.
 #   SSLABLU_RNG_SEED   seed for the randomized HBS sketches     (default 0)
+#   SSLABLU_GPU        1 = slab leaf ops (DtN assembly, body loads, leaf
+#                      solves) on CUDA via hpsalt's reduced_gpu (default 0);
+#                      with SSLABLU_SOLVER=rbhbs also the interface solver
+#                      (omsdirectsolveHBS_torch, blocks resident on the GPU).
+#                      The slab sparse factorizations (MUMPS), the S-map
+#                      formation/sketching through them and the dense rb /
+#                      thomas solvers stay on CPU. HBS compression of the
+#                      S-maps (SSLABLU_RK > 0) uses cuda:0 whenever CUDA is
+#                      available, independent of this flag.
+#                      Needs a torch build with kernels for the GPU (V100:
+#                      the sslabluenv_gpu env; check with test/gpu_check.py).
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
@@ -465,16 +476,16 @@ class SlabSolve:
         # the wrapper hands these back as torch tensors; everything downstream
         # here is numpy
         if torch.is_tensor(self.XXi):
-            self.XXi = self.XXi.detach().numpy()
+            self.XXi = self.XXi.detach().cpu().numpy()
         if torch.is_tensor(self.XXb):
-            self.XXb = self.XXb.detach().numpy()
+            self.XXb = self.XXb.detach().cpu().numpy()
 
         dd = self.sv.solver                       # hpsalt Domain_Driver
         self.dd = dd
-        self.gx = dd.hps.grid_xx.detach().numpy() # (nboxes, p^2, 2), global coords
+        self.gx = dd.hps.grid_xx.detach().cpu().numpy() # (nboxes, p^2, 2), global coords
         self.nb, self.pp2 = self.gx.shape[0], self.gx.shape[1]
-        self.D1 = dd.hps.H.Ds[3].detach().numpy() # leaf d/dx
-        self.D2 = dd.hps.H.Ds[4].detach().numpy() # leaf d/dy
+        self.D1 = dd.hps.H.Ds[3].detach().cpu().numpy() # leaf d/dx
+        self.D2 = dd.hps.H.Ds[4].detach().cpu().numpy() # leaf d/dy
 
         # the leaf-grid flattening must match solve_dir_full's output ordering
         assert np.allclose(np.asarray(self.sv.XXfull), self.gx.reshape(-1, 2)), \
@@ -631,7 +642,7 @@ class SlabSolve:
         g = torch.from_numpy(g[:, np.newaxis])
         with redirect_stdout(io.StringIO()):   # mute per-solve residual prints
             uu = self.sv.solver.solve_dir_full(g, ff_body=fvec, uu_neu=gN)
-        uu = uu.detach().numpy() if torch.is_tensor(uu) else np.asarray(uu)
+        uu = uu.detach().cpu().numpy() if torch.is_tensor(uu) else np.asarray(uu)
         uu = uu.real.reshape(self.nb, self.pp2)
         for b in range(self.nb):               # repair the non-dof leaf corners
             for corner, row, w in self.cfix[b]:
@@ -834,8 +845,10 @@ class ChannelModel:
                 raise RuntimeError("HBS cluster trees differ between interfaces, so "
                                    "slab 0's tree cannot serve every block")
             self.rbhbs = omsdirectsolveHBS.RedBlackSolverHBS(
-                self.nc, RB_RK, tree0, S_list[0][0].quad, cyclic=True, seed=RNG_SEED)
-            self.rbhbs.factorize(S_list)     # T=None: identity-diagonal fast paths
+                self.nc, RB_RK, tree0, S_list[0][0].quad, cyclic=True, seed=RNG_SEED,
+                **({"device": "cuda"} if GPU else {}))
+            with redirect_stdout(io.StringIO()):   # torch variant prints per level
+                self.rbhbs.factorize(S_list)       # T=None: identity-diagonal fast paths
         else:
             self.T, self.smw = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
                 self.OMS, S_list, rhs0, self.Ntot, self.nc)
@@ -913,7 +926,9 @@ class ChannelModel:
             with redirect_stdout(io.StringIO()):   # RedBlackSolver.solve prints
                 return np.asarray(self.rb.solve(rhs)).ravel()
         if SOLVER == "rbhbs":
-            return np.asarray(self.rbhbs.solve(rhs)).ravel()
+            with redirect_stdout(io.StringIO()):
+                x = self.rbhbs.solve(rhs)
+            return (x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)).ravel()
         return omsdirectsolve.block_cyclic_tridiagonal_solve(
             self.OMS, self.T, self.smw, rhs)
 
@@ -1251,6 +1266,9 @@ RK       = int(os.environ.get("SSLABLU_RK", "0"))       # ASSEMBLER rank; 0 = de
 SOLVER   = os.environ.get("SSLABLU_SOLVER", "rb").lower()  # rb | rbhbs | thomas
 RB_RK    = int(os.environ.get("SSLABLU_RB_RK", str(p)))  # rbhbs SOLVER rank (not RK)
 RNG_SEED = int(os.environ.get("SSLABLU_RNG_SEED", "0"))
+GPU      = os.environ.get("SSLABLU_GPU", "0") != "0"     # hpsalt reduced_gpu
+if GPU and not torch.cuda.is_available():
+    raise ValueError("SSLABLU_GPU=1 but torch.cuda.is_available() is False")
 if SOLVER not in ("rb", "rbhbs", "thomas"):
     raise ValueError("SSLABLU_SOLVER must be 'rb', 'rbhbs' or 'thomas', got %r" % SOLVER)
 if SOLVER in ("rb", "rbhbs") and (N < 2 or N & (N - 1)):
@@ -1272,7 +1290,10 @@ if SOLVER == "rbhbs":
     # invalid escape sequence, which warns whenever the module is recompiled
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
-        import direct_solve.omsdirectsolveHBS as omsdirectsolveHBS
+        if GPU:   # same RedBlackSolverHBS API, torch arithmetic on compute_device
+            import direct_solve.omsdirectsolveHBS_torch as omsdirectsolveHBS
+        else:
+            import direct_solve.omsdirectsolveHBS as omsdirectsolveHBS
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
@@ -1301,7 +1322,7 @@ if RIDGE_MIDPANEL and abs(crest_frac - 0.5) > 0.25:
           "fraction %.2f for N = %d, npan_x = %d (not mid-panel)"
           % (RIDGE_XC, crest_frac, N, npan_x))
 # Neumann walls are faces of every slab solver (S-map assembly, kept slabs, gate)
-opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a,
+opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a, reduced_gpu=GPU,
                                 bc_types=NEUMANN_WALLS if WALLS == "neumann" else None)
 
 dt   = 3600.0 * dt_hours
@@ -1346,10 +1367,13 @@ print("S-map assembler          = ",
       ("HBS rk = %d  (SSLABLU_RK)" % RK) if RK > 0 else "dense")
 print("interface solver         = ", {
       "rb":     "cyclic red-black (dense)",
-      "rbhbs":  "cyclic red-black, HBS rk = %d  (SSLABLU_RB_RK)" % RB_RK,
+      "rbhbs":  "cyclic red-black, HBS rk = %d  (SSLABLU_RB_RK)%s"
+                % (RB_RK, ", torch on GPU" if GPU else ""),
       "thomas": "cyclic block-Thomas + SMW (dense)"}[SOLVER])
 if RK > 0:
     print("random-sketch seed       = ", RNG_SEED)
+print("slab leaf ops            = ",
+      ("GPU, %s  (SSLABLU_GPU)" % torch.cuda.get_device_name()) if GPU else "CPU")
 print("output directory         = ", graph_directory)
 if WALLS == "neumann":
     wtxt = "closed / no-normal-flow: Neumann walls, d eta/dn = n_y v* L/(g dt)"
