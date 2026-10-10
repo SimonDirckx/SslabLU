@@ -193,7 +193,7 @@ LCHAN    =  1.0e6         # channel width Ly [m]; domain nondimensionalized by t
 RIDGE_HR =  0.8           # ridge height as a fraction of H0
 RIDGE_KB =  40.0          # von-Mises concentration: larger = narrower ridge
 # Ridge crest position x/L. With the crest at 0.5 it sits exactly on slab
-# interface N/2 AND on a leaf-panel edge. SSLABLU_RIDGE_MIDPANEL=1 (default)
+# interface N/2 AND on a leaf-panel edge. SSLABLU_RIDGE_MIDPANEL=1 (default 0)
 # shifts it by half a panel, 1/32, which is mid-panel for the default
 # N * npan_x = 16 (panel edges at multiples of 2/(N*npan_x); checked below).
 # SSLABLU_RIDGE_MIDPANEL=0 restores the centered ridge. The SAME env var is
