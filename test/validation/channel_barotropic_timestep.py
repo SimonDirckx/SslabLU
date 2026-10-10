@@ -198,7 +198,7 @@ RIDGE_KB =  40.0          # von-Mises concentration: larger = narrower ridge
 # N * npan_x = 16 (panel edges at multiples of 2/(N*npan_x); checked below).
 # SSLABLU_RIDGE_MIDPANEL=0 restores the centered ridge. The SAME env var is
 # read by reentrant_channel_sslablu.jl, so one setting drives both models.
-RIDGE_MIDPANEL = os.environ.get("SSLABLU_RIDGE_MIDPANEL", "1") != "0"
+RIDGE_MIDPANEL = os.environ.get("SSLABLU_RIDGE_MIDPANEL", "0") != "0"
 RIDGE_XC = 0.5 + (1.0 / 32.0 if RIDGE_MIDPANEL else 0.0)
 FCOR     = -1.0e-4        # Coriolis parameter [1/s] (explicit; needs |FCOR|*dt < 2)
 RHO0     =  1025.0        # reference seawater density [kg/m^3]
@@ -1242,7 +1242,7 @@ class ChannelModel:
 ################################################################
 
 N        = int(os.environ.get("SSLABLU_N", "8"))
-p        = int(os.environ.get("SSLABLU_P", "16"))
+p        = int(os.environ.get("SSLABLU_P", "8"))
 npan_x   = int(os.environ.get("SSLABLU_NPAN_X", "4"))   # keep EVEN
 npan_y   = int(os.environ.get("SSLABLU_NPAN_Y", "8"))
 dt_hours = float(os.environ.get("SSLABLU_DT_H", "0.125"))
