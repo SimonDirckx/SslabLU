@@ -1483,6 +1483,8 @@ class oms:
                     err = self._block_error(st, mat, assembler)
                     print("%s ERR (reference slab %d) = " % (label, self._ref_ind), err)
                 self._ref_hbs[side] = (mat, ratio, err)
+                if hasattr(mat,"evict"):
+                    mat.evict()
                 del st
 
         if self.keepLU and len(Il) > 0 and len(Ir) > 0:

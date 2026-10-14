@@ -568,6 +568,11 @@ class solverWrapper:
             self.solver=solver
             if self.opts.reduced_gpu:
                 self.solver.build("reduced_gpu", "MUMPS", verbose=verbose)
+                import gc, torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
             else:
                 self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
