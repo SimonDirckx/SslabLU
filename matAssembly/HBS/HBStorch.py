@@ -629,7 +629,7 @@ def construct_D(U, V, M_om, M_psi):
     return P + torch.bmm(U, Gk.mT)
 
 
-def _uv_side(A, B, k, fast):
+def _uv_side(A, B, k, fast): 
     """One half of a level's basis computation.
 
     Returns (U, M): U the leading k left singular vectors of B (I - A^+ A),
