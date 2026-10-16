@@ -122,13 +122,13 @@ tic = time.time()
 w = Stot_lu@v
 print("LU apply time = ",time.time()-tic)
 
-tic=time.time()
-if Version(scipy.__version__)>=Version("1.14"):
-    uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-else:
-    uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-print("elapsed time gmres = ",time.time()-tic)
-print("pGMRES iters rb          = ", gInfo.niter)
+#tic=time.time()
+#if Version(scipy.__version__)>=Version("1.14"):
+#    uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+#else:
+#    uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+#print("elapsed time gmres = ",time.time()-tic)
+#print("pGMRES iters rb          = ", gInfo.niter)
 v = np.random.default_rng(0).standard_normal(Ntot)
 y1 = Sinv_HBS_rb@v; y2 = Sinv_HBS_rb@v
 print(np.linalg.norm(y1 - y2) / np.linalg.norm(y1))
@@ -138,21 +138,21 @@ y4 = Stot_lu@v
 y5 = Stot_HBS@v
 print("precond vs LU",np.linalg.norm(y4-y5)/np.linalg.norm(y4))
 print("precond vs LU (backward)",np.linalg.norm(v-Sinv_HBS_rb@(Stot_lu@v))/np.linalg.norm(v))
-for slabInd in range(len(dSlabs)):
-    gc_HBS = uhat[slabInd*nc:(slabInd+1)*nc]
-    geom    = np.array(dSlabs[slabInd])
-    slab_i  = oms.slab(geom,lambda p : cube.gb(p,False,True))
-    solver  = oms.solverWrap.solverWrapper(opts)
-    solver.construct(geom,Helm,False,True)
-    Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
-    XXc = XXi[Ic,:]
-    gc = bc(XXc).detach().cpu().numpy()
-    g_from_solver = -solver.solver_ii@(solver.Aib@(bc(XXb).detach().cpu().numpy()))
-    err = np.linalg.norm(gc_HBS-gc,ord=np.inf)
-    err_ii = np.linalg.norm(gc-g_from_solver[Ic],ord=np.inf)
-    err_HBS_vs_ii = np.linalg.norm(gc_HBS-g_from_solver[Ic],ord=np.inf)
-    print("===================LOCAL ERR===================")
-    print("err = ",err)
-    print("err_ii = ",err_ii)
-    print("err_HBS_vs_ii = ",err_HBS_vs_ii)
-    print("===============================================")
+#for slabInd in range(len(dSlabs)):
+#    gc_HBS = uhat[slabInd*nc:(slabInd+1)*nc]
+#    geom    = np.array(dSlabs[slabInd])
+#    slab_i  = oms.slab(geom,lambda p : cube.gb(p,False,True))
+#    solver  = oms.solverWrap.solverWrapper(opts)
+#    solver.construct(geom,Helm,False,True)
+#    Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+#    XXc = XXi[Ic,:]
+#    gc = bc(XXc).detach().cpu().numpy()
+#    g_from_solver = -solver.solver_ii@(solver.Aib@(bc(XXb).detach().cpu().numpy()))
+#    err = np.linalg.norm(gc_HBS-gc,ord=np.inf)
+#    err_ii = np.linalg.norm(gc-g_from_solver[Ic],ord=np.inf)
+#    err_HBS_vs_ii = np.linalg.norm(gc_HBS-g_from_solver[Ic],ord=np.inf)
+#    print("===================LOCAL ERR===================")
+#    print("err = ",err)
+#    print("err_ii = ",err_ii)
+#    print("err_HBS_vs_ii = ",err_HBS_vs_ii)
+#    print("===============================================")

@@ -273,8 +273,9 @@ def _null_col_pinv(Om, Y, k, sel=None):
     R = Vh[..., :n, :].triu()
     W  = torch.ormqr(Vh, tau, Y.mT, left=True, transpose=True).mT
     M  = tla.solve_triangular(R, W[..., :n].mT, upper=True).mT
-    Yp = W[..., n:] 
-    U = tla.svd(Yp, full_matrices=False,driver = 'gesvda').U[..., :k]
+    Yp = W[..., n:]
+    driver='gesvda' if Yp.is_cuda else None
+    U = tla.svd(Yp, full_matrices=False,driver = driver).U[..., :k]
     return U.contiguous(), M
 
 
@@ -322,6 +323,99 @@ def _level_rest(B, M, X, S, nside, outX, outS):
         torch.baddbmm(torch.bmm(B[t].mT, S[t]), G[t], X[t], alpha=-1.0,
                       out=outS[t])
     return D, outX, outS
+
+
+# ---------------------------------------------------------------------------
+# ULV factorization kernels: one chunk of blocks, batched, no host syncs
+# ---------------------------------------------------------------------------
+#
+# Level by level (same arithmetic as ULVsparse.compute_ULV), for a chunk of
+# c blocks with n rows and rank k, m = n - k, and the carries Uhat, R22 of
+# the chunk's fac*c children (None at the leaf):
+#
+#     R'  = D                                       (leaf)
+#         = blkdiag(Uhat) D + blkdiag(R22)          (above)
+#     Uh  = U  or  blkdiag(Uhat) U
+#     W1  = complement of range(V)                  (n x m)
+#     Q R = R' [W1 | V]                             (Householder QR, n x n)
+#     Ru  = R[:m, :],   R22' = R[m:, m:]            (stored / carried)
+#     [Uu; Ud] = Q^T Uh                             (stored / carried)
+#
+# and at the root  Q R = blkdiag(Uhat) D + blkdiag(R22)  (D at a 1-level tree).
+
+def _bd_mult(Uhat_c, X):
+    """blkdiag(Uhat_c) X per block: Uhat_c (c*fac, kc, kc), X (c, fac*kc, p)
+    -> (c, fac*kc, p).  Row stripe j of block i is Uhat_c[fac*i + j] times
+    X[i]'s stripe j, so it is one bmm over a reshape (no zeros multiplied)."""
+    cf, kc, _ = Uhat_c.shape
+    c, nr, p = X.shape
+    return torch.bmm(Uhat_c, X.reshape(cf, kc, p)).reshape(c, nr, p)
+
+
+def _bd_add_(A, R22_c):
+    """A += blkdiag(R22_c) in place: A (c, fac*kc, fac*kc) contiguous,
+    R22_c (c*fac, kc, kc), child j of block i on A[i]'s diagonal block j."""
+    c, nr, _ = A.shape
+    cf, kc, _ = R22_c.shape
+    fac = cf // c
+    A.view(c, fac, kc, fac, kc).diagonal(dim1=1, dim2=3).add_(
+        R22_c.reshape(c, fac, kc, kc).permute(0, 2, 3, 1))
+    return A
+
+
+def _complement(V):
+    """(c, n, n-k) orthonormal basis of range(V)^perp, for V (c, n, k) with
+    orthonormal columns: the trailing n-k columns of V's complete Householder
+    Q, obtained by applying the reflectors to [0; I] instead of forming the
+    n x n Q (ULVsparse.block_qr_tens forms it and discards k columns)."""
+    c, n, k = V.shape
+    Hv, tv = torch.geqrf(V)
+    E = torch.zeros(n, n - k, dtype=V.dtype, device=V.device)
+    E[k:].fill_diagonal_(1.0)
+    return torch.ormqr(Hv, tv, E.expand(c, n, n - k))
+
+
+def _ulv_chunk(D, U, V, Uhat_c, R22_c):
+    """ULV step for a chunk of non-root blocks.  D (c, n, n), U, V (c, n, k)
+    on the device; Uhat_c, R22_c (fac*c, kc, kc) the children's carries, or
+    None at the leaf.  D, U, V are not written.
+
+    Returns (Q, W1, Ru, Uu, Ud, R22): stored Q (c, n, n), W1 (c, n, m),
+    Ru (c, m, n), Uu (c, m, k); carried Ud, R22 (c, k, k).  All contiguous."""
+    c, n, k = V.shape
+    m = n - k
+    if Uhat_c is None:
+        Rp, Uh = D, U
+    else:
+        Rp = _bd_add_(_bd_mult(Uhat_c, D), R22_c)        # fresh, so in place
+        Uh = _bd_mult(Uhat_c, U)
+    # R' [W1 | V] straight into one buffer: no complete Q of V, no concat
+    RW = torch.empty((c, n, n), dtype=D.dtype, device=D.device)
+    if m:
+        W1 = _complement(V)
+        RW[:, :, :m] = torch.bmm(Rp, W1)
+    else:
+        W1 = V.new_empty((c, n, 0))
+    RW[:, :, m:] = torch.bmm(Rp, V)
+    del Rp
+    Q, R = torch.linalg.qr(RW)
+    del RW
+    Ru  = R[:, :m, :].contiguous()
+    R22 = R[:, m:, m:].contiguous()
+    del R
+    C = torch.bmm(Q.mT, Uh)                              # [Uu; Ud] in one bmm
+    # Q comes back column-major from the solver; row-major makes its
+    # download one DMA into the master view
+    return (Q.contiguous(), W1, Ru, C[:, :m].contiguous(),
+            C[:, m:].contiguous(), R22)
+
+
+def _ulv_root(D, Uhat_c, R22_c):
+    """(Q, R) of the root blocks: QR of blkdiag(Uhat) D + blkdiag(R22), or of
+    D itself in a tree with no levels below the root."""
+    Rp = D if Uhat_c is None else _bd_add_(_bd_mult(Uhat_c, D), R22_c)
+    Q, R = torch.linalg.qr(Rp)
+    return Q.contiguous(), R.contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +883,7 @@ class HBSMAT:
                 Om, Psi, Y, Z = (np.asarray(X)[pr] for X in (Om, Psi, Y, Z))
         self.constructHBS(rk, Om, Psi, Y, Z, fast=fast, with_ulv=compute_ULV)
 
-    def _chunk_blocks(self, Nb, n, s, k=None, depth=1):
+    def _chunk_blocks(self, Nb, n, s, k=None, depth=1, ulv=False):
         """(blocks per chunk, device bytes of that chunk's working set).
 
         Per block, in elements.  A non-root level (k given), both sides:
@@ -798,15 +892,18 @@ class HBSMAT:
         temporaries 6ks, with ~ns slack for cuSOLVER workspace.  The root
         (k None), one side: inputs 2ns, geqrf + Q1 2ns, n^2 each for Y Q1, D,
         a temporary.  The depth-1 other chunks in flight hold their inputs and
-        outputs.  Deliberately rough; _CHUNK_BYTES is the knob."""
+        outputs.  With ulv, a level adds R', R'[W1|V], Q, R, W1 and Q^T Uh
+        (~6n^2) and keeps Q, W1, Ru in flight (~3n^2); the root adds R', Q, R.
+        Deliberately rough; _CHUNK_BYTES is the knob."""
         item = torch.finfo(self.dtype_t).bits // 8
         if k is None:
-            per = 4 * n * s + 3 * n * n
-            fly = 2 * n * s + n * n
+            per = 4 * n * s + 3 * n * n + (3 * n * n if ulv else 0)
+            fly = 2 * n * s + n * n + (2 * n * n if ulv else 0)
         else:
             per = (7 * n * s + 2 * s * (n + k) + 2 * n * (n + k)
-                   + 5 * n * n + 4 * n * k + 6 * k * s)
-            fly = 4 * n * s + 2 * n * k + n * n
+                   + 5 * n * n + 4 * n * k + 6 * k * s
+                   + (6 * n * n if ulv else 0))
+            fly = 4 * n * s + 2 * n * k + n * n + (3 * n * n if ulv else 0)
         per_b = item * (per + (depth - 1) * fly)
         c = Nb
         if _CHUNK_BYTES[0]:
@@ -853,11 +950,13 @@ class HBSMAT:
         the next level.  At the root, D = Y Om^+ (unpivoted QR).
 
         Requires s >= n + k at every level and s >= n at the root; Om blocks
-        are assumed to have full row rank (unpivoted QR)."""
-        if with_ulv:
-            raise NotImplementedError(
-                "constructHBS(with_ulv=True) is not ported to the new "
-                "construction yet; build without it")
+        are assumed to have full row rank (unpivoted QR).
+
+        with_ulv: also compute the ULV factorization (Qlist, Wlist, Rlist,
+        Uulist, NNvec; see _ulv_chunk), in the same chunks, while each chunk's
+        D, U, V are still on the device.  The carries Uhat, R22 ((Nb_i, k, k)
+        per level) stay on the device from one level to the next; the factors
+        go to a second host master ('ulv'), like U, V, D."""
         tic_compress = time.time()
         dev = torch.device(self.compute_device)
         dt  = self.dtype_t
@@ -879,18 +978,31 @@ class HBSMAT:
             raise ValueError(f"undersampled: s={s} < n={n_r} at the root")
         self.Nbvec    = [lv[0] for lv in levels] + [Nb_r]
         self.nSamples = s
-        self.NNvec    = np.zeros(1, dtype=np.int64)
+        NN = [0]
+        if with_ulv:                        # ULVsparse bookkeeping
+            for (Nb_i, n, k) in levels:
+                NN.append(NN[-1] + (n - k) * Nb_i)
+            NN.append(NN[-1] + Nb_r * n_r)
+        self.NNvec = np.asarray(NN, dtype=np.int64)
 
-        # ---- host master, allocated once, filled as factors appear --------
+        # ---- host masters, allocated once, filled as factors appear -------
         self._dev.clear()
         rec, lists = _new_master(_core_layout(levels, root), dt)
         self._host['core'] = rec
-        self._host['ulv']  = None
         for nm, lst in lists.items():
             setattr(self, nm, lst)
-        for nm in self._GROUPS['ulv']:
-            setattr(self, nm, [])
         pin = rec['bufs'][dt].registered
+        if with_ulv:
+            rec, lists = _new_master(_ulv_layout(levels, root), dt)
+            self._host['ulv'] = rec
+            for nm, lst in lists.items():
+                setattr(self, nm, lst)
+            pin_ulv = rec['bufs'][dt].registered
+        else:
+            self._host['ulv'] = None
+            for nm in self._GROUPS['ulv']:
+                setattr(self, nm, [])
+        Uhat = R22 = None                   # ULV carries of the level below
 
         pipe = _Pipe(dev, _PIPE_DEPTH[0])
         item = torch.finfo(dt).bits // 8
@@ -903,10 +1015,15 @@ class HBSMAT:
         # ---- levels -------------------------------------------------------
         for i, (Nb_i, n, k) in enumerate(levels):
             nside = 1 if i == len(levels) - 1 else 2   # the root needs no Psi', Z'
-            c, ws = self._chunk_blocks(Nb_i, n, s, k, pipe.depth)
+            c, ws = self._chunk_blocks(Nb_i, n, s, k, pipe.depth, with_ulv)
+            if with_ulv:                    # this level's carries + the last
+                ws += 2 * item * k * k * (Nb_i + (Uhat.shape[0] if i else 0))
             spill = self._spill_next(2 * nside * Nb_i * k * s * item, ws)
             with pipe.on('comp'):
                 sel = _selector(s, n, k, dt, dev)
+                if with_ulv:
+                    Uhat_n = torch.empty((Nb_i, k, k), dtype=dt, device=dev)
+                    R22_n  = torch.empty((Nb_i, k, k), dtype=dt, device=dev)
                 if spill:
                     nxt = [host_pool.get(nside * Nb_i * k * s, dt)
                            .view(nside, Nb_i, k, s) for _ in range(2)]
@@ -938,10 +1055,20 @@ class HBSMAT:
                         None if spill else nxt[0][:, a:b],
                         None if spill else nxt[1][:, a:b])
                     pipe.toc('DTime', 'comp', t0)
-                    pipe.record('computed', j, 'comp')
                     del M, X, S, owned
-                    # with_ulv: the ULV step for this chunk goes here, while
-                    # D, U = B[0], V = B[1] are still on the device.
+                    F = ()
+                    if with_ulv:            # while D, U, V are on the device
+                        t0 = pipe.tic('comp')
+                        ch = slice(fac * a, fac * b)
+                        *F, Ud, R22c = _ulv_chunk(
+                            D, B[0], B[1],
+                            None if i == 0 else Uhat[ch],
+                            None if i == 0 else R22[ch])
+                        Uhat_n[a:b] = Ud
+                        R22_n[a:b] = R22c
+                        del Ud, R22c
+                        pipe.toc('tULV', 'comp', t0)
+                    pipe.record('computed', j, 'comp')
 
                 with pipe.on('d2h'):
                     pipe.wait('d2h', 'computed', j)
@@ -949,6 +1076,10 @@ class HBSMAT:
                     _put(self.Vmats[i][a:b], B[1], pin)
                     _put(self.Dmats[i][a:b], D, pin)
                     nD2H += B.nbytes + D.nbytes
+                    for nm, t in zip(('Qlist', 'Wlist', 'Rlist', 'Uulist'), F):
+                        _put(getattr(self, nm)[i][a:b], t, pin_ulv)
+                        nD2H += t.nbytes
+                    pipe.keep(F, 'd2h')
                     if spill:
                         for t in range(nside):
                             _put(nxt[0][t, a:b], Xn[t], True)
@@ -957,8 +1088,11 @@ class HBSMAT:
                         pipe.keep((Xn, Sn), 'd2h')
                     pipe.keep((B, D), 'd2h')
                     pipe.record('done', j, 'd2h')
-                del B, D, Xn, Sn
+                del B, D, Xn, Sn, F
 
+            if with_ulv:                    # this level's carries feed the next
+                Uhat, R22 = Uhat_n, R22_n
+                del Uhat_n, R22_n
             h2d += src.h2d_bytes
             if src is leaf_src:
                 src.Xs = None     # drop the leaf samples (the caller's, if boxed)
@@ -970,7 +1104,7 @@ class HBSMAT:
             del nxt, sel
 
         # ---- root: D = Y Om^+, chunked like a level -----------------------
-        c, _ = self._chunk_blocks(Nb_r, n_r, s, None, pipe.depth)
+        c, _ = self._chunk_blocks(Nb_r, n_r, s, None, pipe.depth, with_ulv)
         if src.on_host:
             pipe.wait_stream('h2d', 'd2h')
         for a in range(0, Nb_r, c):
@@ -987,17 +1121,27 @@ class HBSMAT:
                 t0 = pipe.tic('comp')
                 D = _pinv_right(X[0], S[0])
                 pipe.toc('blockSolveTime', 'comp', t0)
-                pipe.record('computed', j, 'comp')
                 del X, S, owned
+                F = ()
+                if with_ulv:
+                    t0 = pipe.tic('comp')
+                    ch = slice(fac * a, fac * b)
+                    F = _ulv_root(D, None if Uhat is None else Uhat[ch],
+                                  None if R22 is None else R22[ch])
+                    pipe.toc('tULV', 'comp', t0)
+                pipe.record('computed', j, 'comp')
             with pipe.on('d2h'):
                 pipe.wait('d2h', 'computed', j)
                 _put(self.Dmats[-1][a:b], D, pin)
                 nD2H += D.nbytes
-                pipe.keep((D,), 'd2h')
+                for nm, t in zip(('Qlist', 'Rlist'), F):
+                    _put(getattr(self, nm)[-1][a:b], t, pin_ulv)
+                    nD2H += t.nbytes
+                pipe.keep((D, *F), 'd2h')
                 pipe.record('done', j, 'd2h')
-            del D
+            del D, F
         h2d += src.h2d_bytes
-        src = None
+        src = Uhat = R22 = None
 
         # ---- finish: masters complete, then hand back host buffers --------
         timers = pipe.finish()

@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
-import matAssembly.HBS.HBStorch as HBSnew
+import matAssembly.HBS.HBStorch_new as HBSnew
 from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 import torch
