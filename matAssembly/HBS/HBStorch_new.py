@@ -56,10 +56,12 @@ _PIPE_DEPTH   = [3]        # chunks in flight in the construction pipeline
 _PINNED       = [0]        # bytes this module currently has page-locked
 _APPLY_CHUNK_BYTES = [256 << 20]  # device bytes per block chunk in _apply
                            # (factors + vector rows); 0 means one chunk per level
-_DX_ON_DEVICE = [None]     # _apply with a host output: keep D_leaf x on the
-                           # device between the sweeps?  None: if it fits in
-                           # the device budget; False: accumulate into the
-                           # output on the host instead (one more download)
+_DX_ON_DEVICE = [None]     # apply / solve with a host output: keep the leaf-
+                           # sized intermediate (apply: D_leaf x; solve: the
+                           # leaf's eliminated part) on the device between the
+                           # sweeps?  None: if it fits in the device budget;
+                           # False: park it on the host (apply: accumulate
+                           # into the output; solve: page-locked buffer)
 _STAGE_ON_CPU = [False]    # testing only: on a CPU compute device, route host
                            # vectors through the staging / deferred-scatter
                            # paths that CUDA uses
@@ -520,6 +522,22 @@ class _Pipe:
     def toc(self, attr, stream, t0):
         self.timers.append((attr, t0, self.tic(stream)))
 
+    def step(self, load, compute):
+        """One chunk through the pipeline: load(slot) runs on h2d and returns
+        the device tensors that compute(*tensors, slot) consumes on comp."""
+        j = self.begin()
+        with self.on('h2d'):
+            got = load(j)
+            self.record('loaded', j, 'h2d')
+        with self.on('comp'):
+            self.wait('comp', 'loaded', j)
+            self.keep(got, 'comp')
+            compute(*got, j)
+            self.record('computed', j, 'comp')
+        with self.on('d2h'):
+            self.wait('d2h', 'computed', j)
+            self.record('done', j, 'd2h')
+
     def finish(self):
         """Synchronize; returns {attr: seconds}."""
         self.drain()
@@ -716,6 +734,89 @@ class _RowIO:
                 i = None if g is None else g[r0:r1]
                 pipe.defer(lambda: self._write(T, i, r0, r1, buf, add))
         self.nbytes += y.nbytes
+
+
+class _Call:
+    """What one apply or solve shares: the caller's input X and output
+    target (2-D, rows in io order), their row gather, the pipe, factor
+    fetches, and the end of the call.
+
+      fetch(T, a, b)    blocks a:b of a factor on the compute device
+      rows(rows_max)    (xin, yout): _RowIO for X and for target
+      keep_on_device(e) may e more elements stay on the device?
+      end()             wait (host output or staging) or join, release"""
+
+    def __init__(self, hbs, X, target, io_perm):
+        self.hbs = hbs
+        self.dev = dev = torch.device(hbs.compute_device)
+        self.dt = hbs.dtype_t
+        self.item = torch.finfo(self.dt).bits // 8
+        self.X, self.target = X, target
+        self.ncol = X.shape[1]
+        stage_cpu = dev.type == 'cpu' and _STAGE_ON_CPU[0]
+        self.remote = lambda T: T.device.type == 'cpu' and (
+            dev.type != 'cpu' or stage_cpu)
+        self.g = hbs._io_index(io_perm)
+        self.g_dev = None
+        if self.g is not None and not (self.remote(X) and self.remote(target)):
+            self.g_dev = self.g.to(dev)     # a local vector is gathered there
+        self.pipe = _Pipe(dev, _PIPE_DEPTH[0])
+        self.step = self.pipe.step
+        self.nH2D = 0
+        self.extra = []                     # more _RowIO to release at the end
+
+    def fetch(self, T, a, b):
+        t = T[a:b]
+        if t.device == self.dev and t.dtype == self.dt:
+            return t
+        t = t.to(device=self.dev, dtype=self.dt, non_blocking=True)
+        self.nH2D += t.nbytes
+        return t
+
+    def chunk_blocks(self, Nb, per_block):
+        """Blocks per chunk for per_block elements of device memory each."""
+        cap = _APPLY_CHUNK_BYTES[0]
+        if not cap:
+            return Nb
+        return int(max(1, min(Nb, cap // (self.item * per_block))))
+
+    def rows(self, rows_max):
+        a = (self.dev, self.dt, self.pipe)
+        self.xin = _RowIO(self.X, self.g, self.g_dev, *a,
+                          self.remote(self.X), rows_max)
+        self.yout = _RowIO(self.target, self.g, self.g_dev, *a,
+                           self.remote(self.target), rows_max)
+        return self.xin, self.yout
+
+    def keep_on_device(self, elems):
+        if _DX_ON_DEVICE[0] is not None:
+            return bool(_DX_ON_DEVICE[0])
+        if self.dev.type != 'cuda':
+            return True
+        need = self.item * elems + self.pipe.depth * (_APPLY_CHUNK_BYTES[0] or 0)
+        return torch.cuda.memory_allocated(self.dev) + need <= device_budget(self.dev)
+
+    def host_rows(self, nrows, rows_max):
+        """A page-locked host (nrows, ncol) buffer in tree order, accessed
+        like the caller's vectors (get / put of row ranges)."""
+        H = host_pool.get(nrows * self.ncol, self.dt).view(nrows, self.ncol)
+        io = _RowIO(H, None, None, self.dev, self.dt, self.pipe, True, rows_max)
+        self.extra.append((io, H))
+        return io
+
+    def end(self):
+        if self.yout.remote or self.xin.stage or self.extra:
+            self.pipe.drain()           # host results complete, staging free
+        else:
+            self.pipe.join()            # device result: no host sync
+        for io in (self.xin, self.yout, *(e[0] for e in self.extra)):
+            io.release()
+        for _, H in self.extra:
+            host_pool.put(H.view(-1))
+        if self.pipe.cuda:
+            parked = sum(e[0].nbytes for e in self.extra) // 2   # down + up
+            self.hbs.bytesH2D += self.nH2D + self.xin.nbytes + parked
+            self.hbs.bytesD2H += self.yout.nbytes + parked
 
 
 
@@ -1246,39 +1347,13 @@ class HBSMAT:
         device, or when it fits (_DX_ON_DEVICE); otherwise D0 x is written
         into the output on the host during the up sweep and U0 u added to it
         during the down sweep.  No column chunking: all columns at once."""
-        if v.ndim not in (1, 2):
-            raise ValueError(f"expected 1-D or 2-D input, got ndim={v.ndim}")
         what = 'rmatmat' if transpose else 'matmat'
-        if not self.Dmats:
-            raise RuntimeError(f"{what}: the HBS matrix is not constructed")
-        numpy_input = isinstance(v, np.ndarray)
-        was_vector = v.ndim == 1
-        X = self._as_2d(v)
-        m = int(self.shape[0])
-        if X.shape[0] != m:
-            raise ValueError(f"{what}: expected {m} rows, got {X.shape[0]}")
-        dev = torch.device(self.compute_device)
-        dt = self.dtype_t
-        item = torch.finfo(dt).bits // 8
-        ncol = X.shape[1]
-
-        # ---- output; beta * C goes into it up front -----------------------
-        if out is None:
-            if beta != 0.0 and C is None:
-                raise ValueError(f"{what}: beta != 0 needs out or C")
-            target = torch.empty((m, ncol), dtype=dt,
-                                 device=_HOST if numpy_input else dev)
-        else:
-            target = self._as_2d(out)
-            if tuple(target.shape) != (m, ncol):
-                raise ValueError(f"{what}: out has shape {tuple(target.shape)}"
-                                 f", expected {(m, ncol)}")
-            if (target.device == X.device and target.untyped_storage()
-                    .data_ptr() == X.untyped_storage().data_ptr()):
-                raise ValueError(f"{what}: out must not share memory with v")
+        if out is None and beta != 0.0 and C is None:
+            raise ValueError(f"{what}: beta != 0 needs out or C")
+        X, target, ret = self._vectors(v, out, what, alias_ok=False)
+        m, ncol = X.shape
         if ncol == 0:
-            return out if out is not None else (
-                target.numpy() if numpy_input else target)
+            return ret()
         if beta != 0.0:
             if C is not None and C is not out:
                 Cm = self._as_2d(C)
@@ -1290,14 +1365,8 @@ class HBSMAT:
                 target.mul_(beta)
         add0 = beta != 0.0       # does the first write to a row accumulate?
 
-        # ---- where the caller's vectors are, and the row gather -----------
-        stage_cpu = dev.type == 'cpu' and _STAGE_ON_CPU[0]
-        remote = lambda T: T.device.type == 'cpu' and (dev.type != 'cpu'
-                                                       or stage_cpu)
-        g = self._io_index(io_perm)
-        g_dev = None
-        if g is not None and not (remote(X) and remote(target)):
-            g_dev = g.to(dev)        # a local vector is gathered on the device
+        call = _Call(self, X, target, io_perm)
+        dev, dt, fetch, step = call.dev, call.dt, call.fetch, call.step
 
         # ---- level geometry -----------------------------------------------
         nlev = len(self.Dmats) - 1
@@ -1308,43 +1377,11 @@ class HBSMAT:
         Dop = (lambda D: D.mT) if transpose else (lambda D: D)
 
         def chunk_blocks(Nb, n, k):
-            per = item * (n * n + n * k + 3 * n * ncol + k * ncol)
-            if not _APPLY_CHUNK_BYTES[0]:
-                return Nb
-            return int(max(1, min(Nb, _APPLY_CHUNK_BYTES[0] // per)))
-
-        pipe = _Pipe(dev, _PIPE_DEPTH[0])
-        nH2D = 0
-
-        def fetch(T, a, b):
-            nonlocal nH2D
-            t = T[a:b]
-            if t.device == dev and t.dtype == dt:
-                return t
-            t = t.to(device=dev, dtype=dt, non_blocking=True)
-            nH2D += t.nbytes
-            return t
-
-        def step(load, compute):
-            """One chunk through the pipeline: load() on h2d returns the
-            device tensors compute(*tensors, slot) consumes on comp."""
-            j = pipe.begin()
-            with pipe.on('h2d'):
-                got = load(j)
-                pipe.record('loaded', j, 'h2d')
-            with pipe.on('comp'):
-                pipe.wait('comp', 'loaded', j)
-                pipe.keep(got, 'comp')
-                compute(*got, j)
-                pipe.record('computed', j, 'comp')
-            with pipe.on('d2h'):
-                pipe.wait('d2h', 'computed', j)
-                pipe.record('done', j, 'd2h')
+            return call.chunk_blocks(Nb, n * n + n * k + 3 * n * ncol + k * ncol)
 
         n0 = shp[0][1] if nlev else n_r
         c0 = chunk_blocks(*(shp[0] if nlev else (Nb_r, n_r, 0)))
-        xin = _RowIO(X, g, g_dev, dev, dt, pipe, remote(X), c0 * n0)
-        yout = _RowIO(target, g, g_dev, dev, dt, pipe, remote(target), c0 * n0)
+        xin, yout = call.rows(c0 * n0)
 
         def emit(y, a, b, n, j, add):
             y = y.view((b - a) * n, ncol)
@@ -1365,18 +1402,10 @@ class HBSMAT:
             # ---- device buffers for the call ------------------------------
             upper = sum(Nb * k for Nb, n, k in shp)               # VV[1..]
             upper += sum(Nb * n for Nb, n, k in shp[1:]) + Nb_r * n_r  # W, u
-            if not yout.remote:
-                dx_dev = False           # Dx accumulates into the output
-            elif _DX_ON_DEVICE[0] is not None:
-                dx_dev = bool(_DX_ON_DEVICE[0])
-            elif dev.type == 'cuda':
-                need = item * ncol * (m + upper) + pipe.depth * (
-                    _APPLY_CHUNK_BYTES[0] or item * ncol * m)
-                dx_dev = (torch.cuda.memory_allocated(dev) + need
-                          <= device_budget(dev))
-            else:
-                dx_dev = True
-            with pipe.on('comp'):
+            # Dx accumulates into a device output; for a host output it stays
+            # on the device if it fits
+            dx_dev = yout.remote and call.keep_on_device(ncol * (m + upper))
+            with call.pipe.on('comp'):
                 new = lambda *s: torch.empty(s + (ncol,), dtype=dt, device=dev)
                 VV = [None] + [new(Nb, k) for Nb, n, k in shp]
                 W = [None] + [new(Nb, n) for Nb, n, k in shp[1:]]
@@ -1445,21 +1474,46 @@ class HBSMAT:
                     step(lambda j, a=a, b=b, l=l: (fetch(bwd[l], a, b),),
                          compute)
 
-        # ---- finish ---------------------------------------------------------
-        if yout.remote or xin.stage:
-            pipe.drain()            # host results complete, staging free
-        else:
-            pipe.join()             # device result: no host sync
-        xin.release()
-        yout.release()
-        if pipe.cuda:
-            self.bytesH2D += nH2D + xin.nbytes
-            self.bytesD2H += yout.nbytes
+        call.end()
+        return ret()
 
-        if out is not None:
-            return out
-        res = target[:, 0] if was_vector else target
-        return res.numpy() if numpy_input else res
+    def _vectors(self, v, out, what, alias_ok):
+        """(X, target, ret) for an apply or solve.  X: v as 2-D; target: out
+        as 2-D, or a fresh (m, ncol) tensor -- on the host for numpy v, else
+        on compute_device; ret(): what the call returns (out itself, or the
+        target as numpy / 1-D like v)."""
+        if v.ndim not in (1, 2):
+            raise ValueError(f"{what}: expected 1-D or 2-D input, got "
+                             f"ndim={v.ndim}")
+        if not self.Dmats:
+            raise RuntimeError(f"{what}: the HBS matrix is not constructed")
+        numpy_input = isinstance(v, np.ndarray)
+        was_vector = v.ndim == 1
+        X = self._as_2d(v)
+        m = int(self.shape[0])
+        if X.shape[0] != m:
+            raise ValueError(f"{what}: expected {m} rows, got {X.shape[0]}")
+        if out is None:
+            target = torch.empty((m, X.shape[1]), dtype=self.dtype_t,
+                                 device=_HOST if numpy_input
+                                 else self.compute_device)
+        else:
+            target = self._as_2d(out)
+            if tuple(target.shape) != tuple(X.shape):
+                raise ValueError(f"{what}: out has shape "
+                                 f"{tuple(target.shape)}, expected "
+                                 f"{tuple(X.shape)}")
+            if (not alias_ok and target.device == X.device and
+                    target.untyped_storage().data_ptr()
+                    == X.untyped_storage().data_ptr()):
+                raise ValueError(f"{what}: out must not share memory with v")
+
+        def ret():
+            if out is not None:
+                return out
+            res = target[:, 0] if was_vector else target
+            return res.numpy() if numpy_input else res
+        return X, target, ret
 
 
     # ------------------------------------------------------------------
@@ -1467,8 +1521,256 @@ class HBSMAT:
     # ------------------------------------------------------------------
 
     def compute_ULV(self):
-        return None
+        raise NotImplementedError(
+            "compute_ULV() is not ported yet; build with "
+            "construct(..., compute_ULV=True)")
 
-    def solve(self, b, mode='N', chunk=None, overwrite_b=False, out=None,
-              io_perm=None):
-        return None
+    def solve(self, b, mode='N', out=None, io_perm=None):
+        """x = A^{-1} b (mode 'N') or A^{-T} b (mode 'T') from the ULV factors.
+
+        Same conventions as matmat: numpy in -> numpy out, tensor in ->
+        tensor on compute_device, 1-D in -> 1-D out; with out, written there
+        and returned.  out may be b itself (in place).  io_perm: row order
+        of b and out (see _io_index).
+
+        Works directly on the host masters, level by level in block chunks;
+        each factor crosses the bus once.  Per level (n rows, rank k,
+        m = n - k), with Ru = R[:, :m, :] stored as R11 | R12:
+
+          'N'  up     c = Q^T x;  keep c[:m] (chat), pass c[m:] up
+               root   x = R^{-1} Q^T x,  v = D x
+               down   y = R11^{-1} (chat - Uu v - R12 x)
+                      x = W1 y + V x,    v = U v + D x   (above the leaf)
+          'T'  up     r = r' - D^T v (above the leaf);  y = R11^{-T} W1^T r
+                      v = Uu^T y + U^T v,  r' = V^T r - R12^T y
+               root   x = Q R^{-T} (r' - D^T v)
+               down   x = Q [y; x]
+
+        Only the leaf touches the caller's vectors (gather on the way in,
+        scatter on the way out, as in matmat).  The upper levels' vectors
+        stay on the device; the leaf's own intermediate (chat or y, about as
+        large as b) does too if it fits (_DX_ON_DEVICE), else it is parked
+        in page-locked host memory between the sweeps."""
+        if mode not in ('N', 'T'):
+            raise ValueError(f"solve: mode '{mode}' not recognized; use 'N' "
+                             "or 'T'")
+        if not self.Qlist:
+            raise RuntimeError(
+                "solve() needs the ULV factorization; build with "
+                "construct(..., compute_ULV=True)")
+        X, target, ret = self._vectors(b, out, 'solve', alias_ok=True)
+        ncol = X.shape[1]
+        if ncol == 0:
+            return ret()
+        call = _Call(self, X, target, io_perm)
+        dev, dt, fetch, step = call.dev, call.dt, call.fetch, call.step
+        tri = torch.linalg.solve_triangular
+
+        nlev = len(self.Dmats) - 1
+        shp = [tuple(U.shape) for U in self.Umats[:nlev]]       # (Nb, n, k)
+        Nb_r, n_r = (int(d) for d in self.Dmats[-1].shape[:2])
+
+        def chunk_blocks(Nb, n):
+            return call.chunk_blocks(Nb, 4 * n * n + 4 * n * ncol)
+
+        n0 = shp[0][1] if nlev else n_r
+        c0 = chunk_blocks(shp[0][0] if nlev else Nb_r, n0)
+        xin, yout = call.rows(c0 * n0)
+
+        def leaf_get(a, b, j):
+            return xin.get(a * n0, b * n0, j).view(b - a, n0, ncol)
+
+        def leaf_put(x, a, b, j):
+            yout.put(a * n0, b * n0, x.reshape((b - a) * n0, ncol), j, False)
+
+        def blocks(Nb, c):
+            return [(a, min(a + c, Nb)) for a in range(0, Nb, c)]
+
+        if nlev == 0:
+            # ---- one level: x = R^{-1} Q^T b  or  Q R^{-T} b, per block ----
+            def compute(x, Q, R, j, a, b):
+                if mode == 'N':
+                    leaf_put(tri(R, torch.bmm(Q.mT, x), upper=True), a, b, j)
+                else:
+                    leaf_put(torch.bmm(Q, tri(R.mT, x, upper=False)), a, b, j)
+            for a, b in blocks(Nb_r, c0):
+                step(lambda j: (leaf_get(a, b, j), fetch(self.Qlist[-1], a, b),
+                                fetch(self.Rlist[-1], a, b)),
+                     lambda x, Q, R, j: compute(x, Q, R, j, a, b))
+            call.end()
+            return ret()
+
+        # ---- device buffers: per level l >= 1 (index nlev is the root) -----
+        # Xb[l]: the level-l vector (input going up, solution going down),
+        #        (Nb_l, n_l, ncol); as level l-1's (Nb, k, ncol) it is that
+        #        level's output going up and input going down.
+        # Vb[l]: v at level l, same shape.   Eb[l]: level l's own
+        #        intermediate (chat or y), (Nb_l, m_l, ncol), l < nlev.
+        Nb0, _, k0 = shp[0]
+        m0 = n0 - k0
+        dims = [(Nb, n) for Nb, n, k in shp[1:]] + [(Nb_r, n_r)]
+        upper = 2 * sum(Nb * n for Nb, n in dims)
+        e_dev = (not yout.remote) or call.keep_on_device(
+            ncol * (Nb0 * m0 + upper))
+        with call.pipe.on('comp'):
+            new = lambda *s: torch.empty(s + (ncol,), dtype=dt, device=dev)
+            Xb = [None] + [new(*d) for d in dims]
+            Vb = [None] + [new(*d) for d in dims]
+            Eb = [new(Nb0, m0) if e_dev else None] + \
+                 [new(Nb, n - k) for Nb, n, k in shp[1:]]
+        E_host = None if e_dev else call.host_rows(Nb0 * m0, c0 * m0)
+        below = lambda Z, l: Z[l + 1].view(shp[l][0], shp[l][2], ncol)
+
+        def keep_E(Y, a, b, j):              # store level 0's intermediate
+            if e_dev:
+                Eb[0][a:b] = Y
+            else:
+                E_host.put(a * m0, b * m0, Y.reshape((b - a) * m0, ncol), j,
+                           False)
+
+        def get_E(a, b, j):                  # ... and read it back
+            if e_dev:
+                return ()
+            return (E_host.get(a * m0, b * m0, j).view(b - a, m0, ncol),)
+
+        def sweep_boundary():
+            # a parked intermediate is written by host tasks / DMAs on d2h:
+            # complete before the second sweep reads it back
+            if not e_dev:
+                call.pipe.drain()
+
+        if mode == 'N':
+            # ---- up: c = Q^T x; chat = c[:m], c[m:] goes up -----------------
+            for l in range(nlev):
+                Nb, n, k = shp[l]
+                m_ = n - k
+
+                def compute(Q, *x, l=l, m_=m_):
+                    j = x[-1]
+                    xi = x[0] if l == 0 else Xb[l][a:b]
+                    C = torch.bmm(Q.mT, xi)
+                    if l == 0:
+                        keep_E(C[:, :m_], a, b, j)
+                    else:
+                        Eb[l][a:b] = C[:, :m_]
+                    below(Xb, l)[a:b] = C[:, m_:]
+                for a, b in blocks(Nb, c0 if l == 0 else chunk_blocks(Nb, n)):
+                    step(lambda j, l=l: (fetch(self.Qlist[l], a, b),
+                                         *((leaf_get(a, b, j),) if l == 0
+                                           else ())),
+                         compute)
+
+            # ---- root: x = R^{-1} Q^T x,  v = D x ---------------------------
+            def compute(Q, R, D, j):
+                x = tri(R, torch.bmm(Q.mT, Xb[nlev][a:b]), upper=True)
+                Xb[nlev][a:b] = x
+                torch.bmm(D, x, out=Vb[nlev][a:b])
+            for a, b in blocks(Nb_r, chunk_blocks(Nb_r, n_r)):
+                step(lambda j: (fetch(self.Qlist[-1], a, b),
+                                fetch(self.Rlist[-1], a, b),
+                                fetch(self.Dmats[-1], a, b)), compute)
+            sweep_boundary()
+
+            # ---- down: y = R11^{-1}(chat - Uu v - R12 x), x = W1 y + V x ----
+            for l in range(nlev - 1, -1, -1):
+                Nb, n, k = shp[l]
+                m_ = n - k
+                v_in, x_in = below(Vb, l), below(Xb, l)
+
+                def compute(Uu, R, W1, V, *rest, l=l, m_=m_,
+                            v_in=v_in, x_in=x_in):
+                    j = rest[-1]
+                    x, v = x_in[a:b], v_in[a:b]
+                    xn = torch.bmm(V, x)
+                    if m_:
+                        chat = (rest[0] if (l == 0 and not e_dev)
+                                else Eb[l][a:b])
+                        rhs = chat - torch.bmm(Uu, v) - torch.bmm(R[:, :, m_:], x)
+                        xn.baddbmm_(W1, tri(R[:, :, :m_], rhs, upper=True))
+                    if l == 0:
+                        leaf_put(xn, a, b, j)
+                    else:
+                        U, D = rest[-3], rest[-2]
+                        Xb[l][a:b] = xn
+                        torch.baddbmm(torch.bmm(U, v), D, xn, out=Vb[l][a:b])
+                for a, b in blocks(Nb, c0 if l == 0 else chunk_blocks(Nb, n)):
+                    step(lambda j, l=l: (
+                            fetch(self.Uulist[l], a, b),
+                            fetch(self.Rlist[l], a, b),
+                            fetch(self.Wlist[l], a, b),
+                            fetch(self.Vmats[l], a, b),
+                            *(get_E(a, b, j) if l == 0 else
+                              (fetch(self.Umats[l], a, b),
+                               fetch(self.Dmats[l], a, b)))),
+                         compute)
+        else:
+            # ---- up: r = r' - D^T v; y = R11^{-T} W1^T r; v, r' upwards -----
+            for l in range(nlev):
+                Nb, n, k = shp[l]
+                m_ = n - k
+
+                def compute(W1, V, R, Uu, *rest, l=l, m_=m_):
+                    j = rest[-1]
+                    if l == 0:
+                        r = rest[0]
+                    else:
+                        U, D = rest[0], rest[1]
+                        v = Vb[l][a:b]
+                        r = torch.baddbmm(Xb[l][a:b], D.mT, v, alpha=-1.0)
+                    y = torch.bmm(W1.mT, r)
+                    if m_:
+                        y = tri(R[:, :, :m_].mT, y, upper=False)
+                    if l == 0:
+                        keep_E(y, a, b, j)
+                    else:
+                        Eb[l][a:b] = y
+                    vn = torch.bmm(Uu.mT, y)
+                    if l > 0:
+                        vn.baddbmm_(U.mT, v)
+                    below(Vb, l)[a:b] = vn
+                    torch.baddbmm(torch.bmm(V.mT, r), R[:, :, m_:].mT, y,
+                                  alpha=-1.0, out=below(Xb, l)[a:b])
+                for a, b in blocks(Nb, c0 if l == 0 else chunk_blocks(Nb, n)):
+                    step(lambda j, l=l: (
+                            fetch(self.Wlist[l], a, b),
+                            fetch(self.Vmats[l], a, b),
+                            fetch(self.Rlist[l], a, b),
+                            fetch(self.Uulist[l], a, b),
+                            *((leaf_get(a, b, j),) if l == 0 else
+                              (fetch(self.Umats[l], a, b),
+                               fetch(self.Dmats[l], a, b)))),
+                         compute)
+
+            # ---- root: x = Q R^{-T} (r' - D^T v) ----------------------------
+            def compute(Q, R, D, j):
+                r = torch.baddbmm(Xb[nlev][a:b], D.mT, Vb[nlev][a:b], alpha=-1.0)
+                Xb[nlev][a:b] = torch.bmm(Q, tri(R.mT, r, upper=False))
+            for a, b in blocks(Nb_r, chunk_blocks(Nb_r, n_r)):
+                step(lambda j: (fetch(self.Qlist[-1], a, b),
+                                fetch(self.Rlist[-1], a, b),
+                                fetch(self.Dmats[-1], a, b)), compute)
+            sweep_boundary()
+
+            # ---- down: x = Q [y; x] -----------------------------------------
+            for l in range(nlev - 1, -1, -1):
+                Nb, n, k = shp[l]
+                m_ = n - k
+                x_in = below(Xb, l)
+
+                def compute(Q, *rest, l=l, m_=m_, x_in=x_in):
+                    j = rest[-1]
+                    xn = torch.bmm(Q[:, :, m_:], x_in[a:b])
+                    if m_:
+                        y = rest[0] if (l == 0 and not e_dev) else Eb[l][a:b]
+                        xn.baddbmm_(Q[:, :, :m_], y)
+                    if l == 0:
+                        leaf_put(xn, a, b, j)
+                    else:
+                        Xb[l][a:b] = xn
+                for a, b in blocks(Nb, c0 if l == 0 else chunk_blocks(Nb, n)):
+                    step(lambda j, l=l: (fetch(self.Qlist[l], a, b),
+                                         *(get_E(a, b, j) if l == 0 else ())),
+                         compute)
+
+        call.end()
+        return ret()
