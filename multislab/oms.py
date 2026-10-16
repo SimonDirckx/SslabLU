@@ -1604,6 +1604,9 @@ class oms:
                 tS += assembler.stats.timeSample
                 shapes_ok = shapes_ok and tuple(mat.shape) == tuple(st.A.shape)
                 err = None
+                err = self._block_error(st, mat, assembler)
+                print("%s ERR = " % label, err)
+                err = None
                 if dbg > 0:
                     err = self._block_error(st, mat, assembler)
                     print("%s ERR (reference slab %d) = " % (label, self._ref_ind), err)

@@ -7,6 +7,7 @@ import torch
 import torch.linalg as tla
 import matAssembly.HBS.ULVsparse_torch as ULVsparse
 
+import collections
 import contextlib
 
 # ---------------------------------------------------------------------------
@@ -29,6 +30,13 @@ import contextlib
 #     d2h  : writes chunk j-1's factors to the host master
 # ordered by events, with at most _PIPE_DEPTH chunks in flight.  The host
 # only ever waits for that throttle and for the final synchronize.
+#
+# _apply (matvec/matmat and transposes) streams the factors the same way, in
+# block chunks straight from Umats/Vmats/Dmats; each factor crosses the bus
+# once per call.  Only the leaf level touches the caller's vectors: the input
+# is gathered by perm on the host into page-locked staging, chunk by chunk,
+# and the output scattered back on the host.  The compressed vectors of the
+# upper levels live on the device for the duration of the call.  See _apply.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -46,6 +54,15 @@ _SAMPLE_SPILL_BYTES = [None]  # next level's samples:
 _DEVICE_BUDGET = [None]    # bytes the code may plan to use; None = 85% of total
 _PIPE_DEPTH   = [3]        # chunks in flight in the construction pipeline
 _PINNED       = [0]        # bytes this module currently has page-locked
+_APPLY_CHUNK_BYTES = [256 << 20]  # device bytes per block chunk in _apply
+                           # (factors + vector rows); 0 means one chunk per level
+_DX_ON_DEVICE = [None]     # _apply with a host output: keep D_leaf x on the
+                           # device between the sweeps?  None: if it fits in
+                           # the device budget; False: accumulate into the
+                           # output on the host instead (one more download)
+_STAGE_ON_CPU = [False]    # testing only: on a CPU compute device, route host
+                           # vectors through the staging / deferred-scatter
+                           # paths that CUDA uses
 
 _HOST = torch.device('cpu')
 
@@ -254,14 +271,10 @@ def _null_col_pinv(Om, Y, k, sel=None):
     batch = Om.shape[:-2]
     Vh, tau = torch.geqrf(Om.mT)                     # (..., s, n), (..., n)
     R = Vh[..., :n, :].triu()
-    if sel is None:
-        sel = _selector(s, n, k, Om.dtype, Om.device)
-    Qsel = torch.ormqr(Vh, tau, sel.expand(*batch, s, n + k))   # [Q1 | P]
-    del Vh, tau
-    W = Y @ Qsel                                     # [Y Q1 | Y P]
-    del Qsel
-    M = torch.linalg.solve_triangular(R, W[..., :n].mT, upper=True).mT
-    U = torch.linalg.qr(W[..., n:], mode='reduced').Q
+    W  = torch.ormqr(Vh, tau, Y.mT, left=True, transpose=True).mT
+    M  = tla.solve_triangular(R, W[..., :n].mT, upper=True).mT
+    Yp = W[..., n:] 
+    U = tla.svd(Yp, full_matrices=False,driver = 'gesvda').U[..., :k]
     return U.contiguous(), M
 
 
@@ -322,13 +335,18 @@ class _Pipe:
     Per chunk in slot j = i % depth:  h2d records loaded[j]; comp waits for
     it and records computed[j]; d2h waits for that and records done[j].
     begin() blocks the host on done[j] of chunk i - depth, which bounds the
-    device memory in flight and makes slot j's staging buffers reusable."""
+    device memory in flight and makes slot j's staging buffers reusable.
+
+    defer(fn) queues host work that reads what the current chunk downloads;
+    it runs, in FIFO order, once that chunk's done event has been waited for
+    (in begin() or drain()).  On a non-CUDA device it runs immediately."""
 
     def __init__(self, dev, depth):
         self.cuda = dev.type == 'cuda'
         self.depth = max(1, int(depth))
         self.i = 0
         self.timers = []                    # (attr, start, end)
+        self.tasks = collections.deque()    # (chunk index, fn)
         if self.cuda:
             self.dev = dev
             self.h2d, self.comp, self.d2h = (torch.cuda.Stream(dev)
@@ -348,8 +366,35 @@ class _Pipe:
         j = self.i % self.depth
         if self.cuda and self.i >= self.depth:
             self.ev['done'][j].synchronize()
+            self._run(self.i - self.depth)
         self.i += 1
         return j
+
+    def defer(self, fn):
+        if self.cuda:
+            self.tasks.append((self.i - 1, fn))
+        else:
+            fn()
+
+    def _run(self, upto):
+        # done events are recorded in order on one stream, so every chunk up
+        # to `upto` has completed its downloads
+        while self.tasks and self.tasks[0][0] <= upto:
+            self.tasks.popleft()[1]()
+
+    def drain(self):
+        """Wait for everything, then run all deferred host work."""
+        if self.cuda:
+            torch.cuda.synchronize(self.dev)
+        self._run(math.inf)
+
+    def join(self):
+        """Order the caller's current stream after all pipeline work, without
+        blocking the host (for results that stay on the device)."""
+        if self.cuda:
+            cur = torch.cuda.current_stream(self.dev)
+            for st in (self.h2d, self.comp, self.d2h):
+                cur.wait_stream(st)
 
     def record(self, name, j, stream):
         if self.cuda:
@@ -383,8 +428,7 @@ class _Pipe:
 
     def finish(self):
         """Synchronize; returns {attr: seconds}."""
-        if self.cuda:
-            torch.cuda.synchronize(self.dev)
+        self.drain()
         out = {}
         for attr, a, b in self.timers:
             dt = a.elapsed_time(b) / 1e3 if self.cuda else b - a
@@ -483,6 +527,103 @@ def _as_samples(X, m):
     return X
 
 
+class _RowIO:
+    """The caller's vector (input or output) of an apply, accessed in leaf
+    row chunks in tree order.
+
+    T holds rows in the caller's (io) order; tree row r is row g[r] of T
+    (g None: the identity, so a chunk is a contiguous slice).
+
+      get(r0, r1, slot)          tree rows r0:r1 as an (r1-r0, ncol) tensor
+                                 on the compute device; call on the h2d stream
+      put(r0, r1, y, slot, add)  T[g[r0:r1]] = y  (or += y); y on the compute
+                                 device, call on the comp stream
+
+    A local T (on the compute device) is gathered / scattered there.  A
+    remote T (host, compute on CUDA) goes through page-locked staging slots:
+    on the way in the gather is the staging copy itself (index_select), on
+    the way out the download lands in staging and the scatter is host work
+    deferred until that download is complete.  A page-locked, row-major T of
+    the factor dtype in tree order skips staging: one DMA per chunk."""
+
+    def __init__(self, T, g, g_dev, dev, dt, pipe, remote, rows_max):
+        self.T, self.g, self.g_dev = T, g, g_dev
+        self.dev, self.dt, self.pipe, self.remote = dev, dt, pipe, remote
+        self.ncol = T.shape[1]
+        self.rows_max = rows_max
+        self.direct = (remote and pipe.cuda and g is None and T.dtype == dt
+                       and T.is_contiguous() and T.is_pinned())
+        self.stage = {}
+        self.nbytes = 0                     # bytes across the bus
+
+    def _buf(self, slot, rows):
+        buf = self.stage.get(slot)
+        if buf is None:
+            buf = self.stage[slot] = host_pool.get(self.rows_max * self.ncol,
+                                                   self.dt)
+        return buf[:rows * self.ncol].view(rows, self.ncol)
+
+    def release(self):
+        """Return the staging buffers (only after the pipeline is drained)."""
+        for buf in self.stage.values():
+            host_pool.put(buf)
+        self.stage = {}
+
+    def get(self, r0, r1, slot):
+        T, g = self.T, self.g
+        if not self.remote:
+            x = T[r0:r1] if g is None else T.index_select(0, self.g_dev[r0:r1])
+            return x.to(device=self.dev, dtype=self.dt).contiguous()
+        if self.direct:
+            x = T[r0:r1].to(self.dev, non_blocking=True)
+        else:
+            buf = self._buf(slot, r1 - r0)
+            if g is None:
+                buf.copy_(T[r0:r1])
+            elif T.dtype == self.dt:
+                torch.index_select(T, 0, g[r0:r1], out=buf)
+            else:
+                buf.copy_(T.index_select(0, g[r0:r1]))
+            # off CUDA (_STAGE_ON_CPU) the slot is reused right away: copy
+            x = buf.to(self.dev, non_blocking=True) if self.pipe.cuda \
+                else buf.clone()
+        self.nbytes += x.nbytes
+        return x
+
+    @staticmethod
+    def _write(T, i, r0, r1, y, add):
+        if y.dtype != T.dtype:
+            y = y.to(T.dtype)
+        if i is None:
+            if add:
+                T[r0:r1].add_(y)
+            else:
+                T[r0:r1].copy_(y)
+        elif add:
+            T.index_add_(0, i, y)
+        else:
+            T.index_copy_(0, i, y)
+
+    def put(self, r0, r1, y, slot, add):
+        T, g = self.T, self.g
+        if not self.remote:
+            self._write(T, None if g is None else self.g_dev[r0:r1],
+                        r0, r1, y, add)
+            return
+        pipe = self.pipe
+        with pipe.on('d2h'):
+            pipe.wait_stream('d2h', 'comp')     # y is complete
+            pipe.keep((y,), 'd2h')
+            if self.direct and not add:
+                T[r0:r1].copy_(y, non_blocking=True)
+            else:
+                buf = self._buf(slot, r1 - r0)
+                buf.copy_(y, non_blocking=pipe.cuda)
+                i = None if g is None else g[r0:r1]
+                pipe.defer(lambda: self._write(T, i, r0, r1, buf, add))
+        self.nbytes += y.nbytes
+
+
 
 
 class HBSMAT:
@@ -566,7 +707,7 @@ class HBSMAT:
         self.L  = len(Nbvec)
         self.perm = torch.arange(self.A.shape[0], dtype=torch.int64)
 
-    def set_mats(self, Umats, Dmats, Vmats, Nbvec, fac=4):
+    def set_mats(self, Umats, Dmats, Vmats, Nbvec, fac=2):
         """Adopt externally built factors.  They are copied into a host
         master; the arguments may live anywhere."""
         layout = {'Umats': [tuple(t.shape) for t in Umats],
@@ -896,77 +1037,13 @@ class HBSMAT:
     def rmatvec(self, v):
         return self._apply(v, transpose=True)
 
-    def matmat(self, v, chunk=None, out=None, alpha=1.0, beta=0.0, C=None,
-               io_perm=None):
-        return self._apply(v, transpose=False, chunk=chunk, out=out,
-                           alpha=alpha, beta=beta, C=C, io_perm=io_perm)
+    def matmat(self, v, out=None, alpha=1.0, beta=0.0, C=None, io_perm=None):
+        return self._apply(v, transpose=False, out=out, alpha=alpha,
+                           beta=beta, C=C, io_perm=io_perm)
 
-    def rmatmat(self, v, chunk=None, out=None, alpha=1.0, beta=0.0, C=None,
-                io_perm=None):
-        return self._apply(v, transpose=True, chunk=chunk, out=out,
-                           alpha=alpha, beta=beta, C=C, io_perm=io_perm)
-
-    # -- row order of inputs/outputs ------------------------------------
-    def _g_host(self, io_perm):
-        """Host index g with g[r] = the row of an io_perm-ordered tensor that
-        holds original row perm[r], i.e. inv(io_perm)[perm]; None when that is
-        the identity (io_perm == perm), so no gather is needed at all.
-        io_perm=None means original order, g = perm."""
-        cache = self.__dict__.setdefault('_gcache', {})
-        key = id(io_perm)
-        ent = cache.get(key)
-        if ent is not None and ent[0] is io_perm and ent[1] is self._perm:
-            return ent[2]
-        p = self.perm
-        if io_perm is None:
-            g = p
-        else:
-            io = torch.as_tensor(io_perm, dtype=torch.int64).cpu()
-            inv = torch.empty_like(io)
-            inv[io] = torch.arange(io.numel(), dtype=torch.int64)
-            g = inv[p]
-        if torch.equal(g, torch.arange(g.numel(), dtype=torch.int64)):
-            g = None
-        cache[key] = (io_perm, self._perm, g)
-        cache.pop(('dev', key), None)
-        return g
-
-    def _gidx(self, io_perm, dev):
-        """_g_host on dev (cached)."""
-        g = self._g_host(io_perm)
-        if g is None:
-            return None
-        cache = self._gcache
-        ent = cache.get(('dev', id(io_perm)))
-        if ent is not None and ent[0] is g and _dev_eq(ent[1].device, dev):
-            return ent[1]
-        gd = g.to(dev)
-        cache[('dev', id(io_perm))] = (g, gd)
-        return gd
-
-    # -- column chunks ----------------------------------------------------
-    def _ws_per_col(self, kind):
-        """Device bytes one right-hand-side column costs in an apply or a ULV
-        solve: the per-level vectors of the sweeps.  R is the total row count
-        over all levels; m the matrix size.  Conservative (calibrated on CPU,
-        see the module tests)."""
-        R = sum(int(D.shape[0]) * int(D.shape[1]) for D in self.Dmats)
-        m = int(self.shape[0])
-        if kind == 'apply':
-            return 8 * (2 * R + 4 * m)
-        return 8 * (3 * R + 6 * m)
-
-    def _cols(self, kind, ncol, chunk):
-        if chunk is not None:
-            c = chunk or ncol
-        else:
-            cap = _MATMAT_CHUNK[0] if kind == 'apply' else _SOLVE_CHUNK[0]
-            c = ncol
-            if cap:
-                c = min(c, cap)
-            if _STREAM_BYTES[0]:
-                c = min(c, max(1, _STREAM_BYTES[0] // self._ws_per_col(kind)))
-        return max(1, min(c, max(ncol, 1)))
+    def rmatmat(self, v, out=None, alpha=1.0, beta=0.0, C=None, io_perm=None):
+        return self._apply(v, transpose=True, out=out, alpha=alpha,
+                           beta=beta, C=C, io_perm=io_perm)
 
     @staticmethod
     def _as_2d(X):
@@ -976,238 +1053,278 @@ class HBSMAT:
             X = torch.from_numpy(np.asarray(X))
         return X[:, None] if X.ndim == 1 else X
 
-    def _stream(self, X, target, C, alpha, beta, c, body):
-        """target[:, j] = alpha * body(X[:, j] on dev) + beta * C[:, j], one
-        column chunk j at a time (C may be target itself).  X, target and C
-        may each live on the host or the device; host chunks move with one
-        DMA each when the tensor is column-major.  Synchronizes once at the
-        end if a device-to-host copy may still be in flight."""
-        dev, dt = self.compute_device, self.dtype_t
-        ncol = X.shape[1]
-        pending = False
-        for j0 in range(0, ncol, c):
-            j1 = min(j0 + c, ncol)
-            xc = _to_dev(X[:, j0:j1], dev)
-            if xc.dtype != dt:
-                xc = xc.to(dt)
-            y = body(xc)
-            del xc
-            if alpha != 1.0:
-                y.mul_(alpha)
-            if beta != 0.0:
-                cc = _to_dev(C[:, j0:j1], dev)
-                y.add_(cc.to(dt) if cc.dtype != dt else cc, alpha=beta)
-                del cc
-            pending |= _from_dev(target[:, j0:j1], y)
-            del y
-        if pending:
-            torch.cuda.current_stream(dev).synchronize()
+    def _io_index(self, io_perm):
+        """Host int64 index g with tree row r = row g[r] of a vector in io
+        order, or None when that is the identity.  io_perm: row q of the
+        caller's vectors holds original row io_perm[q]; None means original
+        order, so g = perm.  Cached for the last (perm, io_perm) pair, by
+        identity: do not modify io_perm in place between calls."""
+        p = self.perm
+        c = self.__dict__.get('_gcache')
+        if c is not None and c[0] is p and c[1] is io_perm:
+            return c[2]
+        n = int(self.shape[0])
+        g = torch.arange(n) if p is None else p
+        if io_perm is not None:
+            io = (io_perm.detach().cpu() if torch.is_tensor(io_perm)
+                  else torch.as_tensor(np.asarray(io_perm))).to(torch.int64)
+            inv = torch.empty_like(io)
+            inv[io] = torch.arange(io.numel())
+            g = inv[g]
+        if torch.equal(g, torch.arange(n)):
+            g = None
+        self._gcache = (p, io_perm, g)
+        return g
 
-    def _apply(self, v, transpose, chunk=None, out=None, alpha=1.0, beta=0.0,
-               C=None, io_perm=None):
-        """A v (transpose=False) or A^T v (transpose=True).
+    def _apply(self, v, transpose, out=None, alpha=1.0, beta=0.0, C=None,
+               io_perm=None):
+        """y = alpha * op(A) v + beta * C,  op(A) = A or A^T.
 
-        Without out:
-            numpy in  -> numpy out (host)
-            tensor in -> tensor on compute_device
-            1-D in    -> 1-D out
-        With out (a tensor anywhere, or a writeable float64 numpy array):
-            out <- alpha * op(v) + beta * C     (C defaults to out)
-        computed chunk by chunk on the device and written back; returns out.
+        Without out:  numpy in -> numpy out (host); tensor in -> tensor on
+        compute_device; 1-D in -> 1-D out.  With out (a tensor anywhere or a
+        writeable numpy array): written into out, which is returned; C
+        defaults to out.  out must not share memory with v.  io_perm: the row
+        order of v, out and C (see _io_index); None means original order.
 
-        v is streamed in column chunks (_cols), so neither v nor the result
-        ever exists in full on the device unless it lives there already.
-        io_perm: row order of v, out and C (see constructHBS)."""
+        Works directly on Umats/Vmats/Dmats (host masters); the factors are
+        streamed to the device in block chunks, each crossing once.  With
+        op(A) = A (for A^T swap U and V and transpose every D):
+
+          up      leaf     x_c = gather of x's rows (host, into staging)
+                           VV1_c = V0_c^T x_c,  Dx_c = D0_c x_c
+                  l >= 1   VV(l+1)_c = Vl_c^T VVl_c,  Wl_c = Dl_c VVl_c
+          root             u = Dr VV_top
+          down    l >= 1   Wl_c += Ul_c u_c          (Wl becomes u at level l)
+                  leaf     y_c = Dx_c + U0_c u_c  -> download, scatter (host)
+
+        The upper-level vectors VV, W, u live on the device for the call.
+        Dx (as large as x) stays on the device when the output is on the
+        device, or when it fits (_DX_ON_DEVICE); otherwise D0 x is written
+        into the output on the host during the up sweep and U0 u added to it
+        during the down sweep.  No column chunking: all columns at once."""
         if v.ndim not in (1, 2):
             raise ValueError(f"expected 1-D or 2-D input, got ndim={v.ndim}")
-        numpy_input = isinstance(v, np.ndarray)
-        was_vector  = (v.ndim == 1)
-        X = self._as_2d(v)
-
-        n_in  = int(self.shape[0] if transpose else self.shape[1])
-        n_out = int(self.shape[1] if transpose else self.shape[0])
         what = 'rmatmat' if transpose else 'matmat'
-        if X.shape[0] != n_in:
-            raise ValueError(f"{what}: expected {n_in} rows, got {X.shape[0]}")
-
-        dev, dt = self.compute_device, self.dtype_t
+        if not self.Dmats:
+            raise RuntimeError(f"{what}: the HBS matrix is not constructed")
+        numpy_input = isinstance(v, np.ndarray)
+        was_vector = v.ndim == 1
+        X = self._as_2d(v)
+        m = int(self.shape[0])
+        if X.shape[0] != m:
+            raise ValueError(f"{what}: expected {m} rows, got {X.shape[0]}")
+        dev = torch.device(self.compute_device)
+        dt = self.dtype_t
+        item = torch.finfo(dt).bits // 8
         ncol = X.shape[1]
+
+        # ---- output; beta * C goes into it up front -----------------------
         if out is None:
             if beta != 0.0 and C is None:
                 raise ValueError(f"{what}: beta != 0 needs out or C")
-            target = torch.empty((n_out, ncol), dtype=dt,
+            target = torch.empty((m, ncol), dtype=dt,
                                  device=_HOST if numpy_input else dev)
         else:
             target = self._as_2d(out)
-            if tuple(target.shape) != (n_out, ncol):
-                raise ValueError(f"{what}: out has shape {tuple(target.shape)}, "
-                                 f"expected {(n_out, ncol)}")
-        Cm = (target if C is None else self._as_2d(C)) if beta != 0.0 else None
+            if tuple(target.shape) != (m, ncol):
+                raise ValueError(f"{what}: out has shape {tuple(target.shape)}"
+                                 f", expected {(m, ncol)}")
+            if (target.device == X.device and target.untyped_storage()
+                    .data_ptr() == X.untyped_storage().data_ptr()):
+                raise ValueError(f"{what}: out must not share memory with v")
+        if ncol == 0:
+            return out if out is not None else (
+                target.numpy() if numpy_input else target)
+        if beta != 0.0:
+            if C is not None and C is not out:
+                Cm = self._as_2d(C)
+                if tuple(Cm.shape) != (m, ncol):
+                    raise ValueError(f"{what}: C has shape {tuple(Cm.shape)},"
+                                     f" expected {(m, ncol)}")
+                target.copy_(Cm)
+            if beta != 1.0:
+                target.mul_(beta)
+        add0 = beta != 0.0       # does the first write to a row accumulate?
 
-        F = self._factors(('core',), what)
-        g = self._gidx(io_perm, dev)
-        self._stream(X, target, Cm, alpha, beta,
-                     self._cols('apply', ncol, chunk),
-                     lambda xc: self._apply_2d(xc, transpose, F, g))
-        del F
+        # ---- where the caller's vectors are, and the row gather -----------
+        stage_cpu = dev.type == 'cpu' and _STAGE_ON_CPU[0]
+        remote = lambda T: T.device.type == 'cpu' and (dev.type != 'cpu'
+                                                       or stage_cpu)
+        g = self._io_index(io_perm)
+        g_dev = None
+        if g is not None and not (remote(X) and remote(target)):
+            g_dev = g.to(dev)        # a local vector is gathered on the device
+
+        # ---- level geometry -----------------------------------------------
+        nlev = len(self.Dmats) - 1
+        shp = [tuple(U.shape) for U in self.Umats[:nlev]]
+        Nb_r, n_r = (int(d) for d in self.Dmats[-1].shape[:2])
+        fwd = self.Umats if transpose else self.Vmats   # up:   VV' = F^T VV
+        bwd = self.Vmats if transpose else self.Umats   # down: u = B u' + W
+        Dop = (lambda D: D.mT) if transpose else (lambda D: D)
+
+        def chunk_blocks(Nb, n, k):
+            per = item * (n * n + n * k + 3 * n * ncol + k * ncol)
+            if not _APPLY_CHUNK_BYTES[0]:
+                return Nb
+            return int(max(1, min(Nb, _APPLY_CHUNK_BYTES[0] // per)))
+
+        pipe = _Pipe(dev, _PIPE_DEPTH[0])
+        nH2D = 0
+
+        def fetch(T, a, b):
+            nonlocal nH2D
+            t = T[a:b]
+            if t.device == dev and t.dtype == dt:
+                return t
+            t = t.to(device=dev, dtype=dt, non_blocking=True)
+            nH2D += t.nbytes
+            return t
+
+        def step(load, compute):
+            """One chunk through the pipeline: load() on h2d returns the
+            device tensors compute(*tensors, slot) consumes on comp."""
+            j = pipe.begin()
+            with pipe.on('h2d'):
+                got = load(j)
+                pipe.record('loaded', j, 'h2d')
+            with pipe.on('comp'):
+                pipe.wait('comp', 'loaded', j)
+                pipe.keep(got, 'comp')
+                compute(*got, j)
+                pipe.record('computed', j, 'comp')
+            with pipe.on('d2h'):
+                pipe.wait('d2h', 'computed', j)
+                pipe.record('done', j, 'd2h')
+
+        n0 = shp[0][1] if nlev else n_r
+        c0 = chunk_blocks(*(shp[0] if nlev else (Nb_r, n_r, 0)))
+        xin = _RowIO(X, g, g_dev, dev, dt, pipe, remote(X), c0 * n0)
+        yout = _RowIO(target, g, g_dev, dev, dt, pipe, remote(target), c0 * n0)
+
+        def emit(y, a, b, n, j, add):
+            y = y.view((b - a) * n, ncol)
+            if alpha != 1.0:
+                y.mul_(alpha)
+            yout.put(a * n, b * n, y, j, add)
+
+        if nlev == 0:
+            # ---- a single level: y = Dr x, block diagonal -----------------
+            for a in range(0, Nb_r, c0):
+                b = min(a + c0, Nb_r)
+                step(lambda j: (xin.get(a * n_r, b * n_r, j)
+                                .view(b - a, n_r, ncol),
+                                fetch(self.Dmats[-1], a, b)),
+                     lambda x, D, j: emit(torch.bmm(Dop(D), x),
+                                          a, b, n_r, j, add0))
+        else:
+            # ---- device buffers for the call ------------------------------
+            upper = sum(Nb * k for Nb, n, k in shp)               # VV[1..]
+            upper += sum(Nb * n for Nb, n, k in shp[1:]) + Nb_r * n_r  # W, u
+            if not yout.remote:
+                dx_dev = False           # Dx accumulates into the output
+            elif _DX_ON_DEVICE[0] is not None:
+                dx_dev = bool(_DX_ON_DEVICE[0])
+            elif dev.type == 'cuda':
+                need = item * ncol * (m + upper) + pipe.depth * (
+                    _APPLY_CHUNK_BYTES[0] or item * ncol * m)
+                dx_dev = (torch.cuda.memory_allocated(dev) + need
+                          <= device_budget(dev))
+            else:
+                dx_dev = True
+            with pipe.on('comp'):
+                new = lambda *s: torch.empty(s + (ncol,), dtype=dt, device=dev)
+                VV = [None] + [new(Nb, k) for Nb, n, k in shp]
+                W = [None] + [new(Nb, n) for Nb, n, k in shp[1:]]
+                u_top = new(Nb_r, n_r)
+                Dx = new(*shp[0][:2]) if dx_dev else None
+            # level-l input, as (Nb_l, n_l, ncol): VV[l] regrouped
+            vin = lambda l: VV[l].view(shp[l][0], shp[l][1], ncol) \
+                if l < nlev else VV[l].view(Nb_r, n_r, ncol)
+            # level-(l+1) result read by level l going down, as (Nb_l, k_l, ncol)
+            uin = lambda l: (u_top if l + 1 == nlev else W[l + 1]).view(
+                shp[l][0], shp[l][2], ncol)
+
+            # ---- up sweep -------------------------------------------------
+            for l in range(nlev):
+                Nb, n, k = shp[l]
+                c = c0 if l == 0 else chunk_blocks(Nb, n, k)
+                for a in range(0, Nb, c):
+                    b = min(a + c, Nb)
+                    if l == 0:
+                        def load(j, a=a, b=b):
+                            return (xin.get(a * n, b * n, j).view(b - a, n, ncol),
+                                    fetch(fwd[0], a, b), fetch(self.Dmats[0], a, b))
+
+                        def compute(x, F, D, j, a=a, b=b):
+                            torch.bmm(F.mT, x, out=VV[1][a:b])
+                            if dx_dev:
+                                torch.bmm(Dop(D), x, out=Dx[a:b])
+                            else:
+                                emit(torch.bmm(Dop(D), x), a, b, n, j, add0)
+                    else:
+                        def load(j, a=a, b=b, l=l):
+                            return (fetch(fwd[l], a, b), fetch(self.Dmats[l], a, b))
+
+                        def compute(F, D, j, a=a, b=b, l=l):
+                            x = vin(l)[a:b]
+                            torch.bmm(F.mT, x, out=VV[l + 1][a:b])
+                            torch.bmm(Dop(D), x, out=W[l][a:b])
+                    step(load, compute)
+
+            # ---- root -----------------------------------------------------
+            c = chunk_blocks(Nb_r, n_r, 0)
+            for a in range(0, Nb_r, c):
+                b = min(a + c, Nb_r)
+                step(lambda j: (fetch(self.Dmats[-1], a, b),),
+                     lambda D, j: torch.bmm(Dop(D), vin(nlev)[a:b],
+                                            out=u_top[a:b]))
+
+            # ---- down sweep -----------------------------------------------
+            for l in range(nlev - 1, -1, -1):
+                Nb, n, k = shp[l]
+                c = c0 if l == 0 else chunk_blocks(Nb, n, k)
+                u_in = uin(l)
+                for a in range(0, Nb, c):
+                    b = min(a + c, Nb)
+                    if l > 0:
+                        compute = (lambda B, j, a=a, b=b, l=l:
+                                   W[l][a:b].baddbmm_(B, u_in[a:b]))
+                    elif dx_dev:
+                        compute = (lambda B, j, a=a, b=b:
+                                   emit(Dx[a:b].baddbmm_(B, u_in[a:b]),
+                                        a, b, n, j, add0))
+                    else:
+                        compute = (lambda B, j, a=a, b=b:
+                                   emit(torch.bmm(B, u_in[a:b]),
+                                        a, b, n, j, True))
+                    step(lambda j, a=a, b=b, l=l: (fetch(bwd[l], a, b),),
+                         compute)
+
+        # ---- finish ---------------------------------------------------------
+        if yout.remote or xin.stage:
+            pipe.drain()            # host results complete, staging free
+        else:
+            pipe.join()             # device result: no host sync
+        xin.release()
+        yout.release()
+        if pipe.cuda:
+            self.bytesH2D += nH2D + xin.nbytes
+            self.bytesD2H += yout.nbytes
 
         if out is not None:
             return out
         res = target[:, 0] if was_vector else target
         return res.numpy() if numpy_input else res
 
-    def _apply_2d(self, V, transpose, F, g):
-        """Core HBS apply.  V: 2-D tensor on compute_device in io order.
-        F: factor lists on the same device (from _factors).  g: device gather
-        index into V's rows (_gidx), or None when V is already in tree order."""
-        dmode = 'T' if transpose else 'N'
-        down  = F['Umats'] if transpose else F['Vmats']
-        up    = F['Vmats'] if transpose else F['Umats']
-        Dm    = F['Dmats']
-
-        VV = [V.contiguous() if g is None else V[g]]
-        for M in down:
-            VV.append(block_matvec(M, VV[-1], mode='T'))
-        u = block_matvec(Dm[-1], VV[-1], mode=dmode)
-        for lvl in range(len(up) - 1, -1, -1):
-            u = block_matvec(up[lvl], u) \
-              + block_matvec(Dm[lvl], VV[lvl], mode=dmode)
-        if g is None:
-            return u
-        out = torch.empty_like(u)
-        out[g] = u
-        return out
 
     # ------------------------------------------------------------------
     # solve
     # ------------------------------------------------------------------
 
     def compute_ULV(self):
-        """Factorize an already-compressed block (built with
-        compute_ULV=False, or adopted through set_mats).
-
-        Streams D, U, V from the host master level by level, in the same
-        chunks as construction, and writes the factors to a new host master.
-        constructHBS(with_ulv=True) is cheaper, since there the level factors
-        are already on the device."""
-        tic = time.time()
-        dev, dt, fac = self.compute_device, self.dtype_t, self.fac
-        levels = [tuple(U.shape) for U in self.Umats]
-        root   = tuple(self.Dmats[-1].shape[:2])
-        rec, lists = _new_master(_ulv_layout(levels, root), dt)
-        pin = rec['bufs'][dt].registered
-        self._dev.pop('ulv', None)
-        s = getattr(self, 'nSamples', 1)
-        up = lambda t: t.to(device=dev, dtype=dt)
-
-        NNvec = [0]
-        Uhat = R22 = None
-        for i, (Nb_i, n, k) in enumerate(levels):
-            c = self._chunk_blocks(Nb_i, n, max(s, n), True)
-            Uhat_n = torch.empty((Nb_i, k, k), dtype=dt, device=dev)
-            R22_n  = torch.empty((Nb_i, k, k), dtype=dt, device=dev)
-            for a in range(0, Nb_i, c):
-                b = min(a + c, Nb_i)
-                ch = slice(fac * a, fac * b)
-                Q, W1, Ru, Uu, Ud, R22c = _ulv_chunk(
-                    up(self.Dmats[i][a:b]), up(self.Umats[i][a:b]),
-                    up(self.Vmats[i][a:b]),
-                    None if Uhat is None else Uhat[ch],
-                    None if R22 is None else R22[ch])
-                for nm, t in (('Qlist', Q), ('Wlist', W1),
-                              ('Rlist', Ru), ('Uulist', Uu)):
-                    _put(lists[nm][i][a:b], t, pin)
-                Uhat_n[a:b] = Ud
-                R22_n[a:b]  = R22c
-                del Q, W1, Ru, Uu, Ud, R22c
-            NNvec.append(NNvec[-1] + (n - k) * Nb_i)
-            Uhat, R22 = Uhat_n, R22_n
-        Q, R = _ulv_root(up(self.Dmats[-1]), Uhat, R22)
-        _put(lists['Qlist'][-1], Q, pin)
-        _put(lists['Rlist'][-1], R, pin)
-        NNvec.append(NNvec[-1] + root[0] * R.shape[1])
-        del Q, R, Uhat, R22
-        if dev.type == 'cuda':
-            torch.cuda.synchronize(dev)
-
-        self._host['ulv'] = rec
-        for nm, lst in lists.items():
-            setattr(self, nm, lst)
-        self.NNvec = np.asarray(NNvec, dtype=np.int64)
-        self.tULV = time.time() - tic
+        return None
 
     def solve(self, b, mode='N', chunk=None, overwrite_b=False, out=None,
               io_perm=None):
-        """Apply the inverse (mode='N') or inverse transpose (mode='T') of the
-        HBS operator via its ULV factorization.
-
-        Permutation convention: the factors represent A_p = P A P^T with
-        (P v)[i] = v[perm[i]], so A^{-1} = P^T A_p^{-1} P and likewise for the
-        transpose; only the sweep inside ULVsparse.solve differs by mode.
-
-        b is streamed in column chunks (_cols: _STREAM_BYTES, _SOLVE_CHUNK),
-        so a host b never exists in full on the device.  Results:
-
-            out given    -> written into out (anywhere), returns out
-            overwrite_b  -> written into b itself (a torch tensor of the
-                            factor dtype, or a writeable float64 numpy array)
-            otherwise    numpy in -> numpy out;  tensor in -> tensor on
-                         compute_device
-
-        Overwriting is safe: each chunk is copied to the device before its
-        solution is written back.  io_perm: row order of b and the result.
-        """
-        if not self.Qlist:
-            raise RuntimeError(
-                "solve() requires the ULV factorization, but this HBSMAT has "
-                "an empty Qlist.  Build it with construct(..., compute_ULV=True) "
-                "or call compute_ULV() first."
-            )
-        if mode not in ('N', 'T'):
-            raise NotImplementedError(f"mode '{mode}' not recognized. Use 'N' or 'T'.")
-
-        input_is_numpy = isinstance(b, np.ndarray)
-        if not (input_is_numpy or torch.is_tensor(b)):
-            raise TypeError("b must be either a numpy.ndarray or a torch.Tensor")
-        if b.ndim not in (1, 2):
-            raise ValueError(f"b must have ndim 1 or 2, got ndim={b.ndim}")
-
-        dev, dt = self.compute_device, self.dtype_t
-        B = self._as_2d(b)
-        was_vector = (b.ndim == 1)
-        nrow, ncol = B.shape
-        if nrow != self.perm.shape[0]:
-            raise ValueError(f"solve: expected {self.perm.shape[0]} rows, got {nrow}")
-
-        if out is not None:
-            target, ret = self._as_2d(out), out
-        elif overwrite_b and B.dtype == dt and (
-                not input_is_numpy or b.flags.writeable):
-            target, ret = B, b
-        else:
-            target = torch.empty((nrow, ncol), dtype=dt,
-                                 device=_HOST if input_is_numpy else dev)
-            res = target[:, 0] if was_vector else target
-            ret = res.numpy() if input_is_numpy else res
-
-        F = self._factors(('core', 'ulv'), 'solve')
-        g = self._gidx(io_perm, dev)
-
-        def body(xc):
-            # u = P^T ( ULV^{-1} ( P b ) ) on one chunk; the gather is a copy
-            bp = xc.contiguous() if g is None else xc[g]
-            u = ULVsparse.solve(
-                F['Umats'], F['Dmats'], F['Qlist'], F['Wlist'], F['Uulist'],
-                F['Rlist'], self.NNvec, bp, device=dev, mode=mode,
-                Vmats=F['Vmats'])
-            del bp
-            if g is None:
-                return u
-            r = torch.empty_like(u)
-            r[g] = u
-            return r
-
-        self._stream(B, target, None, 1.0, 0.0,
-                     self._cols('solve', ncol, chunk), body)
-        del F
-        return ret
+        return None

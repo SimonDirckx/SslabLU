@@ -2,7 +2,7 @@ from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 from matAssembly.HBS import HBSTree as HBS
 from matAssembly.HBS import HBSnew
-from matAssembly.HBS import HBStorch
+from matAssembly.HBS import HBStorch_new as HBStorch
 from matAssembly.HBS import HBStorch_strong
 from matAssembly.HBS import HBSnew_strong
 import solver.solver as solver
@@ -155,7 +155,7 @@ class matAssembler:
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
-            s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 20
+            s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
             tic = time.time()
             Om = _standard_normal((linOp.shape[0],s))
             Psi = _standard_normal((linOp.shape[1],s))
@@ -163,10 +163,12 @@ class matAssembler:
             Z = linOp.T@Psi
             self.stats.timeSample=time.time()-tic
             tic = time.time()
+            p = HBSmat.perm.numpy()
+            Om, Psi, Y, Z = (X[p] for X in (Om, Psi, Y, Z))
             HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z,fast=False)
             self.stats.timeCompress=HBSmat.tCompress
             self.stats.nbytes = HBSmat.nbytes
-            
+            print("compression time = ",time.time()-tic)
             if dbg>0:
                 print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))
                 print("\t Toc HBS construction %.2e s"%self.stats.timeCompress)
