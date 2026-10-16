@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg   import LinearOperator
@@ -48,8 +51,88 @@ _ICNTL_OUT_STREAMS = (1, 2, 3, 4)
 _ICNTL_TRANSPOSE = 9
 _ICNTL_SPARSE_RHS = 20      # ICNTL(20): 1 = sparse RHS
 _ICNTL_BLOCK_SIZE = 27      # ICNTL(27): blocking size for multiple RHS
-_ICNTL_BLR = 35             # ICNTL(35): block low-rank
-_CNTL_BLR_TOL = 7           # CNTL(7):  BLR dropping parameter
+
+# ICNTL(27): MUMPS processes multiple right-hand sides in blocks of this many
+# columns and traverses the factors once per block.  Its automatic default is
+# small (a few tens of columns), so a solve with s ~ 100-200 sample columns
+# reads L and U several times over.  "auto" sets ICNTL(27) to the number of
+# columns of each solve call: one pass over the factors per call.
+_BLOCK_SIZE_AUTO = "auto"
+
+
+def _check_block_size(block_size):
+    """None (MUMPS default), "auto" (= columns per call) or a positive int."""
+    if block_size is None or block_size == _BLOCK_SIZE_AUTO:
+        return block_size
+    if isinstance(block_size, (bool, np.bool_)) or \
+            not isinstance(block_size, (int, np.integer)) or block_size < 1:
+        raise ValueError(
+            "mumps_block_size must be None, %r or a positive int, got %r"
+            % (_BLOCK_SIZE_AUTO, block_size))
+    return int(block_size)
+
+
+def _set_block_size_for(ctx, b, block_size):
+    """With block_size="auto", set ICNTL(27) to the column count of b."""
+    if block_size != _BLOCK_SIZE_AUTO:
+        return
+    nrhs = 1 if np.ndim(b) < 2 else int(np.shape(b)[1])
+    ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = max(nrhs, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Right-hand-side hand-off to python-mumps
+#
+# python-mumps' solve() runs prepare_for_fortran on the right-hand side first:
+#   C-ordered b                        -> np.asfortranarray(b): one transposing
+#                                         copy of the whole N x k block, on ONE
+#                                         core (seconds at k ~ 1000)
+#   F-ordered b, overwrite_b=False     -> np.asfortranarray(b.copy()): two
+#   F-ordered b, overwrite_b=True      -> no copy; MUMPS solves in place
+# So the solve operator makes its own Fortran-ordered copy, split over all
+# cores, and hands it over with overwrite_b=True.  The caller's array is never
+# written to, and no extra memory is used compared with python-mumps' copy.
+# --------------------------------------------------------------------------- #
+
+_PAR_COPY_MIN = 1 << 22        # elements (32 MB of float64); smaller: one thread
+_COPY_POOL = None
+
+
+def _ncpu():
+    """Cores this process may run on (respects taskset / SLURM / cgroups)."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:     # not available on every platform
+        return max(1, os.cpu_count() or 1)
+
+
+def _copy_pool():
+    global _COPY_POOL
+    if _COPY_POOL is None:
+        _COPY_POOL = ThreadPoolExecutor(_ncpu(), thread_name_prefix="rhs-copy")
+    return _COPY_POOL
+
+
+def _fortran_rhs(x, dtype):
+    """
+    A fresh Fortran-ordered copy of x in `dtype`, safe to give to MUMPS with
+    overwrite_b=True.  Large 2-D copies are split into row blocks over all
+    cores (numpy releases the GIL while copying); row blocks are what keeps a
+    C -> F transposing copy cache-friendly.
+    """
+    x = np.asarray(x)
+    if x.ndim != 2 or x.size < _PAR_COPY_MIN or _ncpu() == 1:
+        return np.array(x, dtype=dtype, order="F", copy=True)
+    out = np.empty(x.shape, dtype=dtype, order="F")
+    n = x.shape[0]
+    nblk = 4 * _ncpu()
+    step = -(-n // nblk)
+
+    def job(i):
+        out[i * step:(i + 1) * step] = x[i * step:(i + 1) * step]
+
+    list(_copy_pool().map(job, range(nblk)))
+    return out
 
 
 def _silence_mumps(ctx):
@@ -58,14 +141,7 @@ def _silence_mumps(ctx):
         ctx.mumps_instance.icntl[i] = 0
 
 
-def _enable_blr(ctx, blr_tol):
-    """Block-low-rank factorization with dropping tolerance `blr_tol`."""
-    ctx.mumps_instance.icntl[_ICNTL_BLR] = 1
-    ctx.mumps_instance.cntl[_CNTL_BLR_TOL] = blr_tol
-    # ICNTL(36) selects the BLR variant (UFSC); leave at default unless tuning.
-
-
-def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
+def setup_mumps(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO, verbose=0):
     """Analyze + factorize A in one MUMPS context.
 
     Returns (ctx, time_analysis, time_factor).
@@ -78,14 +154,17 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
     ordering : MUMPS ordering for the analysis ('metis', 'auto', 'amd', ...).
         Falls back to 'auto' if the requested ordering is not in this MUMPS
         build.
-    blr_tol : if > 0, enable BLR compression with this dropping tolerance.
     block_size : ICNTL(27), the blocking size for multiple right-hand sides.
-        Setting this to the number of columns you sample with gives one wide
-        BLAS-3 block per chunk.
+        "auto" (default): set per solve call to that call's column count
+            (applied by the operator from setup_solver_Aii_local), so every
+            call is one pass over the factors.
+        int: fixed block size for every solve on this context.
+        None: leave MUMPS' own (small) automatic default.
     verbose : >1 leaves MUMPS' own diagnostics on.
     """
     if mumps is None:
         raise ImportError("setup_mumps requires the python-mumps package")
+    block_size = _check_block_size(block_size)
     ctx = mumps.Context(verbose=bool(verbose > 1))
     # symmetric=False throughout: the symmetric/Cholesky path is deliberately
     # not used here.
@@ -103,8 +182,6 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
 
     if verbose < 2:
         _silence_mumps(ctx)
-    if blr_tol and blr_tol > 0:
-        _enable_blr(ctx, blr_tol)
 
     tic = time()
     # reuse_analysis=True is the whole point of having called analyze():
@@ -115,13 +192,14 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
 
     if verbose < 2:
         _silence_mumps(ctx)
-    if block_size is not None:
-        ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = int(block_size)
+    if isinstance(block_size, int):
+        # fixed size; "auto" is applied per call, None leaves MUMPS' default
+        ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = block_size
 
     return ctx, time_analysis, time_factor
 
 
-def setup_mumps_transpose(A, ordering="metis", blr_tol=0.0, block_size=None,
+def setup_mumps_transpose(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO,
                           verbose=0):
     """Factor A^T explicitly into its own context (opt-in; see `use_ctxT`).
 
@@ -131,26 +209,30 @@ def setup_mumps_transpose(A, ordering="metis", blr_tol=0.0, block_size=None,
     # .T of a CSR matrix is a CSC view; convert so MUMPS receives the same
     # storage type as on the forward path (values unchanged).
     AT = sp.csr_matrix(A.T) if sp.issparse(A) else np.asarray(A).T
-    return setup_mumps(AT, ordering=ordering, blr_tol=blr_tol,
-                       block_size=block_size, verbose=verbose)
+    return setup_mumps(AT, ordering=ordering, block_size=block_size,
+                       verbose=verbose)
 
 
-def mumps_solve(ctx, b, transpose=False):
+def mumps_solve(ctx, b, transpose=False, overwrite_b=False):
     """Solve A x = b, or A^T x = b, against an existing factorization.
 
     No context manager: ICNTL(9) is flipped, the solve runs, and the flag is
     restored in a finally block.  Reentrancy is the same as the original
     contextmanager version (i.e. do not interleave two transposed solves on
     one context from different threads).
+
+    overwrite_b : passed to python-mumps; with a Fortran-ordered b of the
+        system's dtype, True makes MUMPS solve in place (no copy, b is
+        overwritten and returned).
     """
     if not transpose:
-        return ctx.solve(b)
+        return ctx.solve(b, overwrite_b=overwrite_b)
 
     inst = ctx.mumps_instance
     prev = inst.icntl[_ICNTL_TRANSPOSE]
     inst.icntl[_ICNTL_TRANSPOSE] = 0          # A^T x = b
     try:
-        return ctx.solve(b)
+        return ctx.solve(b, overwrite_b=overwrite_b)
     finally:
         inst.icntl[_ICNTL_TRANSPOSE] = prev   # restore A x = b
 
@@ -173,22 +255,42 @@ def mumps_solve_sparse(ctx, b, transpose=False):
         inst.icntl[_ICNTL_TRANSPOSE] = prev
 
 
-def setup_solver_Aii_local(ctx, N, dtype, ctxT=None):
+def setup_solver_Aii_local(ctx, N, dtype, ctxT=None,
+                           block_size=_BLOCK_SIZE_AUTO):
     """LinearOperator applying A^{-1} and A^{-T}.
 
     ctxT is None (default): A^{-T} reuses the A factors via ICNTL(9)=0.
     ctxT given:             A^{-T} is a forward solve against factored A^T.
+    block_size == "auto":   ICNTL(27) is set to each call's column count
+                            just before the solve (see setup_mumps).
 
     NOTE: the argument order changed from the previous
     (ctx, ctxT, N, dtype) -- ctxT is now an optional trailing argument.
     """
+    block_size = _check_block_size(block_size)
+    sys_dtype = np.dtype(dtype)
+
+    def _solve(c, x, transpose):
+        _set_block_size_for(c, x, block_size)
+        if not sp.issparse(x):
+            x = np.asarray(x)
+            # OPT: own multithreaded Fortran copy, solved in place (see
+            #      _fortran_rhs).  Anything python-mumps would reject or treat
+            #      specially (dtype it cannot take, empty, sparse) keeps the
+            #      previous path and therefore the previous behaviour.
+            if x.ndim in (1, 2) and x.size > 0 and \
+                    np.result_type(x.dtype, sys_dtype) == sys_dtype:
+                b = _fortran_rhs(x, sys_dtype)
+                return mumps_solve(c, b, transpose=transpose, overwrite_b=True)
+        return mumps_solve(c, x, transpose=transpose)
+
     def _fwd(x):
-        return ctx.solve(x)
+        return _solve(ctx, x, transpose=False)
 
     def _adj(x):
         if ctxT is not None:
-            return ctxT.solve(x)
-        return mumps_solve(ctx, x, transpose=True)
+            return _solve(ctxT, x, transpose=False)
+        return _solve(ctx, x, transpose=True)
 
     return LinearOperator(
         shape=(N, N),
@@ -467,23 +569,24 @@ class solverOptions:
     MUMPS options below apply to the local factorization of both problem
     types (Dirichlet: Aii; mixed: M) for type 'hpsalt'.
     mumps_ordering: analysis ordering ('metis', 'auto', 'amd', 'scotch', ...)
-    blr_tol:    if > 0, BLR-compressed factorization with this tolerance
     use_ctxT:   factor A^T into a second context instead of reusing the A
                 factors via ICNTL(9)=0.  ~2x memory and factor time; only for
                 cross-checking the transposed-solve path.
-    mumps_block_size: ICNTL(27) blocking size for multiple right-hand sides
+    mumps_block_size: ICNTL(27) blocking size for multiple right-hand sides.
+                'auto' (default): the column count of each solve call, i.e.
+                one pass over the factors per call.  int: fixed size.
+                None: MUMPS' own small automatic default (previous behaviour).
     """
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
-                 mumps_ordering='metis',blr_tol=0.0,use_ctxT=False,
-                 mumps_block_size=None,reduced_gpu=False):
+                 mumps_ordering='metis',use_ctxT=False,
+                 mumps_block_size=_BLOCK_SIZE_AUTO,reduced_gpu=False):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
         self.problem_type = problem_type
         self.mumps_ordering   = mumps_ordering
-        self.blr_tol          = blr_tol
         self.use_ctxT         = use_ctxT
-        self.mumps_block_size = mumps_block_size
+        self.mumps_block_size = _check_block_size(mumps_block_size)
         self.reduced_gpu        = reduced_gpu
 
 def convertGeom(opts,geom):
@@ -590,7 +693,7 @@ class solverWrapper:
             if compute_inverse:
                 if self.opts.problem_type == 'Dirichlet':
                     # OPT: factor Aii through the same tuned MUMPS layer as
-                    #      the mixed path (ordering, BLR, reuse_analysis,
+                    #      the mixed path (ordering, reuse_analysis,
                     #      block size, A^{-T} on the same factors, blocked
                     #      matmat/rmatmat).  It used to go through the driver's
                     #      SparseSolver, which ignored all of those options.
@@ -663,7 +766,7 @@ class solverWrapper:
         Factor the local system matrix A with the tuned MUMPS layer and
         return the LinearOperator applying A^{-1} (matvec / matmat) and
         A^{-T} (rmatvec / rmatmat, on the same factors via ICNTL(9) unless
-        opts.use_ctxT).  Honours opts.mumps_ordering, blr_tol,
+        opts.use_ctxT).  Honours opts.mumps_ordering and
         mumps_block_size.  Sets self.ctx / ctxT / time_analysis / time_factor.
         Used by both the Dirichlet (A = Aii) and the mixed (A = M) path.
 
@@ -674,10 +777,12 @@ class solverWrapper:
         if mumps is None:
             nondefaults = [
                 name for name, default in (
-                    ("mumps_ordering", "metis"), ("blr_tol", 0.0),
-                    ("use_ctxT", False), ("mumps_block_size", None),
+                    ("mumps_ordering", "metis"), ("use_ctxT", False),
                 ) if getattr(self.opts, name) != default
             ]
+            # "auto" / None need nothing from the backend; a fixed size does
+            if self.opts.mumps_block_size not in (None, _BLOCK_SIZE_AUTO):
+                nondefaults.append("mumps_block_size")
             if nondefaults:
                 raise ValueError(
                     "python-mumps is unavailable; the fallback cannot honor "
@@ -699,7 +804,6 @@ class solverWrapper:
         ctx, t_an, t_fa = setup_mumps(
             A,
             ordering=self.opts.mumps_ordering,
-            blr_tol=self.opts.blr_tol,
             block_size=self.opts.mumps_block_size,
             verbose=2 if verbose else 0,
         )
@@ -711,7 +815,6 @@ class solverWrapper:
             ctxT, t_anT, t_faT = setup_mumps_transpose(
                 A,
                 ordering=self.opts.mumps_ordering,
-                blr_tol=self.opts.blr_tol,
                 block_size=self.opts.mumps_block_size,
                 verbose=2 if verbose else 0,
             )
@@ -725,7 +828,8 @@ class solverWrapper:
             print("\t A^-T applies: reusing A factorization with "
                   "ICNTL(9)=0") if verbose else None
 
-        return setup_solver_Aii_local(ctx, A.shape[0], A.dtype, ctxT=self.ctxT)
+        return setup_solver_Aii_local(ctx, A.shape[0], A.dtype, ctxT=self.ctxT,
+                                      block_size=self.opts.mumps_block_size)
 
     def check_adjoint(self, k=4, seed=0, verbose=True):
         """Adjoint-consistency check on this slab's solve operator."""

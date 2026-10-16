@@ -1,6 +1,3 @@
-
-
-
 from scipy.sparse.linalg   import LinearOperator
 import numpy as np
 from matAssembly.HBS import HBSTree as HBS
@@ -14,6 +11,56 @@ import matplotlib.pyplot as plt
 from matAssembly.HBS.simpleoctree import simpletree as tree
 import matAssembly.HBS.slabTree as slabTree
 import torch
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+
+# --------------------------------------------------------------------------- #
+# multithreaded Gaussian test matrices
+#
+# OPT: np.random.standard_normal (legacy RandomState) is single-threaded and
+#      slow: ~1.5-3 s for a 65k x 1344 block, while every other core idles.
+#      Here the block is split into a FIXED number of chunks, each filled by
+#      its own numpy Generator; numpy releases the GIL while filling, so the
+#      chunks run on all cores.  The per-chunk streams are spawned from one
+#      seed drawn from the global NumPy RNG, so np.random.seed(...) still
+#      makes runs reproducible -- and, the chunk count being fixed, with the
+#      same numbers on any number of cores.  (The numbers differ from the old
+#      legacy-RNG ones.)
+# --------------------------------------------------------------------------- #
+
+_RNG_CHUNKS = 64
+_RNG_PAR_MIN = 1 << 20          # elements; smaller blocks use one generator
+_RNG_POOL = None
+
+
+def _ncpu():
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
+def _standard_normal(shape):
+    """Like np.random.standard_normal(shape) (float64, C order), multithreaded."""
+    global _RNG_POOL
+    seed = int(np.random.randint(0, 2**63 - 1, dtype=np.int64))
+    out = np.empty(shape, dtype=np.float64)
+    flat = out.reshape(-1)
+    if flat.size < _RNG_PAR_MIN:
+        np.random.default_rng(seed).standard_normal(out=flat)
+        return out
+    gens = [np.random.default_rng(s)
+            for s in np.random.SeedSequence(seed).spawn(_RNG_CHUNKS)]
+    step = -(-flat.size // _RNG_CHUNKS)
+    if _RNG_POOL is None:
+        _RNG_POOL = ThreadPoolExecutor(_ncpu(), thread_name_prefix="hbs-rng")
+
+    def fill(i):
+        gens[i].standard_normal(out=flat[i * step:(i + 1) * step])
+
+    list(_RNG_POOL.map(fill, range(_RNG_CHUNKS)))
+    return out
 
 
 # Classes for matrix assembly
@@ -110,8 +157,8 @@ class matAssembler:
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
             s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 20
             tic = time.time()
-            Om = np.random.standard_normal((linOp.shape[0],s))
-            Psi = np.random.standard_normal((linOp.shape[1],s))
+            Om = _standard_normal((linOp.shape[0],s))
+            Psi = _standard_normal((linOp.shape[1],s))
             Y = linOp@Om
             Z = linOp.T@Psi
             self.stats.timeSample=time.time()-tic
@@ -223,4 +270,3 @@ class rkHMatAssembler_strong(matAssembler):
 class tolHMatAssembler(matAssembler):
     def __init__(self,tol,leaf_size,rk,ndim=3):
         super(tolHMatAssembler,self).__init__(matAssemblerOptions('epsHBS',tol,leaf_size,rk,ndim))
-

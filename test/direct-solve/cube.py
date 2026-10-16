@@ -75,7 +75,7 @@ opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=Tr
 tic_sys = time.time()
 OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=True,keepLU=True,keepDense=False)
 print("oms built")
-Stot_lu,  rhstot_lu  = OMS.construct_Stot_and_rhstot(bc, assembler,dbg=0)               # LU operator + LU rhs
+Stot_lu,  rhstot_lu  = OMS.construct_Stot_and_rhstot(bc, assembler,dbg = 0)               # LU operator + LU rhs
 print("sys mats done in ",time.time()-tic_sys,"s")
 Stot_HBS, rhstot_HBS = OMS.construct_Stot_and_rhstot(bc, assembler, rhsHBS=True,dbg = 0)  # HBS operator + HBS rhs
 print("sys mats done in ",time.time()-tic_sys,"s")
@@ -85,12 +85,35 @@ step = 30
 strat = rkStrat.linear(rk0+step,step,skip_first_level=False)
 rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,fast=True,identity_diag=True,compute_device='cuda',seed=None)
 rb_solver.factorize(S_rk_list)
+
+
+def set_solve_device(rb, dev):
+    """Point the RB solver and every HBS block it uses at `dev`.
+    Moves no data: the factors already live in the host masters."""
+    dev = torch.device(dev)
+    rb._drop_slot()
+    rb.release_solve_cache()
+    blocks = {id(b): b for b in rb._blocks}
+    for SiM, T, T_hbs, SiP in rb.RB:                 # catch anything not registered
+        for op in (*SiM, *T, *T_hbs, *SiP):
+            blocks.setdefault(id(op), op)
+    for b in blocks.values():
+        if isinstance(b, HBStorch.HBSMAT):
+            b.to(dev)                                # evicts any device copy
+    rb.compute_device = dev
+
+#set_solve_device(rb_solver, 'cpu')
+
 def matvec_rb(v):
     return rb_solver.solve(v)
 Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
 gInfo = gmres_info()
 stol = 1e-7
 v = np.random.standard_normal(size=(Ntot,))
+
+rb_solver.solve(v) #warmup
+
+
 tic = time.time()
 w = Sinv_HBS_rb@v
 v = np.random.standard_normal(size=(Ntot,))

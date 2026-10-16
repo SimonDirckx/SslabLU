@@ -118,6 +118,116 @@ def _dtype_of(obj, default=np.float64):
     return default if dt is None else dt
 
 
+def _real_dtype(dt):
+    """True for real (non-complex) numeric dtypes."""
+    return not np.issubdtype(np.dtype(dt), np.complexfloating)
+
+
+# --------------------------------------------------------------------------- #
+# multithreaded sparse @ dense
+# --------------------------------------------------------------------------- #
+#
+# OPT: the face couplings B[:,J] (forward samples) and B[:,J]^T (adjoint
+#      samples) are applied to s-column blocks around every local solve.
+#      scipy's csr @ dense is single-threaded and costs nnz(B_J) * s
+#      multiply-adds, i.e. ~10-15 s per product for 65k-dof faces at s ~ 1300,
+#      during which every other core idles.  torch's CPU CSR kernel (MKL /
+#      OpenMP) runs the same product on all cores.  The torch tensors share
+#      the scipy index and value arrays, so no memory is duplicated.
+
+try:
+    import torch as _torch_cpu
+except ImportError:      # pragma: no cover - depends on the environment
+    _torch_cpu = None
+
+
+def _torch_csr(M):
+    """
+    scipy sparse -> torch sparse CSR on the CPU.  Index and value arrays are
+    shared with M when their dtypes already fit (int32 indices are kept as
+    int32), so this is normally zero-copy.  M is made canonical (sorted
+    indices, no duplicates) in place, so pass a matrix you own.
+    """
+    M = M.tocsr()
+    M.sum_duplicates()
+    small = M.nnz < 2**31 and max(M.shape) < 2**31
+    idx = np.int32 if small else np.int64
+    crow = _torch_cpu.from_numpy(np.ascontiguousarray(M.indptr, dtype=idx))
+    col = _torch_cpu.from_numpy(np.ascontiguousarray(M.indices, dtype=idx))
+    val = _torch_cpu.from_numpy(np.ascontiguousarray(M.data))
+    with warnings.catch_warnings():
+        # "sparse CSR support is in beta": the CSR @ dense product used here
+        # is stable; keep the warning out of every run's output
+        warnings.filterwarnings("ignore", message=".*[Ss]parse CSR tensor support.*")
+        # M is canonical scipy CSR, so the invariant check would only cost time
+        return _torch_cpu.sparse_csr_tensor(crow, col, val, size=M.shape,
+                                            check_invariants=False)
+
+
+class _SparseMatmul:
+    """
+    X |-> M @ X for a scipy sparse M and a dense 1-D / 2-D host X, returning
+    a numpy array.  Uses torch's multithreaded CPU CSR kernel when torch is
+    importable, scipy otherwise.  If torch raises (unsupported dtype, old
+    version, ...), warns once and uses scipy from then on -- a failure falls
+    back, it never yields a different result.
+    """
+
+    def __init__(self, M):
+        self.M = M.tocsr()
+        self._mt = {}                     # dtype -> torch CSR of M in that dtype
+        self._use_torch = _torch_cpu is not None
+
+    @property
+    def dtype(self):
+        return self.M.dtype
+
+    @property
+    def shape(self):
+        return self.M.shape
+
+    def _torch_of(self, dt):
+        Mt = self._mt.get(dt)
+        if Mt is None:
+            M = self.M if self.M.dtype == dt else self.M.astype(dt)
+            Mt = self._mt[dt] = _torch_csr(M)
+        return Mt
+
+    def _torch_mm(self, X):
+        if np.iscomplexobj(X) and not np.iscomplexobj(self.M.data):
+            # real M, complex X: two real products rather than a complex
+            # copy of M
+            return self._torch_mm(X.real) + 1j * self._torch_mm(X.imag)
+        dt = np.result_type(self.M.dtype, X.dtype)
+        oneD = X.ndim == 1
+        X2 = X[:, None] if oneD else X
+        if X2.dtype == dt and X2.flags.writeable and \
+                (X2.flags.c_contiguous or X2.flags.f_contiguous):
+            # OPT: torch reads C- or Fortran-ordered arrays in place.  The
+            #      solutions coming back from MUMPS are Fortran-ordered, and
+            #      np.ascontiguousarray on them was a single-threaded
+            #      transposing copy of the whole N x s block.
+            Xc = X2
+        else:
+            # dtype change / strided view: one copy, keeping the memory order
+            Xc = np.array(X2, dtype=dt, order="K", copy=True)
+        Y = (self._torch_of(dt) @ _torch_cpu.from_numpy(Xc)).numpy()
+        return Y[:, 0] if oneD else Y
+
+    def __call__(self, X):
+        X = np.asarray(X)
+        if self._use_torch:
+            try:
+                return self._torch_mm(X)
+            except (RuntimeError, TypeError, ValueError, NotImplementedError) as exc:
+                self._use_torch = False
+                warnings.warn(
+                    "oms: torch sparse @ dense failed (%s: %s); using scipy's "
+                    "single-threaded kernel instead"
+                    % (type(exc).__name__, exc), RuntimeWarning, stacklevel=2)
+        return self.M @ X
+
+
 def _eval_reduced_load(reduced_load, solver, slabInd):
     """
     FIX: the original used two incompatible conventions for `reduced_load` --
@@ -1273,9 +1383,12 @@ class oms:
         if sp.issparse(BJ):
             BJ = BJ.tocsr()
             BJT = BJ.T.tocsr()
+            # OPT: multithreaded sparse @ dense (see _SparseMatmul)
+            mul_B, mul_BT = _SparseMatmul(BJ), _SparseMatmul(BJT)
         else:
             BJ = np.asarray(BJ)
             BJT = BJ.T
+            mul_B, mul_BT = BJ.__matmul__, BJT.__matmul__
         dt = np.result_type(_dtype_of(solver.solver_ii), _dtype_of(BJ))
 
         def smatmat(v, transpose=False):
@@ -1285,18 +1398,30 @@ class oms:
             A_solver = handle.get().solver_ii
 
             if not transpose:
-                result = (A_solver @ (BJ @ v_tmp))[I, :]
+                result = (A_solver @ mul_B(v_tmp))[I, :]
             else:
                 # FIX: the original sized this with v.shape[1] instead of
                 #      v_tmp.shape[1], so every 1-D rmatvec raised IndexError.
                 # FIX: dtype was hard-wired to float64, silently killing
                 #      complex problems.
+                # OPT: Fortran order, the layout MUMPS solves in, so the
+                #      solver's copy of it is a straight copy, not a transpose
                 tmp = np.zeros(
                     (nrows_full, v_tmp.shape[1]),
                     dtype=np.result_type(dt, v_tmp.dtype),
+                    order="F",
                 )
                 tmp[I, :] = v_tmp
-                result = BJT @ (A_solver.T @ tmp)
+                if _real_dtype(_dtype_of(A_solver)) and _real_dtype(tmp.dtype) \
+                        and hasattr(A_solver, "rmatmat"):
+                    # OPT: real problem, so A^{-T} == A^{-H}: call the solve's
+                    #      rmatmat directly.  scipy's A_solver.T would compute
+                    #      the same thing as conj(rmatmat(conj(tmp))), i.e. two
+                    #      extra single-threaded N x s copies.
+                    W = A_solver.rmatmat(tmp)
+                else:
+                    W = A_solver.T @ tmp
+                result = mul_BT(W)
             del A_solver
 
             return result.ravel() if oneD else result
@@ -1587,6 +1712,7 @@ class oms:
             discrTime += tDisc
             compressTime += tC
             sampleTime += tS
+            print("sampleTime = ",sampleTime)
 
         for slabInd in range(len(slabs)):
             solver, XXb, XXi, tDisc = self._slab_solver(slabInd, dbg=dbg)
