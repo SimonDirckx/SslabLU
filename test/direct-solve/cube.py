@@ -43,7 +43,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-kh = 10*np.pi
+kh = 40*np.pi
 
 def c11(p):
     return torch.ones_like(p[:,0])
@@ -68,10 +68,10 @@ dSlabs,connectivity,H = cube.dSlabs(N)
 p = 8
 p_disc = p + 2 # To handle different conventions between hps and hpsalt
 a = np.array([H/2,1/32,1/32])
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=False)
-rk0 = 200
+opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
+rk0 = 250
 assembler = mA.rkHMatAssembler(8*p*p,rk0,ndim=3)
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=False)
+opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
 tic_sys = time.time()
 OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=True,keepLU=True,keepDense=False)
 print("oms built")
