@@ -153,6 +153,14 @@
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
+#   SSLABLU_GMRES      1 = conditioning probe of I + S, divergence form only
+#                      (default 0): unrestarted GMRES iterations to 1e-10 for a
+#                      random and a constant rhs; ||(I+S) 1||/||1||, the
+#                      near-null test for the zonal-mean mode that Neumann walls
+#                      + periodic x leave as ell/H grows; and the direct
+#                      solver's amplification ||(I+S)^-1 b||/||b|| for both rhs.
+#                      Printed after the setup and saved in the ssh npz
+#                      (gmres_iters_rand/_const, const_res, amp_rand/_const).
 #   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
 #   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
@@ -169,7 +177,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
+import scipy
 import torch
+from packaging.version import Version
+from scipy.sparse.linalg import gmres
 
 torch.set_default_dtype(torch.double)
 
@@ -286,6 +297,23 @@ IC_CX  = 0.25            # bump center (off the ridge at x = 0.5)
 IC_CY  = 0.5
 
 GATE_TOL = 1.0e-8        # hard-fail threshold for the manufactured gate
+
+GMRES_TOL, GMRES_MAXIT = 1.0e-10, 500     # SSLABLU_GMRES conditioning probe
+
+
+def gmres_iters(A, b):
+    """Unrestarted GMRES iteration count to GMRES_TOL (relative residual), as in
+    channel_barotropic_sweep.py's probe; GMRES_MAXIT + 1 flags no convergence."""
+    n = [0]
+    def cb(_):
+        n[0] += 1
+    kw = dict(callback=cb, callback_type="pr_norm", maxiter=1,
+              restart=GMRES_MAXIT)
+    if Version(scipy.__version__) >= Version("1.14"):
+        _, info = gmres(A, b, rtol=GMRES_TOL, **kw)
+    else:
+        _, info = gmres(A, b, tol=GMRES_TOL, **kw)
+    return n[0] if info == 0 else GMRES_MAXIT + 1
 
 
 def bump_x(x, lib):
@@ -876,6 +904,27 @@ class ChannelModel:
             self.solver_check = (np.linalg.norm(self.solve(r) - x_ref)
                                  / np.linalg.norm(x_ref))
 
+        # optional conditioning probe (SSLABLU_GMRES): GMRES iterations on the
+        # same I + S, for a random rhs and for the constant interface vector,
+        # plus two direct measures of the near-null zonal-mean mode that
+        # Neumann walls + periodic x leave once ell >> H: the residual
+        # ||(I+S) 1|| / ||1|| (-> 0 if I + S nearly annihilates constants) and
+        # the direct solver's amplification ||(I+S)^{-1} 1|| / ||1||
+        self.probe = {}
+        if GMRES_PROBE and conservative:
+            Stot, _ = self.OMS.construct_Stot_and_rhstot_linearOperator(
+                S_list, rhs0, self.Ntot, self.nc)
+            one = np.ones(self.Ntot)
+            tic = time.perf_counter()
+            it_r = gmres_iters(Stot, r)
+            it_c = gmres_iters(Stot, one)
+            self.probe = {
+                "gmres_iters_rand": it_r, "gmres_iters_const": it_c,
+                "const_res": np.linalg.norm(Stot @ one) / np.linalg.norm(one),
+                "amp_rand": np.linalg.norm(self.solve(r)) / np.linalg.norm(r),
+                "amp_const": np.linalg.norm(self.solve(one)) / np.linalg.norm(one),
+                "t_gmres": time.perf_counter() - tic}
+
         tic = time.perf_counter()
         self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
                              own_split=n * H) for n in range(self.N)]
@@ -1297,6 +1346,7 @@ if SOLVER == "rbhbs":
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
+GMRES_PROBE = os.environ.get("SSLABLU_GMRES", "0") != "0"
 # flux_budget() return order, as contributions to the step's volume change dM [m]
 BUDGET_COLS = ["dM", "steric", "res_interior", "res_edge", "res_wall", "res_corner",
                "product_rule", "wall_noncorner", "wall_corner", "jump_noncorner_x",
@@ -1416,6 +1466,14 @@ print("[divergence form]     assemble/factor/keep-slabs = "
 if SOLVER in ("rb", "rbhbs"):
     print("[divergence form]     %s, one random-rhs solve: rel. diff = %.3E"
           % (modC.solver_check_label, modC.solver_check))
+if GMRES_PROBE:
+    pr = modC.probe
+    print("[divergence form]     ell/H = %.3f; GMRES iters (tol %.0E) random / const rhs = %d / %d"
+          "  (%.1f s)" % (ell / H, GMRES_TOL, pr["gmres_iters_rand"],
+                          pr["gmres_iters_const"], pr["t_gmres"]))
+    print("[divergence form]     ||(I+S) 1||/||1|| = %.3E;  ||(I+S)^-1 b||/||b||"
+          " random / const = %.3E / %.3E"
+          % (pr["const_res"], pr["amp_rand"], pr["amp_const"]))
 modN = None
 if CMP_FORM:
     modN = ChannelModel(dt, False, make_assembler(), dSlabs, connectivity, H,
@@ -1608,7 +1666,8 @@ np.savez(SSH_OUT, ns=np.array(SSH_NS), dt=dt, nsteps=NSTEPS, nmid=NSTEPS // 2,
          forced=FORCED, steric_amp=STERIC_AMP, gamma_s=GAMMA_S, tau0=TAU0,
          rdrag=RDRAG, walls=WALLS, wall_band=wall_band, wall_noflux=WALL_NOFLUX,
          sponge_w=SPONGE_W, sponge_rate=SPONGE_RATE, solver=SOLVER, rk=RK, rb_rk=RB_RK,
-         rng_seed=RNG_SEED, solver_check=modC.solver_check, **ssh_export)
+         rng_seed=RNG_SEED, solver_check=modC.solver_check, ell=ell, slab_H=H,
+         **modC.probe, **ssh_export)
 print("Wrote %s  (eta/u/v at %s-squared cell centers)" % (SSH_OUT, SSH_NS))
 
 # ---- optional dt-convergence (rebuilds the operator per dt: slow) ----------

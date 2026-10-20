@@ -12,6 +12,8 @@
 #              (2 npan_y x npan_y leaves, aspect 1:2) fixed for a given npan_y,
 #              so every N at one (npan_y, p) is the SAME discretization, split
 #              into slabs differently: dense rb agrees across N to round-off.
+#   dt       SSLABLU_SWEEP_DT_HS, the timestep in hours (dt preset only, by
+#            default); unset = a single pass at the environment's SSLABLU_DT_H
 #   variant  one solver / rank setting, from the tokens below
 #
 # Variant tokens (SSLABLU_SWEEP_VARIANTS, comma-separated):
@@ -34,6 +36,22 @@
 #            p = 8,12,16, and SSLABLU_COMPARE_FORMS=0 (no non-conservative
 #            twin run: halves the cost; the npz holds the conservative form
 #            only either way). Up to 81 runs.
+#   dt       conditioning / rank vs the screening length ell = sqrt(g H0) dt / L
+#            relative to the slab width H = 1/N: dt = 0.125 (the other
+#            presets' 450 s), 0.25, 0.5, 1, 2, 4 h, so ell/H runs from 0.7 (N=8,
+#            450 s) to 91 (N=32, 4 h). npan_y = 32 (N = 8, 16, 32 on one
+#            discretization), p = 12, variants rb,0.5,1. Each run takes
+#            SSLABLU_NSTEPS = 4 steps (operator properties, not spin-up physics:
+#            forward-Euler Coriolis grows by sqrt(1 + (f dt)^2) per step, ~1.75
+#            at 4 h, so long runs at large dt are not meaningful) with
+#            SSLABLU_GMRES=1 (GMRES iterations and the constant-mode probe of
+#            I + S, in the log and the npz) and SSLABLU_COMPARE_FORMS=0. 54 runs.
+#            The log names gain a _dt<h>h token.
+#   dt_cpu   the dt preset abridged for a CPU-only machine (SSLABLU_GPU defaults
+#            to 0 here): npan_y = 16 (N = 8, 16), p = 8, same variants (RK =
+#            RB_RK = 4, 8) and dts, so ell/H = 0.7 ... 46. 36 runs, into
+#            central_ridge_dt_cpu_runs/. Iteration counts and accuracies are
+#            comparable with the GPU dt preset; timings are not.
 #
 # Output: every run directory, plus the per-run logs in <outdir>/logs/, goes
 # into one subdirectory of the repo root,
@@ -54,15 +72,17 @@
 # Usage (from anywhere):
 #   python test/validation/channel_ridgectr_sweep.py                 # solver preset
 #   SSLABLU_SWEEP_TEST=rankiso python test/validation/channel_ridgectr_sweep.py
-#   SSLABLU_SWEEP_TEST     solver | rankiso                (default solver)
+#   SSLABLU_SWEEP_TEST=dt python test/validation/channel_ridgectr_sweep.py
+#   SSLABLU_SWEEP_TEST     solver | rankiso | dt | dt_cpu  (default solver)
 #   SSLABLU_SWEEP_NPAN_YS  npan_y values
 #   SSLABLU_SWEEP_PS       orders p
 #   SSLABLU_SWEEP_VARIANTS variant tokens (see above)
+#   SSLABLU_SWEEP_DT_HS    timesteps in hours (sets SSLABLU_DT_H per run)
 #   SSLABLU_SWEEP_RK_HI    S-map rank of solver:<r>, as a multiple of p (default 1.5)
 #   SSLABLU_SWEEP_OUTDIR   output subdirectory (relative to the repo root)
 # Every other SSLABLU_* variable in the environment (DT_H, NSTEPS, SSH_NS,
 # RNG_SEED, ...) passes through unchanged; N, P, NPAN_X, NPAN_Y, SOLVER, RK,
-# RB_RK, GPU and RIDGE_MIDPANEL are set here.
+# RB_RK, GPU and RIDGE_MIDPANEL are set here (and DT_H with SSLABLU_SWEEP_DT_HS).
 # =============================================================================
 
 import os
@@ -75,23 +95,32 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "test" / "validation" / "channel_barotropic_timestep.py"
 
 PRESETS = {
-    "solver":  dict(npan_ys="8,16,32", ps="8,12,16", variants="rb,0.5,1,1.5", env={}),
+    "solver":  dict(npan_ys="8,16,32", ps="8,12,16", variants="rb,0.5,1,1.5", dt_hs="", env={}),
     "rankiso": dict(npan_ys="32", ps="8,12,16",
                     variants="rb,smap:4,smap:6,smap:8,smap:12,solver:4,solver:6,solver:8,solver:12",
-                    env={"SSLABLU_COMPARE_FORMS": "0"}),
+                    dt_hs="", env={"SSLABLU_COMPARE_FORMS": "0"}),
+    "dt":      dict(npan_ys="32", ps="12", variants="rb,0.5,1", dt_hs="0.125,0.25,0.5,1,2,4",
+                    env={"SSLABLU_COMPARE_FORMS": "0", "SSLABLU_NSTEPS": "4",
+                         "SSLABLU_GMRES": "1"}),
+    "dt_cpu":  dict(npan_ys="16", ps="8", variants="rb,0.5,1", dt_hs="0.125,0.25,0.5,1,2,4",
+                    env={"SSLABLU_COMPARE_FORMS": "0", "SSLABLU_NSTEPS": "4",
+                         "SSLABLU_GMRES": "1"}, gpu="0"),
 }
 TEST = os.environ.get("SSLABLU_SWEEP_TEST", "solver")
 if TEST not in PRESETS:
     sys.exit("SSLABLU_SWEEP_TEST must be one of %s, got %r" % (", ".join(PRESETS), TEST))
 PRE = PRESETS[TEST]
-GPU = os.environ.get("SSLABLU_GPU", "1") != "0"
+GPU = os.environ.get("SSLABLU_GPU", PRE.get("gpu", "1")) != "0"
 
 NPYs = [int(v) for v in os.environ.get("SSLABLU_SWEEP_NPAN_YS", PRE["npan_ys"]).split(",") if v]
 Ps = [int(v) for v in os.environ.get("SSLABLU_SWEEP_PS", PRE["ps"]).split(",") if v]
 VARIANTS = [v.strip() for v in os.environ.get("SSLABLU_SWEEP_VARIANTS", PRE["variants"]).split(",") if v.strip()]
+# [None] = one pass at whatever SSLABLU_DT_H the environment holds
+DT_HS = [float(v) for v in os.environ.get("SSLABLU_SWEEP_DT_HS", PRE["dt_hs"]).split(",") if v] or [None]
 RK_HI = float(os.environ.get("SSLABLU_SWEEP_RK_HI", "1.5"))
 OUT = REPO / os.environ.get("SSLABLU_SWEEP_OUTDIR",
-                            "central_ridge_%s_%s_runs" % (TEST, "gpu" if GPU else "cpu"))
+                            "central_ridge_%s_runs" % TEST if TEST.endswith("_cpu") and not GPU
+                            else "central_ridge_%s_%s_runs" % (TEST, "gpu" if GPU else "cpu"))
 LOGS = OUT / "logs"
 
 if GPU:
@@ -129,7 +158,7 @@ def variant(tok, p):
     sys.exit("unknown variant token %r (rb, <f>, smap:<r> or solver:<r>)" % tok)
 
 
-# (npan_y, p, N, npan_x, solver, RK, RB_RK, log tag) in loop order
+# (npan_y, p, N, npan_x, solver, RK, RB_RK, log tag, dt in hours or None) in loop order
 configs, skipped = [], []
 for npy in NPYs:
     for p in Ps:
@@ -138,13 +167,14 @@ for npy in NPYs:
             npx = 4 * npy // N
             if npx % 2 or 4 * npy % N:
                 sys.exit("npan_x = 4 npan_y / N = 4*%d/%d must be an even integer" % (npy, N))
-            for tok in VARIANTS:
-                v = variant(tok, p)
-                if isinstance(v, str):
-                    if N == 8:
-                        skipped.append("p=%d %s: %s" % (p, tok, v))
-                    continue
-                configs.append((npy, p, N, npx) + v)
+            for dth in DT_HS:
+                for tok in VARIANTS:
+                    v = variant(tok, p)
+                    if isinstance(v, str):
+                        if N == 8 and dth == DT_HS[0]:
+                            skipped.append("p=%d %s: %s" % (p, tok, v))
+                        continue
+                    configs.append((npy, p, N, npx) + v + (dth,))
             N *= 2
 
 
@@ -160,9 +190,10 @@ def finished_dir(log):
 
 
 def label(c):
-    npy, p, N, npx, solver, rk, rbrk, _ = c
-    return "p=%d N=%d pan=%dx%d %s RK=%d%s" % (p, N, npx, npy, solver, rk,
-                                              (" RB_RK=%d" % rbrk) if solver == "rbhbs" else "")
+    npy, p, N, npx, solver, rk, rbrk, _, dth = c
+    return "p=%d N=%d pan=%dx%d %s RK=%d%s%s" % (p, N, npx, npy, solver, rk,
+                                                (" RB_RK=%d" % rbrk) if solver == "rbhbs" else "",
+                                                (" dt=%gh" % dth) if dth is not None else "")
 
 
 LOGS.mkdir(parents=True, exist_ok=True)
@@ -172,9 +203,10 @@ for s in skipped:
     print("  skipped variant " + s)
 results = []       # (config, status, seconds, output dir)
 for i, c in enumerate(configs):
-    npy, p, N, npx, solver, rk, rbrk, tag = c
+    npy, p, N, npx, solver, rk, rbrk, tag, dth = c
     k = "%d/%d" % (i + 1, len(configs))
-    log = LOGS / ("p%d_N%d_pan%dx%d_%s.log" % (p, N, npx, npy, tag))
+    log = LOGS / ("p%d_N%d_pan%dx%d_%s%s.log" % (p, N, npx, npy, tag,
+                                               ("_dt%gh" % dth) if dth is not None else ""))
     done = finished_dir(log)
     if done is not None:
         print("[%s] %s: skip, already in %s" % (k, label(c), done.name))
@@ -186,6 +218,8 @@ for i, c in enumerate(configs):
                SSLABLU_NPAN_Y=str(npy), SSLABLU_SOLVER=solver, SSLABLU_RK=str(rk),
                SSLABLU_GPU="1" if GPU else "0", SSLABLU_RIDGE_MIDPANEL="0",
                PYTHONUNBUFFERED="1")
+    if dth is not None:
+        env["SSLABLU_DT_H"] = repr(dth)
     if solver == "rbhbs":
         env["SSLABLU_RB_RK"] = str(rbrk)
     else:
@@ -209,10 +243,11 @@ for i, c in enumerate(configs):
 print("")
 print("=============SUMMARY  (%s sweep, ridge crest at x/L = 0.5, %s)============="
       % (TEST, "GPU" if GPU else "CPU"))
-print("  npan_y   p   N  npan_x  solver   RK  RB_RK   status            time [s]   output directory")
-for (npy, p, N, npx, solver, rk, rbrk, _), status, toc, outdir in results:
-    print("  %5d  %3d  %2d  %6d  %-6s  %3d  %5s   %-16s %9.1f   %s"
-          % (npy, p, N, npx, solver, rk, str(rbrk) if solver == "rbhbs" else "-", status, toc, outdir))
+print("  npan_y   p   N  npan_x  dt[h]  solver   RK  RB_RK   status            time [s]   output directory")
+for (npy, p, N, npx, solver, rk, rbrk, _, dth), status, toc, outdir in results:
+    print("  %5d  %3d  %2d  %6d  %5s  %-6s  %3d  %5s   %-16s %9.1f   %s"
+          % (npy, p, N, npx, ("%g" % dth) if dth is not None else "env", solver, rk,
+             str(rbrk) if solver == "rbhbs" else "-", status, toc, outdir))
 print("=================================================")
 print("output in %s/" % OUT.relative_to(REPO))
 if any(r[1].startswith("FAILED") for r in results):
