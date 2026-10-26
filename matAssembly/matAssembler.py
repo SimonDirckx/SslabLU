@@ -155,7 +155,7 @@ class matAssembler:
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
-            s = 2*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
+            s = 3*max(self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 10
             tic = time.time()
             Om = _standard_normal((linOp.shape[0],s))
             Psi = _standard_normal((linOp.shape[1],s))

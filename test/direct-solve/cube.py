@@ -1,8 +1,8 @@
 import numpy as np
 import direct_solve.omsdirectsolveHBS_torch as omsdirectHBS
-import direct_solve.omsdirectsolveHBS_torch_new as omsdirectHBS_new
+import direct_solve.omsdirectsolveHBS_torch_new2 as omsdirectHBS_new
 from direct_solve.omsdirectsolveHBS_torch import rkStrat
-from direct_solve.omsdirectsolveHBS_torch_new import rkStrat as rkStrat_new
+from direct_solve.omsdirectsolveHBS_torch_new2 import rkStrat as rkStrat_new
 import torch
 import scipy
 # oms packages
@@ -45,7 +45,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-kh = 4*np.pi
+kh = 40*np.pi
 
 def c11(p):
     return torch.ones_like(p[:,0])
@@ -69,11 +69,11 @@ N = 33
 dSlabs,connectivity,H = cube.dSlabs(N)
 p = 8
 p_disc = p + 2 # To handle different conventions between hps and hpsalt
-a = np.array([H/2,1/32,1/32])
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=False)
-rk0 = 50
+a = np.array([H/4,1/64,1/64])
+opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
+rk0 = 200
 assembler = mA.rkHMatAssembler(8*p*p,rk0,ndim=3)
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=False)
+opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
 tic_sys = time.time()
 OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=True,keepLU=True,keepDense=False)
 print("oms built")
@@ -83,13 +83,9 @@ Stot_HBS, rhstot_HBS = OMS.construct_Stot_and_rhstot(bc, assembler, rhsHBS=True,
 print("sys mats done in ",time.time()-tic_sys,"s")
 S_rk_list = OMS.hbs_blocks
 Ntot, nc = OMS.Ntot,OMS.nc
-step = 30
-strat = rkStrat_new.linear(rk0+step,step,skip_first_level=False)
+step = 40
+strat = rkStrat_new.linear(200+step,step,skip_first_level=False)
 #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,fast=True,identity_diag=True,compute_device='cpu',seed=None)
-tic = time.time()
-rb_solver = omsdirectHBS_new.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compute_device='cpu',seed=None,dbg=1)
-rb_solver.factorize(S_rk_list)
-print("factor time = ",time.time()-tic)
 
 def set_solve_device(rb, dev):
     """Point the RB solver and every HBS block it uses at `dev`.
@@ -108,40 +104,86 @@ def set_solve_device(rb, dev):
 
 #set_solve_device(rb_solver, 'cpu')
 
-def matvec_rb(v):
-    return rb_solver.solve(v)
-Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
+# ---------------------------------------------------------------------------
+# Solver variants: identical setup, only the `normalized` flag differs.
+# Add an entry here to test another variant.
+# ---------------------------------------------------------------------------
+variants = {"unnormalized": False, "normalized": True}
+
+def make_inv_op(rb):
+    """Wrap one RB solver as a LinearOperator (bound to that solver, not a loop variable)."""
+    def matvec(v):
+        return rb.solve(v)
+    return scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec,dtype=np.float64)
+
+solvers, Sinv_ops, factor_times = {}, {}, {}
+for label, normalized in variants.items():
+    tic = time.time()
+    rb = omsdirectHBS_new.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compute_device='cuda',seed=None,dbg=1,normalized=normalized)
+    rb.factorize(S_rk_list)
+    factor_times[label] = time.time()-tic
+    print(f"construct + factor time {label} = ",factor_times[label])
+    solvers[label]  = rb
+    Sinv_ops[label] = make_inv_op(rb)
+
 gInfo = gmres_info()
 stol = 1e-7
+
+# ---------------------------------------------------------------------------
+# Apply timings (each solver warmed up before its timed apply)
+# ---------------------------------------------------------------------------
 v = np.random.standard_normal(size=(Ntot,))
 
-rb_solver.solve(v) #warmup
+apply_times = {}
+for label, Sinv in Sinv_ops.items():
+    solvers[label].solve(v) #warmup
+    tic = time.time()
+    w = Sinv@v
+    apply_times[label] = time.time()-tic
+    print(f"precond {label} apply time = ",apply_times[label])
 
-
-tic = time.time()
-w = Sinv_HBS_rb@v
-v = np.random.standard_normal(size=(Ntot,))
-print("precond apply time = ",time.time()-tic)
 tic = time.time()
 w = Stot_lu@v
 print("LU apply time = ",time.time()-tic)
 
-#tic=time.time()
-#if Version(scipy.__version__)>=Version("1.14"):
-#    uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-#else:
-#    uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-#print("elapsed time gmres = ",time.time()-tic)
-#print("pGMRES iters rb          = ", gInfo.niter)
+# ---------------------------------------------------------------------------
+# Accuracy: same test vector and same operator products for every solver
+# ---------------------------------------------------------------------------
 v = np.random.default_rng(0).standard_normal(Ntot)
-y1 = Sinv_HBS_rb@v; y2 = Sinv_HBS_rb@v
-print(np.linalg.norm(y1 - y2) / np.linalg.norm(y1))
-y3 = Stot_HBS@v
-print("precond vs HBS",np.linalg.norm(v-Sinv_HBS_rb@y3)/np.linalg.norm(v))
-y4 = Stot_lu@v
-y5 = Stot_HBS@v
-print("precond vs LU",np.linalg.norm(y4-y5)/np.linalg.norm(y4))
-print("precond vs LU (backward)",np.linalg.norm(v-Sinv_HBS_rb@(Stot_lu@v))/np.linalg.norm(v))
+y_hbs = Stot_HBS@v
+y_lu  = Stot_lu@v
+err_hbs_vs_lu = np.linalg.norm(y_lu-y_hbs)/np.linalg.norm(y_lu)   # solver-independent
+print("HBS vs LU operator",err_hbs_vs_lu)
+
+def accuracy_tests(Sinv, v, y_hbs, y_lu):
+    """Solver-dependent accuracy checks; y_hbs = Stot_HBS@v, y_lu = Stot_lu@v."""
+    nv = np.linalg.norm(v)
+    y1 = Sinv@v; y2 = Sinv@v
+    return {
+        "repeatability":         np.linalg.norm(y1-y2)/np.linalg.norm(y1),
+        "precond vs HBS":        np.linalg.norm(v-Sinv@y_hbs)/nv,
+        "precond vs LU (bwd)":   np.linalg.norm(v-Sinv@y_lu)/nv,
+    }
+
+accuracy = {}
+for label, Sinv in Sinv_ops.items():
+    accuracy[label] = accuracy_tests(Sinv, v, y_hbs, y_lu)
+    for name, val in accuracy[label].items():
+        print(f"[{label}] {name}",val)
+
+# ---------------------------------------------------------------------------
+# Side-by-side summary
+# ---------------------------------------------------------------------------
+labels = list(variants)
+rows = [("construct + factor [s]", factor_times), ("apply time [s]", apply_times)]
+rows += [(name, {l: accuracy[l][name] for l in labels}) for name in accuracy[labels[0]]]
+name_w = max(len(name) for name, _ in rows)
+print()
+print(f"{'':<{name_w}}" + "".join(f"{l:>16}" for l in labels))
+for name, vals in rows:
+    print(f"{name:<{name_w}}" + "".join(f"{vals[l]:>16.3e}" for l in labels))
+print(f"(HBS vs LU operator, solver-independent: {err_hbs_vs_lu:.3e})")
+
 #for slabInd in range(len(dSlabs)):
 #    gc_HBS = uhat[slabInd*nc:(slabInd+1)*nc]
 #    geom    = np.array(dSlabs[slabInd])

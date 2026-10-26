@@ -276,7 +276,7 @@ def _null_col_pinv(Om, Y, k, sel=None):
     W  = torch.ormqr(Vh, tau, Y.mT, left=True, transpose=True).mT
     M  = tla.solve_triangular(R, W[..., :n].mT, upper=True).mT
     Yp = W[..., n:]
-    driver='gesvda' if Yp.is_cuda else None
+    driver='gesvd' if Yp.is_cuda else None
     U = tla.svd(Yp, full_matrices=False,driver = driver).U[..., :k]
     return U.contiguous(), M
 
