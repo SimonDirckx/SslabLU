@@ -7,7 +7,8 @@ presets, two replicates each). Run from anywhere, in order:
   python test/validation/channel_sweep_eda/eda_extra.py     # noise floor, rank needed, clean cost
   python test/validation/channel_sweep_eda/eda_figs.py      # three PNGs
 
-Paths: run directories are read from the repo root (see eda_load.ROOTS); every
+Paths: run directories are read from SSLABLU_EDA_DATA (default
+<repo>/central_ridge_rank_old_hps_mem_runs/, see eda_load.ROOTS); every
 intermediate pickle and figure goes to SSLABLU_EDA_OUT (default
 <repo>/channel_sweep_eda_out/). `rows` is the table eda_load.py writes, loaded
 on import when it exists; each row is one run, tagged here with

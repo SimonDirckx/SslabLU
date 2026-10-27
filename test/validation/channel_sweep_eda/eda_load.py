@@ -5,10 +5,15 @@ import numpy as np
 from eda_common import REPO, ROWS_PKL
 
 os.chdir(REPO)
-ROOTS = {("solver", "1013"): "central_ridge_solver_gpu_runs_1013",
-         ("solver", "1018"): "central_ridge_solver_gpu_runs_1018",
-         ("rankiso", "1013"): "central_ridge_rankiso_gpu_runs_1013",
-         ("rankiso", "1018"): "central_ridge_rankiso_gpu_runs_1018"}
+# run directories, relative to the repo root (SSLABLU_EDA_DATA overrides the parent)
+DATA = os.environ.get("SSLABLU_EDA_DATA", "central_ridge_rank_old_hps_mem_runs")
+ROOTS = {("solver", "1013"): os.path.join(DATA, "central_ridge_solver_gpu_runs_1013"),
+         ("solver", "1018"): os.path.join(DATA, "central_ridge_solver_gpu_runs_1018"),
+         ("rankiso", "1013"): os.path.join(DATA, "central_ridge_rankiso_gpu_runs_1013"),
+         ("rankiso", "1018"): os.path.join(DATA, "central_ridge_rankiso_gpu_runs_1018")}
+for _r in ROOTS.values():
+    if not os.path.isdir(_r):
+        raise SystemExit("run directory %s not found (set SSLABLU_EDA_DATA or edit ROOTS)" % _r)
 FIELDS = [f + "_" + t + "_320" for f in ("eta", "u", "v") for t in ("mid", "final")]
 rows = []
 for (sweep, rep), root in ROOTS.items():
