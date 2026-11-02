@@ -71,7 +71,7 @@ p = 8
 p_disc = p + 2 # To handle different conventions between hps and hpsalt
 a = np.array([H/4,1/64,1/64])
 opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
-rk0 = 200
+rk0 = 50
 assembler = mA.rkHMatAssembler(8*p*p,rk0,ndim=3)
 opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
 tic_sys = time.time()
@@ -83,8 +83,8 @@ Stot_HBS, rhstot_HBS = OMS.construct_Stot_and_rhstot(bc, assembler, rhsHBS=True,
 print("sys mats done in ",time.time()-tic_sys,"s")
 S_rk_list = OMS.hbs_blocks
 Ntot, nc = OMS.Ntot,OMS.nc
-step = 40
-strat = rkStrat_new.linear(200+step,step,skip_first_level=False)
+step = 100
+strat = rkStrat_new.linear(rk0+step,step,skip_first_level=False)
 #rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,fast=True,identity_diag=True,compute_device='cpu',seed=None)
 
 def set_solve_device(rb, dev):
@@ -170,6 +170,16 @@ for label, Sinv in Sinv_ops.items():
     accuracy[label] = accuracy_tests(Sinv, v, y_hbs, y_lu)
     for name, val in accuracy[label].items():
         print(f"[{label}] {name}",val)
+
+
+# GMRES iteration count with each solver as preconditioner
+tol_kw = {"rtol": 1e-7} if Version(scipy.__version__) >= Version("1.12") else {"tol": 1e-7}
+for label, Sinv in Sinv_ops.items():
+    info_cb = gmres_info()
+    x, info = gmres(Stot_lu, rhstot_lu, M=Sinv, restart=100,maxiter=1,
+                    callback=info_cb, callback_type='pr_norm', **tol_kw)
+    accuracy[label]["gmres iterations"] = info_cb.niter
+    print(f"[{label}] gmres iterations = {info_cb.niter} (info = {info})")
 
 # ---------------------------------------------------------------------------
 # Side-by-side summary
