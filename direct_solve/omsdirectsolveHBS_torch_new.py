@@ -855,6 +855,9 @@ class RedBlackSolverHBS(DirectSolver):
     def _nsamples(self, rk):
         """s = max(fac*rk, nl) + rk + p: the hard floor (null space of Om
         large enough for rank rk at the worst level) plus oversampling."""
+        print("oversampleing = ", self.oversampling(rk))
+        print("fac = ",self.fac)
+        print("total samples = ",max(self.fac * rk,self.nl)+rk+self.oversampling(rk))
         return max(self.fac * rk, self.nl) + rk + self.oversampling(rk)
 
     # -- the only two operations on blocks ------------------------------------

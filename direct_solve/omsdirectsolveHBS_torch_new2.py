@@ -1,3 +1,4 @@
+from direct_solve.sample_reuse import SampleGraph
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
 import matAssembly.HBS.HBStorch_new as HBSnew
@@ -776,7 +777,7 @@ class ThomasSolverHBS(DirectSolver):
 # ---------------------------------------------------------------------------
 
 
-class RedBlackSolverHBS(DirectSolver):
+class _BlockRedBlackSolverHBS(DirectSolver):
     """Block-tridiagonal solver by cyclic reduction (red-black) on HBS blocks.
 
     System, with the identity on the diagonal and one block row per slab:
@@ -841,6 +842,15 @@ class RedBlackSolverHBS(DirectSolver):
     i.e. one ULV solve per retained node, none in the back pass.  The rhs
     uses exactly the M~^{-1} that the G' samples went through.
 
+    constant_blocks=True asserts identical interior left maps and identical
+    interior right maps (not equality between the two directions). One input
+    representative per direction is used; non-cyclic end rows remain distinct.
+    For cyclic systems the assertion covers all rows. No numerical equality
+    test is performed. Independently compressed copies may differ slightly.
+    Unique constructions are shared per level; constant_block_stats reports
+    builds/reuse. ULV is built once if any user of a diagonal needs it.
+    The default False preserves the original construction path.
+
     store_inverse=True (normalized only) additionally compresses
     Minv_i = M_i^{-1} into its own HBS from the shared solve (the Om block is
     appended to it) and keeps that instead of M_i, so the solve is applies
@@ -857,15 +867,24 @@ class RedBlackSolverHBS(DirectSolver):
     work_device: where the work tensors live.  dbg >= 1 records, per level,
     [(kind, node, t_sample, t_compress), ...] in self.blockTimes and prints
     it after each level.
+    Intermediate samples are shared per level, on the host. sample_cache_bytes
+    defaults to None (retain all reusable intermediates until level completion);
+    a byte limit enables LRU eviction, and 0 disables intermediate caching.
+    Counts and peak cache memory are available in sampling_stats and dbg output.
     """
 
     def __init__(self, m, rk, tree, quad, cyclic=False, seed=None,
                  device='cpu', compute_device=None, work_device='cpu',
                  oversample=None, dbg=0, layout='auto', normalized=False,
-                 store_inverse=False):
+                 store_inverse=False, constant_blocks=False,
+                 sample_cache_bytes=None):
         super().__init__(m, cyclic)
         self.m, self.cyclic = m, cyclic
+        self.sample_cache_bytes = sample_cache_bytes
+        self.sampling_stats = []
         self.normalized = bool(normalized)
+        self.constant_blocks = bool(constant_blocks)
+        self.constant_block_stats = []
         if store_inverse and not self.normalized:
             raise ValueError("store_inverse applies to normalized=True only")
         self.store_inverse = bool(store_inverse)
@@ -919,7 +938,9 @@ class RedBlackSolverHBS(DirectSolver):
     def _nsamples(self, rk):
         """s = max(fac*rk, nl) + rk + p: the hard floor (null space of Om
         large enough for rank rk at the worst level) plus oversampling."""
-        return 3*max(rk, self.nl) + rk + self.oversampling(rk)
+        print("oversampling = ",self.oversampling(rk))
+        print("nsamples = ",max(2*rk,self.nl) + rk + 100 )
+        return max(2*rk, self.nl) + rk + 100
 
     # -- the only two operations on blocks ------------------------------------
 
@@ -1000,6 +1021,8 @@ class RedBlackSolverHBS(DirectSolver):
         for op in SiM + SiP:
             if op is not None:
                 op.compute_device = self.compute_device
+        if self.constant_blocks:
+            SiM, SiP = self._constant_input_blocks(SiM, SiP)
         # node bookkeeping: which original interfaces are present per level
         nodes = list(range(nSlabs))
         self.level_nodes = [nodes]
@@ -1011,272 +1034,212 @@ class RedBlackSolverHBS(DirectSolver):
                                       label='RedBlackSolverHBS')
         RB = [(SiM, [None] * nSlabs, SiP)]
         self.blockTimes, self.levelTimes = [], []
+        self.constant_block_stats = []
+        self.RB = None
+        self.sampling_stats = []
         for rk in ranks:
             t0 = self._clock()
-            build = (self._build_level_normalized if self.normalized
-                     else self._build_level)
-            RB.append(build(*RB[-1], rk))
+            RB.append(self._build_level_constant(*RB[-1], rk))
             dt = self._clock() - t0
             self.levelTimes.append((len(RB[-2][0]), dt, rk))
             if self.dbg >= 1:
                 self._report_level(len(self.levelTimes) - 1)
         self.RB = RB
 
-    def _build_level(self, SiM, T, SiP, rk):
-        N, cyc = len(SiM), self.cyclic
-        s = self._nsamples(rk)
-        Om = torch.randn(self.m, s, generator=self._gen, dtype=self.dtype,
-                         device=self.work_device)
-        Psi = torch.randn(self.m, s, generator=self._gen, dtype=self.dtype,
-                          device=self.work_device)
-        ap, sv = self._ap, self._sv
+    def _edge(self, SiM, SiP, i, j):
+        """Terms of the actual block (i,j); add both directions when N=2."""
+        N = len(SiM)
+        terms = []
+        if (self.cyclic or i > 0) and (i-1) % N == j and SiM[i] is not None:
+            terms.append(SiM[i])
+        if (self.cyclic or i+1 < N) and (i+1) % N == j and SiP[i] is not None:
+            terms.append(SiP[i])
+        return terms
 
-        o = self._o                      # retained parity
-        nnext = len(range(o, N, 2))      # nodes at the next level
+    def _edge_apply(self, terms, X, T=False):
+        result = self._new(X.shape[1]).zero_()
+        for op in terms:
+            self._ap(op, X, out=result, beta=1., T=T)
+        return result
 
-        # eliminated node k: X_k = T_k^{-1} [S^-_k Om | S^+_k Om], one solve
-        # over whichever halves exist (an end node has only one), read by
-        # nodes k-1 and k+1 and dropped after its last reader
-        Xs, uses = {}, {}
+    def _constant_input_blocks(self, SiM, SiP):
+        """Use representatives only where the caller asserts constant blocks.
 
-        def X(k):
-            if k not in Xs:
-                halves = [op for op in (SiM[k], SiP[k]) if op is not None]
-                Xk = self._new(len(halves) * s)
-                for j, op in enumerate(halves):
-                    ap(op, Om, out=Xk[:, j * s:(j + 1) * s])
-                off_m = 0 if SiM[k] is not None else None
-                off_p = (s if SiM[k] is not None else 0) \
-                    if SiP[k] is not None else None
-                Xs[k] = (sv(T[k], Xk), off_m, off_p)
-                uses[k] = 2 if cyc else int(k > 0) + int(k < N - 1)
-            return Xs[k]
-
-        def Xm(k):                       # T_k^{-1} S^-_k Om
-            Xk, off, _ = X(k)
-            return Xk[:, off:off + s]
-
-        def Xp(k):                       # T_k^{-1} S^+_k Om
-            Xk, _, off = X(k)
-            return Xk[:, off:off + s]
-
-        def done(k):
-            uses[k] -= 1
-            if not uses[k]:
-                del Xs[k], uses[k]
-
-        # cyclic with two nodes: the one node left couples to itself through
-        # A_0 and C_0, so they are folded into its diagonal B_0
-        fold = cyc and N == 2
-        times, A, B, C = [], [], [], []
-        for i in range(o, N, 2):
-            kL, kR = (i - 1) % N, (i + 1) % N
-            has_left = cyc or i > 0      # always True for 'symmetric'
-            # inverted later iff eliminated at the next level, or the last one
-            ulv = ((i - o) // 2) % 2 != o or nnext == 1
-
-            # -- samples of B_i (and the solves shared with A_i, C_i) --------
-            t0 = self._clock()
-            YB = Om.clone() if T[i] is None else ap(T[i], Om)
-            ZB = Psi.clone() if T[i] is None else ap(T[i], Psi, T=True)
-            ap(SiP[i], Xm(kR), out=YB, alpha=-1.0, beta=1.0)
-            tp = sv(T[kR], ap(SiP[i], Psi, T=True), 'T')
-            ap(SiM[kR], tp, out=ZB, alpha=-1.0, beta=1.0, T=True)
-            if has_left:
-                ap(SiM[i], Xp(kL), out=YB, alpha=-1.0, beta=1.0)
-                tm = sv(T[kL], ap(SiM[i], Psi, T=True), 'T')
-                ap(SiP[kL], tm, out=ZB, alpha=-1.0, beta=1.0, T=True)
-            if fold:                                     # B_0 + A_0 + C_0
-                ap(SiM[i], Xm(kL), out=YB, alpha=-1.0, beta=1.0)
-                ap(SiM[kL], tm, out=ZB, alpha=-1.0, beta=1.0, T=True)
-                ap(SiP[i], Xp(kR), out=YB, alpha=-1.0, beta=1.0)
-                ap(SiP[kR], tp, out=ZB, alpha=-1.0, beta=1.0, T=True)
-            t1 = self._clock()
-            B.append(self._compress(rk, Om, Psi, YB, ZB, ulv))
-            del YB, ZB
-            times.append(('B', i, t1 - t0, self._clock() - t1))
-
-            # -- A_i = -S^-_i T_{i-1}^{-1} S^-_{i-1}: zero without a left side
-            if (has_left and not fold and SiM[i] is not None
-                    and SiM[kL] is not None):
-                t0 = self._clock()
-                Y = ap(SiM[i], Xm(kL), alpha=-1.0)
-                Z = ap(SiM[kL], tm, alpha=-1.0, T=True)
-                t1 = self._clock()
-                A.append(self._compress(rk, Om, Psi, Y, Z, False))
-                del Y, Z
-                times.append(('A', i, t1 - t0, self._clock() - t1))
-            else:
-                A.append(None)
-
-            # -- C_i = -S^+_i T_{i+1}^{-1} S^+_{i+1}: zero if S^+_{i+1} is ---
-            if not fold and SiP[i] is not None and SiP[kR] is not None:
-                t0 = self._clock()
-                Y = ap(SiP[i], Xp(kR), alpha=-1.0)
-                Z = ap(SiP[kR], tp, alpha=-1.0, T=True)
-                t1 = self._clock()
-                C.append(self._compress(rk, Om, Psi, Y, Z, False))
-                del Y, Z
-                times.append(('C', i, t1 - t0, self._clock() - t1))
-            else:
-                C.append(None)
-
-            done(kR)
-            if has_left:
-                done(kL)
-        self.blockTimes.append(times)
-        return A, B, C
-
-    def _build_level_normalized(self, SiM, Minv_prev, SiP, rk):
-        """One level of the normalized reduction (see class docstring).
-
-        The diagonal of the incoming level is the identity; Minv_prev (the
-        inverses that formed this level's rhs) is not used here.  Returns
-        (G'^-, Minv, G'^+) for the retained nodes, in order.
+        Copies the lists, not factors. Retain distinct end-row maps, since
+        physical boundary conditions can change them even in homogeneous media.
         """
-        N, cyc = len(SiM), self.cyclic
+        SiM, SiP = list(SiM), list(SiP)
+        N = len(SiM)
+        interior = list(range(N)) if self.cyclic else list(range(1, N-1))
+        for blocks in (SiM, SiP):
+            if not interior:
+                continue
+            present = [blocks[i] is not None for i in interior]
+            if any(present) and not all(present):
+                raise ValueError("constant_blocks requires a consistent interior sparsity pattern")
+            representative = blocks[interior[0]]
+            for i in interior:
+                blocks[i] = representative
+        return SiM, SiP
+
+    @staticmethod
+    def _edge_key(terms):
+        # An edge can be a sum at the cyclic N=2 terminal stage. Sorting
+        # canonicalizes that sum; multiplicities are retained.
+        return tuple(sorted(id(op) for op in terms))
+
+    def _build_level_constant(self, SiM, T, SiP, rk):
+        """Sample each unique reduced operator once; preserve the old algebra.
+
+        Keys describe ordered products of incoming operators. Diagonal keys
+        canonicalize sums only. All caches expire at the end of this level.
+        Both normal and transpose samples are evaluated before compression.
+        """
+        N, o = len(SiM), self._o
+        retained = list(range(o, N, 2))
         s = self._nsamples(rk)
         Om = torch.randn(self.m, s, generator=self._gen, dtype=self.dtype,
                          device=self.work_device)
         Psi = torch.randn(self.m, s, generator=self._gen, dtype=self.dtype,
                           device=self.work_device)
-        ap, sv = self._ap, self._sv
-        o = self._o
-
-        # eliminated node k: [G^-_k Om | G^+_k Om] (no solve: diagonal is I),
-        # read by nodes k-1 and k+1 and dropped after its last reader
-        Xs, uses = {}, {}
-
-        def X(k):
-            if k not in Xs:
-                halves = [op for op in (SiM[k], SiP[k]) if op is not None]
-                Xk = self._new(len(halves) * s)
-                for j, op in enumerate(halves):
-                    ap(op, Om, out=Xk[:, j * s:(j + 1) * s])
-                off_m = 0 if SiM[k] is not None else None
-                off_p = (s if SiM[k] is not None else 0) \
-                    if SiP[k] is not None else None
-                Xs[k] = (Xk, off_m, off_p)
-                uses[k] = 2 if cyc else int(k > 0) + int(k < N - 1)
-            return Xs[k]
-
-        def Xm(k):                       # G^-_k Om
-            Xk, off, _ = X(k)
-            return Xk[:, off:off + s]
-
-        def Xp(k):                       # G^+_k Om
-            Xk, _, off = X(k)
-            return Xk[:, off:off + s]
-
-        def done(k):
-            uses[k] -= 1
-            if not uses[k]:
-                del Xs[k], uses[k]
-
-        fold = cyc and N == 2
-        times, A, Minv, C = [], [], [], []
-        for i in range(o, N, 2):
-            kL, kR = (i - 1) % N, (i + 1) % N
-            has_left = cyc or i > 0
-
-            # -- M_i = I - G^+_i G^-_{i+1} - G^-_i G^+_{i-1}: products only --
+        graph = SampleGraph(self._edge_apply, self._sv, {'Om': Om, 'Psi': Psi},
+                            self.sample_cache_bytes)
+        stats = {'diagonal_built': 0, 'diagonal_reused': 0,
+                 'coupling_built': 0, 'coupling_reused': 0,
+                 'inverse_built': 0, 'inverse_reused': 0,
+                 'ulv_built': 0}
+        times = []
+        def compress(action, ulv, kind, i):
             t0 = self._clock()
-            YM, ZM = Om.clone(), Psi.clone()
-            ap(SiP[i], Xm(kR), out=YM, alpha=-1.0, beta=1.0)
-            tp = ap(SiP[i], Psi, T=True)                 # (G^+_i)^T Psi
-            ap(SiM[kR], tp, out=ZM, alpha=-1.0, beta=1.0, T=True)
-            if has_left:
-                ap(SiM[i], Xp(kL), out=YM, alpha=-1.0, beta=1.0)
-                tm = ap(SiM[i], Psi, T=True)             # (G^-_i)^T Psi
-                ap(SiP[kL], tm, out=ZM, alpha=-1.0, beta=1.0, T=True)
-            if fold:                                     # self-coupling
-                ap(SiM[i], Xm(kL), out=YM, alpha=-1.0, beta=1.0)
-                ap(SiM[kL], tm, out=ZM, alpha=-1.0, beta=1.0, T=True)
-                ap(SiP[i], Xp(kR), out=YM, alpha=-1.0, beta=1.0)
-                ap(SiP[kR], tp, out=ZM, alpha=-1.0, beta=1.0, T=True)
-            del tp
-            if has_left:
-                del tm
+            Y, Z = self._new(s), self._new(s)
+            action(Om, Y, False)
+            action(Psi, Z, True)
             t1 = self._clock()
-            M = self._compress(rk, Om, Psi, YM, ZM, True)
-            del YM, ZM
-            times.append(('M', i, t1 - t0, self._clock() - t1))
+            h = self._compress(rk, Om, Psi, Y, Z, ulv)
+            times.append((kind, i, t1-t0, self._clock()-t1))
+            return h
 
-            # -- one M^{-1} solve on [(Om) | G^-_i Xm(kL) | G^+_i Xp(kR)] -----
-            #    (the Om block only when Minv is compressed separately)
-            wantA = (has_left and not fold and SiM[i] is not None
-                     and SiM[kL] is not None)
-            wantC = not fold and SiP[i] is not None and SiP[kR] is not None
-            inv = self.store_inverse
-            t0 = self._clock()
-            R = self._new(s * (int(inv) + int(wantA) + int(wantC)))
-            off, offA, offC = 0, None, None
-            if inv:
-                R[:, :s].copy_(Om)
-                off = s
-            if wantA:
-                offA, off = off, off + s
-                ap(SiM[i], Xm(kL), out=R[:, offA:offA + s])
-            if wantC:
-                offC = off
-                ap(SiP[i], Xp(kR), out=R[:, offC:offC + s])
-            if R.shape[1]:
-                sv(M, R)
-            w = (sv(M, Psi.clone(), 'T')                 # M^{-T} Psi, shared
-                 if (inv or wantA or wantC) else None)
-            t1 = self._clock()
+        def product(left, middle, right, X, transpose):
+            # left @ middle^{-1} @ right, with None middle denoting I.
+            first, second = (left, right) if transpose else (right, left)
+            tmp = graph.apply(first, X, transpose)
+            tmp = graph.solve(middle, tmp, transpose)
+            return graph.apply(second, tmp, transpose)
 
-            if inv:
-                # -- Minv_i compressed: Y = M^{-1} Om, Z = M^{-T} Psi ----------
-                Minv.append(self._compress(rk, Om, Psi,
-                                           R[:, :s].contiguous(), w, False))
-                del M                                    # no longer needed
-                times.append(('Minv', i, t1 - t0, self._clock() - t1))
-            else:
-                # -- keep M itself; its ULV is the inverse used in the solve --
-                Minv.append(M)
-                del M
-                times.append(('M^-1 samples', i, t1 - t0, 0.0))
+        # Plan first: identical diagonals may have users of both parities.
+        # Request ULV if any user is eliminated next, or is the terminal row.
+        descriptors, needs_ulv = [], {}
+        for q, i in enumerate(retained):
+            base = None if self.normalized else T[i]
+            terms = []
+            for j in sorted({(i-1) % N, (i+1) % N}):
+                left = self._edge(SiM, SiP, i, j)
+                right = self._edge(SiM, SiP, j, i)
+                if left and right:
+                    middle = None if self.normalized else T[j]
+                    terms.append((left, middle, right))
+            key = (rk, id(base), tuple(sorted(
+                (self._edge_key(left), id(middle), self._edge_key(right))
+                for left, middle, right in terms)))
+            if not self.constant_blocks:
+                key = (i, key)
+            need = self.normalized or q % 2 != o or len(retained) == 1
+            needs_ulv[key] = needs_ulv.get(key, False) or need
+            descriptors.append((i, key, base, terms))
 
-            # -- G'^-_i = -M^{-1} G^-_i G^-_{i-1} --------------------------------
-            if wantA:
-                t0 = self._clock()
-                Y = torch.neg(R[:, offA:offA + s])
-                Z = ap(SiM[kL], ap(SiM[i], w, T=True), alpha=-1.0, T=True)
-                t1 = self._clock()
-                A.append(self._compress(rk, Om, Psi, Y, Z, False))
-                del Y, Z
-                times.append(('A', i, t1 - t0, self._clock() - t1))
-            else:
-                A.append(None)
+        Dcache, diagonals = {}, []
+        for i, key, base, terms in descriptors:
+            if key in Dcache:
+                diagonals.append(Dcache[key])
+                stats['diagonal_reused'] += 1
+                continue
+            def diagonal(X, out, transpose, base=base, terms=terms):
+                if base is None:
+                    out.copy_(X)
+                else:
+                    out.copy_(graph.value(graph.apply([base], graph.root(transpose), transpose)))
+                for left, middle, right in terms:
+                    out.sub_(graph.value(product(left, middle, right, graph.root(transpose), transpose)))
+            D = compress(diagonal, needs_ulv[key], 'M' if self.normalized else 'B', i)
+            diagonals.append(D)
+            Dcache[key] = D
+            stats['diagonal_built'] += 1
+            stats['ulv_built'] += int(needs_ulv[key])
 
-            # -- G'^+_i = -M^{-1} G^+_i G^+_{i+1} --------------------------------
-            if wantC:
-                t0 = self._clock()
-                Y = torch.neg(R[:, offC:offC + s])
-                Z = ap(SiP[kR], ap(SiP[i], w, T=True), alpha=-1.0, T=True)
-                t1 = self._clock()
-                C.append(self._compress(rk, Om, Psi, Y, Z, False))
-                del Y, Z
-                times.append(('C', i, t1 - t0, self._clock() - t1))
-            else:
-                C.append(None)
-            del R, w
+        A, C = [None]*len(retained), [None]*len(retained)
+        Scache = {}
+        if len(retained) > 1:
+            for q, i in enumerate(retained):
+                for step, target, kind in ((-1, A, 'A'), (1, C, 'C')):
+                    j, dest = i+step, i+2*step
+                    if not self.cyclic and not (0 <= j < N and 0 <= dest < N):
+                        continue
+                    j, dest = j % N, dest % N
+                    left, right = self._edge(SiM, SiP, i, j), self._edge(SiM, SiP, j, dest)
+                    if not left or not right:
+                        continue
+                    middle = None if self.normalized else T[j]
+                    D = diagonals[q] if self.normalized else None
+                    key = (rk, id(D), self._edge_key(left), id(middle), self._edge_key(right))
+                    if not self.constant_blocks:
+                        key = (i, step, key)
+                    if key in Scache:
+                        target[q] = Scache[key]
+                        stats['coupling_reused'] += 1
+                        continue
+                    def coupling(X, out, transpose, left=left, middle=middle,
+                                 right=right, D=D):
+                        tmp = graph.root(transpose)
+                        if transpose:
+                            tmp = graph.solve(D, tmp, True)
+                        tmp = product(left, middle, right, tmp, transpose)
+                        if not transpose:
+                            tmp = graph.solve(D, tmp)
+                        out.copy_(graph.value(tmp)).mul_(-1.)
+                    target[q] = compress(coupling, False, kind, i)
+                    Scache[key] = target[q]
+                    stats['coupling_built'] += 1
 
-            done(kR)
-            if has_left:
-                done(kL)
+        # Preserve the optional older normalized inverse-storage mode.
+        B = diagonals
+        if self.normalized and self.store_inverse:
+            B, invcache = [], {}
+            for i, D in zip(retained, diagonals):
+                key = id(D)
+                if key not in invcache:
+                    def inverse(X, out, transpose, D=D):
+                        out.copy_(graph.value(graph.solve(D, graph.root(transpose), transpose)))
+                    invcache[key] = compress(inverse, False, 'Minv', i)
+                    stats['inverse_built'] += 1
+                else:
+                    stats['inverse_reused'] += 1
+                B.append(invcache[key])
+        self.sampling_stats.append(dict(graph.stats))
         self.blockTimes.append(times)
-        return A, Minv, C
+        self.constant_block_stats.append(stats)
+        return A, B, C
 
     def _report_level(self, j):
         N, dt, rk = self.levelTimes[j]
         ts = sum(t[2] for t in self.blockTimes[j])
         tc = sum(t[3] for t in self.blockTimes[j])
-        print(f" level {j}: nSlabs = {N:5d}  rk = {rk:4d}  {dt:8.2f} s  "
+        print(f"[timing] level {j}: nSlabs = {N:5d}  rk = {rk:4d}  {dt:8.2f} s  "
               f"(sample {ts:.2f} s, compress {tc:.2f} s)")
         for kind, i, a, b in self.blockTimes[j]:
             print(f"   {kind}[{i:4d}]  sample {a:8.3f} s  compress {b:8.3f} s")
+        ss = self.sampling_stats[j]
+        print(f"[sample reuse] level {j}: hits={ss['hits']}, "
+              f"apply columns={ss['apply_columns']}, solve columns={ss['solve_columns']}, "
+              f"peak host MiB={ss['peak_bytes']/2**20:.1f}, evictions={ss['evictions']}")
+        if self.constant_blocks:
+            stats = self.constant_block_stats[j]
+            print(f"[reuse] level {j}: D built={stats['diagonal_built']}, "
+                  f"reused={stats['diagonal_reused']}; "
+                  f"S built={stats['coupling_built']}, reused={stats['coupling_reused']}; "
+                  f"ULV built={stats['ulv_built']}")
+            if self.store_inverse:
+                print(f"[reuse] Minv built={stats['inverse_built']}, "
+                      f"reused={stats['inverse_reused']}")
 
     # -- solve -------------------------------------------------------------------
 
@@ -1348,3 +1311,15 @@ class RedBlackSolverHBS(DirectSolver):
         if numpy_input:
             return x.cpu().numpy()
         return x.to(F.device)
+
+
+from direct_solve.oms_input import OMSInputMixin
+
+
+class RedBlackSolverHBS(OMSInputMixin, _BlockRedBlackSolverHBS):
+    """OMS-based preconditioner. Construct with (rank_strategy, oms, **options),
+    then call factorize() and solve(rhs). Input operators are never recompressed.
+    operator=None selects LU when retained, otherwise HBS; operator='hbs' or
+    'lu' explicitly selects a source. See OMSInputMixin for tree options.
+    """
+    _rank_strategy_type = rkStrat

@@ -1,8 +1,10 @@
 import numpy as np
-import direct_solve.omsdirectsolveHBS_torch as omsdirectHBS
+#import direct_solve.omsdirectsolveHBS_torch as omsdirectHBS
 import direct_solve.omsdirectsolveHBS_torch_new2 as omsdirectHBS_new
-from direct_solve.omsdirectsolveHBS_torch import rkStrat
+import direct_solve.omsnormalized as omsnormalized
+#from direct_solve.omsdirectsolveHBS_torch import rkStrat
 from direct_solve.omsdirectsolveHBS_torch_new2 import rkStrat as rkStrat_new
+from direct_solve.omsnormalized import rkStrat as rkStrat_normalized
 import torch
 import scipy
 # oms packages
@@ -13,9 +15,10 @@ import solver.hpsmultidomain.hpsmultidomain.pdo as pdoalt
 import time
 import geometry.geom_3D.cube as cube
 import matAssembly.HBS.HBStorch as HBStorch
+import matAssembly.HBS.HBStorch_new as HBStorch_new
 import scipy.special as special
 from packaging.version import Version
-from scipy.sparse.linalg import gmres
+from scipy.sparse.linalg import LinearOperator, gmres
 
 
 def dense_to_linop(A):
@@ -45,7 +48,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-kh = 40*np.pi
+kh = 40.3*np.pi
 
 def c11(p):
     return torch.ones_like(p[:,0])
@@ -67,67 +70,75 @@ def bc(p):
 
 N = 33
 dSlabs,connectivity,H = cube.dSlabs(N)
-p = 8
+p = 10
 p_disc = p + 2 # To handle different conventions between hps and hpsalt
-a = np.array([H/4,1/64,1/64])
+a = np.array([H/2,1/64,1/64])
 opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
-rk0 = 50
-assembler = mA.rkHMatAssembler(8*p*p,rk0,ndim=3)
+rk0 = 300
+leaf_size = 8*p*p
+assembler = mA.rkHMatAssembler(leaf_size,rk0,ndim=3)
 opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
 tic_sys = time.time()
-OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=True,keepLU=True,keepDense=False)
+compare_input_hbs = True  # Optional old input-compression accuracy comparison.
+OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=compare_input_hbs,keepLU=True,keepDense=False)
 print("oms built")
 Stot_lu,  rhstot_lu  = OMS.construct_Stot_and_rhstot(bc, assembler,dbg = 0)               # LU operator + LU rhs
 print("sys mats done in ",time.time()-tic_sys,"s")
-Stot_HBS, rhstot_HBS = OMS.construct_Stot_and_rhstot(bc, assembler, rhsHBS=True,dbg = 0)  # HBS operator + HBS rhs
-print("sys mats done in ",time.time()-tic_sys,"s")
-S_rk_list = OMS.hbs_blocks
+Stot_HBS = OMS.global_operator('hbs') if compare_input_hbs else None
 Ntot, nc = OMS.Ntot,OMS.nc
-step = 100
+step = 50
 strat = rkStrat_new.linear(rk0+step,step,skip_first_level=False)
-#rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compress_diag=True,fast=True,identity_diag=True,compute_device='cpu',seed=None)
 
-def set_solve_device(rb, dev):
-    """Point the RB solver and every HBS block it uses at `dev`.
-    Moves no data: the factors already live in the host masters."""
-    dev = torch.device(dev)
-    rb._drop_slot()
-    rb.release_solve_cache()
-    blocks = {id(b): b for b in rb._blocks}
-    for SiM, T, T_hbs, SiP in rb.RB:                 # catch anything not registered
-        for op in (*SiM, *T, *T_hbs, *SiP):
-            blocks.setdefault(id(op), op)
-    for b in blocks.values():
-        if isinstance(b, HBStorch.HBSMAT):
-            b.to(dev)                                # evicts any device copy
-    rb.compute_device = dev
+# All three preconditioners sample the same original OMS operators.
+compute_device = 'cuda'
+constant_blocks = True  # Constant interiors; non-cyclic boundary rows remain distinct.
+strat_normalized = rkStrat_normalized.linear(rk0+step, step, skip_first_level=False)
 
-#set_solve_device(rb_solver, 'cpu')
 
-# ---------------------------------------------------------------------------
-# Solver variants: identical setup, only the `normalized` flag differs.
-# Add an entry here to test another variant.
-# ---------------------------------------------------------------------------
-variants = {"unnormalized": False, "normalized": True}
+def benchmark_clock():
+    """Include completed GPU work in wall-clock measurements."""
+    if torch.device(compute_device).type == 'cuda':
+        torch.cuda.synchronize(torch.device(compute_device))
+    return time.perf_counter()
+
+
+# operator=None follows OMS: LU when retained, otherwise HBS.
+# Set operator='hbs' explicitly to compare HBS-backed input (requires it built).
+variants = {
+    'unnormalized': lambda: omsdirectHBS_new.RedBlackSolverHBS(
+        strat, OMS, leaf_size=leaf_size,compute_device=compute_device, seed=None, dbg=1,
+        normalized=False, constant_blocks=constant_blocks,operator="hbs")#,
+    #'normalized': lambda: omsdirectHBS_new.RedBlackSolverHBS(
+        #strat, OMS,leaf_size=leaf_size, compute_device=compute_device, seed=None, dbg=1,
+        #normalized=True, constant_blocks=constant_blocks,operator="hbs"),
+    #'new_normalized': lambda: omsnormalized.RedBlackSolverHBS(
+        #strat_normalized, OMS,leaf_size=leaf_size, compute_device=compute_device,
+        #work_device='cpu', seed=None, dbg=1, block_diagnostics=False,
+        #sample_panel_cols=64, random_buffer_bytes=32 << 20,
+        #constant_blocks=constant_blocks,operator="hbs"),
+}
+
 
 def make_inv_op(rb):
-    """Wrap one RB solver as a LinearOperator (bound to that solver, not a loop variable)."""
-    def matvec(v):
-        return rb.solve(v)
-    return scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec,dtype=np.float64)
+    """Bind each preconditioner to its own solver."""
+    return LinearOperator(shape=(Ntot, Ntot), matvec=rb.solve, dtype=np.float64)
 
-solvers, Sinv_ops, factor_times = {}, {}, {}
-for label, normalized in variants.items():
-    tic = time.time()
-    rb = omsdirectHBS_new.RedBlackSolverHBS(nc,strat,tree = S_rk_list[0][0].tree,quad = False,compute_device='cuda',seed=None,dbg=1,normalized=normalized)
-    rb.factorize(S_rk_list)
-    factor_times[label] = time.time()-tic
-    print(f"construct + factor time {label} = ",factor_times[label])
-    solvers[label]  = rb
+
+solvers, Sinv_ops, factor_times, setup_times = {}, {}, {}, {}
+for label, make_solver in variants.items():
+    tic = benchmark_clock()
+    rb = make_solver()
+    setup_times[label] = benchmark_clock()-tic
+    tic = benchmark_clock()
+    rb.factorize()
+    factor_times[label] = benchmark_clock()-tic
+    print(f"input preparation time {label} = ", setup_times[label])
+    print(f"construct + factor time {label} = ", factor_times[label])
+    solvers[label] = rb
     Sinv_ops[label] = make_inv_op(rb)
 
 gInfo = gmres_info()
-stol = 1e-7
+stol = 1e-9
 
 # ---------------------------------------------------------------------------
 # Apply timings (each solver warmed up before its timed apply)
@@ -137,33 +148,36 @@ v = np.random.standard_normal(size=(Ntot,))
 apply_times = {}
 for label, Sinv in Sinv_ops.items():
     solvers[label].solve(v) #warmup
-    tic = time.time()
+    tic = benchmark_clock()
     w = Sinv@v
-    apply_times[label] = time.time()-tic
+    apply_times[label] = benchmark_clock()-tic
     print(f"precond {label} apply time = ",apply_times[label])
 
-tic = time.time()
+tic = benchmark_clock()
 w = Stot_lu@v
-print("LU apply time = ",time.time()-tic)
+print("LU apply time = ", benchmark_clock()-tic)
 
 # ---------------------------------------------------------------------------
 # Accuracy: same test vector and same operator products for every solver
 # ---------------------------------------------------------------------------
 v = np.random.default_rng(0).standard_normal(Ntot)
-y_hbs = Stot_HBS@v
+y_hbs = Stot_HBS@v if Stot_HBS is not None else None
 y_lu  = Stot_lu@v
-err_hbs_vs_lu = np.linalg.norm(y_lu-y_hbs)/np.linalg.norm(y_lu)   # solver-independent
-print("HBS vs LU operator",err_hbs_vs_lu)
+err_hbs_vs_lu = None if y_hbs is None else np.linalg.norm(y_lu-y_hbs)/np.linalg.norm(y_lu)
+if err_hbs_vs_lu is not None:
+    print("HBS vs LU operator", err_hbs_vs_lu)
 
 def accuracy_tests(Sinv, v, y_hbs, y_lu):
-    """Solver-dependent accuracy checks; y_hbs = Stot_HBS@v, y_lu = Stot_lu@v."""
+    """Compare against the original LU operator and optional input HBS operator."""
     nv = np.linalg.norm(v)
     y1 = Sinv@v; y2 = Sinv@v
-    return {
+    result = {
         "repeatability":         np.linalg.norm(y1-y2)/np.linalg.norm(y1),
-        "precond vs HBS":        np.linalg.norm(v-Sinv@y_hbs)/nv,
         "precond vs LU (bwd)":   np.linalg.norm(v-Sinv@y_lu)/nv,
     }
+    if y_hbs is not None:
+        result["precond vs HBS"] = np.linalg.norm(v-Sinv@y_hbs)/nv
+    return result
 
 accuracy = {}
 for label, Sinv in Sinv_ops.items():
@@ -172,27 +186,45 @@ for label, Sinv in Sinv_ops.items():
         print(f"[{label}] {name}",val)
 
 
+# Exact manufactured trace in original OMS ordering, computed once outside timings.
+u_exact = OMS.interface_values(bc)
+u_exact_norm = np.linalg.norm(u_exact)
+
 # GMRES iteration count with each solver as preconditioner
-tol_kw = {"rtol": 1e-7} if Version(scipy.__version__) >= Version("1.12") else {"tol": 1e-7}
+tol_kw = {"rtol": 1e-9} if Version(scipy.__version__) >= Version("1.12") else {"tol": 1e-9}
 for label, Sinv in Sinv_ops.items():
     info_cb = gmres_info()
+    tic = benchmark_clock()
     x, info = gmres(Stot_lu, rhstot_lu, M=Sinv, restart=100,maxiter=1,
-                    callback=info_cb, callback_type='pr_norm', **tol_kw)
+                    callback=info_cb,callback_type='pr_norm', **tol_kw)
+    gmres_time = benchmark_clock()-tic
+    interface_error = np.linalg.norm(x - u_exact)
+    relative_error = (interface_error / u_exact_norm if u_exact_norm else
+                      (0.0 if interface_error == 0.0 else float("inf")))
     accuracy[label]["gmres iterations"] = info_cb.niter
-    print(f"[{label}] gmres iterations = {info_cb.niter} (info = {info})")
+    accuracy[label]["gmres time [s]"] = gmres_time
+    accuracy[label]["gmres info"] = info
+    accuracy[label]["gmres relative interface error"] = relative_error
+    print(f"[{label}] gmres iterations = {info_cb.niter} (info = {info}), "
+          f"time = {gmres_time:.3e} s, "
+          f"true interface error = {relative_error:.3e}")
 
 # ---------------------------------------------------------------------------
 # Side-by-side summary
 # ---------------------------------------------------------------------------
 labels = list(variants)
-rows = [("construct + factor [s]", factor_times), ("apply time [s]", apply_times)]
+rows = [("input preparation [s]", setup_times),
+        ("construct + factor [s]", factor_times),
+        ("total setup [s]", {l: setup_times[l]+factor_times[l] for l in labels}),
+        ("apply time [s]", apply_times)]
 rows += [(name, {l: accuracy[l][name] for l in labels}) for name in accuracy[labels[0]]]
 name_w = max(len(name) for name, _ in rows)
 print()
 print(f"{'':<{name_w}}" + "".join(f"{l:>16}" for l in labels))
 for name, vals in rows:
     print(f"{name:<{name_w}}" + "".join(f"{vals[l]:>16.3e}" for l in labels))
-print(f"(HBS vs LU operator, solver-independent: {err_hbs_vs_lu:.3e})")
+if err_hbs_vs_lu is not None:
+    print(f"(HBS vs LU operator, solver-independent: {err_hbs_vs_lu:.3e})")
 
 #for slabInd in range(len(dSlabs)):
 #    gc_HBS = uhat[slabInd*nc:(slabInd+1)*nc]

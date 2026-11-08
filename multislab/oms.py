@@ -985,6 +985,7 @@ class oms:
         self.nbytes = 0
         self.densebytes = 0
         self.stats = omsStats()
+        self.interface_points = None  # first interface, original local ordering
         self.ncs = []          # FIX: per-slab interface sizes; self.nc alone
                                #      silently assumed every slab was the same.
 
@@ -1691,6 +1692,7 @@ class oms:
         self._slab_info = []
         self._n_offloaded = 0
         self.ncs = []
+        self.interface_points = None
         self.glob_source_dofs = []
         connectivity = self.connectivity
         slabs = self.slabList
@@ -1726,6 +1728,8 @@ class oms:
             Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r = self._slab_indices(
                 slabInd, solver, XXb, XXi)
             nc = len(Ic)
+            if slabInd == 0:
+                self.interface_points = np.array(_host_ndarray(XXi[Ic, :]), copy=True)
             if dbg > 1:
                 print("SLAB %2.0d size = %2.0d" % (slabInd, nc))
             self.ncs.append(nc)
@@ -1751,6 +1755,7 @@ class oms:
             ptype = getattr(solver.opts, "problem_type", "Dirichlet")
             info = SimpleNamespace(
                 Il=np.asarray(Il), Ir=np.asarray(Ir), Ic=np.asarray(Ic),
+                pts_c=np.array(_host_ndarray(XXi[Ic, :]), copy=True),
                 Igb=np.asarray(Igb),
                 pts_gb=XXb[Igb, :] if ptype == "Dirichlet" else None,
                 pts_N=XXb[solver.JN, :] if ptype == "mixed" else None,
@@ -2062,6 +2067,68 @@ class oms:
                 "%s needs the local factorizations; construct with keepLU=True" % what)
         if not self._lu_handles:
             raise RuntimeError("%s called before construct_Stot_helper()" % what)
+
+    def interface_values(self, solution):
+        """Evaluate a scalar solution at global interface points in OMS DOF order.
+
+        `solution` accepts a NumPy (npoints, ndim) array and returns one value
+        per point. This uses coordinates retained during construction, with
+        reference-slab translations already applied; no local solves needed.
+        """
+        if not self._built:
+            raise RuntimeError("Build the OMS before evaluating interface values")
+        values = []
+        for info, dofs in zip(self._slab_info, self.glob_target_dofs):
+            if not hasattr(info, 'pts_c'):
+                raise RuntimeError("Rebuild the OMS to retain interface coordinates")
+            v = np.asarray(_host_ndarray(solution(info.pts_c))).reshape(-1)
+            if v.size != len(dofs):
+                raise ValueError("solution must return one scalar per interface point")
+            values.append(v)
+        result = np.empty(self.Ntot, dtype=np.result_type(*[v.dtype for v in values]))
+        for dofs, v in zip(self.glob_target_dofs, values):
+            result[np.asarray(list(dofs), dtype=np.int64)] = v
+        return result
+
+    def direct_solver_blocks(self, operator=None):
+        """Return signed off-diagonal LinearOperators, left then right per row.
+
+        No recompression and no eager materialization of off-loaded HBS blocks.
+        LU is preferred when available. Keep this OMS alive while using them;
+        rebuilding/closing it invalidates the operators and its preconditioner.
+        """
+        operator = self._resolve_operator(operator)
+        if not self._built:
+            raise RuntimeError("Build the OMS before constructing a direct solver")
+        rows, cache = [], {}
+        for i, conn in enumerate(self.connectivity):
+            neighbours = [int(j) for j in conn if j >= 0]
+            row, start = [], 0
+            for col, j in enumerate(neighbours):
+                n = self.ncs[j]
+                if operator == "lu":
+                    fused = self._S_lu[i]
+                    key = (id(fused), start, n)
+                    if key not in cache:
+                        cache[key] = (fused if start == 0 and n == fused.shape[1]
+                                      else self._column_restriction(fused, start, n))
+                else:
+                    handle = self._S_hbs[i]
+                    key = (id(handle), col)
+                    if key not in cache:
+                        def apply(v, transpose=False, handle=handle, col=col):
+                            block = handle.get()[col]
+                            value = (block.T if transpose else block) @ v
+                            return np.asarray(_host_ndarray(value))
+                        cache[key] = LinearOperator(
+                            (self.ncs[i], n), dtype=self._dtype,
+                            matvec=apply, matmat=apply,
+                            rmatvec=lambda v, f=apply: f(v, True),
+                            rmatmat=lambda v, f=apply: f(v, True))
+                row.append(cache[key])
+                start += n
+            rows.append(row)
+        return rows
 
     @property
     def hbs_blocks(self):
