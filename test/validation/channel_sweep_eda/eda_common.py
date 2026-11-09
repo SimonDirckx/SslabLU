@@ -6,6 +6,10 @@ presets, two replicates each). Run from anywhere, in order:
   python test/validation/channel_sweep_eda/eda_analyze.py   # tables A-E (stdout)
   python test/validation/channel_sweep_eda/eda_extra.py     # noise floor, rank needed, clean cost
   python test/validation/channel_sweep_eda/eda_figs.py      # three PNGs
+Manuscript figures (one sweep pair, default the SSLABLU_FASTLEAF=1 sweeps;
+see manuscript_load.py for the SSLABLU_MS_* paths), into OUT/manuscript_figs/:
+  python test/validation/channel_sweep_eda/manuscript_load.py
+  python test/validation/channel_sweep_eda/manuscript_figs.py
 
 Paths: run directories are read from SSLABLU_EDA_DATA (default
 <repo>/central_ridge_rank_old_hps_mem_runs/, see eda_load.ROOTS); every

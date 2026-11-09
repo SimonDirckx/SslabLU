@@ -40,11 +40,22 @@
 #     rhs = ( Aii^{-1} ( b_C - Aib[:,Igb] fgb ) )[Ic]
 #
 # (bc-only special case is oms.construct_Stot_helper's rhs = -(...)[Ic]).
-# Reconstruction uses solve_dir_full(g, ff_body=fvec), which threads the body
-# load through the leaf solves. Both the sign/indexing of this rhs and the leaf
-# derivative matrices are verified by a manufactured-solution GATE (cubic
-# u = x^3 + y^3, collocation-exact) before any time stepping happens --
-# IMEXconvdiv.py's "gate" pattern ported to the oms stack.
+# Reconstruction is the same skeleton solve with the solved interface traces in
+# the lift, followed by the leaf solves u_c = A_cc^{-1} (f_c - A_cx u_x). Both
+# the sign/indexing of this rhs and the leaf derivative matrices are verified
+# by a manufactured-solution GATE (cubic u = x^3 + y^3, collocation-exact)
+# before any time stepping happens -- IMEXconvdiv.py's "gate" pattern ported to
+# the oms stack.
+#
+# CACHED LEAF PATH (SSLABLU_FASTLEAF=1, default). dt is fixed, so every leaf
+# block is too: SlabSolve factors each leaf's A_cc once (LU, and the solution
+# operator S = -A_cc^{-1} A_cx) with hpsalt's own A_loc assembly. A step then
+# costs one batched lu_solve per slab, w_c = A_cc^{-1} f_c: its condensed load
+# -N_x[:, Jc] w_c gives b_C, and the reconstruction reuses it, u_c = w_c + S u_x.
+# hpsalt's get_rhs / solve_dir_full (SSLABLU_FASTLEAF=0, the path of earlier
+# runs) instead rebuild A_loc and refactor A_cc on every call -- three times per
+# slab per step -- and compute the body load twice. Both paths give the same
+# field to round-off; each run checks this once on random data (setup block).
 #
 # GRADIENTS OF THE NUMERICAL FIELD. R^n and the velocity update need grad(eta)
 # and div(H u) from the numerical solution: applied per leaf box with the
@@ -150,6 +161,11 @@
 #                      available, independent of this flag.
 #                      Needs a torch build with kernels for the GPU (V100:
 #                      the sslabluenv_gpu env; check with test/gpu_check.py).
+#   SSLABLU_FASTLEAF   1 = cached leaf factors (see CACHED LEAF PATH above;
+#                      default). Memory, on the leaf-op device: (p^2 + 4p) p^2
+#                      doubles per leaf, ~0.34 GB per double slab of 16 x 32
+#                      leaves at p = 16, per PDO form. 0 = hpsalt's get_rhs /
+#                      solve_dir_full every step (slower; same field to round-off)
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
@@ -183,6 +199,8 @@ except ImportError:
     import hpsmultidomain.pdo as pdo
 
 import solver.solver as solverWrap
+# the leaf-operator assembly hpsalt itself uses (importable once solver is)
+import hpsmultidomain.hps_parallel_leaf_ops as leaf_ops
 import matAssembly.matAssembler as mA
 import multislab.oms as oms
 import multislab.omsdirectsolve as omsdirectsolve
@@ -464,6 +482,11 @@ class SlabSolve:
     (`del ... solver`), so each slab is discretized a second time here and
     KEPT. Wasteful but honest; unifying the two passes would mean extending
     oms itself to optionally retain its solvers.
+
+    With SSLABLU_FASTLEAF=1 the slab also keeps its leaf factors (see CACHED
+    LEAF PATH in the header): body_rhs() returns, next to the rhs, the step's
+    `load` (skeleton rhs b0 and leaf solutions w_c), which reconstruct() reuses.
+    The *_ref methods are hpsalt's get_rhs / solve_dir_full path.
     """
 
     def __init__(self, geom, diff_op, opts, gb_vec, own_split=None):
@@ -486,6 +509,20 @@ class SlabSolve:
         self.nb, self.pp2 = self.gx.shape[0], self.gx.shape[1]
         self.D1 = dd.hps.H.Ds[3].detach().cpu().numpy() # leaf d/dx
         self.D2 = dd.hps.H.Ds[4].detach().cpu().numpy() # leaf d/dy
+        # gradx/grady are BLAS products F @ D^T (np.einsum('ij,bj->bi') does
+        # not use BLAS: ~100x slower on a 16 x 32-leaf slab at p = 16)
+        self.D1T = np.ascontiguousarray(self.D1.T)
+        self.D2T = np.ascontiguousarray(self.D2.T)
+
+        # time-invariant bathymetry on the leaf grids: H, dH/dx, dH/dy [m]
+        self.Hp = H0 * depth_frac(self.gx[:, :, 0], self.gx[:, :, 1])
+        self.Hpx = H0 * ddepth_frac_dx(self.gx[:, :, 0], self.gx[:, :, 1])
+        self.Hpy = H0 * ddepth_frac_dy(self.gx[:, :, 0], self.gx[:, :, 1])
+
+        # Dirichlet lift -Aib g, by where g lives: the two slab interfaces (new
+        # every step) and the global-boundary points; column blocks sliced once
+        self.Aib_lr = self.sv.Aib[:, np.concatenate((self.Il, self.Ir))].tocsr()
+        self.Aib_gb = self.sv.Aib[:, self.Igb].tocsr()
 
         # the leaf-grid flattening must match solve_dir_full's output ordering
         assert np.allclose(np.asarray(self.sv.XXfull), self.gx.reshape(-1, 2)), \
@@ -545,6 +582,15 @@ class SlabSolve:
                 w = bw / (uxn[ci] - xs)
                 fixes.append((corner[0], row, w / w.sum()))
             self.cfix.append(fixes)
+        # the same repair as arrays, for one vectorized pass (fix_corners)
+        self.cfix_box = np.arange(self.nb)[:, None]                      # (nb, 1)
+        self.cfix_idx = np.array([[c for c, _, _ in f] for f in self.cfix])   # (nb, 4)
+        self.cfix_row = np.array([[r for _, r, _ in f] for f in self.cfix])   # (nb, 4, p)
+        self.cfix_wts = np.array([[w for _, _, w in f] for f in self.cfix])   # (nb, 4, p)
+
+        self.fast = FASTLEAF and not dd.hps.interpolate
+        if self.fast:
+            self._build_leaf_cache(torch.device("cuda") if opts.reduced_gpu else CPU)
 
         # --- closed-wall (no-flux) support -----------------------------------
         # leaf points on the y-walls (for the emulated v* mask and the IC seed)
@@ -606,12 +652,123 @@ class SlabSolve:
         return (self.neu_ny * vstar[self.neu_box, self.neu_node] / gdtL)[:, None]
 
     def gradx(self, F):
-        return np.einsum('ij,bj->bi', self.D1, F)
+        return F @ self.D1T
 
     def grady(self, F):
-        return np.einsum('ij,bj->bi', self.D2, F)
+        return F @ self.D2T
 
-    def skeleton_load(self, fvec, gN=None):
+    def _build_leaf_cache(self, dev):
+        """CACHED LEAF PATH: factor every leaf block once. hpsalt dropped-corner
+        indexing (Jc leaf interior, Jx face nodes without the corners); A_loc
+        from hpsalt's get_Aloc_2d, so these are the blocks its leaf passes
+        rebuild on every call. Kept on dev: LU of A_cc, S = -A_cc^{-1} A_cx, and
+        the index maps of hps.reduce_body / hps.expand_boundary_data."""
+        dd, hps = self.dd, self.dd.hps
+        self.dev = dev
+        self.Jc_np, self.Jx_np = np.asarray(hps.H.JJ.Jc), np.asarray(hps.H.JJ.Jx)
+        self.Jc = torch.as_tensor(self.Jc_np, device=dev)
+        self.Jx = torch.as_tensor(self.Jx_np, device=dev)
+        # leaf nodes = Jc + Jx + the 4 corners, which fix_corners fills
+        assert all(np.array_equal(np.sort(np.concatenate((self.Jc_np, self.Jx_np, c))),
+                                  np.arange(self.pp2)) for c in self.cfix_idx), \
+            "leaf nodes are not Jc + Jx + 4 corners"
+        xx, Ds = hps.grid_xx.to(dev), hps.H.Ds.to(dev)
+        chunk = max(1, int(2.5e8 // (8 * self.pp2 ** 2)))   # ~250 MB of A_loc at a time
+        lus, pivs, Ss = [], [], []
+        for b0 in range(0, self.nb, chunk):
+            Aloc = leaf_ops.get_Aloc_2d(hps.p, xx, Ds, hps.pdo, b0, min(self.nb, b0 + chunk), dev)
+            lu, piv = torch.linalg.lu_factor(Aloc[:, self.Jc[:, None], self.Jc])
+            Ss.append(-torch.linalg.lu_solve(lu, piv, Aloc[:, self.Jc[:, None], self.Jx]))
+            lus.append(lu); pivs.append(piv)
+            del Aloc
+        self.lu, self.piv, self.S = torch.cat(lus), torch.cat(pivs), torch.cat(Ss)
+        # leaf body load -> outward normal flux on Jx: h = -N_x[:, Jc] w_c
+        self.Nxc = torch.as_tensor(np.asarray(hps.H.Nx), device=dev)[:, self.Jc]
+        self.cache_bytes = sum(t.numel() * t.element_size() for t in (self.lu, self.piv, self.S))
+
+        # reduce_body: h summed onto copy 1 of each interior skeleton point, read
+        # out in the unknown order Ji (I_Ctot, then the Neumann points I_Ntot)
+        I_unique = hps.I_unique.detach().cpu().numpy()
+        c1, c2 = hps.I_copy1.detach().cpu().numpy(), hps.I_copy2.detach().cpu().numpy()
+        self.Ji_np = dd.Ji.detach().cpu().numpy()
+        self.IX_np = dd.I_Xtot.detach().cpu().numpy()
+        self.nC = len(dd.I_Ctot)                  # Neumann rows of Aii follow these
+        self.n_unique = len(I_unique)
+        self.red_c1 = torch.as_tensor(c1, device=dev)
+        self.red_c2 = torch.as_tensor(c2, device=dev)
+        self.red_idx = torch.as_tensor(I_unique[self.Ji_np], device=dev)
+        # expand_boundary_data: every leaf face slot reads its unique point
+        src = np.full(self.nb * len(self.Jx_np), -1)
+        src[I_unique] = np.arange(self.n_unique)
+        src[c2] = src[c1]
+        assert (src >= 0).all(), "a leaf face slot has no unique point"
+        self.exp_src = src.reshape(self.nb, len(self.Jx_np))
+
+    def fix_corners(self, uu):
+        """Repair the non-dof leaf corners of a (nb, p^2) leaf field in place:
+        each by barycentric extrapolation along its x-edge (cfix), all at once."""
+        uu[self.cfix_box, self.cfix_idx] = np.einsum(
+            'bkj,bkj->bk', self.cfix_wts, uu[self.cfix_box[:, :, None], self.cfix_row])
+        return uu
+
+    def body_load(self, fvec, fgb, gN=None):
+        """Cached path, one batched leaf solve: w_c = A_cc^{-1} f_c on every leaf,
+        and the skeleton rhs with zero interface data,
+            b0 = b_C (+ g_N on the Neumann rows) - Aib[:,Igb] fgb,
+        b_C the statically condensed body load (hps.reduce_body). Returns the
+        `load` (b0, w_c) that local_solve() and reconstruct() consume."""
+        F = fvec.detach().cpu().numpy() if torch.is_tensor(fvec) else np.asarray(fvec)
+        fc = torch.from_numpy(F.reshape(self.nb, self.pp2)[:, self.Jc_np]).to(self.dev)
+        wc = torch.linalg.lu_solve(self.lu, self.piv, fc.unsqueeze(-1))
+        h = (-(self.Nxc @ wc)).reshape(-1)
+        h[self.red_c1] += h[self.red_c2]
+        b0 = h[self.red_idx].cpu().numpy()
+        if gN is not None:
+            b0[self.nC:] += np.asarray(gN).ravel()
+        if len(self.Igb):
+            b0 = b0 - self.Aib_gb @ fgb
+        return b0, wc
+
+    def local_solve(self, fvec, fgb, gN=None, load=None):
+        """u_i = Aii^{-1} ( b - Aib[:,Igb] fgb ) on all of Ii, with zero data on
+        the slab interfaces (Il, Ir)."""
+        if not self.fast:
+            return self._local_solve_ref(fvec, fgb, gN)
+        b0 = (load if load is not None else self.body_load(fvec, fgb, gN))[0]
+        return np.asarray(self.sv.solver_ii @ b0).ravel()
+
+    def body_rhs(self, fvec, fgb, gN=None):
+        """Interface-system rhs of this slab (central-interface restriction),
+        rhs = ( Aii^{-1} ( b - Aib[:,Igb] fgb ) )[Ic], and the step's `load` for
+        reconstruct() (None on the hpsalt path)."""
+        if not self.fast:
+            return self._local_solve_ref(fvec, fgb, gN)[self.Ic], None
+        load = self.body_load(fvec, fgb, gN)
+        return self.local_solve(fvec, fgb, gN, load=load)[self.Ic], load
+
+    def reconstruct(self, ul, ur, fgb, fvec, gN=None, load=None):
+        """Full leaf field from solved neighbor traces + wall data (Dirichlet fgb
+        or Neumann gN) + body load. Cached path: the skeleton solve with the
+        traces in the lift, then u_c = w_c + S u_x on every leaf (hps.solve)."""
+        if not self.fast:
+            return self._reconstruct_ref(ul, ur, fgb, fvec, gN)
+        b0, wc = load if load is not None else self.body_load(fvec, fgb, gN)
+        ulr = np.concatenate((ul, ur))
+        b = b0 - self.Aib_lr @ ulr if ulr.size else b0
+        sol = np.zeros(self.n_unique)                 # on hpsalt's unique surface points
+        sol[self.Ji_np] = np.asarray(self.sv.solver_ii @ b).ravel()
+        g = np.zeros(self.XXb.shape[0])
+        g[self.Il] = ul
+        g[self.Ir] = ur
+        g[self.Igb] = fgb
+        sol[self.IX_np] = g
+        ux = torch.from_numpy(sol[self.exp_src]).to(self.dev)      # (nb, faces)
+        uu = torch.zeros(self.nb, self.pp2, dtype=ux.dtype, device=self.dev)
+        uu[:, self.Jx] = ux
+        uu[:, self.Jc] = wc[..., 0] + (self.S @ ux.unsqueeze(-1))[..., 0]
+        return self.fix_corners(uu.cpu().numpy())
+
+    def _skeleton_load_ref(self, fvec, gN=None):
         """b: the statically-condensed body load on the rows of Aii, in the order
         Ii (domain_driver.get_rhs with zero Dirichlet data): b_C on the interior
         skeleton, then -- Neumann walls -- g_N + the single-copy load on the wall
@@ -620,21 +777,14 @@ class SlabSolve:
         b = self.dd.get_rhs(None, uu_dir_vec=zero_dir, ff_body_vec=fvec, uu_neu_vec=gN)
         return b.detach().cpu().numpy().real.ravel()
 
-    def local_solve(self, fvec, fgb, gN=None):
-        """u_i = Aii^{-1} ( b - Aib[:,Igb] fgb ) on all of Ii, with zero data on
-        the slab interfaces (Il, Ir)."""
-        w = self.sv.solver_ii @ (self.skeleton_load(fvec, gN)
-                                 - self.sv.Aib[:, self.Igb] @ fgb)
+    def _local_solve_ref(self, fvec, fgb, gN=None):
+        """local_solve through hpsalt's get_rhs."""
+        w = self.sv.solver_ii @ (self._skeleton_load_ref(fvec, gN)
+                                 - self.Aib_gb @ fgb)
         return np.asarray(w).ravel()
 
-    def body_rhs(self, fvec, fgb, gN=None):
-        """Interface-system rhs of this slab (central-interface restriction):
-        rhs = ( Aii^{-1} ( b - Aib[:,Igb] fgb ) )[Ic]."""
-        return self.local_solve(fvec, fgb, gN)[self.Ic]
-
-    def reconstruct(self, ul, ur, fgb, fvec, gN=None):
-        """Full leaf field from solved neighbor traces + wall data (Dirichlet fgb
-        or Neumann gN) + body load."""
+    def _reconstruct_ref(self, ul, ur, fgb, fvec, gN=None):
+        """reconstruct through hpsalt's solve_dir_full."""
         g = np.zeros(self.XXb.shape[0])
         g[self.Il] = ul
         g[self.Ir] = ur
@@ -643,11 +793,7 @@ class SlabSolve:
         with redirect_stdout(io.StringIO()):   # mute per-solve residual prints
             uu = self.sv.solver.solve_dir_full(g, ff_body=fvec, uu_neu=gN)
         uu = uu.detach().cpu().numpy() if torch.is_tensor(uu) else np.asarray(uu)
-        uu = uu.real.reshape(self.nb, self.pp2)
-        for b in range(self.nb):               # repair the non-dof leaf corners
-            for corner, row, w in self.cfix[b]:
-                uu[b, corner] = w @ uu[b, row]
-        return uu
+        return self.fix_corners(uu.real.reshape(self.nb, self.pp2))
 
     def integrate_own(self, F):
         return float((self.W[self.own] * F[self.own]).sum())
@@ -710,7 +856,8 @@ class SlabSolve:
 #     (a) leaf derivative matrices Ds[3]/Ds[4] (orientation + physical scaling)
 #     (b) sign/indexing of the skeleton-reduced body rhs (with Neumann walls,
 #         also the wall rows and their data)
-#     (c) body-load reconstruction through solve_dir_full
+#     (c) body-load reconstruction (cached leaf path, or solve_dir_full with
+#         SSLABLU_FASTLEAF=0)
 #     (d) Neumann walls: the reconstructed field's discrete du/dn on the wall
 #         nodes equals the data -- what makes v = 0 on the walls exact
 #
@@ -880,14 +1027,36 @@ class ChannelModel:
         self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
                              own_split=n * H) for n in range(self.N)]
         self.t_keep = time.perf_counter() - tic
+        self.cache_bytes = sum(getattr(s, "cache_bytes", 0) for s in self.sl)
+
+        # cached leaf path vs hpsalt's get_rhs / solve_dir_full, once, on slab 0
+        # with random interface traces, wall data and body load: interface rhs
+        # and reconstructed leaf field, max rel. diff (expect round-off)
+        self.leaf_check = np.nan
+        s0 = self.sl[0]
+        if s0.fast:
+            rng = np.random.default_rng(1)
+            ul, ur = rng.standard_normal(len(s0.Il)), rng.standard_normal(len(s0.Ir))
+            fgb = rng.standard_normal(len(s0.Igb))
+            gN = rng.standard_normal((len(s0.neu_ny), 1)) if s0.neumann else None
+            fvec = torch.from_numpy(rng.standard_normal((s0.nb * s0.pp2, 1)))
+            rhs, load = s0.body_rhs(fvec, fgb, gN)
+            uu = s0.reconstruct(ul, ur, fgb, fvec, gN, load=load)
+            rhs_ref = s0._local_solve_ref(fvec, fgb, gN)[s0.Ic]
+            uu_ref = s0._reconstruct_ref(ul, ur, fgb, fvec, gN)
+            self.leaf_check = max(np.linalg.norm(rhs - rhs_ref) / np.linalg.norm(rhs_ref),
+                                  np.linalg.norm(uu - uu_ref) / np.linalg.norm(uu_ref))
+            if self.leaf_check > GATE_TOL:
+                raise RuntimeError("cached leaf path differs from hpsalt's by %.3E > %.1E "
+                                   "(SSLABLU_FASTLEAF=0 runs the hpsalt path)"
+                                   % (self.leaf_check, GATE_TOL))
 
         # steady forcing fields, precomputed once per slab (leaf grids)
         self.a_wind = []      # eastward wind acceleration tau^x/(rho0 H)
         self.eta_s = []       # steric relaxation target eta_s(y)
         for s in self.sl:
-            xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
-            Hp = H0 * depth_frac(xg, yg)
-            self.a_wind.append(wind_stress(yg) / (RHO0 * Hp))
+            yg = s.gx[:, :, 1]
+            self.a_wind.append(wind_stress(yg) / (RHO0 * s.Hp))
             self.eta_s.append(steric_height(yg))
 
         # initial condition
@@ -998,9 +1167,8 @@ class ChannelModel:
         """Per-unit-density energy: int 1/2 g eta^2 + 1/2 H (u^2+v^2)."""
         tot = 0.0
         for i, s in enumerate(self.sl):
-            Hp = H0 * depth_frac(s.gx[:, :, 0], s.gx[:, :, 1])
             e = (0.5 * GRAV * self.eta[i] ** 2
-                 + 0.5 * Hp * (self.u[i] ** 2 + self.v[i] ** 2))
+                 + 0.5 * s.Hp * (self.u[i] ** 2 + self.v[i] ** 2))
             tot += s.integrate_own(e)
         return tot
 
@@ -1015,13 +1183,10 @@ class ChannelModel:
 
         # ---- explicit predictor + body load R^n, per slab -----------------
         tic = time.perf_counter()
-        fgbs, gNs, fvecs, ustars, vstars = [], [], [], [], []
+        fgbs, gNs, fvecs, loads, ustars, vstars = [], [], [], [], [], []
         rhstot = np.zeros(self.Ntot)
         for i, s in enumerate(self.sl):
-            xg, yg = s.gx[:, :, 0], s.gx[:, :, 1]
-            Hp = H0 * depth_frac(xg, yg)
-            Hpx = H0 * ddepth_frac_dx(xg, yg)
-            Hpy = H0 * ddepth_frac_dy(xg, yg)   # nonzero across the gap band
+            Hp, Hpx, Hpy = s.Hp, s.Hpx, s.Hpy   # Hpy: nonzero across the gap band
 
             # explicit momentum predictor: rotation, and (if forced) eastward
             # wind stress tau/(rho0 H) and linear bottom drag -r u
@@ -1075,8 +1240,8 @@ class ChannelModel:
                 fgb = self.wall_eta(s.XXb[s.Igb, :], tnew)   # Dirichlet wall data
             fvec = torch.from_numpy(R.reshape(-1, 1).copy())
 
-            rhstot[i * self.nc:(i + 1) * self.nc] = s.body_rhs(fvec, fgb, gN)
-            fgbs.append(fgb); gNs.append(gN); fvecs.append(fvec)
+            rhstot[i * self.nc:(i + 1) * self.nc], load = s.body_rhs(fvec, fgb, gN)
+            fgbs.append(fgb); gNs.append(gN); fvecs.append(fvec); loads.append(load)
             ustars.append(us); vstars.append(vs)
         t_rhs = time.perf_counter() - tic
 
@@ -1091,7 +1256,7 @@ class ChannelModel:
             kl, kr = self.connectivity[i]
             ul = uhat[kl * self.nc:(kl + 1) * self.nc]
             ur = uhat[kr * self.nc:(kr + 1) * self.nc]
-            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i])
+            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i], load=loads[i])
             self.u[i] = ustars[i] - gdtL * s.gradx(eta_new)
             self.v[i] = vstars[i] - gdtL * s.grady(eta_new)
             self.eta[i] = eta_new
@@ -1267,6 +1432,7 @@ SOLVER   = os.environ.get("SSLABLU_SOLVER", "rb").lower()  # rb | rbhbs | thomas
 RB_RK    = int(os.environ.get("SSLABLU_RB_RK", str(p)))  # rbhbs SOLVER rank (not RK)
 RNG_SEED = int(os.environ.get("SSLABLU_RNG_SEED", "0"))
 GPU      = os.environ.get("SSLABLU_GPU", "0") != "0"     # hpsalt reduced_gpu
+FASTLEAF = os.environ.get("SSLABLU_FASTLEAF", "1") != "0"  # cached leaf factors
 if GPU and not torch.cuda.is_available():
     raise ValueError("SSLABLU_GPU=1 but torch.cuda.is_available() is False")
 if SOLVER not in ("rb", "rbhbs", "thomas"):
@@ -1373,7 +1539,8 @@ print("interface solver         = ", {
 if RK > 0:
     print("random-sketch seed       = ", RNG_SEED)
 print("slab leaf ops            = ",
-      ("GPU, %s  (SSLABLU_GPU)" % torch.cuda.get_device_name()) if GPU else "CPU")
+      ("GPU, %s  (SSLABLU_GPU)" % torch.cuda.get_device_name()) if GPU else "CPU",
+      " leaf factors %s (SSLABLU_FASTLEAF)" % ("cached" if FASTLEAF else "rebuilt per call"))
 print("output directory         = ", graph_directory)
 if WALLS == "neumann":
     wtxt = "closed / no-normal-flow: Neumann walls, d eta/dn = n_y v* L/(g dt)"
@@ -1416,12 +1583,18 @@ print("[divergence form]     assemble/factor/keep-slabs = "
 if SOLVER in ("rb", "rbhbs"):
     print("[divergence form]     %s, one random-rhs solve: rel. diff = %.3E"
           % (modC.solver_check_label, modC.solver_check))
+if FASTLEAF:
+    print("[divergence form]     cached leaf path vs hpsalt, random data: rel. diff = %.3E"
+          "  (cache %.2f GB)" % (modC.leaf_check, modC.cache_bytes / 1e9))
 modN = None
 if CMP_FORM:
     modN = ChannelModel(dt, False, make_assembler(), dSlabs, connectivity, H,
                         opts, label="non-conservative")
     print("[non-conservative]    assemble/factor/keep-slabs = "
           "%.2f / %.2f / %.2f s" % (modN.t_asm, modN.t_fac, modN.t_keep))
+    if FASTLEAF:
+        print("[non-conservative]    cached leaf path vs hpsalt, random data: rel. diff = %.3E"
+              "  (cache %.2f GB)" % (modN.leaf_check, modN.cache_bytes / 1e9))
 t_setup = time.perf_counter() - tic
 
 M0C = modC.mass()
