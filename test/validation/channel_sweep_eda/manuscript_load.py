@@ -4,7 +4,8 @@
   python test/validation/channel_sweep_eda/manuscript_figs.py
 
 Run directories and sweep stdout files, relative to the repo root (defaults:
-the cached-leaf-path sweeps, SSLABLU_FASTLEAF=1):
+the cached-leaf-path sweeps, SSLABLU_FASTLEAF=1, under central_ridge_runs/ if
+they are there, else at the root):
   SSLABLU_MS_SOLVER       solver-preset run directory
   SSLABLU_MS_RANKISO      rankiso-preset run directory
   SSLABLU_MS_SOLVER_OUT   that sweep's tee'd stdout files (SUMMARY wall times):
@@ -19,8 +20,13 @@ import numpy as np
 from eda_common import REPO, OUT
 
 os.chdir(REPO)
-ROOTS = {"solver": os.environ.get("SSLABLU_MS_SOLVER", "central_ridge_solver_gpu_runs_fastleaf"),
-         "rankiso": os.environ.get("SSLABLU_MS_RANKISO", "central_ridge_rankiso_gpu_runs_fastleaf")}
+def _default_root(name):
+    """name under central_ridge_runs/ if it is there, else at the repo root."""
+    return os.path.join("central_ridge_runs", name) if os.path.isdir(os.path.join("central_ridge_runs", name)) else name
+
+
+ROOTS = {"solver": os.environ.get("SSLABLU_MS_SOLVER", _default_root("central_ridge_solver_gpu_runs_fastleaf")),
+         "rankiso": os.environ.get("SSLABLU_MS_RANKISO", _default_root("central_ridge_rankiso_gpu_runs_fastleaf"))}
 OUTS = {k: sorted({f for pat in os.environ.get(v, d).split(",") if pat for f in glob.glob(pat.strip())})
         for k, v, d in (("solver", "SSLABLU_MS_SOLVER_OUT", "solver_sweep_fastleaf*.out"),
                         ("rankiso", "SSLABLU_MS_RANKISO_OUT", "rankiso_sweep_fastleaf*.out"))}
