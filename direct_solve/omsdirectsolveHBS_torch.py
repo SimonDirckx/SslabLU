@@ -1,6 +1,11 @@
 import numpy as np
 from scipy.sparse.linalg   import LinearOperator
-import matAssembly.HBS.HBStorch_new as HBSnew
+# HBStorch, not HBStorch_new: this module uses host_empty, _from_dev,
+# uv_timers, uv_timers_reset, memlock_limit, _dev_eq, _STREAM_BYTES and
+# _UV_SYNC, which only HBStorch defines.  Blocks must be built with
+# rkHMatAssembler(..., hbs_backend='HBStorch').  The HBStorch_new solvers are
+# omsdirectsolveHBS_torch_new2 and omsnormalized.
+import matAssembly.HBS.HBStorch as HBSnew
 from abc import ABC, abstractmethod
 from direct_solve.omsdirectsolve import DirectSolver
 import torch

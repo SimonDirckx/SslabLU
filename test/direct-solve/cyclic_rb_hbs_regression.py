@@ -22,7 +22,9 @@
 # unit square, periodic in x (N = 8 cyclic double slabs, the layout of
 # test/validation/channel_barotropic_timestep.py), Dirichlet on the y-walls.
 # The fold does not depend on the channel's ridge, so it is left out. The
-# S-maps are HBS-compressed (rkHMatAssembler), which both HBS modules require.
+# S-maps are HBS-compressed (rkHMatAssembler), which both HBS modules require,
+# with hbs_backend='HBStorch': these two modules are written against HBStorch
+# blocks, not the assembler's default HBStorch_new ones.
 #
 # DESIGN, AND WHY:
 #   * Compare IN-PROCESS against the dense RedBlackSolver on the SAME S-blocks
@@ -140,9 +142,9 @@ def assemble(ell):
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     with redirect_stdout(io.StringIO()):
-        S_list, _, Ntot, nc = OMS.construct_Stot_helper(
-            lambda p: np.zeros(p.shape[0]), mA.rkHMatAssembler(LEAF, RK_S), dbg=0)
-    return S_list, Ntot, nc
+        _, Ntot = OMS.construct_Stot_helper(
+            lambda p: np.zeros(p.shape[0]), mA.rkHMatAssembler(LEAF, RK_S, hbs_backend='HBStorch'), dbg=0)
+    return OMS.hbs_blocks, Ntot, OMS.nc
 
 
 ################################################################

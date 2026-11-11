@@ -3,6 +3,7 @@ import numpy as np
 from matAssembly.HBS import HBSTree as HBS
 from matAssembly.HBS import HBSnew
 from matAssembly.HBS import HBStorch_new as HBStorch
+from matAssembly.HBS import HBStorch as HBStorch_v1
 from matAssembly.HBS import HBStorch_strong
 from matAssembly.HBS import HBSnew_strong
 import solver.solver as solver
@@ -91,10 +92,22 @@ class matAssemblerOptions:
     tree:   if specified, use this cluster tree set-up
     ndim:   dimension of the interfaces (2 if problem is 3D, 1 if problem is 1D)
     reduced: (deprecated, default false)
+    hbs_backend: module the 'rkHBS' blocks are built with.  'HBStorch_new'
+            (default) is what direct_solve.omsdirectsolveHBS_torch_new2 /
+            omsnormalized consume.  'HBStorch' is what
+            direct_solve.omsdirectsolveHBS and omsdirectsolveHBS_torch were
+            written against; those two solvers need blocks of this kind.
 
 
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,quad = False,reduced=False):
+    HBS_BACKENDS = {'HBStorch_new': HBStorch, 'HBStorch': HBStorch_v1}
+
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,quad = False,reduced=False,
+                 hbs_backend:str='HBStorch_new'):
+        if hbs_backend not in self.HBS_BACKENDS:
+            raise ValueError("hbs_backend must be one of %s, got %r"
+                             % (sorted(self.HBS_BACKENDS), hbs_backend))
+        self.hbs_backend = hbs_backend
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
@@ -154,7 +167,8 @@ class matAssembler:
             self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-            HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
+            backend = self.matOpts.HBS_BACKENDS[self.matOpts.hbs_backend]
+            HBSmat = backend.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
             s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 50
             tic = time.time()
             Om = _standard_normal((linOp.shape[0],s))
@@ -263,8 +277,9 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad))
+    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False,hbs_backend='HBStorch_new'):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad,
+                                                                 hbs_backend=hbs_backend))
 class rkHMatAssembler_strong(matAssembler):
     def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
         super(rkHMatAssembler_strong,self).__init__(matAssemblerOptions('rkHBS_strong',0,leaf_size,rk,tree,ndim,quad))

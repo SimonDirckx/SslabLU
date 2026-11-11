@@ -182,12 +182,12 @@ def gb(p):
 # =============================================================================
 
 def assemble_S(diff_op, dSlabs, connectivity, opts, assembler, dbg=0):
-    OMS = oms.oms(dSlabs, diff_op, gb, opts, connectivity)
+    OMS = oms.oms(dSlabs, diff_op, gb, opts, connectivity, offload=False)
     tic = time.perf_counter()
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=dbg)
+    rhs_list, Ntot = OMS.construct_Stot_helper(bc, assembler, dbg=dbg)
+    S_rk_list, nc = OMS.hbs_blocks, OMS.nc
     t_asm = time.perf_counter() - tic
-    Stot, rhstot = OMS.construct_Stot_and_rhstot_linearOperator(
-        S_rk_list, rhs_list, Ntot, nc, dbg=0)
+    Stot, rhstot = OMS.global_operator('hbs'), OMS.construct_rhstot(bc)
     return OMS, S_rk_list, rhs_list, Stot, rhstot, Ntot, nc, t_asm
 
 
@@ -355,7 +355,7 @@ for dt_hours in DT_HOURS:
     print("")
     print("  rk   err_vs_ref     rel_res      t_asm     t_fac     t_slv   compr")
     for rk in RANKS:
-        assembler_rk = mA.rkHMatAssembler(leaf, rk, ndim=2)
+        assembler_rk = mA.rkHMatAssembler(leaf, rk, ndim=2, hbs_backend='HBStorch')
         (OMSr, S_rk, rhs_rk, Stot_rk, rhstot_rk,
          _, _, t_asm) = assemble_S(diff_op, dSlabs, connectivity,
                                    opts, assembler_rk, dbg=0)

@@ -480,8 +480,10 @@ class SlabSolve:
 
     oms.construct_Stot_helper discards its slab solvers after assembling S
     (`del ... solver`), so each slab is discretized a second time here and
-    KEPT. Wasteful but honest; unifying the two passes would mean extending
-    oms itself to optionally retain its solvers.
+    KEPT. Wasteful but honest. oms(keepLU=True) now retains a slimmed copy
+    of each slab solver (factors, plus interpolation state with keepInterp),
+    but not the Domain_Driver internals used below (leaf grids, Ds, the
+    cached leaf path), so the two passes are still separate.
 
     With SSLABLU_FASTLEAF=1 the slab also keeps its leaf factors (see CACHED
     LEAF PATH in the header): body_rhs() returns, next to the rhs, the step's
@@ -955,10 +957,15 @@ class ChannelModel:
         zero_bc = lambda p: np.zeros(p.shape[0])
 
         tic = time.perf_counter()
-        self.OMS = oms.oms(dSlabs, self.diff_op, gb, opts, connectivity)
+        # offload=False: every S-block is handed to the interface solver at
+        # once, so keep them resident (the oms default moves device-resident
+        # blocks to host and streams them back one slab at a time)
+        self.OMS = oms.oms(dSlabs, self.diff_op, gb, opts, connectivity,
+                           offload=False)
         with redirect_stdout(io.StringIO()):
-            S_list, rhs0, self.Ntot, self.nc = \
+            rhs0, self.Ntot = \
                 self.OMS.construct_Stot_helper(zero_bc, assembler, dbg=0)
+        S_list, self.nc = self.OMS.hbs_blocks, self.OMS.nc
         self.t_asm = time.perf_counter() - tic
 
         # both solvers (and step()) use contiguous interface blocks i*nc:(i+1)*nc
@@ -1514,7 +1521,8 @@ def outpath(name):
 
 def make_assembler():
     if RK > 0:
-        return mA.rkHMatAssembler(leaf_size, RK)
+        # HBStorch blocks: what direct_solve.omsdirectsolveHBS(_torch) consume
+        return mA.rkHMatAssembler(leaf_size, RK, hbs_backend='HBStorch')
     return mA.denseMatAssembler()
 
 

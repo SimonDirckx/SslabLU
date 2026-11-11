@@ -7,6 +7,14 @@ import time
 # oms packages  (same conventions as twistedTorus.py / thinSlab3D.py)
 import solver.solver as solverWrap
 import matAssembly.matAssembler as mA
+import matAssembly.HBS.HBStorch as HBStorch
+# HBStorch's default fast-path basis ('svd_host') runs its SVDs in a host
+# thread pool whose workers call torch.set_num_threads.  After any such call,
+# a batched CPU torch.linalg.solve with large blocks -- every hpsalt leaf
+# build at p = 16 -- stalls inside MKL, so the next OMS construction never
+# returns.  'svd_dev' computes the same SVDs with torch.linalg.svd on the
+# compute device, without the pool.
+HBStorch._UV_BASIS[0] = 'svd_dev'
 import multislab.oms as oms
 import matAssembly.HBS.slabTree as slabTree
 
@@ -201,13 +209,16 @@ ncval = 0
 for ind in range(len(rkvec)):
     rk = int(rkvec[ind])
 
-    assembler = mA.rkHMatAssembler(leaf_size, rk)                 # (1)
-    OMS = oms.oms(dSlabs, pdo_lap, gb, opts, connectivity)
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=1)
-    Stot, rhstot = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list, rhs_list, Ntot, nc, dbg=0)
+    # HBStorch blocks: what direct_solve.omsdirectsolveHBS consumes (the
+    # assembler's default, HBStorch_new, is for the *_new2 / normalized solvers)
+    assembler = mA.rkHMatAssembler(leaf_size, rk, hbs_backend='HBStorch')  # (1)
+    OMS = oms.oms(dSlabs, pdo_lap, gb, opts, connectivity, offload=False)
+    rhs_list, Ntot = OMS.construct_Stot_helper(bc, assembler, dbg=1)
+    S_rk_list, nc = OMS.hbs_blocks, OMS.nc
+    Stot, rhstot = OMS.global_operator('hbs'), OMS.construct_rhstot(bc)
 
     tic = time.time()
-    ds = omsdirectHBS.ThomasSolverHBS(nc, rk)                     # (2)
+    ds = omsdirectHBS.ThomasSolverHBS(nc, rk, normalized=False)   # (2) pivots only
     ds.factorize(S_rk_list)
     uhat = ds.solve(rhstot.copy(), OMS.glob_target_dofs)
     tsolve = time.time() - tic
@@ -379,8 +390,9 @@ try:
     from collections import defaultdict
 
     dense_asm = mA.denseMatAssembler()
-    OMSd = oms.oms(dSlabs, pdo_lap, gb, opts, connectivity)
-    S_dense, _, _, ncd = OMSd.construct_Stot_helper(bc, dense_asm, dbg=0)
+    OMSd = oms.oms(dSlabs, pdo_lap, gb, opts, connectivity, offload=False)
+    OMSd.construct_Stot_helper(bc, dense_asm, dbg=0)
+    S_dense, ncd = OMSd.hbs_blocks, OMSd.nc    # dense assembler: numpy blocks
 
     mid  = len(S_dense) // 2
     Sblk = np.asarray(S_dense[mid][0])              # nc x nc dense off-diagonal S-map
@@ -567,7 +579,7 @@ tvec2  = np.zeros(shape=(len(rkvec2),))
 for ind in range(len(rkvec2)):
     rk = int(rkvec2[ind])
     tic = time.time()
-    ds = omsdirectHBS.ThomasSolverHBS(mtot, rk)
+    ds = omsdirectHBS.ThomasSolverHBS(mtot, rk, normalized=False)   # pivots only
     ds.factorize(S_rk_list)
     x_hbs = ds.solve(rhs2.copy())
     tvec2[ind] = time.time() - tic
