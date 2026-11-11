@@ -92,8 +92,8 @@ def add_reference_lines(ax, Ns, ys, exponents, labels):
 
 def main():
     # --- h-refinement: vary nb, p fixed ---
-    p_fixed = 6
-    nb_list = [2,3,4]                       # two small sizes
+    p_fixed = 8
+    nb_list = [12,16,20,24]                       # two small sizes
     h_results = []
     print(f"h-refinement (p = {p_fixed}):")
     for nb in nb_list:
@@ -106,8 +106,8 @@ def main():
         h_results.append((N, elapsed,elapsed_solve, peak,mem))
 
     # --- p-refinement: vary p, nb fixed ---
-    nb_fixed = 4
-    p_list = [4,6,8]                        # two small sizes
+    nb_fixed = 14
+    p_list = [6,8,10,12]                        # two small sizes
     p_results = []
     print(f"\np-refinement (nb = {nb_fixed}):")
     for p in p_list:

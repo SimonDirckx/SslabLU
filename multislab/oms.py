@@ -1,23 +1,79 @@
 """
 Overlapping multi-slab (OMS) decomposition.
 
-Two front-end classes:
-    oms     -- interface operators are compressed (rank-structured) via an assembler
-    oms_lu  -- interface operators are kept as un-compressed local solve operators
+One front-end class, `oms`, configured by two flags:
 
-Both share bookkeeping and the global S-operator assembly through _omsBase.
+    constructHBS  keepLU   operators available   default
+    ------------  ------   -------------------   -------
+    True          False    HBS                   HBS
+    True          True     HBS, LU               LU
+    False         True     LU                    LU
+    False         False    -- rejected: nothing would be kept to solve with --
+
+Operator selection (flag rhsHBS on construct_Stot_and_rhstot):
+    LU  : exact fused local-solve operator
+    HBS : compressed blocks K_{i,i+-1}
+The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  in both cases,
+computed during construction.  Re-evaluating it for new boundary data
+(construct_rhstot) needs keepLU; keepLU also enables uX_full.
+
+Body loads (body_load=f, both problem types): f is reduced per slab by the
+local solver (solverWrapper.reduce_body_load -- static condensation for HPS),
+giving (f_i on Ii, f_b on Ib) in the row convention of A_ii / A_ib:
+    Dirichlet:  A_ii u_i = f_i - A_ib u_b
+    mixed:      M w = [f_i; g_N + f_b[JN]] - E u_D
+The reduced load is computed ONCE per slab during construction and kept
+(|Ii| (+|JN|) values per slab); a new bc, the HBS-side rhs and reconstruct()
+reuse it without touching the leaves again.  Only a NEW body load after
+construction needs the reducer, which is kept with keepInterp (it shares the
+leaf discretization with the interpolation state, so it costs nothing extra).
+`reduced_load` (already-reduced loads, the previous interface) is still
+accepted: a sequence of per-slab (b_C, b_X), or a callable on the local driver
+(construction time only -- slimmed solvers no longer keep the driver).
+
+Volumetric solution (reconstruct / interp): each double slab's Dirichlet
+trace is assembled from the neighbours' interface values in uhat plus the
+physical boundary data, solved against the kept factorization, lifted to the
+full grid by local leaf solves, and evaluated piecewise (each point by the
+slab whose centre is nearest in x).  No refactorization when keepLU (and
+keepInterp) are set.
+
+keepDense (default False): also form every block K_{i,i+-1} densely during
+construction, as the source-target map applied to the identity -- the exact,
+uncompressed counterpart of the HBS blocks (S_dense_list).  Costs one local
+solve with |J| right-hand sides per face and nc*|J| memory per face.
 
 Changes relative to the original are tagged  # FIX:  (correctness) and  # OPT:
 (performance / hygiene).
+
+Fused LU operator: the left and right source faces of a slab share one local
+solve,  (A^{-1} (B_l v_l + B_r v_r))[Ic],  instead of two separate solves.
+
+stiff_mat_const: all maps of the reduced system are derived from ONE interior
+double-slab set-up (both source faces present), rather than from slab 0 (right
+map) plus slab 1 (left map).  Boundary slabs reuse the reference maps.
+
+Off-loading (default: on whenever stiff_mat_const is False): if a slab's HBS
+blocks and/or LU factors live on a CUDA device, they are copied to host
+memory as soon as they are built and moved back one slab at a time when the
+operator is applied, so device memory is O(one slab) instead of O(all
+slabs).  torch and cupy are handled automatically; other device types can be
+registered with register_device_mover().  After the first slab, the final
+host footprint is estimated and checked against the available host memory
+(MemoryError if it does not fit).
 """
 
 from __future__ import annotations
 
+import copy
 import time
+import types
+import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import LinearOperator, splu
 
 import solver.solver as solverWrap
 from solver.solver import stMap
@@ -25,8 +81,8 @@ from solver.solver import stMap
 # OPT: dropped unused imports (sys, matplotlib.pyplot, scipy.sparse.linalg as
 #      splinalg) and the duplicated numpy / solver imports.
 
-__all__ = ["slab", "omsStats", "oms", "oms_lu"]
-
+__all__ = ["slab", "omsStats", "oms", "OMSSolution", "register_device_mover",
+           "register_host_sizer"]
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -62,6 +118,116 @@ def _dtype_of(obj, default=np.float64):
     return default if dt is None else dt
 
 
+def _real_dtype(dt):
+    """True for real (non-complex) numeric dtypes."""
+    return not np.issubdtype(np.dtype(dt), np.complexfloating)
+
+
+# --------------------------------------------------------------------------- #
+# multithreaded sparse @ dense
+# --------------------------------------------------------------------------- #
+#
+# OPT: the face couplings B[:,J] (forward samples) and B[:,J]^T (adjoint
+#      samples) are applied to s-column blocks around every local solve.
+#      scipy's csr @ dense is single-threaded and costs nnz(B_J) * s
+#      multiply-adds, i.e. ~10-15 s per product for 65k-dof faces at s ~ 1300,
+#      during which every other core idles.  torch's CPU CSR kernel (MKL /
+#      OpenMP) runs the same product on all cores.  The torch tensors share
+#      the scipy index and value arrays, so no memory is duplicated.
+
+try:
+    import torch as _torch_cpu
+except ImportError:      # pragma: no cover - depends on the environment
+    _torch_cpu = None
+
+
+def _torch_csr(M):
+    """
+    scipy sparse -> torch sparse CSR on the CPU.  Index and value arrays are
+    shared with M when their dtypes already fit (int32 indices are kept as
+    int32), so this is normally zero-copy.  M is made canonical (sorted
+    indices, no duplicates) in place, so pass a matrix you own.
+    """
+    M = M.tocsr()
+    M.sum_duplicates()
+    small = M.nnz < 2**31 and max(M.shape) < 2**31
+    idx = np.int32 if small else np.int64
+    crow = _torch_cpu.from_numpy(np.ascontiguousarray(M.indptr, dtype=idx))
+    col = _torch_cpu.from_numpy(np.ascontiguousarray(M.indices, dtype=idx))
+    val = _torch_cpu.from_numpy(np.ascontiguousarray(M.data))
+    with warnings.catch_warnings():
+        # "sparse CSR support is in beta": the CSR @ dense product used here
+        # is stable; keep the warning out of every run's output
+        warnings.filterwarnings("ignore", message=".*[Ss]parse CSR tensor support.*")
+        # M is canonical scipy CSR, so the invariant check would only cost time
+        return _torch_cpu.sparse_csr_tensor(crow, col, val, size=M.shape,
+                                            check_invariants=False)
+
+
+class _SparseMatmul:
+    """
+    X |-> M @ X for a scipy sparse M and a dense 1-D / 2-D host X, returning
+    a numpy array.  Uses torch's multithreaded CPU CSR kernel when torch is
+    importable, scipy otherwise.  If torch raises (unsupported dtype, old
+    version, ...), warns once and uses scipy from then on -- a failure falls
+    back, it never yields a different result.
+    """
+
+    def __init__(self, M):
+        self.M = M.tocsr()
+        self._mt = {}                     # dtype -> torch CSR of M in that dtype
+        self._use_torch = _torch_cpu is not None
+
+    @property
+    def dtype(self):
+        return self.M.dtype
+
+    @property
+    def shape(self):
+        return self.M.shape
+
+    def _torch_of(self, dt):
+        Mt = self._mt.get(dt)
+        if Mt is None:
+            M = self.M if self.M.dtype == dt else self.M.astype(dt)
+            Mt = self._mt[dt] = _torch_csr(M)
+        return Mt
+
+    def _torch_mm(self, X):
+        if np.iscomplexobj(X) and not np.iscomplexobj(self.M.data):
+            # real M, complex X: two real products rather than a complex
+            # copy of M
+            return self._torch_mm(X.real) + 1j * self._torch_mm(X.imag)
+        dt = np.result_type(self.M.dtype, X.dtype)
+        oneD = X.ndim == 1
+        X2 = X[:, None] if oneD else X
+        if X2.dtype == dt and X2.flags.writeable and \
+                (X2.flags.c_contiguous or X2.flags.f_contiguous):
+            # OPT: torch reads C- or Fortran-ordered arrays in place.  The
+            #      solutions coming back from MUMPS are Fortran-ordered, and
+            #      np.ascontiguousarray on them was a single-threaded
+            #      transposing copy of the whole N x s block.
+            Xc = X2
+        else:
+            # dtype change / strided view: one copy, keeping the memory order
+            Xc = np.array(X2, dtype=dt, order="K", copy=True)
+        Y = (self._torch_of(dt) @ _torch_cpu.from_numpy(Xc)).numpy()
+        return Y[:, 0] if oneD else Y
+
+    def __call__(self, X):
+        X = np.asarray(X)
+        if self._use_torch:
+            try:
+                return self._torch_mm(X)
+            except (RuntimeError, TypeError, ValueError, NotImplementedError) as exc:
+                self._use_torch = False
+                warnings.warn(
+                    "oms: torch sparse @ dense failed (%s: %s); using scipy's "
+                    "single-threaded kernel instead"
+                    % (type(exc).__name__, exc), RuntimeWarning, stacklevel=2)
+        return self.M @ X
+
+
 def _eval_reduced_load(reduced_load, solver, slabInd):
     """
     FIX: the original used two incompatible conventions for `reduced_load` --
@@ -77,11 +243,67 @@ def _eval_reduced_load(reduced_load, solver, slabInd):
             "indexed by slab, or a callable taking the local solver."
         )
     if callable(reduced_load):
-        out = reduced_load(solver.solver)
+        drv = getattr(solver, "solver", None)
+        if drv is None:
+            raise RuntimeError(
+                "a callable reduced_load needs the local driver (solver.solver), "
+                "which kept solvers no longer carry; pass body_load= instead "
+                "(reduced by the solver itself), or a per-slab sequence")
+        out = reduced_load(drv)
     else:
         out = reduced_load[slabInd]
     b_C, b_X = out
     return np.asarray(b_C), np.asarray(b_X)
+
+
+def _check_load_args(reduced_load, body_load):
+    if reduced_load is not None and body_load is not None:
+        raise ValueError(
+            "pass either body_load (reduced by the local solver) or "
+            "reduced_load (already reduced), not both")
+
+
+def _reducer_of(solver):
+    """The local solver's body-load reducer, or a clear error."""
+    if not hasattr(solver, "body_reducer"):
+        raise RuntimeError(
+            "this kept local solver has no body-load reducer: reducing a NEW "
+            "body load after construction needs keepInterp=True (or pass the "
+            "body load at construction)")
+    red = solver.body_reducer
+    if red is None:
+        raise NotImplementedError(
+            getattr(solver, "body_reduce_unavailable", None)
+            or "body load reduction is not available for this solver")
+    return red
+
+
+def _slab_load(solver, slabInd, body_load, reduced_load, offset):
+    """
+    Reduced load of one slab, in the form the local solves use:
+        None               no load
+        (b_C, None)        Dirichlet: b_C on Ii
+        (b_C, b_N)         mixed:     b_C on Ii, b_N on the Neumann rows JN
+    Host numpy arrays.  body_load is reduced by the solver (one leaf pass);
+    reduced_load is the previous, already-reduced interface.
+    """
+    if body_load is not None:
+        b_C, b_X = _reducer_of(solver).reduce(body_load, offset)
+    elif reduced_load is not None:
+        b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
+    else:
+        return None
+    b_C = np.ascontiguousarray(np.asarray(_host_ndarray(b_C)).reshape(-1))
+    if b_C.shape[0] != len(solver.Ii):
+        raise ValueError("slab %d: reduced load has %d interior values, expected %d"
+                         % (slabInd, b_C.shape[0], len(solver.Ii)))
+    if getattr(solver.opts, "problem_type", "Dirichlet") != "mixed":
+        return (b_C, None)
+    b_X = np.asarray(_host_ndarray(b_X)).reshape(-1)
+    if b_X.shape[0] != len(solver.Ib):
+        raise ValueError("slab %d: reduced load has %d boundary values, expected %d"
+                         % (slabInd, b_X.shape[0], len(solver.Ib)))
+    return (b_C, np.ascontiguousarray(b_X[np.asarray(solver.JN)]))
 
 
 # --------------------------------------------------------------------------- #
@@ -171,35 +393,604 @@ class omsStats:
         self.n_factorizations = None   # 1 when stiff_mat_const is used
         self.n_assembled = None        # distinct interface blocks built
         self.n_reused = None           # blocks served from the cache
+        self.n_offloaded = 0           # device objects moved to host
+        self.host_bytes = 0            # host bytes held by kept operators
+        self.host_bytes_estimate = None  # projected after the first slab
+        self.dense_timing = None       # total time forming dense blocks (keepDense)
+
 
 
 # --------------------------------------------------------------------------- #
-# shared base
+# off-loading: compute device (CUDA) -> host memory
 # --------------------------------------------------------------------------- #
+#
+# Every heavy per-slab object (HBS blocks, local LU factors) is held through a
+# *handle* with one method, get().
+#   _Resident : object stays where it is.
+#   _OnHost   : a copy of the object in which every device array has been
+#               replaced by a host copy (_HostLeaf).  get() rebuilds the object
+#               with fresh device arrays, so a caller that drops its reference
+#               after use keeps at most one slab on the device.
+# Objects are walked through containers, instance __dict__s, bound methods and
+# function closures (a LinearOperator built from lambdas that capture device
+# tensors is handled).  Objects without device data are left untouched.
+
+_DEVICE_MOVERS = {}   # cls -> fn(obj, pin_memory) -> (host, restore) | None
+_HOST_SIZERS = {}     # cls -> fn(obj) -> host bytes held by obj
+_MAX_DEPTH = 10
+_NOCHANGE = object()
 
 
-class _omsBase:
+def register_device_mover(cls, to_host):
     """
-    Bookkeeping and global S-operator assembly shared by `oms` and `oms_lu`.
+    Teach oms to off-load objects of type `cls` (and subclasses).
 
-    The two classes were ~90% duplicated in the original, which is why the
-    compute_global_dofs bug existed twice and the rmatvec bug three times.
+    to_host(obj, pin_memory) must return None if `obj` is not on a compute
+    device, else (host_value, restore) with restore(host_value) giving back
+    an equivalent device object.  torch tensors, cupy arrays and cupyx sparse
+    matrices are registered automatically when those packages are importable.
+    """
+    _DEVICE_MOVERS[cls] = to_host
+
+
+def register_host_sizer(cls, nbytes):
+    """Teach the host-memory estimate the footprint of an opaque type."""
+    _HOST_SIZERS[cls] = nbytes
+
+
+def _lookup(table, obj):
+    for c in type(obj).__mro__:
+        f = table.get(c)
+        if f is not None:
+            return f
+    return None
+
+
+def _host_ndarray(x):
+    """x as a host numpy array (device arrays are copied to the host)."""
+    f = _lookup(_DEVICE_MOVERS, x)
+    if f is not None:
+        r = f(x, False)
+        if r is not None:
+            x = r[0]
+    return np.asarray(x)
+
+
+# ---- defaults ------------------------------------------------------------- #
+
+def _superlu_nbytes(lu):
+    # nnz of L+U with values + row indices, plus two permutations.  SuperLU
+    # does not expose its dtype cheaply; assume complex128 as an upper bound
+    # would be too pessimistic, so assume float64.
+    return int(lu.nnz) * (8 + 4) + 2 * int(lu.shape[0]) * 4
+
+
+register_host_sizer(type(splu(sp.eye(1, format="csc"))), _superlu_nbytes)
+
+try:  # pragma: no cover - depends on the environment
+    import torch as _torch
+
+    def _torch_to_host(t, pin_memory):
+        if t.device.type != "cuda":
+            return None
+        dev = t.device
+        h = t.detach().to("cpu")
+        if pin_memory:
+            h = h.pin_memory()
+        return h, (lambda x, dev=dev: x.to(dev, non_blocking=True))
+
+    def _torch_nbytes(t):
+        if t.device.type != "cpu":
+            return 0
+        if t.layout == _torch.strided:
+            return t.untyped_storage().nbytes()
+        if t.layout == _torch.sparse_coo:
+            t = t.coalesce()
+            return sum(_torch_nbytes(x) for x in (t.indices(), t.values()))
+        parts = [getattr(t, a)() for a in
+                 ("crow_indices", "col_indices", "ccol_indices", "row_indices", "values")
+                 if hasattr(t, a)]
+        total = 0
+        for p in parts:
+            try:
+                total += _torch_nbytes(p)
+            except RuntimeError:
+                pass
+        return total
+
+    register_device_mover(_torch.Tensor, _torch_to_host)
+    register_host_sizer(_torch.Tensor, _torch_nbytes)
+except ImportError:
+    pass
+
+try:  # pragma: no cover - depends on the environment
+    import cupy as _cupy
+
+    def _cupy_to_host(a, pin_memory):
+        dev = a.device.id
+
+        def restore(x, dev=dev):
+            with _cupy.cuda.Device(dev):
+                return _cupy.asarray(x)
+        return _cupy.asnumpy(a), restore
+
+    register_device_mover(_cupy.ndarray, _cupy_to_host)
+    register_host_sizer(_cupy.ndarray, lambda a: 0)
+    try:
+        import cupyx.scipy.sparse as _cusp
+
+        def _cusp_to_host(a, pin_memory):
+            dev, cls = a.device.id if hasattr(a, "device") else None, type(a)
+
+            def restore(x, dev=dev, cls=cls):
+                if dev is None:
+                    return cls(x)
+                with _cupy.cuda.Device(dev):
+                    return cls(x)
+            return a.get(), restore
+
+        register_device_mover(_cusp.spmatrix, _cusp_to_host)
+        register_host_sizer(_cusp.spmatrix, lambda a: 0)
+    except ImportError:
+        pass
+except ImportError:
+    pass
+
+
+# ---- tree walking --------------------------------------------------------- #
+
+class _HostLeaf:
+    """Host copy of one device object, plus how to put it back."""
+    __slots__ = ("host", "restore")
+
+    def __init__(self, host, restore):
+        self.host = host
+        self.restore = restore
+
+
+_OPAQUE = (str, bytes, int, float, complex, bool, type(None), range, slice,
+           np.ndarray, np.generic, np.dtype, np.ufunc, type, types.ModuleType,
+           types.BuiltinFunctionType, types.CodeType)
+
+
+def _map_tree(obj, leaf_fn, memo, depth=0):
+    """
+    Return `obj` with every leaf for which leaf_fn(leaf) is not _NOCHANGE
+    replaced.  Sub-trees that contain no such leaf are returned as-is (same
+    identity), so untouched objects are never copied.
+    """
+    oid = id(obj)
+    if oid in memo:
+        return memo[oid]
+    r = leaf_fn(obj)
+    if r is not _NOCHANGE:
+        memo[oid] = r
+        return r
+    if depth > _MAX_DEPTH or isinstance(obj, _OPAQUE) or sp.issparse(obj):
+        return obj
+    memo[oid] = obj            # breaks cycles; overwritten if we copy
+    d = depth + 1
+
+    if isinstance(obj, (list, tuple)):
+        new = [_map_tree(x, leaf_fn, memo, d) for x in obj]
+        if all(a is b for a, b in zip(new, obj)):
+            return obj
+        out = new if isinstance(obj, list) else (
+            type(obj)(*new) if hasattr(obj, "_fields") else type(obj)(new))
+    elif isinstance(obj, dict):
+        new = {k: _map_tree(v, leaf_fn, memo, d) for k, v in obj.items()}
+        if all(new[k] is obj[k] for k in obj):
+            return obj
+        out = type(obj)(new) if type(obj) is not dict else new
+    elif isinstance(obj, types.FunctionType):
+        cells = obj.__closure__ or ()
+        vals = []
+        for c in cells:
+            try:
+                vals.append(c.cell_contents)
+            except ValueError:            # empty cell
+                vals.append(_NOCHANGE)
+        new_vals = [v if v is _NOCHANGE else _map_tree(v, leaf_fn, memo, d)
+                    for v in vals]
+        defs = obj.__defaults__ or ()
+        new_defs = tuple(_map_tree(x, leaf_fn, memo, d) for x in defs)
+        if all(a is b for a, b in zip(new_vals, vals)) and \
+                all(a is b for a, b in zip(new_defs, defs)):
+            return obj
+        closure = tuple(c if nv is v else types.CellType(nv)
+                        for c, v, nv in zip(cells, vals, new_vals)) or None
+        out = types.FunctionType(obj.__code__, obj.__globals__, obj.__name__,
+                                 new_defs or None, closure)
+        out.__kwdefaults__ = obj.__kwdefaults__
+        out.__dict__.update(obj.__dict__)
+    elif isinstance(obj, types.MethodType):
+        f = _map_tree(obj.__func__, leaf_fn, memo, d)
+        s = _map_tree(obj.__self__, leaf_fn, memo, d)
+        if f is obj.__func__ and s is obj.__self__:
+            return obj
+        out = types.MethodType(f, s)
+    elif hasattr(obj, "__dict__") and not callable(getattr(obj, "__get__", None)):
+        attrs = vars(obj)
+        new = {k: _map_tree(v, leaf_fn, memo, d) for k, v in attrs.items()}
+        if all(new[k] is attrs[k] for k in attrs):
+            return obj
+        try:
+            out = copy.copy(obj)
+            out.__dict__.update(new)
+        except Exception:
+            return obj                    # cannot rebuild: leave on device
+    else:
+        return obj
+    memo[oid] = out
+    return out
+
+
+def _to_host(obj, pin_memory=False):
+    """(host copy of obj, number of device objects moved)."""
+    moved = [0]
+
+    def leaf(x):
+        f = _lookup(_DEVICE_MOVERS, x)
+        if f is None:
+            return _NOCHANGE
+        r = f(x, pin_memory)
+        if r is None:
+            return _NOCHANGE
+        moved[0] += 1
+        return _HostLeaf(*r)
+
+    return _map_tree(obj, leaf, {}), moved[0]
+
+
+def _to_device(obj):
+    def leaf(x):
+        return x.restore(x.host) if isinstance(x, _HostLeaf) else _NOCHANGE
+    return _map_tree(obj, leaf, {})
+
+
+def _host_nbytes(obj):
+    """Host bytes reachable from obj (arrays counted once by their base)."""
+    seen = set()
+    total = [0]
+
+    def arr_bytes(a):
+        root = a
+        while isinstance(root.base, np.ndarray):
+            root = root.base
+        if id(root) not in seen:
+            seen.add(id(root))
+            total[0] += root.nbytes
+
+    def leaf(x):
+        # read-only walk: always report _NOCHANGE so nothing is ever copied
+        if isinstance(x, _HostLeaf):
+            x = x.host
+        if isinstance(x, np.ndarray):
+            arr_bytes(x)
+        elif sp.issparse(x):
+            for a in ("data", "indices", "indptr", "row", "col", "offsets"):
+                v = getattr(x, a, None)
+                if isinstance(v, np.ndarray):
+                    arr_bytes(v)
+        else:
+            f = _lookup(_HOST_SIZERS, x)
+            if f is not None and id(x) not in seen:
+                seen.add(id(x))
+                total[0] += int(f(x))
+        return _NOCHANGE
+
+    _map_tree(obj, leaf, {})
+    return total[0]
+
+
+# ---- handles -------------------------------------------------------------- #
+
+class _Resident:
+    __slots__ = ("_obj",)
+
+    def __init__(self, obj):
+        self._obj = obj
+
+    def get(self):
+        return self._obj
+
+    def host_tree(self):
+        return self._obj
+
+
+class _OnHost:
+    __slots__ = ("_tree",)
+
+    def __init__(self, tree):
+        self._tree = tree
+
+    def get(self):
+        return _to_device(self._tree)
+
+    def host_tree(self):
+        return self._tree
+
+
+# ---- host memory ---------------------------------------------------------- #
+
+def _available_host_memory():
+    """
+    Bytes of host memory this process can still allocate: MemAvailable,
+    tightened by a cgroup limit if one applies (SLURM / containers).
+    None if it cannot be determined.
+    """
+    avail = None
+    try:
+        import psutil
+        avail = int(psutil.virtual_memory().available)
+    except Exception:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+    for lim, cur in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                     ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                      "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            with open(lim) as f:
+                s = f.read().strip()
+            if s == "max":
+                continue
+            with open(cur) as f:
+                room = int(s) - int(f.read().strip())
+            if room >= 0 and room < (1 << 60):
+                avail = room if avail is None else min(avail, room)
+            break
+        except (OSError, ValueError):
+            continue
+    return avail
+
+
+def _fmt_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+# attributes of the solver wrapper that the kept LU handle actually needs;
+# coordinates and the full stiffness matrix are deliberately left behind.
+_LU_ATTRS = {
+    "Dirichlet": ("opts", "solver_ii", "Ii", "Ib", "Aib"),
+    # OPT: the driver ("solver") is no longer kept: it holds the assembled
+    #      sparse matrices (A, A_CC, A_CX, A_XC, A_XX) and was only needed by
+    #      the callable reduced_load; body loads now go through body_reducer.
+    "mixed": ("opts", "solver_ii", "Ii", "Ib", "E", "JD", "JN"),
+}
+# what volumetric reconstruction / interpolation additionally needs (the leaf
+# discretization and grid, not the stiffness matrix); order matters: reading
+# interp_state is what sets interp_unavailable
+_INTERP_ATTRS = ("interp_state", "interp_unavailable")
+# body-load reducer: shares the leaf discretization with interp_state, so it
+# is kept together with it at no extra memory cost
+_REDUCER_ATTRS = ("body_reducer", "body_reduce_unavailable")
+
+
+def _slim_solver(solver, keep_interp=True):
+    ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+    ns = SimpleNamespace()
+    attrs = _LU_ATTRS.get(ptype, _LU_ATTRS["Dirichlet"])
+    if keep_interp:
+        attrs = attrs + _INTERP_ATTRS + _REDUCER_ATTRS
+    for a in attrs:
+        if hasattr(solver, a):
+            setattr(ns, a, getattr(solver, a))
+    return ns
+
+
+# --------------------------------------------------------------------------- #
+# volumetric solution: ownership + piecewise evaluation
+# --------------------------------------------------------------------------- #
+
+_OWNER_CHUNK = 1 << 16
+
+
+def _slab_bounds(slabList):
+    """(lo, hi), each (nslabs, ndim): the bounding box of every slab."""
+    geoms = [np.asarray(g, dtype=np.float64) for g in slabList]
+    lo = np.stack([g.min(axis=0) for g in geoms])
+    hi = np.stack([g.max(axis=0) for g in geoms])
+    return lo, hi
+
+
+def _as_points(pts, ndim):
+    pts = np.asarray(_host_ndarray(pts), dtype=np.float64)
+    if pts.ndim == 1 and ndim == 1:
+        pts = pts[:, None]
+    if pts.ndim != 2 or pts.shape[1] != ndim:
+        raise ValueError("pts must have shape (npts, %d), got %r"
+                         % (ndim, pts.shape))
+    return pts
+
+
+def _owners(pts, lo, hi, candidates=None):
+    """
+    Owner slab of every point: among the candidate slabs whose box contains
+    the point, the one whose centre is closest in x (the stacking direction).
+    Owner regions are thus [xc_i - h/2, xc_i + h/2] away from the ends, and
+    every evaluation stays well inside its slab.  -1 = in no candidate slab.
+    """
+    idx = np.arange(lo.shape[0]) if candidates is None else \
+        np.asarray(candidates, dtype=np.int64)
+    owner = np.full(pts.shape[0], -1, dtype=np.int64)
+    if idx.size == 0 or pts.shape[0] == 0:
+        return owner
+    lo_c, hi_c = lo[idx], hi[idx]
+    xc = 0.5 * (lo_c[:, 0] + hi_c[:, 0])
+    scale = max(1.0, float(np.max(np.abs(lo_c))), float(np.max(np.abs(hi_c))))
+    tol = 1e-10 * scale
+    for s in range(0, pts.shape[0], _OWNER_CHUNK):
+        P = pts[s:s + _OWNER_CHUNK]
+        inside = np.all((P[:, None, :] >= lo_c[None] - tol)
+                        & (P[:, None, :] <= hi_c[None] + tol), axis=2)
+        dist = np.where(inside, np.abs(P[:, :1] - xc[None, :]), np.inf)
+        k = np.argmin(dist, axis=1)
+        ok = np.isfinite(dist[np.arange(P.shape[0]), k])
+        blk = owner[s:s + _OWNER_CHUNK]
+        blk[ok] = idx[k[ok]]
+    return owner
+
+
+def _evaluate(pts, owner, fields):
+    """
+    Fill out[owner == i] from the field of slab i, for (i, grid, offset,
+    values) in `fields`.  Points owned by no slab (or by a slab not in
+    `fields`) are NaN.
+    """
+    out = None
+    for i, grid, offset, values in fields:
+        I = np.flatnonzero(owner == i)
+        if I.size == 0:
+            continue
+        loc = pts[I] if offset is None else pts[I] - offset
+        vals = np.asarray(grid.interp(loc, values))
+        if out is None or not np.can_cast(vals.dtype, out.dtype, "same_kind"):
+            dt = vals.dtype if out is None else np.result_type(out, vals)
+            new = np.full(pts.shape[0], np.nan, dtype=np.result_type(dt, np.float64))
+            if out is not None:
+                new[:] = out
+            out = new
+        out[I] = vals
+    if out is None:
+        out = np.full(pts.shape[0], np.nan)
+    return out
+
+
+class OMSSolution:
+    """
+    Volumetric OMS solution, as returned by oms.reconstruct(): the local
+    full-grid field of every reconstructed double slab, evaluated piecewise.
+
+        u = sol(pts)                        # NaN outside the domain
+        u, owner = sol(pts, return_owner=True)
+        XX, ui = sol.slab(i)                # raw field of slab i (global coords)
+
+    Evaluation is cheap and repeatable (no solves).  Each point is evaluated
+    by the reconstructed slab whose centre is closest in x (see _owners); if
+    only some slabs were reconstructed, ownership is restricted to those.
+    """
+
+    def __init__(self, lo, hi):
+        self._lo, self._hi = lo, hi
+        self._fields = {}           # i -> (grid, offset | None, values)
+
+    def _add(self, i, grid, offset, values):
+        self._fields[int(i)] = (grid, offset, np.asarray(values))
+
+    @property
+    def ndim(self):
+        return self._lo.shape[1]
+
+    @property
+    def slabs(self):
+        """Indices of the reconstructed slabs."""
+        return sorted(self._fields)
+
+    def owner(self, pts):
+        pts = _as_points(pts, self.ndim)
+        return _owners(pts, self._lo, self._hi, candidates=self.slabs)
+
+    def slab(self, i):
+        """(full-grid coordinates in the global frame, values) of slab i."""
+        if i not in self._fields:
+            raise KeyError("slab %d was not reconstructed" % i)
+        grid, offset, values = self._fields[i]
+        XX = grid.XXfull if offset is None else grid.XXfull + offset
+        return XX, values
+
+    def __call__(self, pts, return_owner=False):
+        pts = _as_points(pts, self.ndim)
+        owner = _owners(pts, self._lo, self._hi, candidates=self.slabs)
+        out = _evaluate(pts, owner, ((i,) + self._fields[i]
+                                     for i in np.unique(owner[owner >= 0])))
+        return (out, owner) if return_owner else out
+
+    def host_nbytes(self):
+        return _host_nbytes([v for v in self._fields.values()])
+
+
+# --------------------------------------------------------------------------- #
+# oms
+# --------------------------------------------------------------------------- #
+
+
+class oms:
+    """
+    Overlapping multi-slab decomposition for  (I - K) u = f,  K block
+    tridiagonal with K_{i,i-1}, K_{i,i+1} the left / right maps of double
+    slab i.
+
+    @param
+    slabList:      list of double-wide slabs
+    pdo:           global partial differential operator
+    gb:            indicator of the global (physical) boundary
+    solver_opts:   solver options (h and p specs)
+    connectivity:  connectivity[i] = [left neighbour, right neighbour], <0 = none
+    constructHBS:  compress K_{i,i+-1} into HBS blocks (needs an assembler)
+    keepLU:        keep the local factorizations (exact operator, new rhs)
+    keepDense:     also form the blocks K_{i,i+-1} densely (no compression) as
+                   the source-target maps applied to the identity; available
+                   as S_dense_list, laid out like hbs_blocks.  For testing:
+                   one local solve with |J| right-hand sides and nc*|J|
+                   memory per face.
+    stiff_mat_const: every slab is a rigid translate with identical local
+                   matrices -> one factorization, one reference set-up
+    offload:       move per-slab HBS blocks / LU factors that live on a CUDA
+                   device to host memory once built.  None (default) = on
+                   unless stiff_mat_const.  No-op for host-resident data.
+    pin_memory:    pin the host copies (faster host->device transfer when the
+                   operator is applied, but page-locked memory is scarcer).
+    check_host_memory: after the first slab, project the final host
+                   footprint and raise MemoryError if it will not fit.
+    host_mem_fraction: fraction of the available host memory the projection
+                   may use (default 0.9).
+    keepInterp:    with keepLU, also keep per slab what volumetric
+                   reconstruction needs besides the factors (leaf
+                   discretization and grid; no stiffness matrix), so that
+                   reconstruct() / interp() never refactorize.  Default True;
+                   set False to save that memory (reconstruct() then rebuilds
+                   slabs on demand).
     """
 
     def __init__(self, slabList: list, pdo, gb, solver_opts, connectivity,
-                 stiff_mat_const=False):
+                 constructHBS=True, keepLU=False, stiff_mat_const=False,
+                 offload=None, pin_memory=False, keepDense=False,
+                 check_host_memory=True, host_mem_fraction=0.9,
+                 keepInterp=True):
+        if not constructHBS and not keepLU:
+            raise ValueError(
+                "oms(constructHBS=False, keepLU=False): you have asked for every "
+                "local solve to be done and then for all of it to be thrown away. "
+                "With neither the HBS blocks nor the LU factors kept there is no "
+                "operator left to solve with -- only a very expensive way of "
+                "heating the room. Set constructHBS=True, keepLU=True, or both."
+            )
         self.slabList = slabList
         self.pdo = pdo
         self.connectivity = connectivity
         self.opts = solver_opts
         self.gb = gb
+        self.constructHBS = bool(constructHBS)
+        self.keepLU = bool(keepLU)
+        self.keepDense = bool(keepDense)
+        self.keepInterp = bool(keepInterp)
+
         self.glob_target_dofs = []
         self.glob_source_dofs = []
         self.localSolver = None
         self.nbytes = 0
         self.densebytes = 0
         self.stats = omsStats()
-        self.nc = None
+        self.interface_points = None  # first interface, original local ordering
         self.ncs = []          # FIX: per-slab interface sizes; self.nc alone
                                #      silently assumed every slab was the same.
 
@@ -208,28 +999,198 @@ class _omsBase:
         # matrices (Aii, Aib, Abi, Abb, and for 'mixed' also M, E, JD, JN).
         # That needs constant PDE coefficients AND isomorphic discretizations
         # -- constant coefficients alone are not enough under a non-uniform
-        # mesh.  Under it, one factorization and one assembly per distinct
-        # face serve the whole decomposition.
+        # mesh.  Under it, one factorization and one reference set-up serve
+        # the whole decomposition.
         self.stiff_mat_const = bool(stiff_mat_const)
         self._ref_solver = None
+        self._ref_ind = None      # index of the reference (interior) slab
+        self._ref_faces = None    # (Il, Ir, Ic) of the reference slab
+        self._ref_hbs = {}        # side -> (block, ratio, err)
+        self._ref_lu = {}         # 'l' / 'r' / 'lr' -> operator
         self._offsets = None
         self._block_cache = {}
         self._n_factorizations = 0
         self._n_assembled = 0
         self._n_reused = 0
 
+        # ---- off-loading -------------------------------------------------- #
+        # FIX: without stiff_mat_const every slab's HBS blocks (oms) or LU
+        #      factors (oms_lu) stayed on the compute device, so device memory
+        #      grew with the number of slabs until OOM.
+        self.offload = (not self.stiff_mat_const) if offload is None else bool(offload)
+        self.pin_memory = bool(pin_memory)
+        self.check_host_memory = bool(check_host_memory)
+        self.host_mem_fraction = float(host_mem_fraction)
+        self._n_offloaded = 0
+
+        # ---- products of construct_Stot_helper ---------------------------- #
+        self._S_hbs = []          # per slab: handle -> [blocks] (src order)
+        self._S_dense = []        # per slab: [dense blocks] (src order), keepDense
+        self._dense_cache = {}    # stiff_mat_const: (side, I, J) -> dense block
+        self._rhs_cache = None    # bc, reduced_load, body_load, rhs_list of the
+                                  # most recent rhs (construction or construct_rhstot)
+        self._built = False
+        self._S_lu = []           # per slab: fused LinearOperator
+        self._lu_handles = []     # per slab: handle -> slim local solver
+        self._slab_info = []      # per slab: compact data for rhs / uX_full
+        self._dtype = np.float64
+
+    # ------------------------------------------------------------------ #
+    # sizes
+    # ------------------------------------------------------------------ #
+
+    @property
+    def Ntot(self):
+        """Total number of interface dofs of the reduced system (None before
+        construction)."""
+        return sum(self.ncs) if self.ncs else None
+
+    @property
+    def nc(self):
+        """
+        Interface size per slab, for code that assumes it is uniform.
+        Returns the last slab's size; warns if the sizes differ between slabs
+        (use `ncs` for the per-slab list, or glob_target_dofs for offsets).
+        None before construction.
+        """
+        if not self.ncs:
+            return None
+        if any(n != self.ncs[0] for n in self.ncs):
+            sizes = sorted(set(self.ncs))
+            warnings.warn(
+                "oms.nc: interface sizes differ between slabs (%d distinct "
+                "values, %d..%d); returning the last one (%d).  Use oms.ncs for "
+                "the per-slab sizes and oms.glob_target_dofs for offsets."
+                % (len(sizes), sizes[0], sizes[-1], self.ncs[-1]),
+                UserWarning, stacklevel=2)
+        return self.ncs[-1]
+
+    # ------------------------------------------------------------------ #
+    # lifetime
+    # ------------------------------------------------------------------ #
+
+    def close(self):
+        """Release all kept operators (host and device)."""
+        self._S_hbs, self._S_lu, self._lu_handles = [], [], []
+        self._S_dense, self._dense_cache = [], {}
+        self._ref_hbs, self._ref_lu, self._block_cache = {}, {}, {}
+        self._ref_solver = self.localSolver = None
+        self._rhs_cache = None
+        self._built = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _offload(self, obj):
+        """
+        Handle for `obj`.  With off-loading on, device arrays inside it are
+        copied to host memory now and the device copies are released as soon
+        as the caller drops `obj`; get() moves them back on demand.
+        """
+        if not self.offload:
+            return _Resident(obj)
+        host, moved = _to_host(obj, self.pin_memory)
+        if moved == 0:
+            return _Resident(obj)         # nothing on a device: nothing to do
+        self._n_offloaded += moved
+        return _OnHost(host)
+
+    # ------------------------------------------------------------------ #
+    # host-memory projection
+    # ------------------------------------------------------------------ #
+
+    def _check_host_memory(self, n_faces_first, dbg=0):
+        """
+        Called once the first slab is complete.  Projects the host memory
+        the finished decomposition will hold (kept LUs, HBS blocks,
+        bookkeeping), scaling LU / bookkeeping by the number of slabs and HBS blocks by the number of source faces, and compares
+        the *remaining* growth against the available host memory.
+
+        The projection assumes the other slabs are about as large as the
+        first; for strongly non-uniform decompositions it is indicative only.
+        """
+        nslabs = len(self.slabList)
+        total_faces = sum((c[0] >= 0) + (c[1] >= 0) for c in self.connectivity)
+
+        lu_b = _host_nbytes(self._lu_handles[0].host_tree()) if self._lu_handles else 0
+        hbs_b = _host_nbytes(self._S_hbs[0].host_tree()) if self._S_hbs else 0
+        dense_b = _host_nbytes(self._S_dense[0]) if self._S_dense else 0
+        info_b = _host_nbytes(self._slab_info[0])
+
+        per_face = hbs_b / max(n_faces_first, 1)
+        per_face_dense = dense_b / max(n_faces_first, 1)
+        estimate = int((lu_b + info_b) * nslabs
+                       + (per_face + per_face_dense) * total_faces)
+        held = lu_b + hbs_b + dense_b + info_b
+        self.stats.host_bytes_estimate = estimate
+
+        avail = _available_host_memory()
+        if dbg > 0:
+            print("host memory: first slab holds %s, projected total %s, "
+                  "available %s" % (_fmt_bytes(held), _fmt_bytes(estimate),
+                                    "unknown" if avail is None else _fmt_bytes(avail)))
+        if not self.check_host_memory:
+            return
+        if avail is None:
+            warnings.warn("oms: cannot determine available host memory; "
+                          "skipping the host-memory check", RuntimeWarning,
+                          stacklevel=3)
+            return
+        need = estimate - held
+        budget = self.host_mem_fraction * avail
+        if need > budget:
+            parts = []
+            if lu_b:
+                parts.append("LU factors %s/slab" % _fmt_bytes(lu_b))
+            if hbs_b:
+                parts.append("HBS blocks %s/face" % _fmt_bytes(per_face))
+            if dense_b:
+                parts.append("dense blocks %s/face" % _fmt_bytes(per_face_dense))
+            raise MemoryError(
+                "oms: after slab 1 of %d the decomposition is projected to need "
+                "%s more host memory (total %s: %s), but only %s is available "
+                "(%.0f%% of %s).  Options: keepDense=False unless the exact "
+                "blocks are needed, keepLU=False if the HBS operator "
+                "suffices, stiff_mat_const=True if the slabs are translates, "
+                "fewer / smaller slabs, or check_host_memory=False to try anyway."
+                % (nslabs, _fmt_bytes(need), _fmt_bytes(estimate),
+                   ", ".join(parts) or "bookkeeping", _fmt_bytes(budget),
+                   100 * self.host_mem_fraction, _fmt_bytes(avail)))
+
     # ------------------------------------------------------------------ #
     # constant-stiffness-matrix support
     # ------------------------------------------------------------------ #
 
+    def _reference_index(self):
+        """
+        FIX: the reference used to be slabList[0].  That is a *boundary*
+             double slab: its left face lies on the physical boundary, so it
+             only carries the right map K_{i,i+1}.  The left map K_{i,i-1} then
+             had to come from a second, overlapping slab (slabList[1]) with its
+             own complete set-up.  An interior double slab carries both source
+             faces, so one set-up yields both maps for the whole system.
+             Falls back to slab 0 only if no interior slab exists.
+        """
+        if self._ref_ind is None:
+            self._ref_ind = 0
+            for i, conn in enumerate(self.connectivity):
+                if conn[0] >= 0 and conn[1] >= 0:
+                    self._ref_ind = i
+                    break
+        return self._ref_ind
+
     def _compute_offsets(self, atol=None):
         """
-        Verify every slab is a rigid translate of slabList[0] and return the
-        translation vectors.  A stiff_mat_const run is only legitimate if this
-        holds, so it is checked rather than assumed.
+        Verify every slab is a rigid translate of the reference slab and
+        return the translation vectors.  A stiff_mat_const run is only
+        legitimate if this holds, so it is checked rather than assumed.
         """
         slabs = [np.asarray(s, dtype=float) for s in self.slabList]
-        ref = slabs[0]
+        r = self._reference_index()
+        ref = slabs[r]
         ext0 = ref.max(axis=0) - ref.min(axis=0)
         scale = max(1.0, float(np.max(np.abs(ext0))), float(np.max(np.abs(ref))))
         tol = _COORD_RTOL * scale if atol is None else atol
@@ -238,51 +1199,51 @@ class _omsBase:
         for i, g in enumerate(slabs):
             if g.shape != ref.shape:
                 raise ValueError(
-                    "stiff_mat_const: slab %d has geometry shape %r, slab 0 has %r"
-                    % (i, g.shape, ref.shape))
+                    "stiff_mat_const: slab %d has geometry shape %r, reference "
+                    "slab %d has %r" % (i, g.shape, r, ref.shape))
             d = g.min(axis=0) - ref.min(axis=0)
             if not np.allclose(g, ref + d, rtol=0.0, atol=tol):
                 raise ValueError(
-                    "stiff_mat_const: slab %d is not a rigid translate of slab 0 "
-                    "(max deviation %.3e, tol %.3e).  The local stiffness "
-                    "matrices will not coincide."
-                    % (i, float(np.max(np.abs(g - (ref + d)))), tol))
+                    "stiff_mat_const: slab %d is not a rigid translate of "
+                    "reference slab %d (max deviation %.3e, tol %.3e).  The "
+                    "local stiffness matrices will not coincide."
+                    % (i, r, float(np.max(np.abs(g - (ref + d)))), tol))
             offsets.append(d)
         return offsets
+
+    def _build_local_solver(self, slabInd, dbg=0):
+        geom = np.array(self.slabList[slabInd])
+        solver = solverWrap.solverWrapper(self.opts)
+        solver.construct(geom, self.pdo, verbose=dbg)
+        self._n_factorizations += 1
+        return solver
 
     def _slab_solver(self, slabInd, dbg=0):
         """
         Return (solver, XXb, XXi, tDisc) for slab `slabInd`.
 
-        stiff_mat_const=False : discretize and factorize this slab (as before).
-        stiff_mat_const=True  : build slab 0 once and hand back the reference
-                                solver with rigidly shifted coordinates, so
-                                gb / bc are still evaluated at true *global*
-                                positions.
+        stiff_mat_const=False : discretize and factorize this slab.
+        stiff_mat_const=True  : build the reference (interior) slab once and
+                                hand back its solver with rigidly shifted
+                                coordinates, so gb / bc are still evaluated
+                                at true *global* positions.
         """
         if not self.stiff_mat_const:
-            geom = np.array(self.slabList[slabInd])
             t0 = time.time()
-            solver = solverWrap.solverWrapper(self.opts)
-            solver.construct(geom, self.pdo, verbose=dbg)
-            self._n_factorizations += 1
+            solver = self._build_local_solver(slabInd, dbg)
             return solver, solver.XXb, solver.XXi, time.time() - t0
 
         tDisc = 0.0
         if self._ref_solver is None:
             self._offsets = self._compute_offsets()
-            geom = np.array(self.slabList[0])
             t0 = time.time()
-            solver = solverWrap.solverWrapper(self.opts)
-            solver.construct(geom, self.pdo, verbose=dbg)
+            self._ref_solver = self._build_local_solver(self._reference_index(), dbg)
             tDisc = time.time() - t0
-            self._ref_solver = solver
-            self.localSolver = solver
-            self._n_factorizations += 1
+            self.localSolver = self._ref_solver
             if dbg > 0:
-                print("stiff_mat_const: single reference factorization built "
-                      "in %5.2f s, reused for all %d slabs"
-                      % (tDisc, len(self.slabList)))
+                print("stiff_mat_const: single reference factorization "
+                      "(slab %d) built in %5.2f s, reused for all %d slabs"
+                      % (self._ref_ind, tDisc, len(self.slabList)))
 
         ref = self._ref_solver
         d = self._offsets[slabInd]
@@ -297,18 +1258,17 @@ class _omsBase:
 
     def _slab_indices(self, slabInd, solver, XXb, XXi):
         """
-        Per-slab index sets, shared by both front-ends.  Returns
-        (Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r).
+        Per-slab index sets.  Returns (Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r),
+        pts_l / pts_r being the physical source coordinates of each face.
 
-        For problem_type='mixed', Il/Ir index into solver.JD, so the physical
-        source coordinates are XXb[JD[I]] -- see the FIX in compute_stmaps.
+        For problem_type='mixed', Il/Ir index into solver.JD, so the source
+        coordinates are XXb[JD[I]], not XXb[I].
         """
         geom = np.array(self.slabList[slabInd])
         slab_i = slab(geom, self.gb)
         Il, Ir, Ic, Igb, XXi, XXb = slab_i.compute_idxs_and_pts(
             solver, XXb=XXb, XXi=XXi)
 
-        pts_l = pts_r = None
         if getattr(solver.opts, "problem_type", "Dirichlet") == "mixed":
             xl = float(geom[0][0])
             xr = float(geom[1][0])
@@ -318,21 +1278,50 @@ class _omsBase:
             Ir = np.flatnonzero(_coord_close(XD, xr, scale))
             pts_l = XXb[solver.JD[Il], :]
             pts_r = XXb[solver.JD[Ir], :]
+        else:
+            pts_l = XXb[Il, :]
+            pts_r = XXb[Ir, :]
 
         return Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r
+
+    def _reference_faces(self, dbg=0):
+        """
+        Under stiff_mat_const: (solver, Il, Ir, Ic, XXi, pts_l, pts_r, tDisc)
+        of the reference double slab, in the reference solver's local
+        numbering.  Every map of the reduced system is derived from these.
+        """
+        r = self._reference_index()
+        solver, XXb, XXi, tDisc = self._slab_solver(r, dbg=dbg)
+        Il, Ir, Ic, _, XXi, _, pts_l, pts_r = self._slab_indices(
+            r, solver, XXb, XXi)
+        self._ref_faces = (np.asarray(Il), np.asarray(Ir), np.asarray(Ic))
+        return solver, Il, Ir, Ic, XXi, pts_l, pts_r, tDisc
+
+    def _matches_reference(self, Ic, J, side):
+        """
+        True if this slab's (target, source) index pair coincides with the
+        reference slab's pair for `side` ('l' or 'r').  Normally always true;
+        it can fail only if gb trims a face differently on some slab, in which
+        case the caller falls back to building that block explicitly.
+        """
+        if self._ref_faces is None:
+            return False
+        Il, Ir, Ic_ref = self._ref_faces
+        J_ref = Il if side == "l" else Ir
+        return (len(J_ref) > 0 and np.array_equal(np.asarray(Ic), Ic_ref)
+                and np.array_equal(np.asarray(J), J_ref))
 
     @staticmethod
     def _block_key(I, J, side):
         """
-        Cache key for a source-target block.  The operator depends only on the
-        (target, source) index pair, so identical pairs across slabs give
-        bit-identical blocks when the stiffness matrices coincide.  `side` is
-        carried along so that an empty left face and an empty right face --
-        which have identical (empty) index arrays -- cannot collide.
+        Cache key for a source-target block.  `side` is carried along so that
+        an empty left face and an empty right face -- which have identical
+        (empty) index arrays -- cannot collide.
         """
         return (side, np.asarray(I).tobytes(), np.asarray(J).tobytes())
 
-
+    # ------------------------------------------------------------------ #
+    # bookkeeping
     # ------------------------------------------------------------------ #
 
     def compute_global_dofs(self):
@@ -366,49 +1355,85 @@ class _omsBase:
         return glob_source_dofs
 
     # ------------------------------------------------------------------ #
+    # local operators
+    # ------------------------------------------------------------------ #
 
-    def _make_st_linop(self, I, J, Bcols, A_solver, nrows_full):
+    @staticmethod
+    def _coupling(solver):
+        """(Bcols, nrows) of the local solve, by problem type."""
+        ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+        if ptype == "Dirichlet":
+            return solver.Aib, len(solver.Ii)
+        if ptype == "mixed":
+            return solver.E, len(solver.Ii) + len(solver.JN)
+        raise NameError(
+            "solver problem type not recognized: must be 'Dirichlet' or 'mixed'."
+        )
+
+    def _make_st_linop(self, I, J, solver, handle=None):
         """
         Build one source-target LinearOperator:  v |-> (A^{-1} B[:,J] v)[I].
 
-        OPT: B[:,J] used to be re-sliced on *every* apply.  Sparse column
-             slicing is not free and a randomized assembler applies this
-             hundreds of times; it is hoisted here, together with its
-             transpose.
+        `solver` must be resident at call time (used for B and the dtype).
+        The local solve itself goes through `handle`, so an off-loaded
+        factorization is only loaded while the operator is being applied.
+
+        OPT: B[:,J] used to be re-sliced on *every* apply.  It is hoisted
+             here, together with its transpose (it is a thin face coupling,
+             cheap to keep resident).
         """
+        Bcols, nrows_full = self._coupling(solver)
+        if handle is None:
+            handle = _Resident(solver)
         BJ = Bcols[:, J]
         if sp.issparse(BJ):
             BJ = BJ.tocsr()
             BJT = BJ.T.tocsr()
+            # OPT: multithreaded sparse @ dense (see _SparseMatmul)
+            mul_B, mul_BT = _SparseMatmul(BJ), _SparseMatmul(BJT)
         else:
             BJ = np.asarray(BJ)
             BJT = BJ.T
-        dt = np.result_type(_dtype_of(A_solver), _dtype_of(BJ))
+            mul_B, mul_BT = BJ.__matmul__, BJT.__matmul__
+        dt = np.result_type(_dtype_of(solver.solver_ii), _dtype_of(BJ))
 
         def smatmat(v, transpose=False):
             v_in = np.asarray(v)
             oneD = v_in.ndim == 1
             v_tmp = v_in[:, np.newaxis] if oneD else v_in
+            A_solver = handle.get().solver_ii
 
             if not transpose:
-                result = (A_solver @ (BJ @ v_tmp))[I, :]
+                result = (A_solver @ mul_B(v_tmp))[I, :]
             else:
                 # FIX: the original sized this with v.shape[1] instead of
                 #      v_tmp.shape[1], so every 1-D rmatvec raised IndexError.
                 # FIX: dtype was hard-wired to float64, silently killing
                 #      complex problems.
+                # OPT: Fortran order, the layout MUMPS solves in, so the
+                #      solver's copy of it is a straight copy, not a transpose
                 tmp = np.zeros(
                     (nrows_full, v_tmp.shape[1]),
                     dtype=np.result_type(dt, v_tmp.dtype),
+                    order="F",
                 )
                 tmp[I, :] = v_tmp
-                result = BJT @ (A_solver.T @ tmp)
+                if _real_dtype(_dtype_of(A_solver)) and _real_dtype(tmp.dtype) \
+                        and hasattr(A_solver, "rmatmat"):
+                    # OPT: real problem, so A^{-T} == A^{-H}: call the solve's
+                    #      rmatmat directly.  scipy's A_solver.T would compute
+                    #      the same thing as conj(rmatmat(conj(tmp))), i.e. two
+                    #      extra single-threaded N x s copies.
+                    W = A_solver.rmatmat(tmp)
+                else:
+                    W = A_solver.T @ tmp
+                result = mul_BT(W)
+            del A_solver
 
             return result.ravel() if oneD else result
 
         # OPT: passing dtype explicitly stops SciPy from probing the operator
-        #      with matvec(zeros(N)) just to infer it -- that probe is a full
-        #      local solve, four of them per slab.
+        #      with matvec(zeros(N)) just to infer it -- a full local solve.
         return LinearOperator(
             shape=(len(I), len(J)),
             dtype=dt,
@@ -418,144 +1443,59 @@ class _omsBase:
             rmatmat=lambda v: smatmat(v, transpose=True),
         )
 
-    # ------------------------------------------------------------------ #
-
-    def construct_Stot_and_rhstot_linearOperator(
-        self, S_list, rhs_list, Ntot, nc=None, dbg=0
-    ):
-        """
-        Construct the global S operator (as I + S) and the global rhs.
-
-        EXPLAINER OF CONVENTIONS:
-            - global dof ordering is inferred from the supplied connectivity
-            - joined slabs are contiguous (fictitious domain extension used for
-              periodic domains)
-            - no domain checks are done (garbage in, garbage out)
-            - contiguous blocks are used for global dofs, to improve efficiency
-            - first INTERFACES (i.e. 'Ic') is assumed to be global dofs
-              0...len(Ic)-1
-
-        `nc` is retained for signature compatibility and is no longer used.
-        """
-        tgt = [_as_index(b) for b in self.glob_target_dofs]
-        src = [[_as_index(b) for b in row] for row in self.glob_source_dofs]
-
-        # FIX: dtype is now inferred rather than forced to float64, so complex
-        #      (Helmholtz / time-harmonic) problems survive.
-        dts = [_dtype_of(np.asarray(r)) for r in rhs_list]
-        dts += [_dtype_of(blk) for row in S_list for blk in row]
-        dtype = np.result_type(*dts)
-
-        rhstot = np.zeros(Ntot, dtype=dtype)
-        # FIX: was rhstot[i*nc:(i+1)*nc] with a single global nc, which
-        #      contradicts the per-slab glob_target_dofs built alongside it.
-        for i, rhs in enumerate(rhs_list):
-            rhstot[tgt[i]] = rhs
-
-        def smatmat(v, transpose=False):
-            v_in = np.asarray(v)
-            oneD = v_in.ndim == 1
-            v_tmp = v_in[:, np.newaxis] if oneD else v_in
-
-            # OPT: one copy (the identity term) instead of astype-then-copy.
-            result = v_tmp.astype(np.result_type(v_tmp.dtype, dtype), copy=True)
-
-            if not transpose:
-                for i in range(len(tgt)):
-                    ti = tgt[i]
-                    for j, sj in enumerate(src[i]):
-                        result[ti] += S_list[i][j] @ v_tmp[sj]
-            else:
-                for i in range(len(tgt)):
-                    ti = tgt[i]
-                    for j, sj in enumerate(src[i]):
-                        result[sj] += S_list[i][j].T @ v_tmp[ti]
-
-            return result.ravel() if oneD else result
-
-        Linop = LinearOperator(
-            shape=(Ntot, Ntot),
-            dtype=dtype,
-            matvec=smatmat,
-            rmatvec=lambda v: smatmat(v, transpose=True),
-            matmat=smatmat,
-            rmatmat=lambda v: smatmat(v, transpose=True),
-        )
-        return Linop, rhstot
-
-    # ------------------------------------------------------------------ #
-
-    def _summary(self, discrTime, sampleTime, compressTime, glob_target_dofs,
-                 relerrl=None, relerrr=None, compression=None):
-        # FIX: averages were divided by len(connectivity)-1, which is both an
-        #      off-by-one and a ZeroDivisionError for a single-slab run.
-        nslabs = max(len(self.slabList), 1)
-        # Under stiff_mat_const the work is not per-slab, so averaging over
-        # slabs would understate it by a factor of nslabs.  Report totals.
-        nfac = max(self._n_factorizations, 1)
-        nasm = max(self._n_assembled, 1)
-        print("============================OMS SUMMARY============================")
-        if self.stiff_mat_const:
-            print("stiff_mat_const              =  True")
-            print("factorizations               = ", self._n_factorizations,
-                  " (of", nslabs, "slabs)")
-            print("blocks assembled / reused    = ", self._n_assembled, "/",
-                  self._n_reused)
-            print("total discr. time            = ", discrTime)
-            print("total sample time            = ", sampleTime)
-            print("total compr. time            = ", compressTime)
-        print("avg. discr. time             = ", discrTime / nfac)
-        print("avg. sample time             = ", sampleTime / nasm)
-        print("avg. compr. time             = ", compressTime / nasm)
-        if compression is not None:
-            print("compression rate             = ", compression)
-        print("total dofs                   = ",
-              sum(len(dof) for dof in glob_target_dofs))
-        if relerrl is not None:
-            print("estim. max. err. ( l // r )  = (", relerrl, " // ", relerrr, ")")
-        print("===================================================================")
-
-
-# --------------------------------------------------------------------------- #
-# oms : compressed interface operators
-# --------------------------------------------------------------------------- #
-
-
-class oms(_omsBase):
-    """
-    overlapping multislab class
-    @param
-    slablist: list of double-wide slabs
-    pdo:    global partial differential operator
-    solver_opts: solver options (h and p specs)
-    connectivity: encodes which double slabs are connected to which
-    """
-
-    def compute_stmaps(self, Il, Ic, Ir, XXi, XXb, solver):
+    def _stmap(self, Ic, J, pts, XXi, solver):
+        """One source-target map  J -> Ic  of the local double slab."""
         A_solver = solver.solver_ii
-        nrows = len(solver.Ii)
-
-        Linop_r = self._make_st_linop(Ic, Ir, solver.Aib, A_solver, nrows)
-        Linop_l = self._make_st_linop(Ic, Il, solver.Aib, A_solver, nrows)
-
-        st_r = stMap(Linop_r, XXb[Ir, :], XXi[Ic, :],
+        return stMap(self._make_st_linop(Ic, J, solver), pts, XXi[Ic, :],
                      A_solver.shape[0], A_solver.shape[1])
-        st_l = stMap(Linop_l, XXb[Il, :], XXi[Ic, :],
-                     A_solver.shape[0], A_solver.shape[1])
-        return st_l, st_r
+
+    def compute_stmaps(self, Il, Ic, Ir, XXi, XXb, solver, pts_l=None, pts_r=None):
+        """Separate left / right source-target maps of one double slab."""
+        pts_l = XXb[Il, :] if pts_l is None else pts_l
+        pts_r = XXb[Ir, :] if pts_r is None else pts_r
+        return (self._stmap(Ic, Il, pts_l, XXi, solver),
+                self._stmap(Ic, Ir, pts_r, XXi, solver))
+
+    @staticmethod
+    def _column_restriction(op, start, n):
+        """
+        x |-> op @ [0; x; 0], with x occupying columns start:start+n of op.
+        Lets a boundary slab reuse the reference slab's fused [Il, Ir]
+        operator instead of owning a separate one.  The zero block costs a
+        sparse multiply, not an extra local solve.
+        """
+        ncols = op.shape[1]
+        sl = slice(start, start + n)
+
+        def mv(x):
+            x = np.asarray(x)
+            full = np.zeros((ncols,) + x.shape[1:],
+                            dtype=np.result_type(op.dtype, x.dtype))
+            full[sl] = x
+            return op @ full
+
+        def rmv(y):
+            y = np.asarray(y)
+            out = op.rmatvec(y) if y.ndim == 1 else op.rmatmat(y)
+            return out[sl]
+
+        return LinearOperator(shape=(op.shape[0], n), dtype=op.dtype,
+                              matvec=mv, rmatvec=rmv, matmat=mv, rmatmat=rmv)
 
     # ------------------------------------------------------------------ #
+    # HBS blocks
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _block_error(st, mat, assembler):
+        V = np.random.standard_normal(size=(st.A.shape[1], assembler.matOpts.maxRank))
+        U = st.A @ V
+        return np.linalg.norm(U - mat @ V) / np.linalg.norm(U)
 
     def _assemble_cached(self, st, I, J, assembler, slabInd, label, dbg):
         """
-        Compress one source-target block, reusing an identical block when
-        stiff_mat_const is set.
-
-        Under stiff_mat_const the whole (source points, target points)
-        configuration is rigidly translated from slab to slab, so the
-        compressed block is numerically identical and only the *distinct*
-        (Ic, J) index pairs need assembling -- two for an entire decomposition
-        instead of two per slab.
+        Compress one source-target block.  Under stiff_mat_const an identical
+        (I, J) pair is served from the cache.
 
         Returns (block, was_freshly_assembled, compression_ratio).
         """
@@ -585,28 +1525,209 @@ class oms(_omsBase):
             self._block_cache[key] = (mat, ratio)
         return mat, True, ratio
 
+    def _hbs_block(self, side, Ic, J, pts, slabInd, solver, XXi, assembler, dbg):
+        """
+        One HBS block of slab `slabInd`.  Under stiff_mat_const it is taken
+        from the reference set-up (explicit build only if this slab's face
+        differs from the reference face).
+
+        Returns (block, compression_ratio, err, tCompress, tSample, shape_ok).
+        """
+        if self.stiff_mat_const and side in self._ref_hbs \
+                and self._matches_reference(Ic, J, side):
+            if slabInd != self._ref_ind:
+                self._n_reused += 1
+            mat, ratio, err = self._ref_hbs[side]
+            return mat, ratio, err, 0.0, 0.0, True
+
+        label = "LEFT" if side == "l" else "RIGHT"
+        if self.stiff_mat_const and dbg > 0:
+            print("stiff_mat_const: %s face of slab %d differs from the "
+                  "reference face; building it explicitly" % (label, slabInd))
+        st = self._stmap(Ic, J, pts, XXi, solver)
+        mat, fresh, ratio = self._assemble_cached(
+            st, Ic, J, assembler, slabInd, label, dbg)
+        tC = assembler.stats.timeCompress if fresh else 0.0
+        tS = assembler.stats.timeSample if fresh else 0.0
+        # FIX: shapeMatch was printed but its computation was commented out.
+        shape_ok = tuple(mat.shape) == tuple(st.A.shape)
+        err = None
+        if dbg > 0:
+            err = self._block_error(st, mat, assembler)
+            print("%s ERR = " % label, err)
+        return mat, ratio, err, tC, tS, shape_ok
+
+    # ------------------------------------------------------------------ #
+    # dense blocks (keepDense)
     # ------------------------------------------------------------------ #
 
-    def construct_Stot_helper(self, bc, assembler, dbg=0):
+    def _dense_block(self, side, Ic, J, pts, XXi, solver):
         """
-        Construct S_rk_list and the other helpers needed for the S operator,
-        whether it is applied iteratively or factorized directly.
+        One block formed densely: the source-target map of face `side`
+        applied to the identity, i.e. (A^{-1} B[:,J])[Ic] with no compression.
+        One local solve with len(J) right-hand sides.  Under stiff_mat_const
+        an identical (side, Ic, J) triple is served from the cache (the
+        solver is shared, so the block is too).
+
+        Returns (block, was_freshly_formed).
         """
+        key = self._block_key(Ic, J, side) if self.stiff_mat_const else None
+        if key is not None and key in self._dense_cache:
+            return self._dense_cache[key], False
+        st = self._stmap(Ic, J, pts, XXi, solver)
+        D = _host_ndarray(st.A @ np.identity(len(J)))
+        del st
+        if key is not None:
+            self._dense_cache[key] = D
+        return D, True
+
+    # ------------------------------------------------------------------ #
+    # reference set-up (stiff_mat_const)
+    # ------------------------------------------------------------------ #
+
+    def _build_reference(self, assembler, dbg=0):
+        """
+        stiff_mat_const: derive everything from ONE interior double slab --
+        the HBS blocks K_{i,i-1}, K_{i,i+1} (constructHBS) and / or the fused
+        exact operator [K_{i,i-1}  K_{i,i+1}] (keepLU).
+
+        Returns (tDisc, tCompress, tSample, shapes_match).
+        """
+        self._ref_hbs, self._ref_lu = {}, {}
+        solver, Il, Ir, Ic, XXi, pts_l, pts_r, tDisc = self._reference_faces(dbg)
+        tC = tS = 0.0
+        shapes_ok = True
+
+        if self.constructHBS:
+            for side, J, pts, label in (("l", Il, pts_l, "LEFT"),
+                                        ("r", Ir, pts_r, "RIGHT")):
+                if len(J) == 0:
+                    continue          # only if no interior slab exists
+                st = self._stmap(Ic, J, pts, XXi, solver)
+                mat, _, ratio = self._assemble_cached(
+                    st, Ic, J, assembler, self._ref_ind, label, dbg)
+                tC += assembler.stats.timeCompress
+                tS += assembler.stats.timeSample
+                shapes_ok = shapes_ok and tuple(mat.shape) == tuple(st.A.shape)
+                err = None
+                err = self._block_error(st, mat, assembler)
+                print("%s ERR = " % label, err)
+                err = None
+                if dbg > 0:
+                    err = self._block_error(st, mat, assembler)
+                    print("%s ERR (reference slab %d) = " % (label, self._ref_ind), err)
+                self._ref_hbs[side] = (mat, ratio, err)
+                if hasattr(mat,"evict"):
+                    mat.evict()
+                del st
+
+        if self.keepLU and len(Il) > 0 and len(Ir) > 0:
+            op = self._make_st_linop(
+                Ic, np.concatenate([np.asarray(Il), np.asarray(Ir)]), solver)
+            self._n_assembled += 1
+            self._ref_lu = {
+                "lr": op,
+                "l": self._column_restriction(op, 0, len(Il)),
+                "r": self._column_restriction(op, len(Il), len(Ir)),
+            }
+        return tDisc, tC, tS, shapes_ok
+
+    def _ref_lu_operator(self, tag, Ic, Il, Ir):
+        """Reference-derived LU operator for a slab with source faces `tag`."""
+        if not self._ref_lu:
+            return None
+        ok = ((tag in ("l", "lr")) <= self._matches_reference(Ic, Il, "l")) and \
+             ((tag in ("r", "lr")) <= self._matches_reference(Ic, Ir, "r"))
+        return self._ref_lu[tag] if ok else None
+
+    # ------------------------------------------------------------------ #
+    # right-hand side
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _local_rhs(solver, bc, info, load):
+        """
+        Local rhs with zero neighbour data; `load` from _slab_load (None = no
+        body load).
+        """
+        Ic = info.Ic
+        ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+        if ptype == "Dirichlet":
+            if len(info.Igb) == 0 and load is None:
+                # no global-boundary Dirichlet data (e.g. Neumann walls through
+                # solverOptions(bc_types=...)) and no body load: skip a local
+                # solve of a zero vector
+                return np.zeros(len(Ic))
+            fgb = bc(info.pts_gb)
+            if load is None:
+                return -(solver.solver_ii @ (solver.Aib[:, info.Igb] @ fgb))[Ic]
+            # A_ii u_i = f_i - A_ib g
+            g = np.asarray(_host_ndarray(solver.Aib[:, info.Igb] @ fgb)).reshape(-1)
+            return np.asarray(_host_ndarray(
+                solver.solver_ii @ (load[0] - g))).reshape(-1)[Ic]
+        if ptype == "mixed":
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(solver.JN))
+            else:
+                b_C, b_N = load
+            g_N = np.asarray(_host_ndarray(bc(info.pts_N))).reshape(-1)
+            rhs = solver.solver_ii @ np.concatenate([b_C, g_N + b_N])
+            return rhs[Ic]
+        raise NameError(
+            "solver problem type not recognized, must be 'Dirichlet' or 'mixed'"
+        )
+
+    # ------------------------------------------------------------------ #
+    # construction
+    # ------------------------------------------------------------------ #
+
+    def construct_Stot_helper(self, bc, assembler=None, reduced_load=None, dbg=0,
+                              body_load=None):
+        """
+        Build the per-slab interface operators and local right-hand sides.
+        Returns (rhs_list, Ntot).  The operators are kept on the object and
+        combined into I - K by global_operator().
+
+        body_load : optional callable f(xx) (torch points, global coordinates),
+                    the body load of L u = f; reduced per slab by the local
+                    solver and kept.  Mutually exclusive with reduced_load.
+        """
+        if self.constructHBS and assembler is None:
+            raise ValueError("constructHBS=True needs an `assembler`")
+        _check_load_args(reduced_load, body_load)
+
+        # OPT: calling this twice used to keep a second full set of local
+        #      solvers alive; everything from a previous call is dropped.
+        self.close()
+        self._slab_info = []
+        self._n_offloaded = 0
+        self.ncs = []
+        self.interface_points = None
+        self.glob_source_dofs = []
         connectivity = self.connectivity
         slabs = self.slabList
 
         Ntot = 0
-        S_rk_list = []
         rhs_list = []
         glob_target_dofs = []
         startCentral = 0
+        dtypes = []
 
         discrTime = 0.0
         compressTime = 0.0
         sampleTime = 0.0
+        denseTime = 0.0
         shapeMatch = True
         relerrl = 0.0
         relerrr = 0.0
+
+        if self.stiff_mat_const:
+            # One interior double slab -> every map of the whole system.
+            tDisc, tC, tS, shapeMatch = self._build_reference(assembler, dbg)
+            discrTime += tDisc
+            compressTime += tC
+            sampleTime += tS
+            print("sampleTime = ",sampleTime)
 
         for slabInd in range(len(slabs)):
             solver, XXb, XXi, tDisc = self._slab_solver(slabInd, dbg=dbg)
@@ -614,352 +1735,302 @@ class oms(_omsBase):
             if dbg > 1 and tDisc > 0:
                 print("SLAB %2.0d discretization time = %5.2f s" % (slabInd, tDisc))
 
-            Il, Ir, Ic, Igb, XXi, XXb, _, _ = self._slab_indices(
+            Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r = self._slab_indices(
                 slabInd, solver, XXb, XXi)
             nc = len(Ic)
+            if slabInd == 0:
+                self.interface_points = np.array(_host_ndarray(XXi[Ic, :]), copy=True)
             if dbg > 1:
                 print("SLAB %2.0d size = %2.0d" % (slabInd, nc))
-            self.nc = nc
             self.ncs.append(nc)
             Ntot += nc
             glob_target_dofs.append(range(startCentral, startCentral + nc))
             startCentral += nc
 
-            fgb = bc(XXb[Igb, :])
-            st_l, st_r = self.compute_stmaps(Il, Ic, Ir, XXi, XXb, solver)
-
-            if len(Igb) > 0:
-                rhs = solver.solver_ii @ (solver.Aib[:, Igb] @ fgb)
-                rhs = -rhs[Ic]
-            else:
-                # no global-boundary Dirichlet data (e.g. Neumann walls): skip
-                # a local solve of a zero vector
-                rhs = np.zeros(len(Ic))
-            rhs_list.append(rhs)
-
-            bool_l = len(Il) > 0
-            bool_r = len(Ir) > 0
-
+            L, R = connectivity[slabInd][0], connectivity[slabInd][1]
             # FIX: the geometric emptiness of Il/Ir and the topological
-            #      connectivity flags must agree, otherwise the block stored
-            #      below is silently the *previous* slab's matrix (rkMat_l /
-            #      rkMat_r were never cleared between iterations).
-            if bool_l != (connectivity[slabInd][0] >= 0):
+            #      connectivity flags must agree, otherwise the operator is
+            #      applied to the wrong dofs.
+            if (len(Il) > 0) != (L >= 0):
                 raise ValueError(
                     "slab %d: left connectivity says %s but %d left-face dofs "
-                    "were found" % (slabInd, connectivity[slabInd][0], len(Il))
-                )
-            if bool_r != (connectivity[slabInd][1] >= 0):
+                    "were found" % (slabInd, L, len(Il)))
+            if (len(Ir) > 0) != (R >= 0):
                 raise ValueError(
                     "slab %d: right connectivity says %s but %d right-face dofs "
-                    "were found" % (slabInd, connectivity[slabInd][1], len(Ir))
-                )
+                    "were found" % (slabInd, R, len(Ir)))
 
-            rkMat_l = None
-            rkMat_r = None
-            compression_l = None
-            compression_r = None
-            fresh_l = False
-            fresh_r = False
+            # OPT: keep only what rhs / uX_full need; the original stored the
+            #      full XXi / XXb point arrays of every slab.
+            ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+            info = SimpleNamespace(
+                Il=np.asarray(Il), Ir=np.asarray(Ir), Ic=np.asarray(Ic),
+                pts_c=np.array(_host_ndarray(XXi[Ic, :]), copy=True),
+                Igb=np.asarray(Igb),
+                pts_gb=XXb[Igb, :] if ptype == "Dirichlet" else None,
+                pts_N=XXb[solver.JN, :] if ptype == "mixed" else None,
+            )
+            # FIX (regression): the rhs is the exact local solve, as in the
+            #      original oms / oms_lu.  A compressed boundary-to-interface
+            #      map was briefly built here; its source set (the slab's
+            #      physical walls) is not a planar interface, so the HBS tree
+            #      cannot be built on it.
+            # reduced body load: one leaf pass per slab, kept for later rhs /
+            # reconstruction (per-slab offset: the load is not translation
+            # invariant even when the operator is)
+            info.load = _slab_load(solver, slabInd, body_load, reduced_load,
+                                   self._slab_offset(slabInd))
+            rhs = self._local_rhs(solver, bc, info, info.load)
+            rhs_list.append(rhs)
+            dtypes.append(_dtype_of(np.asarray(rhs)))
 
-            # FIX: dividing by np.prod(shape)*8 blew up (ZeroDivisionError,
-            #      then nan in stats.compression) whenever a face was empty.
-            #      Byte accounting now lives in _assemble_cached and counts
-            #      each distinct block once, so stats.compression stays a true
-            #      per-block ratio under reuse.
-            if bool_r:
-                rkMat_r, fresh_r, compression_r = self._assemble_cached(
-                    st_r, Ic, Ir, assembler, slabInd, "RIGHT", dbg)
-                if fresh_r:
-                    compressTime += assembler.stats.timeCompress
-                    sampleTime += assembler.stats.timeSample
-            if bool_l:
-                rkMat_l, fresh_l, compression_l = self._assemble_cached(
-                    st_l, Ic, Il, assembler, slabInd, "LEFT", dbg)
-                if fresh_l:
-                    compressTime += assembler.stats.timeCompress
-                    sampleTime += assembler.stats.timeSample
+            # source faces in glob_source_dofs order: left, then right
+            faces = []
+            if L >= 0:
+                faces.append(("l", Il, pts_l))
+            if R >= 0:
+                faces.append(("r", Ir, pts_r))
 
-            # FIX: shapeMatch was printed but its computation was commented
-            #      out, so it always reported True.
-            if bool_l and rkMat_l is not None:
-                shapeMatch = shapeMatch and (tuple(rkMat_l.shape) == tuple(st_l.A.shape))
-            if bool_r and rkMat_r is not None:
-                shapeMatch = shapeMatch and (tuple(rkMat_r.shape) == tuple(st_r.A.shape))
+            # ---- HBS blocks ------------------------------------------------ #
+            if self.constructHBS:
+                blocks, errs, ratios = [], {}, {}
+                for side, J, pts in faces:
+                    mat, ratio, err, tC, tS, ok = self._hbs_block(
+                        side, Ic, J, pts, slabInd, solver, XXi, assembler, dbg)
+                    compressTime += tC
+                    sampleTime += tS
+                    shapeMatch = shapeMatch and ok
+                    blocks.append(mat)
+                    dtypes.append(_dtype_of(mat))
+                    errs[side], ratios[side] = err, ratio
 
-            if dbg > 0:
-                errl = errr = None
-                if bool_l:
-                    Vl = np.random.standard_normal(
-                        size=(st_l.A.shape[1], assembler.matOpts.maxRank))
-                    Ul = st_l.A @ Vl
-                    errl = np.linalg.norm(Ul - rkMat_l @ Vl) / np.linalg.norm(Ul)
-                    relerrl = max(relerrl, errl)
-                    print("LEFT ERR = ", errl)
-                if bool_r:
-                    Vr = np.random.standard_normal(
-                        size=(st_r.A.shape[1], assembler.matOpts.maxRank))
-                    Ur = st_r.A @ Vr
-                    errr = np.linalg.norm(Ur - rkMat_r @ Vr) / np.linalg.norm(Ur)
-                    relerrr = max(relerrr, errr)
-                    print("RIGHT ERR = ", errr)
+                if dbg > 0:
+                    if errs.get("l") is not None:
+                        relerrl = max(relerrl, errs["l"])
+                    if errs.get("r") is not None:
+                        relerrr = max(relerrr, errs["r"])
+                    if dbg > 1:
+                        # FIX: the per-slab report used to print the running
+                        #      maxima rather than this slab's own errors.
+                        sides = [f[0] for f in faces]
+                        print("SLAB %d error = %s" % (slabInd, " // ".join(
+                            "%5.2e" % errs[s] for s in sides)))
+                        print("SLAB %d compression = %s\n" % (slabInd, " // ".join(
+                            "%5.3e" % ratios[s] for s in sides)))
 
+                # Reference blocks are shared -> keep resident.  Otherwise the
+                # slab's blocks go to the store right away.
+                if self.stiff_mat_const:
+                    self._S_hbs.append(_Resident(blocks))
+                else:
+                    self._S_hbs.append(self._offload(blocks))
+                del blocks
+
+            # ---- dense blocks: exact, from the stMaps (keepDense) --------- #
+            if self.keepDense:
+                t0 = time.time()
+                self._S_dense.append([
+                    self._dense_block(side, Ic, J, pts, XXi, solver)[0]
+                    for side, J, pts in faces])
+                denseTime += time.time() - t0
                 if dbg > 1:
-                    # FIX: the per-slab report used to print the running maxima
-                    #      relerrl/relerrr rather than this slab's own errors.
-                    if bool_l and bool_r:
-                        print("SLAB %d error = %5.2e // %5.2e" % (slabInd, errl, errr))
-                        print("SLAB %d compression = %5.3e // %5.3e\n"
-                              % (slabInd, compression_l, compression_r))
-                    elif bool_r:
-                        print("SLAB %d error = %5.2e" % (slabInd, errr))
-                        print("SLAB %d compression = %5.3e\n" % (slabInd, compression_r))
-                    elif bool_l:
-                        print("SLAB %d error = %5.2e" % (slabInd, errl))
-                        print("SLAB %d compression = %5.3e\n" % (slabInd, compression_l))
+                    print("SLAB %d dense blocks formed in %5.2f s"
+                          % (slabInd, time.time() - t0))
 
-            if connectivity[slabInd][0] < 0:
-                S_rk_list.append([rkMat_r])
-            elif connectivity[slabInd][1] < 0:
-                S_rk_list.append([rkMat_l])
-            else:
-                S_rk_list.append([rkMat_l, rkMat_r])
+            # ---- kept LU / fused exact operator --------------------------- #
+            if self.keepLU:
+                tag = "".join(f[0] for f in faces)
+                J = np.concatenate([np.asarray(f[1]) for f in faces])
+                S_i = None
+                if self.stiff_mat_const:
+                    handle = _Resident(solver)
+                    S_i = self._ref_lu_operator(tag, Ic, Il, Ir)
+                    if S_i is not None:
+                        if slabInd != self._ref_ind:
+                            self._n_reused += 1
+                    else:
+                        key = self._block_key(Ic, J, tag)
+                        if key in self._block_cache:
+                            S_i = self._block_cache[key][0]
+                            self._n_reused += 1
+                        else:
+                            S_i = self._make_st_linop(Ic, J, solver, handle)
+                            self._n_assembled += 1
+                            self._block_cache[key] = (S_i, float("nan"))
+                else:
+                    # linop needs B / dtype from the resident solver, then
+                    # the factorization itself moves off the device.
+                    handle = self._offload(_slim_solver(solver, self.keepInterp))
+                    S_i = self._make_st_linop(Ic, J, solver, handle)
+                    self._n_assembled += 1
+                self._S_lu.append(S_i)
+                self._lu_handles.append(handle)
+                dtypes.append(S_i.dtype)
 
-            del st_l, st_r, Il, Ir, Ic, Igb, XXi, XXb
+            self._slab_info.append(info)
+            if slabInd == 0 and not self.stiff_mat_const:
+                self._check_host_memory(len(faces), dbg)
+
+            del Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r
             if not self.stiff_mat_const:
-                del solver
+                del solver        # its factorization is on disk or discarded
 
-            if dbg > 0:
-                print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
+            #if dbg > 0:
+            print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
 
+        # Without keepLU nothing needs the reference factorization any more.
+        if self.stiff_mat_const and not self.keepLU:
+            self._ref_solver = None
+            self.localSolver = None
+
+        self._dtype = np.result_type(*dtypes) if dtypes else np.float64
         compression = (self.nbytes / self.densebytes) if self.densebytes else float("nan")
-        if dbg > 0:
-            self._summary(discrTime, sampleTime, compressTime, glob_target_dofs,
-                          relerrl, relerrr, compression)
-            print("shapes match?                = ", shapeMatch)
 
         nfac = max(self._n_factorizations, 1)
         nasm = max(self._n_assembled, 1)
-        self.stats.compression = compression
+        self.stats.compression = compression if self.constructHBS else None
         self.stats.sampl_timing = sampleTime / nasm
         self.stats.compr_timing = compressTime / nasm
         self.stats.discr_timing = discrTime / nfac
         self.stats.n_factorizations = self._n_factorizations
         self.stats.n_assembled = self._n_assembled
         self.stats.n_reused = self._n_reused
-        self.glob_target_dofs = glob_target_dofs
-        self.compute_global_dofs()
-
-        return S_rk_list, rhs_list, Ntot, self.nc
-
-    # ------------------------------------------------------------------ #
-
-    def construct_Stot_and_rhstot(self, bc, assembler, dbg=0):
-        S_rk_list, rhs_list, Ntot, nc = self.construct_Stot_helper(bc, assembler, dbg)
-        return self.construct_Stot_and_rhstot_linearOperator(
-            S_rk_list, rhs_list, Ntot, nc, dbg)
-
-    def construct_rhstot(self, bc):
-        """
-        TODO IMPLEMENT RHS -- `oms` does not cache local solvers, so the rhs
-        cannot be rebuilt without re-discretizing.  See oms_lu.construct_rhstot.
-        """
-        raise NotImplementedError(
-            "oms does not cache local solvers; use oms_lu.construct_rhstot"
-        )
-
-
-# --------------------------------------------------------------------------- #
-# oms_lu : un-compressed interface operators
-# --------------------------------------------------------------------------- #
-
-
-class oms_lu(_omsBase):
-    """
-    overlapping multislab class, no interface reduction
-    @param
-    slablist: list of double-wide slabs
-    pdo:    global partial differential operator
-    solver_opts: solver options (h and p specs)
-    connectivity: encodes which double slabs are connected to which
-    """
-
-    def __init__(self, slabList: list, pdo, gb, solver_opts, connectivity,
-                 stiff_mat_const=False):
-        super().__init__(slabList, pdo, gb, solver_opts, connectivity,
-                         stiff_mat_const=stiff_mat_const)
-        self.solvers = []
-        self.idx = []
-
-    # ------------------------------------------------------------------ #
-
-    def compute_stmaps(self, Il, Ic, Ir, XXi, XXb, solver, pts_l=None, pts_r=None):
-        A_solver = solver.solver_ii
-        ptype = solver.opts.problem_type
-
-        if ptype == "Dirichlet":
-            Bcols = solver.Aib
-            nrows = len(solver.Ii)
-        elif ptype == "mixed":
-            Bcols = solver.E
-            nrows = len(solver.Ii) + len(solver.JN)
-        else:
-            raise NameError(
-                "solver problem type not recognized: must be 'Dirichlet' or 'mixed'."
-            )
-
-        Linop_r = self._make_st_linop(Ic, Ir, Bcols, A_solver, nrows)
-        Linop_l = self._make_st_linop(Ic, Il, Bcols, A_solver, nrows)
-
-        # FIX: for problem_type='mixed', Il/Ir index *into solver.JD*, not into
-        #      XXb.  XXb[Ir,:] therefore handed the assembler the coordinates of
-        #      the wrong points.  Callers now pass the correct source points.
-        if pts_l is None:
-            pts_l = XXb[Il, :]
-        if pts_r is None:
-            pts_r = XXb[Ir, :]
-
-        st_r = stMap(Linop_r, pts_r, XXi[Ic, :], A_solver.shape[0], A_solver.shape[1])
-        st_l = stMap(Linop_l, pts_l, XXi[Ic, :], A_solver.shape[0], A_solver.shape[1])
-        return st_l, st_r
-
-    # ------------------------------------------------------------------ #
-
-    def _local_rhs(self, solver, bc, Ic, Igb, XXb, reduced_load, slabInd):
-        ptype = solver.opts.problem_type
-        if ptype == "Dirichlet":
-            if len(Igb) == 0:   # no global-boundary Dirichlet data: skip a solve of zeros
-                return np.zeros(len(Ic))
-            fgb = bc(XXb[Igb, :])
-            return -(solver.solver_ii @ (solver.Aib[:, Igb] @ fgb))[Ic]
-        if ptype == "mixed":
-            # composition returns (b_C on C-space, b_X on X-space)
-            b_C, b_X = _eval_reduced_load(reduced_load, solver, slabInd)
-            b_N = b_X[solver.JN]                  # X-space load on Neumann rows
-            fgb = bc(XXb[solver.JN, :])           # g_N
-            rhs = solver.solver_ii @ np.concatenate([b_C, fgb + b_N])
-            return rhs[Ic]
-        raise NameError(
-            "solver problem type not recognized, must be 'Dirichlet' or 'mixed'"
-        )
-
-    # ------------------------------------------------------------------ #
-
-    def construct_Stot_helper(self, bc, reduced_load=None, dbg=0):
-        """
-        Construct S_lu_list and the other helpers needed for the S operator.
-        """
-        connectivity = self.connectivity
-        slabs = self.slabList
-
-        Ntot = 0
-        S_lu_list = []
-        rhs_list = []
-        glob_target_dofs = []
-        startCentral = 0
-
-        discrTime = 0.0
-        compressTime = 0.0
-        sampleTime = 0.0
-
-        for slabInd in range(len(slabs)):
-            solver, XXb, XXi, tDisc = self._slab_solver(slabInd, dbg=dbg)
-            discrTime += tDisc
-            self.solvers.append(solver)   # same object for every slab when
-                                          # stiff_mat_const is set
-            if dbg > 1 and tDisc > 0:
-                print("SLAB %2.0d discretization time = %5.2f s"
-                      % (slabInd, tDisc))
-
-            Il, Ir, Ic, Igb, XXi, XXb, pts_l, pts_r = self._slab_indices(
-                slabInd, solver, XXb, XXi)
-
-            self.idx.append((Il, Ir, Ic, Igb, XXi, XXb))
-
-            nc = len(Ic)
-            if dbg > 1:
-                print("SLAB %2.0d size = %2.0d" % (slabInd, nc))
-            self.nc = nc
-            self.ncs.append(nc)
-            Ntot += nc
-            glob_target_dofs.append(range(startCentral, startCentral + nc))
-            startCentral += nc
-
-            # Under stiff_mat_const identical (Ic, J) pairs give the identical
-            # operator, so build each distinct one once.
-            key_l = self._block_key(Ic, Il, 'l') if self.stiff_mat_const else None
-            key_r = self._block_key(Ic, Ir, 'r') if self.stiff_mat_const else None
-            if (key_l is not None and key_l in self._block_cache
-                    and key_r in self._block_cache):
-                A_l = self._block_cache[key_l][0]
-                A_r = self._block_cache[key_r][0]
-                self._n_reused += 1
-            else:
-                st_l, st_r = self.compute_stmaps(Il, Ic, Ir, XXi, XXb, solver,
-                                                 pts_l=pts_l, pts_r=pts_r)
-                A_l, A_r = st_l.A, st_r.A
-                self._n_assembled += 1
-                if key_l is not None:
-                    self._block_cache[key_l] = (A_l, float("nan"))
-                    self._block_cache[key_r] = (A_r, float("nan"))
-
-            rhs_list.append(
-                self._local_rhs(solver, bc, Ic, Igb, XXb, reduced_load, slabInd))
-
-            if connectivity[slabInd][0] < 0:
-                S_lu_list.append([A_r])
-            elif connectivity[slabInd][1] < 0:
-                S_lu_list.append([A_l])
-            else:
-                S_lu_list.append([A_l, A_r])
-
-            if dbg > 0:
-                print("overlapping slab ", slabInd + 1, " of ", len(slabs), " done")
+        self.stats.n_offloaded = self._n_offloaded
+        self.stats.dense_timing = denseTime if self.keepDense else None
+        self.stats.host_bytes = self.host_nbytes()
 
         if dbg > 0:
-            self._summary(discrTime, sampleTime, compressTime, glob_target_dofs)
+            self._summary(discrTime, sampleTime, compressTime, glob_target_dofs,
+                          relerrl if self.constructHBS else None,
+                          relerrr if self.constructHBS else None,
+                          compression if self.constructHBS else None)
+            if self.constructHBS:
+                print("shapes match?                = ", shapeMatch)
 
-        self.stats.discr_timing = discrTime / max(self._n_factorizations, 1)
-        self.stats.n_factorizations = self._n_factorizations
-        self.stats.n_assembled = self._n_assembled
-        self.stats.n_reused = self._n_reused
         self.glob_target_dofs = glob_target_dofs
         self.compute_global_dofs()
-
-        return S_lu_list, rhs_list, Ntot, self.ncs
-
-    # ------------------------------------------------------------------ #
-
-    def construct_Stot_and_rhstot(self, bc, reduced_load=None, dbg=0):
-        # FIX: the original signature was (self, bc, assembler, dbg=0) and the
-        #      body called construct_Stot_helper(bc, dbg) -- so dbg landed in
-        #      the reduced_load slot and `assembler` was never used at all.
-        S_lu_list, rhs_list, Ntot, nc = self.construct_Stot_helper(
-            bc, reduced_load, dbg)
-        return self.construct_Stot_and_rhstot_linearOperator(
-            S_lu_list, rhs_list, Ntot, nc, dbg)
+        self._rhs_cache = SimpleNamespace(bc=bc, reduced_load=reduced_load,
+                                          body_load=body_load, rhs_list=rhs_list)
+        self._built = True
+        return rhs_list, Ntot
 
     # ------------------------------------------------------------------ #
+    # global operator
+    # ------------------------------------------------------------------ #
 
-    def construct_rhstot(self, bc, reduced_load=None, dbg=0):
+    def _resolve_hbs(self, rhsHBS):
         """
-        Rebuild the global rhs only, reusing the cached local solvers.
+        One switch selects operator AND rhs together:
+            False -> exact LU operator  (needs keepLU)
+            True  -> HBS operator       (needs constructHBS)
+            None  -> LU when the factorizations are kept, else HBS.
+        The rhs is the exact local-solve rhs on both sides.
         """
-        if not self.solvers:
-            raise RuntimeError(
-                "construct_rhstot() requires cached solvers; call "
-                "construct_Stot_helper() first"
-            )
+        if rhsHBS is None:
+            return not self.keepLU
+        if rhsHBS and not self.constructHBS:
+            raise ValueError("rhsHBS=True needs constructHBS=True")
+        if not rhsHBS and not self.keepLU:
+            raise ValueError("rhsHBS=False (the LU versions) needs keepLU=True")
+        return bool(rhsHBS)
+
+    def _resolve_operator(self, operator):
+        if operator is None:
+            return "hbs" if self._resolve_hbs(None) else "lu"
+        if operator not in ("hbs", "lu"):
+            raise ValueError("operator must be 'hbs' or 'lu'")
+        self._resolve_hbs(operator == "hbs")          # validates availability
+        return operator
+
+    def global_operator(self, operator=None):
+        """
+        I + S as a LinearOperator (S = -K, sign carried by the local maps).
+
+        operator='lu'  : exact fused local solves (default if keepLU)
+        operator='hbs' : compressed HBS blocks    (default otherwise)
+
+        Only the operator: no rhs, no construction.  Use it to get a second
+        view of an already-built decomposition (e.g. the LU operator next to
+        the HBS one to measure compression error); construct_Stot_and_rhstot
+        is the normal entry point.
+
+        With off-loading, each application streams one slab's blocks or
+        factorization from the store at a time.
+
+        EXPLAINER OF CONVENTIONS:
+            - global dof ordering is inferred from the supplied connectivity
+            - joined slabs are contiguous (fictitious domain extension used for
+              periodic domains)
+            - contiguous blocks are used for global dofs, to improve efficiency
+        """
+        operator = self._resolve_operator(operator)
         if not self.glob_target_dofs:
-            raise RuntimeError("construct_rhstot() called before glob_target_dofs")
+            raise RuntimeError("global_operator() called before construct_Stot_helper()")
 
-        rhs_list = []
-        for slabInd in range(len(self.slabList)):
-            solver = self.solvers[slabInd]
-            Il, Ir, Ic, Igb, XXi, XXb = self.idx[slabInd]
-            rhs_list.append(
-                self._local_rhs(solver, bc, Ic, Igb, XXb, reduced_load, slabInd))
+        tgt = [_as_index(b) for b in self.glob_target_dofs]
+        src = [[_as_index(b) for b in row] for row in self.glob_source_dofs]
+        Ntot = sum(len(b) for b in self.glob_target_dofs)
+        dtype = self._dtype
 
+        def _blen(b):
+            return (b.stop - b.start) if isinstance(b, slice) else len(b)
+
+        lens = [[_blen(b) for b in row] for row in src]
+
+        if operator == "hbs":
+            handles = self._S_hbs
+
+            def smatmat(v, transpose=False):
+                v_in = np.asarray(v)
+                oneD = v_in.ndim == 1
+                v_tmp = v_in[:, np.newaxis] if oneD else v_in
+                # OPT: one copy (the identity term) instead of astype-then-copy.
+                result = v_tmp.astype(np.result_type(v_tmp.dtype, dtype), copy=True)
+                for i, ti in enumerate(tgt):
+                    blocks = handles[i].get()      # one slab resident at a time
+                    if not transpose:
+                        for blk, sj in zip(blocks, src[i]):
+                            result[ti] += blk @ v_tmp[sj]
+                    else:
+                        for blk, sj in zip(blocks, src[i]):
+                            result[sj] += blk.T @ v_tmp[ti]
+                    del blocks
+                return result.ravel() if oneD else result
+        else:
+            ops = self._S_lu
+
+            def smatmat(v, transpose=False):
+                v_in = np.asarray(v)
+                oneD = v_in.ndim == 1
+                v_tmp = v_in[:, np.newaxis] if oneD else v_in
+                result = v_tmp.astype(np.result_type(v_tmp.dtype, dtype), copy=True)
+                if not transpose:
+                    for i, ti in enumerate(tgt):
+                        srcs = src[i]
+                        if len(srcs) == 1:
+                            x = v_tmp[srcs[0]]
+                        else:
+                            x = np.concatenate([v_tmp[sj] for sj in srcs], axis=0)
+                        result[ti] += ops[i] @ x          # ONE local solve
+                else:
+                    for i, ti in enumerate(tgt):
+                        y = ops[i].T @ v_tmp[ti]          # ONE local solve
+                        off = 0
+                        for sj, n in zip(src[i], lens[i]):
+                            result[sj] += y[off:off + n]
+                            off += n
+                return result.ravel() if oneD else result
+
+        return LinearOperator(
+            shape=(Ntot, Ntot),
+            dtype=dtype,
+            matvec=smatmat,
+            rmatvec=lambda v: smatmat(v, transpose=True),
+            matmat=smatmat,
+            rmatmat=lambda v: smatmat(v, transpose=True),
+        )
+
+    def _assemble_rhs(self, rhs_list):
         Ntot = sum(len(b) for b in self.glob_target_dofs)
         dtype = np.result_type(*[np.asarray(r).dtype for r in rhs_list])
         rhstot = np.zeros(Ntot, dtype=dtype)
@@ -968,14 +2039,227 @@ class oms_lu(_omsBase):
             rhstot[_as_index(self.glob_target_dofs[i])] = rhs
         return rhstot
 
+    def construct_Stot_and_rhstot(self, bc, assembler=None, reduced_load=None,
+                                  dbg=0, rhsHBS=None, body_load=None):
+        """
+        Return (I + S as LinearOperator, global rhs), both from the same side:
+
+            rhsHBS=False : exact LU operator   (needs keepLU)
+            rhsHBS=True  : HBS operator        (needs constructHBS)
+            rhsHBS=None  : LU if keepLU, else HBS
+
+        The rhs is the exact local-solve rhs  -(A^{-1} A_ib g)[Ic]  on both
+        sides (as in the original oms and oms_lu), plus the body-load term
+        (A^{-1} f_i)[Ic] when body_load is given (see construct_Stot_helper).
+        It is computed during construction; for different boundary data it
+        needs keepLU.  Pass the same bc / body_load objects to every call: the
+        cached rhs is matched by identity.
+
+        The decomposition (factorizations, compression) is built on the first
+        call only; later calls reuse it.  Call construct_Stot_helper() to
+        force a rebuild.
+        """
+        hbs = self._resolve_hbs(rhsHBS)          # fail fast, before any work
+        if not self._built:
+            self.construct_Stot_helper(bc, assembler, reduced_load, dbg,
+                                       body_load=body_load)
+        return (self.global_operator("hbs" if hbs else "lu"),
+                self.construct_rhstot(bc, reduced_load, rhsHBS=hbs,
+                                      body_load=body_load))
+
+    # ------------------------------------------------------------------ #
+    # things that need the kept factorizations
     # ------------------------------------------------------------------ #
 
-    def uX_full(self, uhat, i, b_C, b_X):
-        solver = self.solvers[i]          # cached wrapper for slab i
+    def _require_lu(self, what):
+        if not self.keepLU:
+            raise RuntimeError(
+                "%s needs the local factorizations; construct with keepLU=True" % what)
+        if not self._lu_handles:
+            raise RuntimeError("%s called before construct_Stot_helper()" % what)
+
+    def interface_values(self, solution):
+        """Evaluate a scalar solution at global interface points in OMS DOF order.
+
+        `solution` accepts a NumPy (npoints, ndim) array and returns one value
+        per point. This uses coordinates retained during construction, with
+        reference-slab translations already applied; no local solves needed.
+        """
+        if not self._built:
+            raise RuntimeError("Build the OMS before evaluating interface values")
+        values = []
+        for info, dofs in zip(self._slab_info, self.glob_target_dofs):
+            if not hasattr(info, 'pts_c'):
+                raise RuntimeError("Rebuild the OMS to retain interface coordinates")
+            v = np.asarray(_host_ndarray(solution(info.pts_c))).reshape(-1)
+            if v.size != len(dofs):
+                raise ValueError("solution must return one scalar per interface point")
+            values.append(v)
+        result = np.empty(self.Ntot, dtype=np.result_type(*[v.dtype for v in values]))
+        for dofs, v in zip(self.glob_target_dofs, values):
+            result[np.asarray(list(dofs), dtype=np.int64)] = v
+        return result
+
+    def direct_solver_blocks(self, operator=None):
+        """Return signed off-diagonal LinearOperators, left then right per row.
+
+        No recompression and no eager materialization of off-loaded HBS blocks.
+        LU is preferred when available. Keep this OMS alive while using them;
+        rebuilding/closing it invalidates the operators and its preconditioner.
+        """
+        operator = self._resolve_operator(operator)
+        if not self._built:
+            raise RuntimeError("Build the OMS before constructing a direct solver")
+        rows, cache = [], {}
+        for i, conn in enumerate(self.connectivity):
+            neighbours = [int(j) for j in conn if j >= 0]
+            row, start = [], 0
+            for col, j in enumerate(neighbours):
+                n = self.ncs[j]
+                if operator == "lu":
+                    fused = self._S_lu[i]
+                    key = (id(fused), start, n)
+                    if key not in cache:
+                        cache[key] = (fused if start == 0 and n == fused.shape[1]
+                                      else self._column_restriction(fused, start, n))
+                else:
+                    handle = self._S_hbs[i]
+                    key = (id(handle), col)
+                    if key not in cache:
+                        def apply(v, transpose=False, handle=handle, col=col):
+                            block = handle.get()[col]
+                            value = (block.T if transpose else block) @ v
+                            return np.asarray(_host_ndarray(value))
+                        cache[key] = LinearOperator(
+                            (self.ncs[i], n), dtype=self._dtype,
+                            matvec=apply, matmat=apply,
+                            rmatvec=lambda v, f=apply: f(v, True),
+                            rmatmat=lambda v, f=apply: f(v, True))
+                row.append(cache[key])
+                start += n
+            rows.append(row)
+        return rows
+
+    @property
+    def hbs_blocks(self):
+        """
+        The old `S_rk_list`: one list per slab, each holding that slab's HBS
+        blocks ordered like glob_source_dofs[slabInd] (left face, then right;
+        end slabs have a single block).  So  hbs_blocks[0][0].tree  is the
+        tree of slab 0's block, as before.
+
+        With off-loading this brings every slab's blocks back to the device at
+        once, which is what off-loading exists to avoid -- use
+        hbs_blocks_for(slabInd) to walk them one slab at a time.  Under
+        stiff_mat_const all slabs share the reference blocks.
+        """
+        self._require_hbs()
+        if self._n_offloaded and self.offload:
+            warnings.warn(
+                "oms.hbs_blocks materializes the blocks of all %d slabs at "
+                "once, undoing the off-loading; use hbs_blocks_for(slabInd) "
+                "to take them one slab at a time."
+                % len(self._S_hbs), RuntimeWarning, stacklevel=2)
+        return [h.get() for h in self._S_hbs]
+
+    def hbs_blocks_for(self, slabInd):
+        """One slab's HBS blocks: hbs_blocks[slabInd], without materializing
+        the others."""
+        self._require_hbs()
+        return self._S_hbs[slabInd].get()
+
+    @property
+    def S_dense_list(self):
+        """
+        The dense (uncompressed) counterpart of hbs_blocks, formed from the
+        source-target maps during construction (keepDense=True): one list per
+        slab, ordered like glob_source_dofs[slabInd] (left face, then right;
+        end slabs have a single block).  Host numpy arrays.  Under
+        stiff_mat_const, slabs whose faces match share the same arrays, so do
+        not modify them in place.
+        """
+        if not self.keepDense:
+            raise RuntimeError("S_dense_list needs keepDense=True")
+        if not self._S_dense:
+            raise RuntimeError("S_dense_list used before construct_Stot_helper()")
+        return self._S_dense
+
+    def _require_hbs(self):
+        if not self.constructHBS:
+            raise RuntimeError("hbs_blocks needs constructHBS=True")
+        if not self._S_hbs:
+            raise RuntimeError("hbs_blocks used before construct_Stot_helper()")
+
+    def host_nbytes(self):
+        """Host bytes currently held by the kept operators and bookkeeping."""
+        trees = [h.host_tree() for h in self._S_hbs + self._lu_handles]
+        return _host_nbytes([trees, self._slab_info, self._ref_hbs, self._S_dense])
+
+    def construct_rhstot(self, bc, reduced_load=None, dbg=0, rhsHBS=None,
+                         body_load=None):
+        """
+        Global (exact) rhs for boundary data `bc` and body load `body_load`
+        (or already-reduced `reduced_load`; None = no load).  `rhsHBS` is
+        accepted for symmetry with construct_Stot_and_rhstot and only
+        validated: the rhs does not depend on the operator choice.
+
+        Same bc and load objects as the most recent rhs: returned from the
+        cache (no local solves).  Same load, new bc: the kept reduced loads are
+        reused (local solves only, no leaf work).  A new body load is reduced
+        per slab (needs keepInterp for the reducer).  Anything new needs the
+        kept factorizations (keepLU=True).  The result becomes the default for
+        reconstruct() / interp().
+        """
+        self._resolve_hbs(rhsHBS)
+        if not self._built:
+            raise RuntimeError("construct_rhstot() called before construct_Stot_helper()")
+        _check_load_args(reduced_load, body_load)
+        cache = self._rhs_cache
+        same_load = cache is not None and cache.reduced_load is reduced_load \
+            and cache.body_load is body_load
+        if same_load and cache.bc is bc:
+            return self._assemble_rhs(cache.rhs_list)
+        if not self.keepLU:
+            raise RuntimeError(
+                "construct_rhstot() for new boundary data or loads needs the "
+                "local factorizations; construct with keepLU=True")
+        self._require_lu("construct_rhstot()")
+        rhs_list, loads = [], []
+        for slabInd, (h, info) in enumerate(zip(self._lu_handles, self._slab_info)):
+            solver = h.get()
+            load = info.load if same_load else _slab_load(
+                solver, slabInd, body_load, reduced_load, self._slab_offset(slabInd))
+            loads.append(load)
+            rhs_list.append(self._local_rhs(solver, bc, info, load))
+            del solver
+        # commit only once every slab succeeded
+        for info, load in zip(self._slab_info, loads):
+            info.load = load
+        self._rhs_cache = SimpleNamespace(bc=bc, reduced_load=reduced_load,
+                                          body_load=body_load, rhs_list=rhs_list)
+        return self._assemble_rhs(rhs_list)
+
+    def uX_full(self, uhat, i, b_C=None, b_X=None):
+        """
+        Exterior trace of slab i (mixed).  b_C / b_X default to the kept
+        reduced load of the most recent rhs (zero if there was none).
+        """
+        self._require_lu("uX_full()")
+        solver = self._lu_handles[i].get()
         if solver.opts.problem_type != "mixed":
             raise NameError("uX_full is only defined for problem_type='mixed'")
 
-        Il, Ir, Ic, _, _, _ = self.idx[i]
+        info = self._slab_info[i]
+        Il, Ir = info.Il, info.Ir
+        if b_C is None and b_X is None:
+            load = getattr(info, "load", None)
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(solver.JN))
+            else:
+                b_C, b_N = load
+        else:
+            b_C = np.asarray(b_C)
+            b_N = np.asarray(b_X)[solver.JN]
 
         # ---- exterior trace, length nX, in I_Xtot ordering ----
         uX = np.zeros(len(solver.Ib), dtype=np.result_type(np.asarray(uhat).dtype,
@@ -992,7 +2276,6 @@ class oms_lu(_omsBase):
             uX[solver.JD[Ir]] = uhat[_as_index(self.glob_target_dofs[iR])]
 
         # Source 2: physical walls <- solved Neumann values from the local solve
-        b_N = np.asarray(b_X)[solver.JN]
         g_N = np.zeros(len(solver.JN))                # homogeneous Neumann data
         u_D = uX[solver.JD]                           # artificial-face data
         rhs = np.concatenate([b_C, g_N + b_N]) - solver.E @ u_D
@@ -1000,3 +2283,316 @@ class oms_lu(_omsBase):
         uX[solver.JN] = w[len(b_C):]                  # lower block = u_N
 
         return uX
+
+    # ------------------------------------------------------------------ #
+    # volumetric reconstruction and interpolation
+    # ------------------------------------------------------------------ #
+
+    def _slab_offset(self, slabInd):
+        """Translation reference-solver frame -> global frame (stiff_mat_const),
+        None otherwise."""
+        if not self.stiff_mat_const:
+            return None
+        if self._offsets is None:
+            self._offsets = self._compute_offsets()
+        d = np.asarray(self._offsets[slabInd], dtype=np.float64)
+        return d if np.any(d) else None
+
+    def _fresh_solver(self, slabInd, dbg=0):
+        """A new local solver for slab `slabInd`, outside the statistics."""
+        solver = solverWrap.solverWrapper(self.opts)
+        solver.construct(np.array(self.slabList[slabInd]), self.pdo, verbose=dbg)
+        return solver
+
+    @staticmethod
+    def _interp_state_of(solver):
+        st = getattr(solver, "interp_state", None)
+        if st is None:
+            raise NotImplementedError(
+                getattr(solver, "interp_unavailable", None)
+                or "this local solver keeps no interpolation state")
+        return st
+
+    def _interp_solvers(self, slabs, refactor, dbg=0):
+        """
+        Yield (slabInd, local solver) for the requested slabs, one at a time.
+        Kept factorizations are reused (off-loaded ones come back one slab at
+        a time); otherwise, with refactor='auto', slabs are rebuilt on demand
+        (under stiff_mat_const: the reference slab, once).
+        """
+        if refactor not in ("auto", "never"):
+            raise ValueError("refactor must be 'auto' or 'never', got %r" % (refactor,))
+        if not slabs:
+            return
+        have_lu = self.keepLU and len(self._lu_handles) == len(self.slabList)
+        if have_lu and not self.stiff_mat_const and not self.keepInterp:
+            have_lu = False     # factors kept, but not the leaf/grid data
+        if not have_lu:
+            if refactor == "never":
+                raise RuntimeError(
+                    "reconstruct(): the local factorizations (or, with "
+                    "keepInterp=False, the interpolation data) were not kept; "
+                    "construct with keepLU=True, keepInterp=True, or pass "
+                    "refactor='auto' to rebuild slabs on demand")
+            warnings.warn(
+                "oms.reconstruct(): local solvers not kept -- rebuilding %s"
+                % ("the reference slab once" if self.stiff_mat_const
+                   else "each requested slab (one factorization per slab)"),
+                RuntimeWarning, stacklevel=3)
+
+        ref = None
+        for i in slabs:
+            if have_lu:
+                solver = self._lu_handles[i].get()
+            elif self.stiff_mat_const:
+                if ref is None:
+                    t0 = time.time()
+                    ref = self._fresh_solver(self._reference_index(), dbg)
+                    if dbg > 0:
+                        print("reconstruct: reference slab rebuilt in %5.2f s"
+                              % (time.time() - t0))
+                solver = ref
+            else:
+                t0 = time.time()
+                solver = self._fresh_solver(i, dbg)
+                if dbg > 1:
+                    print("reconstruct: slab %d rebuilt in %5.2f s"
+                          % (i, time.time() - t0))
+            yield i, solver
+            del solver
+
+    def _local_skeleton(self, solver, slabInd, uhat, bc, load):
+        """
+        Full Dirichlet data of double slab `slabInd` from the global interface
+        solution, and the resulting local solve against the kept factors.
+        `load` as from _slab_load (None = no body load).
+        Returns (u_i on Ii, u_b on Ib).
+        """
+        info = self._slab_info[slabInd]
+        L, R = self.connectivity[slabInd][0], self.connectivity[slabInd][1]
+        ptype = getattr(solver.opts, "problem_type", "Dirichlet")
+
+        def trace(nb, faces, dtype):
+            u = np.zeros(nb, dtype=dtype)
+            done = np.zeros(nb, dtype=bool)
+            for nbr, J, side in faces:
+                if nbr < 0:
+                    continue
+                v = uhat[_as_index(self.glob_target_dofs[nbr])]
+                if len(v) != len(J):
+                    raise ValueError(
+                        "slab %d: %s face has %d dofs but neighbour %d's "
+                        "interface has %d" % (slabInd, side, len(J), nbr, len(v)))
+                u[J] = v
+                done[J] = True
+            return u, done
+
+        faces = ((L, info.Il, "left"), (R, info.Ir, "right"))
+
+        if ptype == "Dirichlet":
+            nb = len(solver.Ib)
+            g = np.asarray(_host_ndarray(bc(info.pts_gb))).reshape(-1) \
+                if len(info.Igb) else np.zeros(0)
+            dt = np.result_type(uhat.dtype, g.dtype, np.float64,
+                                *(() if load is None else (load[0].dtype,)))
+            u_b, done = trace(nb, faces, dt)
+            u_b[info.Igb] = g
+            done[info.Igb] = True
+            if not done.all():
+                raise ValueError(
+                    "slab %d: %d of %d boundary dofs have neither a neighbour "
+                    "trace nor physical boundary data (check gb / connectivity)"
+                    % (slabInd, int((~done).sum()), nb))
+            if load is None:
+                u_i = -np.asarray(solver.solver_ii @ (solver.Aib @ u_b)).reshape(-1)
+            else:
+                # A_ii u_i = f_i - A_ib u_b
+                v = load[0] - np.asarray(_host_ndarray(solver.Aib @ u_b)).reshape(-1)
+                u_i = np.asarray(_host_ndarray(solver.solver_ii @ v)).reshape(-1)
+            return u_i, u_b
+
+        if ptype == "mixed":
+            JD, JN = np.asarray(solver.JD), np.asarray(solver.JN)
+            if load is None:
+                b_C, b_N = np.zeros(len(solver.Ii)), np.zeros(len(JN))
+            else:
+                b_C, b_N = load
+            g_N = np.asarray(_host_ndarray(bc(info.pts_N))).reshape(-1)
+            dt = np.result_type(uhat.dtype, g_N.dtype, b_C.dtype, np.float64)
+            u_D, done = trace(len(JD), faces, dt)
+            if not done.all():
+                raise ValueError(
+                    "slab %d: %d Dirichlet dofs are not covered by a neighbour "
+                    "interface (physical Dirichlet faces are not supported for "
+                    "problem_type='mixed')" % (slabInd, int((~done).sum())))
+            # same convention as _local_rhs:  M w = [b_C; g_N + b_N] - E u_D
+            rhs = np.concatenate([b_C, g_N + b_N]) \
+                - np.asarray(solver.E @ u_D).reshape(-1)
+            w = np.asarray(solver.solver_ii @ rhs).reshape(-1)
+            nC = len(solver.Ii)
+            u_b = np.zeros(len(solver.Ib), dtype=np.result_type(dt, w.dtype))
+            u_b[JD] = u_D
+            u_b[JN] = w[nC:]
+            return w[:nC], u_b
+
+        raise NameError(
+            "solver problem type not recognized, must be 'Dirichlet' or 'mixed'")
+
+    def _slab_fields(self, uhat, slabs, bc=None, reduced_load=None,
+                     body_load=None, refactor="auto", dbg=0):
+        """Yield (slabInd, grid, offset, values on grid.XXfull) per slab."""
+        if not self._built:
+            raise RuntimeError("reconstruct() called before construct_Stot_helper()")
+        cache = self._rhs_cache
+        bc = cache.bc if bc is None else bc
+        # Skeleton load (which reduced load the local solves use) and leaf
+        # load (the body load full_solution lifts the leaf interiors with):
+        #   reduced_load given          -> it, on the skeleton; body_load (if
+        #                                  any) in the leaves  [previous API]
+        #   body_load given             -> kept reduced loads if it is the
+        #                                  load of the most recent rhs (or if
+        #                                  that rhs used a reduced_load, whose
+        #                                  leaf load this is); else reduced
+        #                                  anew per slab
+        #   neither                     -> kept reduced loads; the most recent
+        #                                  rhs's body_load in the leaves
+        if reduced_load is not None:
+            skel, leaf_load = "given", body_load
+        elif body_load is not None:
+            kept = cache.reduced_load is not None or body_load is cache.body_load
+            skel, leaf_load = ("kept" if kept else "reduce"), body_load
+        else:
+            skel, leaf_load = "kept", cache.body_load
+
+        uhat = np.asarray(_host_ndarray(uhat))
+        if uhat.ndim == 2 and uhat.shape[1] == 1:
+            uhat = uhat[:, 0]
+        if uhat.ndim != 1 or uhat.shape[0] != self.Ntot:
+            raise ValueError("uhat must have length Ntot = %d, got shape %r"
+                             % (self.Ntot, uhat.shape))
+
+        for i, solver in self._interp_solvers(slabs, refactor, dbg):
+            t0 = time.time()
+            st = self._interp_state_of(solver)
+            offset = self._slab_offset(i)
+            if skel == "kept":
+                load = getattr(self._slab_info[i], "load", None)
+            elif skel == "reduce":
+                load = _slab_load(solver, i, body_load, None, offset)
+            else:
+                load = _slab_load(solver, i, None, reduced_load, offset)
+            u_i, u_b = self._local_skeleton(solver, i, uhat, bc, load)
+            values = st.full_solution(u_i, u_b, body_load=leaf_load, offset=offset)
+            if dbg > 1:
+                print("reconstruct: slab %d done in %5.2f s" % (i, time.time() - t0))
+            yield i, st.grid, offset, values
+            del solver, st
+
+    def _check_slabs(self, slabs):
+        n = len(self.slabList)
+        if slabs is None:
+            return list(range(n))
+        slabs = sorted(set(int(i) for i in np.atleast_1d(slabs)))
+        if slabs and (slabs[0] < 0 or slabs[-1] >= n):
+            raise IndexError("slab indices must lie in [0, %d)" % n)
+        return slabs
+
+    def reconstruct(self, uhat, bc=None, reduced_load=None, body_load=None,
+                    slabs=None, refactor="auto", dbg=0):
+        """
+        Volumetric solution from the reduced solution `uhat` (length Ntot).
+
+        For every requested double slab, its Dirichlet trace is assembled from
+        the neighbours' interface values in `uhat` and the physical boundary
+        data, the local problem is solved against the KEPT factorization
+        (keepLU=True; no refactorization), and the skeleton solution is lifted
+        to the full grid by local leaf solves.  Returns an OMSSolution, which
+        evaluates the result at arbitrary points.
+
+        bc               : defaults to that of the most recent rhs.
+        body_load        : defaults to that of the most recent rhs; its kept
+                           reduced loads are reused, and full_solution lifts
+                           the leaf interiors with it.  A different body_load
+                           is reduced anew per slab.  Both problem types.
+        reduced_load     : previous interface -- an already-reduced load for
+                           the skeleton; body_load is then only the leaf load.
+        slabs            : subset of slab indices (default: all).
+        refactor         : 'auto' -> if the local solvers were not kept,
+                                     rebuild them on demand (warns);
+                           'never' -> raise instead.
+
+        Memory: one full-grid field per slab (about twice the number of grid
+        points, because the double slabs overlap).  Use interp() to stream
+        instead.
+        """
+        slabs = self._check_slabs(slabs)
+        lo, hi = _slab_bounds(self.slabList)
+        sol = OMSSolution(lo, hi)
+        t0 = time.time()
+        for i, grid, offset, values in self._slab_fields(
+                uhat, slabs, bc, reduced_load, body_load, refactor, dbg):
+            sol._add(i, grid, offset, values)
+        if dbg > 0:
+            print("reconstruct: %d slabs in %5.2f s" % (len(slabs), time.time() - t0))
+        return sol
+
+    def interp(self, pts, uhat, bc=None, reduced_load=None, body_load=None,
+               refactor="auto", return_owner=False, dbg=0):
+        """
+        Evaluate the volumetric solution at `pts` (npts, ndim) in one pass,
+        without storing the per-slab fields: only slabs that own at least one
+        point are reconstructed, one at a time.  NaN outside the domain.
+        Same arguments as reconstruct().  For repeated evaluation, use
+        reconstruct() once and call the result instead.
+        """
+        lo, hi = _slab_bounds(self.slabList)
+        pts = _as_points(pts, lo.shape[1])
+        owner = _owners(pts, lo, hi)
+        needed = np.unique(owner[owner >= 0]).tolist()
+        out = _evaluate(pts, owner, self._slab_fields(
+            uhat, needed, bc, reduced_load, body_load, refactor, dbg))
+        return (out, owner) if return_owner else out
+
+    # ------------------------------------------------------------------ #
+
+    def _summary(self, discrTime, sampleTime, compressTime, glob_target_dofs,
+                 relerrl=None, relerrr=None, compression=None):
+        # FIX: averages were divided by len(connectivity)-1, which is both an
+        #      off-by-one and a ZeroDivisionError for a single-slab run.
+        nslabs = max(len(self.slabList), 1)
+        nfac = max(self._n_factorizations, 1)
+        nasm = max(self._n_assembled, 1)
+        print("============================OMS SUMMARY============================")
+        print("constructHBS / keepLU        = ", self.constructHBS, "/", self.keepLU)
+        if self.stiff_mat_const:
+            print("stiff_mat_const              =  True (reference slab %d)"
+                  % self._ref_ind)
+            print("factorizations               = ", self._n_factorizations,
+                  " (of", nslabs, "slabs)")
+            print("blocks assembled / reused    = ", self._n_assembled, "/",
+                  self._n_reused)
+            print("total discr. time            = ", discrTime)
+            print("total sample time            = ", sampleTime)
+            print("total compr. time            = ", compressTime)
+        print("available (operator + rhs)   = ", " / ".join(
+            k for k, ok in (("LU", self.keepLU), ("HBS", self.constructHBS))
+            if ok), " (default %s)" % ("LU" if self.keepLU else "HBS"))
+        if self.offload:
+            print("device objects off-loaded    = ", self._n_offloaded)
+        print("host bytes held              = ", _fmt_bytes(self.host_nbytes()))
+        if self.stats.host_bytes_estimate is not None:
+            print("host bytes projected (slab 1)= ",
+                  _fmt_bytes(self.stats.host_bytes_estimate))
+        print("avg. discr. time             = ", discrTime / nfac)
+        if self.constructHBS:
+            print("avg. sample time             = ", sampleTime / nasm)
+            print("avg. compr. time             = ", compressTime / nasm)
+        if compression is not None:
+            print("compression rate             = ", compression)
+        if self.keepDense:
+            print("dense blocks kept (time)     = ", self.stats.dense_timing)
+        print("total dofs                   = ",
+              sum(len(dof) for dof in glob_target_dofs))
+        if relerrl is not None:
+            print("estim. max. err. ( l // r )  = (", relerrl, " // ", relerrr, ")")
+        print("===================================================================")

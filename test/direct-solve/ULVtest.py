@@ -16,7 +16,7 @@ import solver.spectralmultidomain.hps.pdo as pdo
 # validation&testing
 import time
 from scipy.sparse.linalg import gmres
-import solver.HPSInterp3D as interp
+#import solver.HPSInterp3D as interp
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as splinalg
 import multislab.omsdirectsolve as omsdirect
@@ -26,7 +26,7 @@ import direct_solve.omsdirectsolve as omsdirect
 import geometry.geom_3D.cube as cube
 from scipy.sparse.linalg import LinearOperator
 import matAssembly.HBS.HBStorch as HBStorch
-HBStorch._UV_MODE[0] = 'qr'
+
 
 def dense_to_linop(A):
     A = np.array(A)
@@ -60,7 +60,7 @@ class gmres_info(object):
 jax_avail   = False
 torch_avail = not jax_avail
 hpsalt      = torch_avail
-kh = 50.
+kh = 150.
 if jax_avail:
     def c11(p):
         return jnp.ones_like(p[...,0])
@@ -101,9 +101,9 @@ def bc(p):
     #return np.sin(kh*(p[:,0]+p[:,1]+p[:,2])/np.sqrt(3))
 
 
-N = 17
+N = 33
 dSlabs,connectivity,H = cube.dSlabs(N)
-pvec = np.array([8],dtype = np.int64)
+pvec = np.array([10],dtype = np.int64)
 err=np.zeros(shape = (len(pvec),))
 discr_time=np.zeros(shape = (len(pvec),))
 sample_time = np.zeros(shape=(len(pvec),))
@@ -118,74 +118,85 @@ for indp in range(len(pvec)):
     if hpsalt:
         formulation = "hpsalt"
         p_disc = p_disc + 2 # To handle different conventions between hps and hpsalt
-    a = np.array([H/4,1/64,1/64])
-    assembler = mA.rkHMatAssembler(512,256,ndim=3)
+    a = np.array([H/2,1/64,1/64])
+    assembler = mA.rkHMatAssembler(800,450,ndim=3)
     opts = solverWrap.solverOptions(formulation,[p_disc,p_disc,p_disc],a,reduced_gpu=True)
-    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True)
-    print("computing S blocks & rhs's...")
-    S_rk_list, rhs_list, Ntot, nc = OMS.construct_Stot_helper(bc, assembler, dbg=0)
-    print("done")
-    Stot,rhstot  = OMS.construct_Stot_and_rhstot_linearOperator(S_rk_list,rhs_list,Ntot,nc,dbg=0)
+    tic_sys = time.time()
+    OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=jax_avail,torch_avail=torch_avail),opts,connectivity,stiff_mat_const=True,constructHBS=True,keepLU=True)
+    Stot_lu,  rhstot_lu  = OMS.construct_Stot_and_rhstot(bc, assembler)               # LU operator + LU rhs
+    print("sys mats done in ",time.time()-tic_sys,"s")
+    Stot_HBS, rhstot_HBS = OMS.construct_Stot_and_rhstot(bc, assembler, rhsHBS=True)  # HBS operator + HBS rhs
+    print("sys mats done in ",time.time()-tic_sys,"s")
+    Ntot, nc = OMS.Ntot,OMS.nc
     niter = 0
-    print("type SrkList  = ",type(S_rk_list))
-    print("len SrkList  = ",len(S_rk_list))
-    print("type rhstot  = ",type(rhstot))
-    print("type rhslist  = ",type(rhs_list))
-    print("len rhs_list  = ",len(rhs_list))
     print("Ntot = ",Ntot)
-    tree = S_rk_list[0][0].tree
-    rk = 64
-    P = tree.perm_leaf
-    print("perm is identity?", np.array_equal(np.asarray(tree.perm_leaf), np.arange(nc)))
-    sizes = np.array([len(tree.get_box_inds(l)) for l in tree.get_leaves()])
-    print("nc                 ", nc)
-    print("len(perm_leaf)     ", len(P), " unique:", len(np.unique(P)))
-    print("duplicated DOFs    ", len(P)-len(np.unique(P)))
-    print("S block shape      ", S_rk_list[0][0].shape)
-    print("nleaves / nlevels  ", tree.nleaves, tree.nlevels,
-      " balanced:", tree.nleaves == 2**(tree.nlevels-1))
-    print("actual leaf sizes  ", sizes.min(), sizes.max(), " HBSMAT nl:", len(P)//tree.nleaves)
-    print("leaf exact?        ", len(P)//tree.nleaves <= rk)
-    strat = rkStrat.linear(256,40,skip_first_level=False)
+    strat = rkStrat.linear(450,10,skip_first_level=False)
+    S_rk_list = OMS.hbs_blocks
     tic = time.time()
-    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,S_rk_list[0][0].quad,fast=True,device='cuda',debug_blocks=16,oversample=50)
-    import matAssembly.HBS.HBStorch as HBStorch
-    rb_solver.fast = False          # both switch to the SVD of L
-    #rb_solver._nsamples = lambda rk: 1334
+    rb_solver = omsdirectHBS.RedBlackSolverHBS(nc,strat,S_rk_list[0][0].tree,quad=False,fast=True,device='cuda',debug_blocks=16,oversample=100)
     print("rb rk      =", rb_solver.rk)
     print("rb s       =", rb_solver._nsamples(rb_solver.rk))
     print("tree mls   =", rb_solver.tree._min_leaf_size)
+    tic = time.time()
     rb_solver.factorize(S_rk_list)
+    t_fact = time.time() - tic
+
     rb_solver.print_timing()
     rb_solver.print_block_errors()
-    print("RB solver factorized in ",time.time()-tic,"s")
-    h = next(b for b in rb_solver._blocks if hasattr(b,'_resident'))
-    assert h.compute_device.type == 'cuda'
-    h.evict()
-    assert h._resident['core'] is None
-    assert h.Dmats[0].device.type == 'cpu'
-    n0 = h.nFill
-    y = h.matmat(np.random.randn(h.shape[1],4))
-    assert h.nFill == n0+1
-    assert h._resident['core'] == h.compute_device
-    r = rb_solver.residency_report()
-    print(f"{(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
+    print("RB solver factorized in ", t_fact, "s")
+
+    r  = rb_solver.residency_report()
+    t0 = rb_solver.traffic()                         # after factorize
+    tot = t0['total_bytes']
+    print(f"old ratio (device_nbytes denom): {(r['GB_H2D']+r['GB_D2H'])/r['GB_total']:.1f}x")
+    print(f"new ratio (full-size denom):     {(t0['H2D']+t0['D2H'])/tot:.1f}x")
+
     v = np.random.standard_normal(Ntot)
-    print("delta =", np.linalg.norm(Stot@rb_solver.solve(v) - v)/np.linalg.norm(v))
+    tic = time.time()
+    rsv = rb_solver.solve(v)                         # numpy out -> already synced
+    t_solve = time.time() - tic
+    t1 = rb_solver.traffic()                         # after one solve
+
+    print(f"solve {t_solve:.2f} s: "f"H2D {(t1['H2D']-t0['H2D'])/tot:.2f}x, "f"D2H {(t1['D2H']-t0['D2H'])/tot:.2f}x per solve")
+    tic = time.time()
+    vprime = Stot_lu@rsv
+    print("Stot_lu apply time = ",time.time()-tic)
+    print("delta =", np.linalg.norm(vprime - v)/np.linalg.norm(v))
     def matvec_rb(v):
         return rb_solver.solve(v)
     Sinv_HBS_rb  = scipy.sparse.linalg.LinearOperator(shape=(Ntot,Ntot),matvec=matvec_rb,dtype=np.float64)
     tic = time.time()
-    v = np.random.standard_normal(size=(Sinv_HBS_rb.shape[0],))
-    u = Sinv_HBS_rb@v
+    v = np.random.standard_normal(Ntot)
+    b = Stot_lu @ v
+    u, info = gmres(Stot_lu, b, rtol=1e-8, M=Sinv_HBS_rb, maxiter=20, restart=20)
+    print("kappa lower bound:", np.linalg.norm(u-v)/np.linalg.norm(v) / 1e-6)
+    print("artificial solution error: ",np.linalg.norm(u-v)/np.linalg.norm(v))
     print("RB solver time = ",time.time()-tic)
+    v = np.random.standard_normal(Ntot)
+    tic = time.time()
+    b = Sinv_HBS_rb@v
+    print("precond apply time = ",time.time()-tic)
     tot = rb_solver.footprint()
     gInfo = gmres_info()
-    stol = 1e-8
-
+    stol = 1e-7
+    tic = time.time()
     if Version(scipy.__version__)>=Version("1.14"):
-        uhat,info   = gmres(Stot,rhstot,rtol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
+        uhat,info   = gmres(Stot_lu,rhstot_lu,rtol=stol,callback=gInfo,maxiter=20,restart=20,M=Sinv_HBS_rb)
     else:
-        uhat,info   = gmres(Stot,rhstot,tol=stol,callback=gInfo,maxiter=50,restart=50,M=Sinv_HBS_rb)
-
+        uhat,info   = gmres(Stot_lu,rhstot_lu,tol=stol,callback=gInfo,maxiter=20,restart=20,M=Sinv_HBS_rb)
+    print("elapsed time gmres = ",time.time()-tic)
+    print("pGMRES iters rb          = ", gInfo.niter)
+    for slabInd in range(len(dSlabs)):
+        geom    = np.array(dSlabs[slabInd])
+        slab_i  = oms.slab(geom,lambda p : cube.gb(p,jax_avail,torch_avail))
+        solver  = oms.solverWrap.solverWrapper(opts)
+        solver.construct(geom,Helm,False,False)
+        Il,Ir,Ic,Igb,XXi,XXb = slab_i.compute_idxs_and_pts(solver)
+        XXc = XXi[Ic,:]
+        gc = bc(XXc)
+        gc_hat = uhat[slabInd*nc:(slabInd+1)*nc]
+        err_loc = np.linalg.norm(gc_hat-gc)/np.linalg.norm(gc)
+        print("===================LOCAL ERR===================")
+        print("err ghat = ",err_loc)
+        print("===============================================")
 

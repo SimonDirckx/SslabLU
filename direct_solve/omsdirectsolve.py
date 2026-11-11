@@ -1074,7 +1074,7 @@ class RedBlackSolver(DirectSolver):
         #
         # RedBlackSolverHBS (omsdirectsolveHBS and omsdirectsolveHBS_torch)
         # applies the same fold in _build_level and _build_level_fused; see
-        # "PERIODIC COARSEST LEVEL" in its docstring.
+        # "CYCLIC COARSEST STEP" in its docstring.
         if len(B_dense) == 1 and cyclic:
             B_dense[0] = B_dense[0] + A_dense[0] + C_dense[0]
 

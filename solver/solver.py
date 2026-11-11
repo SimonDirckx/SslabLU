@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg   import LinearOperator
@@ -6,7 +9,12 @@ from solver.spectral.spectralSolver import spectralSolver as spectral
 import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
 import solver.HPSInterp as interp
-import mumps
+import warnings
+
+try:
+    import mumps
+except ImportError:
+    mumps = None
 
 # Things we need to add:
 from solver.hpsmultidomain.hpsmultidomain import domain_driver as hpsalt
@@ -43,8 +51,88 @@ _ICNTL_OUT_STREAMS = (1, 2, 3, 4)
 _ICNTL_TRANSPOSE = 9
 _ICNTL_SPARSE_RHS = 20      # ICNTL(20): 1 = sparse RHS
 _ICNTL_BLOCK_SIZE = 27      # ICNTL(27): blocking size for multiple RHS
-_ICNTL_BLR = 35             # ICNTL(35): block low-rank
-_CNTL_BLR_TOL = 7           # CNTL(7):  BLR dropping parameter
+
+# ICNTL(27): MUMPS processes multiple right-hand sides in blocks of this many
+# columns and traverses the factors once per block.  Its automatic default is
+# small (a few tens of columns), so a solve with s ~ 100-200 sample columns
+# reads L and U several times over.  "auto" sets ICNTL(27) to the number of
+# columns of each solve call: one pass over the factors per call.
+_BLOCK_SIZE_AUTO = "auto"
+
+
+def _check_block_size(block_size):
+    """None (MUMPS default), "auto" (= columns per call) or a positive int."""
+    if block_size is None or block_size == _BLOCK_SIZE_AUTO:
+        return block_size
+    if isinstance(block_size, (bool, np.bool_)) or \
+            not isinstance(block_size, (int, np.integer)) or block_size < 1:
+        raise ValueError(
+            "mumps_block_size must be None, %r or a positive int, got %r"
+            % (_BLOCK_SIZE_AUTO, block_size))
+    return int(block_size)
+
+
+def _set_block_size_for(ctx, b, block_size):
+    """With block_size="auto", set ICNTL(27) to the column count of b."""
+    if block_size != _BLOCK_SIZE_AUTO:
+        return
+    nrhs = 1 if np.ndim(b) < 2 else int(np.shape(b)[1])
+    ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = max(nrhs, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Right-hand-side hand-off to python-mumps
+#
+# python-mumps' solve() runs prepare_for_fortran on the right-hand side first:
+#   C-ordered b                        -> np.asfortranarray(b): one transposing
+#                                         copy of the whole N x k block, on ONE
+#                                         core (seconds at k ~ 1000)
+#   F-ordered b, overwrite_b=False     -> np.asfortranarray(b.copy()): two
+#   F-ordered b, overwrite_b=True      -> no copy; MUMPS solves in place
+# So the solve operator makes its own Fortran-ordered copy, split over all
+# cores, and hands it over with overwrite_b=True.  The caller's array is never
+# written to, and no extra memory is used compared with python-mumps' copy.
+# --------------------------------------------------------------------------- #
+
+_PAR_COPY_MIN = 1 << 22        # elements (32 MB of float64); smaller: one thread
+_COPY_POOL = None
+
+
+def _ncpu():
+    """Cores this process may run on (respects taskset / SLURM / cgroups)."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:     # not available on every platform
+        return max(1, os.cpu_count() or 1)
+
+
+def _copy_pool():
+    global _COPY_POOL
+    if _COPY_POOL is None:
+        _COPY_POOL = ThreadPoolExecutor(_ncpu(), thread_name_prefix="rhs-copy")
+    return _COPY_POOL
+
+
+def _fortran_rhs(x, dtype):
+    """
+    A fresh Fortran-ordered copy of x in `dtype`, safe to give to MUMPS with
+    overwrite_b=True.  Large 2-D copies are split into row blocks over all
+    cores (numpy releases the GIL while copying); row blocks are what keeps a
+    C -> F transposing copy cache-friendly.
+    """
+    x = np.asarray(x)
+    if x.ndim != 2 or x.size < _PAR_COPY_MIN or _ncpu() == 1:
+        return np.array(x, dtype=dtype, order="F", copy=True)
+    out = np.empty(x.shape, dtype=dtype, order="F")
+    n = x.shape[0]
+    nblk = 4 * _ncpu()
+    step = -(-n // nblk)
+
+    def job(i):
+        out[i * step:(i + 1) * step] = x[i * step:(i + 1) * step]
+
+    list(_copy_pool().map(job, range(nblk)))
+    return out
 
 
 def _silence_mumps(ctx):
@@ -53,14 +141,7 @@ def _silence_mumps(ctx):
         ctx.mumps_instance.icntl[i] = 0
 
 
-def _enable_blr(ctx, blr_tol):
-    """Block-low-rank factorization with dropping tolerance `blr_tol`."""
-    ctx.mumps_instance.icntl[_ICNTL_BLR] = 1
-    ctx.mumps_instance.cntl[_CNTL_BLR_TOL] = blr_tol
-    # ICNTL(36) selects the BLR variant (UFSC); leave at default unless tuning.
-
-
-def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
+def setup_mumps(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO, verbose=0):
     """Analyze + factorize A in one MUMPS context.
 
     Returns (ctx, time_analysis, time_factor).
@@ -73,12 +154,17 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
     ordering : MUMPS ordering for the analysis ('metis', 'auto', 'amd', ...).
         Falls back to 'auto' if the requested ordering is not in this MUMPS
         build.
-    blr_tol : if > 0, enable BLR compression with this dropping tolerance.
     block_size : ICNTL(27), the blocking size for multiple right-hand sides.
-        Setting this to the number of columns you sample with gives one wide
-        BLAS-3 block per chunk.
+        "auto" (default): set per solve call to that call's column count
+            (applied by the operator from setup_solver_Aii_local), so every
+            call is one pass over the factors.
+        int: fixed block size for every solve on this context.
+        None: leave MUMPS' own (small) automatic default.
     verbose : >1 leaves MUMPS' own diagnostics on.
     """
+    if mumps is None:
+        raise ImportError("setup_mumps requires the python-mumps package")
+    block_size = _check_block_size(block_size)
     ctx = mumps.Context(verbose=bool(verbose > 1))
     # symmetric=False throughout: the symmetric/Cholesky path is deliberately
     # not used here.
@@ -96,8 +182,6 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
 
     if verbose < 2:
         _silence_mumps(ctx)
-    if blr_tol and blr_tol > 0:
-        _enable_blr(ctx, blr_tol)
 
     tic = time()
     # reuse_analysis=True is the whole point of having called analyze():
@@ -108,13 +192,14 @@ def setup_mumps(A, ordering="metis", blr_tol=0.0, block_size=None, verbose=0):
 
     if verbose < 2:
         _silence_mumps(ctx)
-    if block_size is not None:
-        ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = int(block_size)
+    if isinstance(block_size, int):
+        # fixed size; "auto" is applied per call, None leaves MUMPS' default
+        ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = block_size
 
     return ctx, time_analysis, time_factor
 
 
-def setup_mumps_transpose(A, ordering="metis", blr_tol=0.0, block_size=None,
+def setup_mumps_transpose(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO,
                           verbose=0):
     """Factor A^T explicitly into its own context (opt-in; see `use_ctxT`).
 
@@ -124,26 +209,30 @@ def setup_mumps_transpose(A, ordering="metis", blr_tol=0.0, block_size=None,
     # .T of a CSR matrix is a CSC view; convert so MUMPS receives the same
     # storage type as on the forward path (values unchanged).
     AT = sp.csr_matrix(A.T) if sp.issparse(A) else np.asarray(A).T
-    return setup_mumps(AT, ordering=ordering, blr_tol=blr_tol,
-                       block_size=block_size, verbose=verbose)
+    return setup_mumps(AT, ordering=ordering, block_size=block_size,
+                       verbose=verbose)
 
 
-def mumps_solve(ctx, b, transpose=False):
+def mumps_solve(ctx, b, transpose=False, overwrite_b=False):
     """Solve A x = b, or A^T x = b, against an existing factorization.
 
     No context manager: ICNTL(9) is flipped, the solve runs, and the flag is
     restored in a finally block.  Reentrancy is the same as the original
     contextmanager version (i.e. do not interleave two transposed solves on
     one context from different threads).
+
+    overwrite_b : passed to python-mumps; with a Fortran-ordered b of the
+        system's dtype, True makes MUMPS solve in place (no copy, b is
+        overwritten and returned).
     """
     if not transpose:
-        return ctx.solve(b)
+        return ctx.solve(b, overwrite_b=overwrite_b)
 
     inst = ctx.mumps_instance
     prev = inst.icntl[_ICNTL_TRANSPOSE]
     inst.icntl[_ICNTL_TRANSPOSE] = 0          # A^T x = b
     try:
-        return ctx.solve(b)
+        return ctx.solve(b, overwrite_b=overwrite_b)
     finally:
         inst.icntl[_ICNTL_TRANSPOSE] = prev   # restore A x = b
 
@@ -166,22 +255,42 @@ def mumps_solve_sparse(ctx, b, transpose=False):
         inst.icntl[_ICNTL_TRANSPOSE] = prev
 
 
-def setup_solver_Aii_local(ctx, N, dtype, ctxT=None):
+def setup_solver_Aii_local(ctx, N, dtype, ctxT=None,
+                           block_size=_BLOCK_SIZE_AUTO):
     """LinearOperator applying A^{-1} and A^{-T}.
 
     ctxT is None (default): A^{-T} reuses the A factors via ICNTL(9)=0.
     ctxT given:             A^{-T} is a forward solve against factored A^T.
+    block_size == "auto":   ICNTL(27) is set to each call's column count
+                            just before the solve (see setup_mumps).
 
     NOTE: the argument order changed from the previous
     (ctx, ctxT, N, dtype) -- ctxT is now an optional trailing argument.
     """
+    block_size = _check_block_size(block_size)
+    sys_dtype = np.dtype(dtype)
+
+    def _solve(c, x, transpose):
+        _set_block_size_for(c, x, block_size)
+        if not sp.issparse(x):
+            x = np.asarray(x)
+            # OPT: own multithreaded Fortran copy, solved in place (see
+            #      _fortran_rhs).  Anything python-mumps would reject or treat
+            #      specially (dtype it cannot take, empty, sparse) keeps the
+            #      previous path and therefore the previous behaviour.
+            if x.ndim in (1, 2) and x.size > 0 and \
+                    np.result_type(x.dtype, sys_dtype) == sys_dtype:
+                b = _fortran_rhs(x, sys_dtype)
+                return mumps_solve(c, b, transpose=transpose, overwrite_b=True)
+        return mumps_solve(c, x, transpose=transpose)
+
     def _fwd(x):
-        return ctx.solve(x)
+        return _solve(ctx, x, transpose=False)
 
     def _adj(x):
         if ctxT is not None:
-            return ctxT.solve(x)
-        return mumps_solve(ctx, x, transpose=True)
+            return _solve(ctxT, x, transpose=False)
+        return _solve(ctx, x, transpose=True)
 
     return LinearOperator(
         shape=(N, N),
@@ -235,6 +344,219 @@ class stMap:
         self.n_large = n_large
 
 
+# =========================================================================== #
+#  Interpolation / reconstruction state
+#
+#  What a local solver must keep, beyond its factorization, so that a
+#  boundary trace can be turned into a volumetric field and that field be
+#  interpolated -- after the solver itself has been slimmed down or
+#  off-loaded by oms.  Two layers:
+#
+#    HPSInterpGrid     : evaluation only (grid + panel layout).  Light; what an
+#                        OMSSolution keeps per slab.
+#    HPSaltInterpState : + leaf reconstruction (skeleton -> full grid).  Holds
+#                        the leaf discretization (HPS_Multidomain), not the
+#                        sparse matrix and not the factorization.
+#
+#  The two hooks the OMS layer relies on are
+#      state.full_solution(u_i, u_b, ...)  -> values on grid._XXfull
+#      state.grid.interp(pts, f)           -> values at pts
+#  Supporting another discretization means providing an object with these.
+# =========================================================================== #
+
+def _to_numpy(x):
+    """torch tensor (any device) or array-like -> numpy array."""
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+class HPSInterpGrid:
+    """
+    Duck-types the attributes HPSInterp.interp reads from a solver:
+    ndim, npan_dim, p, geom (with .box_geom), _XXfull.
+    """
+    def __init__(self, typestr, ndim, npan_dim, p, geom, XXfull):
+        self.typestr  = typestr
+        self.ndim     = int(ndim)
+        self.npan_dim = np.asarray(_to_numpy(npan_dim)).astype(np.int64)
+        self.p        = np.asarray(_to_numpy(p)).astype(np.int64)
+        self.geom     = geom
+        self._XXfull  = np.asarray(_to_numpy(XXfull), dtype=np.float64)
+
+    @property
+    def XXfull(self):
+        return self._XXfull
+
+    def interp(self, pts, f):
+        """Values f on _XXfull -> values at pts (points inside this grid)."""
+        return interp.interp(self, np.asarray(pts, dtype=np.float64),
+                             np.asarray(f), self.typestr)
+
+
+class HPSaltInterpState:
+    """
+    Reconstruction + interpolation state of one hpsalt (Domain_Driver) slab.
+
+    Coded against the statically condensed DtN path of hpslib/hpsmultidomain:
+    the skeleton solution (on XX = xx_active, split into Ji / Jx) is lifted to
+    the leaf interiors by HPS_Multidomain.solve, i.e. batched local leaf
+    solves.  That step does NOT touch the slab-level sparse factorization.
+    """
+    typestr = "hpsalt"
+
+    def __init__(self, driver, sparse_assembly):
+        if getattr(driver, "use_iti_maps", False):
+            raise NotImplementedError(
+                "interpolation: ItI leaf maps are not supported")
+        if not getattr(driver, "statically_condense", True):
+            raise NotImplementedError(
+                "interpolation: statically_condense=False is not supported")
+        hps = driver.hps
+        self.hps      = hps
+        self.n_active = int(len(hps.I_unique))
+        self.Ii       = np.asarray(_to_numpy(driver._Ji)).astype(np.int64)
+        self.Ib       = np.asarray(_to_numpy(driver._Jx)).astype(np.int64)
+        self.device   = "cuda" if sparse_assembly == "reduced_gpu" else "cpu"
+        self.grid     = HPSInterpGrid(self.typestr, hps.d, hps.n, hps.p,
+                                      driver.geom, driver._XXfull)
+
+    def interp(self, pts, f):
+        return self.grid.interp(pts, f)
+
+    def full_solution(self, u_i, u_b, body_load=None, offset=None):
+        """
+        Skeleton values (u_i on Ii, u_b on Ib) -> values on grid._XXfull.
+
+        body_load : optional callable f(xx) (torch, global coordinates), the
+                    body load the local problem was solved with.
+        offset    : translation from this solver's own coordinates to the
+                    global ones (stiff_mat_const); body_load is evaluated at
+                    the shifted points.
+        """
+        import torch
+
+        u_i = np.ascontiguousarray(np.asarray(u_i).reshape(-1))
+        u_b = np.ascontiguousarray(np.asarray(u_b).reshape(-1))
+        if len(u_i) != len(self.Ii) or len(u_b) != len(self.Ib):
+            raise ValueError(
+                "full_solution: got %d interior / %d boundary values, expected "
+                "%d / %d" % (len(u_i), len(u_b), len(self.Ii), len(self.Ib)))
+        dt = np.result_type(u_i.dtype, u_b.dtype, np.float64)
+        uu = torch.zeros((self.n_active, 1),
+                         dtype=torch.from_numpy(np.zeros(0, dtype=dt)).dtype)
+        uu[torch.from_numpy(self.Ii), 0] = torch.from_numpy(u_i.astype(dt))
+        uu[torch.from_numpy(self.Ib), 0] = torch.from_numpy(u_b.astype(dt))
+
+        ff = body_load
+        if body_load is not None and offset is not None and np.any(offset):
+            shift = torch.as_tensor(np.asarray(offset, dtype=np.float64))
+
+            def ff(xx, _f=body_load, _s=shift):
+                return _f(xx + _s.to(device=xx.device, dtype=xx.dtype))
+
+        sol, _ = self.hps.solve(torch.device(self.device), uu,
+                                ff_body_func=ff)
+        return _to_numpy(sol[:, 0])
+
+
+# =========================================================================== #
+#  Body-load reduction
+#
+#  A local slab problem with body load f reads, after the discretization has
+#  eliminated whatever it eliminates,
+#
+#      Aii u_i + Aib u_b = f_i        (rows Ii)
+#      Abi u_i + Abb u_b = f_b        (rows Ib; used by flux / Neumann rows)
+#
+#  (f_i, f_b) is the REDUCED load: in the row convention of Aii / Aib, and in
+#  general not the body load sampled at points.  How it is obtained depends on
+#  the discretization (static condensation for HPS; plain sampling for a
+#  collocation scheme that keeps every point), so it lives here, next to the
+#  discretization, behind one interface:
+#
+#      reducer.reduce(body_load, offset=None) -> (f_i on Ii, f_b on Ib)
+#
+#  body_load : callable f(xx), torch points in GLOBAL coordinates, f of the
+#              same PDO the slab was built with (L u = f).
+#  offset    : translation from the solver's own coordinates to the global
+#              ones (stiff_mat_const), as in full_solution.
+#  Returns host numpy arrays; real when the load is real.
+#
+#  Supporting another discretization means one BodyLoadReducer subclass and
+#  one dispatch line in solverWrapper.body_reducer.
+# =========================================================================== #
+
+def _shifted(body_load, offset):
+    """body_load evaluated at xx + offset (torch points); body_load if no shift."""
+    if offset is None or not np.any(offset):
+        return body_load
+    import torch
+    shift = torch.as_tensor(np.asarray(offset, dtype=np.float64))
+
+    def ff(xx, _f=body_load, _s=shift):
+        return _f(xx + _s.to(device=xx.device, dtype=xx.dtype))
+    return ff
+
+
+class BodyLoadReducer:
+    """Interface: reduce(body_load, offset=None) -> (f_i on Ii, f_b on Ib)."""
+    typestr = None
+
+    def reduce(self, body_load, offset=None):
+        raise NotImplementedError
+
+
+class HPSaltBodyReducer(BodyLoadReducer):
+    """
+    Static condensation of a body load for one hpsalt (Domain_Driver) slab.
+
+    Uses HPS_Multidomain.reduce_body -- batched leaf solves, duplicated face
+    copies summed -- which returns the condensed load on the active
+    (I_unique) ordering, the ordering XX / Ji / Jx index into.  Same
+    convention as Domain_Driver.get_rhs:
+        A_CC u_i = -A_CX u_b + reduce_body(...)[Ji].
+    Holds only the leaf discretization (shared with HPSaltInterpState), not
+    the sparse matrix and not the factorization.
+    """
+    typestr = "hpsalt"
+
+    def __init__(self, driver, sparse_assembly):
+        if getattr(driver, "use_iti_maps", False):
+            raise NotImplementedError(
+                "body load reduction: ItI leaf maps are not supported")
+        if not getattr(driver, "statically_condense", True):
+            raise NotImplementedError(
+                "body load reduction: statically_condense=False is not "
+                "supported (the uncondensed driver takes no body load)")
+        hps = driver.hps
+        self.hps      = hps
+        self.n_active = int(len(hps.I_unique))
+        self.Ii       = np.asarray(_to_numpy(driver._Ji)).astype(np.int64)
+        self.Ib       = np.asarray(_to_numpy(driver._Jx)).astype(np.int64)
+        self.device   = "cuda" if sparse_assembly == "reduced_gpu" else "cpu"
+
+    def reduce(self, body_load, offset=None):
+        import torch
+        if not callable(body_load):
+            raise TypeError(
+                "body_load must be a callable f(xx) on torch points in global "
+                "coordinates; vector body loads are not supported yet")
+        red = self.hps.reduce_body(torch.device(self.device),
+                                   _shifted(body_load, offset), None)
+        red = _to_numpy(red).reshape(-1)
+        if red.shape[0] != self.n_active:
+            raise ValueError(
+                "reduce_body returned %d values, expected %d (one per active "
+                "dof); is body_load returning one value per point?"
+                % (red.shape[0], self.n_active))
+        # reduce_body allocates a complex buffer for function loads; keep a
+        # real problem real
+        if np.iscomplexobj(red) and not np.any(red.imag):
+            red = np.ascontiguousarray(red.real)
+        return red[self.Ii], red[self.Ib]
+
+
 class solverOptions:
     """
     Class that encodes the options for a local slab Solver
@@ -244,12 +566,16 @@ class solverOptions:
     a:          characteristic scale in case of HPS
     problem_type: 'Dirichlet' or 'mixed'
                     for mixed, the assumption (for now) is  that we have Dirichlet on vertical bdry sections, Neumann on rest
+    MUMPS options below apply to the local factorization of both problem
+    types (Dirichlet: Aii; mixed: M) for type 'hpsalt'.
     mumps_ordering: analysis ordering ('metis', 'auto', 'amd', 'scotch', ...)
-    blr_tol:    if > 0, BLR-compressed factorization with this tolerance
     use_ctxT:   factor A^T into a second context instead of reusing the A
                 factors via ICNTL(9)=0.  ~2x memory and factor time; only for
                 cross-checking the transposed-solve path.
-    mumps_block_size: ICNTL(27) blocking size for multiple right-hand sides
+    mumps_block_size: ICNTL(27) blocking size for multiple right-hand sides.
+                'auto' (default): the column count of each solve call, i.e.
+                one pass over the factors per call.  int: fixed size.
+                None: MUMPS' own small automatic default (previous behaviour).
     bc_types:   hpsalt only (2D). Boundary type per face of every local slab, passed
                 to Domain_Driver, e.g. {'x': 'dirichlet', 'y': 'neumann'} for slabs
                 whose x faces are the slab interfaces and whose y faces are walls.
@@ -263,16 +589,15 @@ class solverOptions:
                 problem_type='mixed', not to be combined with it.
     """
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
-                 mumps_ordering='metis',blr_tol=0.0,use_ctxT=False,
-                 mumps_block_size=None,reduced_gpu=False,bc_types=None):
+                 mumps_ordering='metis',use_ctxT=False,
+                 mumps_block_size=_BLOCK_SIZE_AUTO,reduced_gpu=False,bc_types=None):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
         self.problem_type = problem_type
         self.mumps_ordering   = mumps_ordering
-        self.blr_tol          = blr_tol
         self.use_ctxT         = use_ctxT
-        self.mumps_block_size = mumps_block_size
+        self.mumps_block_size = _check_block_size(mumps_block_size)
         self.reduced_gpu        = reduced_gpu
         self.bc_types         = bc_types
         if bc_types is not None:
@@ -366,6 +691,11 @@ class solverWrapper:
             self.solver=solver
             if self.opts.reduced_gpu:
                 self.solver.build("reduced_gpu", "MUMPS", verbose=verbose)
+                import gc, torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
             else:
                 self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
@@ -382,11 +712,20 @@ class solverWrapper:
             self.Aii = solver.Aii
             if compute_inverse:
                 if self.opts.problem_type == 'Dirichlet':
+                    # OPT: factor Aii through the same tuned MUMPS layer as
+                    #      the mixed path (ordering, reuse_analysis,
+                    #      block size, A^{-T} on the same factors, blocked
+                    #      matmat/rmatmat).  It used to go through the driver's
+                    #      SparseSolver, which ignored all of those options.
                     tic      = time()
-                    solver.setup_solver_Aii()
-                    self.solver_ii = solver.solver_Aii
+                    self.solver_ii = self._factor_mumps(self.Aii, verbose)
+                    # hand the same operator to the driver, so its own solve
+                    # paths never trigger a second (lazy) factorization
+                    solver.setup_solver_Aii(solve_op=self.solver_ii)
                     toc      = time() - tic
-                    print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
+                    print("\t Toc construct Aii inverse %5.2f s "
+                          "(analysis %5.2f s, factor %5.2f s)"
+                          % (toc, self.time_analysis, self.time_factor)) if verbose else None
                 elif self.opts.problem_type == 'mixed':
                     tic      = time()
                     # scale the face-detection tolerance with the geometry;
@@ -409,38 +748,8 @@ class solverWrapper:
                     self.JD = JD
                     self.JN = JN
 
-                    # ---- one factorization; A^{-T} reuses it -------------- #
-                    ctx, t_an, t_fa = setup_mumps(
-                        M,
-                        ordering=self.opts.mumps_ordering,
-                        blr_tol=self.opts.blr_tol,
-                        block_size=self.opts.mumps_block_size,
-                        verbose=2 if verbose else 0,
-                    )
-                    self.ctx = ctx
-                    self.time_analysis = t_an
-                    self.time_factor   = t_fa
-
-                    if self.opts.use_ctxT:
-                        ctxT, t_anT, t_faT = setup_mumps_transpose(
-                            M,
-                            ordering=self.opts.mumps_ordering,
-                            blr_tol=self.opts.blr_tol,
-                            block_size=self.opts.mumps_block_size,
-                            verbose=2 if verbose else 0,
-                        )
-                        self.ctxT = ctxT
-                        self.time_analysis += t_anT
-                        self.time_factor   += t_faT
-                        print("\t A^-T applies: dedicated A^T factorization "
-                              "(use_ctxT)") if verbose else None
-                    else:
-                        self.ctxT = None
-                        print("\t A^-T applies: reusing A factorization with "
-                              "ICNTL(9)=0") if verbose else None
-
-                    self.solver_ii = setup_solver_Aii_local(
-                        ctx, M.shape[0], M.dtype, ctxT=self.ctxT)
+                    # one factorization; A^{-T} reuses it
+                    self.solver_ii = self._factor_mumps(M, verbose)
                     toc      = time() - tic
                     print("\t Toc construct Aii inverse %5.2f s "
                           "(analysis %5.2f s, factor %5.2f s)"
@@ -472,10 +781,176 @@ class solverWrapper:
         self.XXb = solver.XX[self.Ib,:]
         self.ndofs = solver.XX.shape[0]
 
+    def _factor_mumps(self, A, verbose=False):
+        """
+        Factor the local system matrix A with the tuned MUMPS layer and
+        return the LinearOperator applying A^{-1} (matvec / matmat) and
+        A^{-T} (rmatvec / rmatmat, on the same factors via ICNTL(9) unless
+        opts.use_ctxT).  Honours opts.mumps_ordering and
+        mumps_block_size.  Sets self.ctx / ctxT / time_analysis / time_factor.
+        Used by both the Dirichlet (A = Aii) and the mixed (A = M) path.
+
+        Without python-mumps, use the existing SparseSolver backend with
+        default options.  Its total build time is reported as time_factor;
+        analysis and numerical factorization are not timed separately.
+        """
+        if mumps is None:
+            nondefaults = [
+                name for name, default in (
+                    ("mumps_ordering", "metis"), ("use_ctxT", False),
+                ) if getattr(self.opts, name) != default
+            ]
+            # "auto" / None need nothing from the backend; a fixed size does
+            if self.opts.mumps_block_size not in (None, _BLOCK_SIZE_AUTO):
+                nondefaults.append("mumps_block_size")
+            if nondefaults:
+                raise ValueError(
+                    "python-mumps is unavailable; the fallback cannot honor "
+                    "non-default options: " + ", ".join(nondefaults))
+            from solver.hpsmultidomain.hpsmultidomain.sparse_utils import SparseSolver
+
+            backend = SparseSolver(sp.csr_matrix(A))
+            self.ctx = self.ctxT = None
+            self.time_analysis = 0.0
+            self.time_factor = backend.build_time
+            warnings.warn(
+                f"python-mumps is unavailable; using SparseSolver's {backend.backend} backend.",
+                RuntimeWarning, stacklevel=2)
+            # solve_op's closures own the backend, including its factors.
+            # OMS retains solver_ii when it discards the rest of this wrapper.
+            return backend.solve_op
+
+        A = A.tocsc() if sp.issparse(A) else A
+        ctx, t_an, t_fa = setup_mumps(
+            A,
+            ordering=self.opts.mumps_ordering,
+            block_size=self.opts.mumps_block_size,
+            verbose=2 if verbose else 0,
+        )
+        self.ctx = ctx
+        self.time_analysis = t_an
+        self.time_factor   = t_fa
+
+        if self.opts.use_ctxT:
+            ctxT, t_anT, t_faT = setup_mumps_transpose(
+                A,
+                ordering=self.opts.mumps_ordering,
+                block_size=self.opts.mumps_block_size,
+                verbose=2 if verbose else 0,
+            )
+            self.ctxT = ctxT
+            self.time_analysis += t_anT
+            self.time_factor   += t_faT
+            print("\t A^-T applies: dedicated A^T factorization "
+                  "(use_ctxT)") if verbose else None
+        else:
+            self.ctxT = None
+            print("\t A^-T applies: reusing A factorization with "
+                  "ICNTL(9)=0") if verbose else None
+
+        return setup_solver_Aii_local(ctx, A.shape[0], A.dtype, ctxT=self.ctxT,
+                                      block_size=self.opts.mumps_block_size)
+
     def check_adjoint(self, k=4, seed=0, verbose=True):
         """Adjoint-consistency check on this slab's solve operator."""
         return check_adjoint_consistency(self.solver_ii, k=k, seed=seed,
                                          verbose=verbose, name="Aii^-1")
+
+    @property
+    def interp_state(self):
+        """
+        Reconstruction + interpolation state (see HPSaltInterpState), built
+        on first access and cached.  None if this solver type does not support
+        it yet; the reason is then in `interp_unavailable`.  Never raises, so
+        it is safe to probe with getattr / hasattr.
+        """
+        st = self.__dict__.get("_interp_state")
+        if st is not None or not self.constructed:
+            return st
+        if self.type == "hpsalt":
+            try:
+                st = HPSaltInterpState(
+                    self.solver,
+                    "reduced_gpu" if self.opts.reduced_gpu else "reduced_cpu")
+            except NotImplementedError as exc:
+                self.interp_unavailable = str(exc)
+                return None
+            self._interp_state = st
+            return st
+        self.interp_unavailable = (
+            "volumetric reconstruction is not implemented for solver type %r"
+            % (self.type,))
+        return None
+
+    @property
+    def body_reducer(self):
+        """
+        Body-load reducer (see BodyLoadReducer), built on first access and
+        cached.  None if this solver type does not support it yet; the reason
+        is then in `body_reduce_unavailable`.  Never raises, so it is safe to
+        probe with getattr / hasattr (oms keeps it on slimmed solvers).
+        """
+        red = self.__dict__.get("_body_reducer")
+        if red is not None or not self.constructed:
+            return red
+        if self.type == "hpsalt":
+            try:
+                red = HPSaltBodyReducer(
+                    self.solver,
+                    "reduced_gpu" if self.opts.reduced_gpu else "reduced_cpu")
+            except NotImplementedError as exc:
+                self.body_reduce_unavailable = str(exc)
+                return None
+            self._body_reducer = red
+            return red
+        self.body_reduce_unavailable = (
+            "body load reduction is not implemented for solver type %r"
+            % (self.type,))
+        return None
+
+    def reduce_body_load(self, body_load, offset=None):
+        """
+        Reduced load (f_i on Ii, f_b on Ib) of `body_load` for this slab, in
+        the row convention of Aii / Aib:  Aii u_i + Aib u_b = f_i.
+
+        body_load : callable f(xx), torch points in global coordinates.
+        offset    : solver -> global translation (stiff_mat_const), or None.
+        """
+        red = self.body_reducer
+        if red is None:
+            raise NotImplementedError(
+                getattr(self, "body_reduce_unavailable", None)
+                or "body load reduction is not available for this solver")
+        return red.reduce(body_load, offset)
+
+    def check_body_reduction(self, v, Lv, offset=None, verbose=True):
+        """
+        Self-test of reduce_body_load on this slab.  For a smooth v and its
+        image under the PDO, Lv = L v (both callables on torch points in global
+        coordinates), static condensation gives exactly
+
+            f_i = Aii v_i + Aib v_b      on Ii
+
+        up to the spectral differentiation error of v.  Returns the relative
+        error.  A sign or scaling mismatch shows up as O(1).
+        """
+        import torch
+        f_i, _ = self.reduce_body_load(Lv, offset)
+        XX = self.XX if hasattr(self.XX, "detach") else torch.as_tensor(np.asarray(self.XX))
+        if offset is not None and np.any(offset):
+            XX = XX + torch.as_tensor(np.asarray(offset, dtype=np.float64)).to(
+                device=XX.device, dtype=XX.dtype)
+        vv = _to_numpy(v(XX)).reshape(-1)
+        Ii = np.asarray(_to_numpy(self.Ii)).astype(np.int64)
+        Ib = np.asarray(_to_numpy(self.Ib)).astype(np.int64)
+        ref = np.asarray(self.Aii @ vv[Ii]).reshape(-1) \
+            + np.asarray(self.Aib @ vv[Ib]).reshape(-1)
+        nrm = np.linalg.norm(ref)
+        err = np.linalg.norm(f_i - ref) / (nrm if nrm > 0 else 1.0)
+        if verbose:
+            print("check_body_reduction: ||f_i - (Aii v_i + Aib v_b)|| / ||.|| "
+                  "= %.3e" % err)
+        return err
 
     #given values f on the full solver grid, interpolate f to the points x
     def interp(self,pts,f):

@@ -17,7 +17,8 @@ def interp(solver,pts,f,typestr):
     
 
 def interp_2d(solver,pts,f,typestr):
-    g = np.zeros(shape=(pts.shape[0],))
+    # dtype follows f: a float buffer silently dropped the imaginary part
+    g = np.zeros(shape=(pts.shape[0],),dtype=np.result_type(np.asarray(f).dtype,np.float64))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_2d(npan_dim,solver.geom)
     if typestr=='hps':
@@ -32,7 +33,7 @@ def interp_2d(solver,pts,f,typestr):
     return g
 
 def interp_3d(solver,pts,f,typestr):
-    g = np.zeros(shape=(pts.shape[0],))
+    g = np.zeros(shape=(pts.shape[0],),dtype=np.result_type(np.asarray(f).dtype,np.float64))
     npan_dim = solver.npan_dim
     boxes = construct_boxes_3d(npan_dim,solver.geom)
     ord=[solver.p,solver.p,solver.p]
@@ -109,7 +110,9 @@ def construct_boxes_3d(npan_dim,geom):
     return boxes
 
 def idxs_2d(p,box):
-    return np.where( (box[0][0]<=p[:,0]) & (box[1][0]>=p[:,0]) & (box[0][1]<=p[:,1]) & (box[1][1]>=p[:,1]))[0]
+    # same 1e-10 slack as idxs_3d: panel edges of translated slabs are not
+    # bit-identical to the box edges recomputed in construct_boxes_2d
+    return np.where( (box[0][0]<p[:,0]+1e-10) & (box[1][0]>p[:,0]-1e-10) & (box[0][1]<p[:,1]+1e-10) & (box[1][1]>p[:,1]-1e-10) )[0]
 def idxs_3d(p,box):
     return np.where( (box[0][0]<p[:,0]+1e-10) & (box[1][0]>p[:,0]-1e-10) & (box[0][1]<p[:,1]+1e-10) & (box[1][1]>p[:,1]-1e-10) & (box[0][2]<p[:,2]+1e-10) & (box[1][2]>p[:,2]-1e-10) )[0]
 
@@ -127,7 +130,8 @@ def tucker_tol(Tens,tol):
     k1 = sum(s1>tol)
     k2 = sum(s2>tol)
 
-    core = tenalg.multi_mode_dot(Tens,[U0[:,:k0].T,U1[:,:k1].T,U2[:,:k2].T])
+    # projection needs U^H, not U^T (identical for real data)
+    core = tenalg.multi_mode_dot(Tens,[U0[:,:k0].conj().T,U1[:,:k1].conj().T,U2[:,:k2].conj().T])
     return core,U0[:,:k0],U1[:,:k1],U2[:,:k2]
 
 
@@ -145,7 +149,9 @@ def chebInterpFromSamples(xpts,ff,targetpts):
         f0 = ff
     N,aT = computeTransform(xpts)
 
-    DFT = np.fft.fft(np.vstack((f0[::-1,:],f0[1:N-1,:])),axis=0).real / (2 * N - 2)
+    DFT = np.fft.fft(np.vstack((f0[::-1,:],f0[1:N-1,:])),axis=0) / (2 * N - 2)
+    if not np.iscomplexobj(f0):
+        DFT = DFT.real
     coeffs      = DFT[:N,:] * 2
     coeffs[0,:]   /= 2
     coeffs[-1,:]  /= 2
@@ -158,12 +164,12 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
         ord = ord0
     else:
         raise ValueError("solver type not recognized")
-    _,I0  = np.unique(XX.round(decimals=10),axis=0,return_index=True)
+    _,I0  = np.unique(np.round(np.asarray(XX),decimals=10),axis=0,return_index=True)
     f0    = f[I0]
     F = np.reshape(f0,(ord[0],ord[1],ord[2]))
     
     core,U0,U1,U2 = tucker_tol(F,1e-12)
-    F_approx = np.zeros(shape =(pts.shape[0],))
+    F_approx = np.zeros(shape =(pts.shape[0],),dtype=np.result_type(F.dtype,np.float64))
     
     xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
     ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
@@ -181,11 +187,13 @@ def local_interp_3d(pts,f,XX,box,ord0,typestr):
     return F_approx
 def local_interp_2d(pts,f,XX,box,ord0,typestr):
     ord = [ord0[0],ord0[1]]
-    _,I0  = np.unique(XX,axis=0,return_index=True)
+    # rounded as in local_interp_3d, so float noise on shared panel edges
+    # cannot leave duplicates behind (the reshape would then fail)
+    _,I0  = np.unique(np.round(np.asarray(XX),decimals=10),axis=0,return_index=True)
     f0      = f[I0]
     F = np.reshape(f0,(ord[0],ord[1]))
     [U,s,Vh]=np.linalg.svd(F)
-    F_approx = np.zeros(shape =(pts.shape[0],))
+    F_approx = np.zeros(shape =(pts.shape[0],),dtype=np.result_type(F.dtype,np.float64))
     
     xpts = ((cheb.cheb(ord[0])[0]+1)/2.)*(box[1][0]-box[0][0])+box[0][0]
     ypts = ((cheb.cheb(ord[1])[0]+1)/2.)*(box[1][1]-box[0][1])+box[0][1]
