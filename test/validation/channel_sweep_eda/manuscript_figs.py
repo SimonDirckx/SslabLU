@@ -5,7 +5,7 @@ and *.png and prints the numbers quoted with them.
   fig1 problem (bathymetry, slabs, eta and velocity of the reference run)
   fig2 spin-up of the reference run
   fig3 self-convergence, slab-count invariance, volume drift / wall flux
-  fig4 cost vs DoF and run-time composition (N = 8, dense rb)
+  fig4 cost vs DoF, setup in time steps, composition of one step (N = 8, dense rb)
   fig5 slab count at a fixed discretization (the finest npan_y of the solver
        sweep with every p)
   fig6 HBS compression error vs rank (rankiso sweep, npan_y = 32)
@@ -24,7 +24,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from manuscript_common import *
 
 FIG = os.path.join(OUT, "manuscript_figs", "")
@@ -126,14 +125,9 @@ for p in PS:
     d = [rbany(n, p)["dof"] for n in ns]
     a.loglog(d, [ERR[(p, n)] for n in ns], "-o", color=PC[p])
     a.loglog(d, [rel(fld(rbany(n, p), "u"), fld(REF, "u")) for n in ns], ":", marker="o", mfc="none", color=PC[p])
-    for n in ns:                                              # same discretization, other slab counts
-        for N in NSOF(n)[1:]:
-            a.plot(rbany(n, p, N)["dof"], rel(fld(rbany(n, p, N)), fld(REF)), NM[N], color=PC[p], ms=6.5, mfc="none", mew=0.7)
-a.plot(REF["dof"], REF_ERR, "o", color=PC[REF["p"]], mfc="none", mew=0.9)
-a.set_xlabel("degrees of freedom"); a.set_ylabel("relative $L^2$ error vs. reference")
+a.set_xlabel("degrees of freedom"); a.set_ylabel("rel. $L^2$ error vs. reference")
 a.add_artist(a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS], loc="lower left"))
-a.legend(handles=[Line2D([], [], color=GREY, ls="-", label=r"$\eta$"), Line2D([], [], color=GREY, ls=":", marker="o", mfc="none", label="$u$")]
-         + [Line2D([], [], color=GREY, ls="", marker=NM[N], mfc="none", ms=6.5, label="$N$ = %d" % N) for N in (16, 32, 64, 128)],
+a.legend(handles=[Line2D([], [], color=GREY, ls="-", marker="o", label=r"$\eta$"), Line2D([], [], color=GREY, ls=":", marker="o", mfc="none", label="$u$")],
          loc="upper right", handlelength=1.6, fontsize=7)
 a.set_ylim(1e-12, 1)
 a = ax[1]
@@ -142,73 +136,80 @@ for p, n in LAY:
     for N in NSOF(n)[1:]:
         x = rbany(n, p, N)
         a.semilogy(b["dof"], max(rel(fld(x, f), fld(b, f)) for f in ("eta", "u", "v")), NM[N], color=PC[p], mfc="none", ms=6, mew=0.8)
-    a.semilogy(b["dof"], disc(p, n), "o", color=PC[p], ms=4.5, mfc=PC[p] if (p, n) in ERR else "none")
+    if (p, n) in ERR:                                         # the reference has no error of its own to show
+        a.semilogy(b["dof"], disc(p, n), "o", color=PC[p], ms=4.5)
 a.set_xscale("log")
 a.axhspan(1e-16, 1e-11, color="#eeeeee", lw=0, zorder=0)
 a.text(0.97, 0.04, "round-off band", transform=a.transAxes, ha="right", fontsize=7, color=GREY)
-a.set_ylim(1e-14, 1); a.set_xlabel("degrees of freedom")
-a.set_ylabel("relative difference / error")
-a.legend(handles=[Line2D([], [], color=GREY, ls="", marker="o", label="discretization error ($N$ = 8)"),
-                  Line2D([], [], color=GREY, ls="", marker="s", mfc="none", label="$N$ = 16 ... 128 vs $N$ = 8")],
-         loc="upper right")
+a.set_ylim(1e-14, 1e2); a.set_xlabel("degrees of freedom")
+a.set_ylabel("rel. difference, $N$ slabs vs. $N$ = 8")
+a.legend(handles=[Line2D([], [], color=GREY, ls="", marker="o", label=r"disc. error, $\eta$")]
+         + [Line2D([], [], color=GREY, ls="", marker=NM[N], mfc="none", label="$N$ = %d" % N) for N in (16, 32, 64, 128)],
+         loc="upper right", bbox_to_anchor=(1.02, 1.0), ncol=2, columnspacing=0.6, handletextpad=0.2, handlelength=1.2, fontsize=6.5)
 a = ax[2]
 for p in PS:
     rr = [rbany(n, p) for n in NPYS if (p, n) in LAY]
     a.loglog([r["dof"] for r in rr], [abs(r["mass_rel"]) for r in rr], "-o", color=PC[p])
     a.loglog([r["dof"] for r in rr], [r["wall_v"] / r["ts"]["max_u"][-1] for r in rr], ":", marker="v", mfc="none", color=PC[p])
-a.set_xlabel("degrees of freedom"); a.set_ylabel("relative error")
+a.set_xlabel("degrees of freedom"); a.set_ylabel("normalized defect")
 a.legend(handles=[Line2D([], [], color=GREY, marker="o", label=r"volume drift $|\Delta V| / \int|\eta|$"),
                   Line2D([], [], color=GREY, ls=":", marker="v", mfc="none", label=r"wall $\max|v| \,/\, \max|u|$")],
          loc="center left", bbox_to_anchor=(0, 0.42))
 a.set_ylim(1e-17, 3)
-for i, a in enumerate(ax):
-    tidy(a); panel(a, "(%s)" % "abc"[i])
+for i, (a, t) in enumerate(zip(ax, ("self-convergence", "slab-count invariance", "conservation and wall closure"))):
+    tidy(a); a.set_title("(%s) %s" % ("abc"[i], t), fontsize=8.5, loc="left")
 save(fig, "fig3_accuracy")
 
 # ---------------------------------------------------------------- 4. cost scaling, N = 8, dense rb
-fig, ax = plt.subplots(1, 2, figsize=(7.2, 3.3), gridspec_kw=dict(wspace=0.3, width_ratios=(1, 1.25)))
+# (a) absolute times; (b) setup in units of steps; (c) composition of one step.
+# Nothing here depends on the 800-step run length. Factorization (~0.1% of
+# setup) is too small to plot; its share is printed below.
+fig, ax = plt.subplots(1, 3, figsize=(7.4, 2.7), gridspec_kw=dict(wspace=0.42))
 a = ax[0]
 for p in PS:
     rr = [rbany(n, p) for n in NPYS if (p, n) in LAY]
     d = [r["dof"] for r in rr]
+    a.loglog(d, [r["asm"] for r in rr], "--s", color=PC[p], mfc="none")
+    a.loglog(d, [r["keep"] for r in rr], "-.D", color=PC[p], mfc="none", ms=3.5)
     a.loglog(d, [r["leaf"] for r in rr], "-o", color=PC[p])
-    a.loglog(d, [r["once"] for r in rr], "--s", color=PC[p], mfc="none")
     a.loglog(d, [r["t_solve"] for r in rr], ":^", color=PC[p], mfc="none")
-dd = np.array([1e4, 6e6])
-a.loglog(dd, 0.003 * dd / 1e4, color=GREY, lw=0.7)
-a.text(1.2e5, 0.012, r"$\propto$ DoF", color=GREY, fontsize=7)
+dd = np.array([2e4, 6e6])
+a.loglog(dd, 0.0035 * dd / 2e4, color=GREY, lw=0.7)          # below rhs + recon.
+a.text(2.5e5, 0.012, r"$\propto$ DoF", color=GREY, fontsize=7)
+a.loglog(dd, 2.0 * (dd / 2e4) ** 1.5, color=GREY, lw=0.7)    # above assembly
+a.text(6e6, 2.2e4, r"$\propto$ DoF$^{3/2}$", color=GREY, fontsize=7, ha="right")
 a.set_xlabel("degrees of freedom"); a.set_ylabel("wall time  [s]")
-a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS]
-         + [Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="setup, once"),
-            Line2D([], [], color=GREY, ls="-", marker="o", label="rhs + recon., per step"),
-            Line2D([], [], color=GREY, ls=":", marker="^", mfc="none", label="interface solve, per step")],
-         loc="upper left", ncol=2, columnspacing=0.8, handlelength=1.8)
-a.set_ylim(3e-4, 3e4)
+a.legend(handles=[Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="S-map assembly"),
+                  Line2D([], [], color=GREY, ls="-.", marker="D", mfc="none", ms=3.5, label="slab storage"),
+                  Line2D([], [], color=GREY, ls="-", marker="o", label="rhs + recon., per step"),
+                  Line2D([], [], color=GREY, ls=":", marker="^", mfc="none", label="interface solve, per step")],
+         loc="upper left", handlelength=2.2, fontsize=6.5)
+a.set_ylim(3e-4, 2e5)
 a = ax[1]
-parts = (("S-map assembly", "asm", "#999999"), ("factorization", "fac", "#000000"), ("slab storage", "keep", "#cccccc"),
-         ("body-load rhs", "t_rhs", "#56B4E9"), ("interface solve", "t_solve", "#D55E00"), ("reconstruction", "t_recon", "#0072B2"))
-_rr = [rbany(n, p) for p, n in LAY]
-SHARE = {"fac": " ($\\leq$%.2f%%)" % max(100 * r["fac"] / r["cost"] for r in _rr),
-         "t_solve": " ($\\leq$%.1f%%)" % max(100 * 800 * r["t_solve"] / r["cost"] for r in _rr)}
-labs, ys, k = [], [], 0
 for p in PS:
-    for n in NPYS:
-        if (p, n) not in LAY:
-            continue
-        r = rbany(n, p)
-        left = 0.0
-        for nm, f, col in parts:
-            w = 100 * (r[f] * (800 if f.startswith("t_") else 1)) / r["cost"]
-            a.barh(k, w, left=left, color=col, height=0.75, lw=0)
-            left += w
-        a.text(101, k, "%.0f s" % r["cost"], va="center", fontsize=6.5)
-        labs.append("$p$ = %d, %s" % (p, leaves(n))); ys.append(k); k += 1
-    k += 0.5
-a.set_yticks(ys); a.set_yticklabels(labs, fontsize=6.8); a.invert_yaxis()
-a.set_xlim(0, 100); a.set_xlabel("share of run time, setup + 800 steps  [%]")
-a.legend(handles=[Patch(color=c, label=nm + SHARE.get(f, "")) for nm, f, c in parts], loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3)
-for i, a in enumerate(ax):
-    tidy(a); panel(a, "(%s)" % "ab"[i])
+    rr = [rbany(n, p) for n in NPYS if (p, n) in LAY]
+    a.loglog([r["dof"] for r in rr], [r["once"] / r["step"] for r in rr], "-o", color=PC[p])
+a.axhline(800, color=GREY, lw=0.6, ls="--")
+a.text(1.1e4, 800 * 1.12, "800 steps (runs here)", color=GREY, fontsize=6.5, va="bottom")
+a.set_xlabel("degrees of freedom"); a.set_ylabel("setup cost  [time steps]")
+a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS], loc="lower right")
+a.set_ylim(40, 2000)
+a.yaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+a = ax[2]
+for p in PS:
+    rr = [rbany(n, p) for n in NPYS if (p, n) in LAY]
+    d = [r["dof"] for r in rr]
+    for f, sty in (("t_rhs", "-o"), ("t_recon", "--d"), ("t_solve", ":^")):
+        a.loglog(d, [100 * r[f] / r["step"] for r in rr], sty, color=PC[p], mfc=PC[p] if f == "t_rhs" else "none", ms=4)
+a.set_xlabel("degrees of freedom"); a.set_ylabel("share of one time step  [%]")
+a.legend(handles=[Line2D([], [], color=GREY, ls="-", marker="o", label="predictor + slab rhs solve"),
+                  Line2D([], [], color=GREY, ls="--", marker="d", mfc="none", label="slab recon. + velocity update"),
+                  Line2D([], [], color=GREY, ls=":", marker="^", mfc="none", label="interface solve")],
+         loc="center left", bbox_to_anchor=(0.0, 0.6), handlelength=2.2, fontsize=6.5)   # in the gap between the curves
+a.set_ylim(0.5, 100)
+a.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: "%g" % v))
+for i, (a, t) in enumerate(zip(ax, ("cost vs. problem size", "setup in time steps", "one time step"))):
+    tidy(a); a.set_title("(%s) %s" % ("abc"[i], t), fontsize=8.5, loc="left")
 save(fig, "fig4_cost")
 
 # ---------------------------------------------------------------- 5. slab count at fixed discretization
@@ -225,13 +226,13 @@ for p in PS:
     ax[2].semilogy(NS, [r["asm"] for r in hb_], "--s", color=PC[p], mfc="none")
     ax[2].semilogy(NS, [r["fac"] for r in rb_], "-.o", color=PC[p], ms=3)
     ax[2].semilogy(NS, [r["fac"] for r in hb_], ":s", color=PC[p], mfc="none", ms=3)
-ax[0].set_ylabel("rhs + reconstruction per step  [s]"); ax[0].set_ylim(0)
+ax[0].set_ylabel("wall time per step  [s]"); ax[0].set_ylim(0)
 ax[0].legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS], loc="lower right")
-ax[1].set_ylabel("interface solve per step  [s]")
+ax[1].set_ylabel("wall time per step  [s]")
 ax[1].legend(handles=[Line2D([], [], color=GREY, marker="o", label="dense red-black"),
                       Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="HBS red-black, rank $p$")], loc="upper left")
 ax[1].set_ylim(2e-3, 3)
-ax[2].set_ylabel("one-time cost  [s]")
+ax[2].set_ylabel("wall time  [s]")
 ax[2].legend(handles=[Line2D([], [], color=GREY, marker="o", label="assembly, dense"),
                       Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="assembly, HBS"),
                       Line2D([], [], color=GREY, ls="-.", marker="o", ms=3, label="factor, dense"),
@@ -240,7 +241,8 @@ ax[2].legend(handles=[Line2D([], [], color=GREY, marker="o", label="assembly, de
 ax[2].set_ylim(1e-2, 2e3)
 for i, a in enumerate(ax):
     a.set_xscale("log", base=2); a.set_xticks(NS); a.set_xticklabels([str(N) for N in NS]); a.minorticks_off()
-    a.set_xlabel("slabs $N$ (%s leaves)" % leaves(NPY5)); tidy(a); panel(a, "(%s)" % "abc"[i])
+    a.set_xlabel("double slabs $N$ (= interfaces)"); tidy(a)   # all at leaves(NPY5) leaves: in the caption
+    a.set_title("(%s) %s" % ("abc"[i], ("leaf work per step", "interface solve per step", "one-time setup")[i]), fontsize=8.5, loc="left")
 save(fig, "fig5_slabcount")
 
 
@@ -251,26 +253,28 @@ def herr(k, n, p, N, r):
     return rel(fld(x), fld(rbof(x))) if x else np.nan
 
 
-fig, ax = plt.subplots(2, 3, figsize=(7.2, 4.3), sharex=True, sharey=True, gridspec_kw=dict(wspace=0.08, hspace=0.12))
-for i, (k, nm) in enumerate((("smap", "S-map compression\n(dense solver)"), ("solver", "solver compression\n(S-maps at rank 1.5$p$)"))):
+PMK = {8: dict(marker="o", ms=4.5), 12: dict(marker="s", ms=4.5), 16: dict(marker="^", ms=4, mfc="none", mew=0.9)}  # p = 12 and 16 overlap
+fig = plt.figure(figsize=(7.2, 5.0))
+sfs = fig.subfigures(2, 1, hspace=0.04)
+for i, (k, nm) in enumerate((("smap", "S-map compression (dense solver)"), ("solver", "solver compression (S-maps at rank 1.5$p$)"))):
+    sfs[i].suptitle(nm, fontsize=9, fontweight="bold", y=0.99)
+    ax = sfs[i].subplots(1, 3, sharey=True, gridspec_kw=dict(wspace=0.08))
+    sfs[i].subplots_adjust(top=0.82, bottom=0.18 if i else 0.08)
     for j, N in enumerate((8, 16, 32)):
-        a = ax[i, j]
+        a = ax[j]
         a.axhspan(*FLOOR, color="#eeeeee", lw=0, zorder=-5)
         for p in PS:
-            a.semilogy(RANKS, [herr(k, 32, p, N, r) for r in RANKS], "-o", color=PC[p], zorder=3)
+            a.semilogy(RANKS, [herr(k, 32, p, N, r) for r in RANKS], "-", color=PC[p], zorder=3, **PMK[p])
             a.axhline(disc(p, 32), color=PC[p], ls=":", lw=0.9, zorder=2)
         a.set_xticks(RANKS); a.set_ylim(1e-10, 3e-2); tidy(a)
-        if i == 0:
-            a.set_title("$N$ = %d slabs" % N)
+        a.set_title("(%s) $N$ = %d" % ("abcdef"[3 * i + j], N), fontsize=8.5, loc="left")
         if j == 0:
-            a.set_ylabel(nm + "\n" + r"rel. error in $\eta$ vs. dense")
-        if i == 1:
-            a.set_xlabel("rank")
-        panel(a, "(%s)" % "abcdef"[3 * i + j])
-ax[0, 2].text(11.8, 3e-9, "repeat-run spread", ha="right", va="center", fontsize=7, color=GREY)
-fig.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS]
-           + [Line2D([], [], color=GREY, ls=":", label="discretization error of that $p$, %s leaves" % leaves(32))],
-           loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.04))
+            a.set_ylabel(r"rel. error in $\eta$ vs. dense")
+        a.set_xlabel("rank") if i == 1 else a.set_xticklabels([])
+fig.legend(handles=[Line2D([], [], color=PC[p], label="$p$ = %d" % p, **PMK[p]) for p in PS]
+           + [Line2D([], [], color=GREY, ls=":", label="discretization error of that $p$, %s leaves" % leaves(32)),
+              Line2D([], [], color="#eeeeee", lw=6, label="repeat-run spread")],
+           loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.06), columnspacing=1.2)
 save(fig, "fig6_rank")
 
 # ---------------------------------------------------------------- 7. accuracy vs cost (solver sweep)
@@ -283,16 +287,17 @@ for p in PS:
     a.plot([one(sweep="solver", npy=n, p=p, N=8, kind="rb")["cost"] for n in ns], [disc(p, n) for n in ns], "-", color=PC[p], lw=0.8, zorder=0)
 a.axhspan(*FLOOR, color="#eeeeee", lw=0, zorder=-5)
 a.axhline(REF_ERR, color=GREY, lw=0.6, ls="--")
-a.text(max(x["cost"] for x in find(sweep="solver")), REF_ERR * 1.5, "reference error bound", fontsize=6.5, color=GREY, ha="right")
+a.text(min(x["cost"] for x in find(sweep="solver")), REF_ERR * 1.5, "reference error bound", fontsize=6.5, color=GREY, ha="left")
 TK = [t for t in (10, 30, 100, 300, 1000, 3000, 10000) if min(x["cost"] for x in rows) / 1.5 < t < max(x["cost"] for x in rows) * 1.5]
 a.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
 a.set_xticks(TK); a.set_xticklabels([str(t) for t in TK])
 a.set_xlabel("run time, setup + 800 steps  [s]"); a.set_ylabel(r"relative error in $\eta$ vs. reference")
 a.legend(handles=[Line2D([], [], color=PC[p], marker="o", ls="-", lw=0.8, label="$p$ = %d" % p) for p in PS]
          + [Line2D([], [], color=GREY, marker="o", ls="", label="dense"),
-            Line2D([], [], color=GREY, marker="x", ls="", label="HBS, rank\n$p/2, p, 3p/2$")],
+            Line2D([], [], color=GREY, marker="x", ls="", label="HBS, rank\n$p/2, p, 3p/2$"),
+            Line2D([], [], color="#eeeeee", lw=6, label="repeat-run spread")],
          loc="center left", bbox_to_anchor=(1.0, 0.5))
-tidy(a)
+tidy(a); a.set_title("accuracy vs. run time", fontsize=8.5, loc="left")
 save(fig, "fig7_error_cost")
 
 # ---------------------------------------------------------------- 8. compression across interface sizes (rankiso)
@@ -307,11 +312,12 @@ for N in (8, 32):
         pts = sorted((p * n, herr(k, n, p, N, 8)) for p, n in ISO)
         a.loglog(*zip(*pts), mk, color=NC[N], mfc=NC[N] if k == "smap" else "none", mew=0.9, ls="-" if k == "smap" else "--", lw=0.7)
 a.axhspan(*FLOOR, color="#eeeeee", lw=0, zorder=-5)
-a.set_xlabel("interface size $n_c$ = npan$_y\\,p$"); a.set_ylabel(r"compression error in $\eta$, rank 8")
+a.set_xlabel("interface size $n_c$ = npan$_y\\,p$"); a.set_ylabel(r"rel. error in $\eta$, compressed vs. dense")
 NCT = sorted({p * n for p, n in ISO})
 a.legend(handles=[Line2D([], [], color=NC[N], marker="o", ls="", label="$N$ = %d" % N) for N in (8, 32)]
          + [Line2D([], [], color=GREY, marker="o", ls="-", lw=0.7, label="S-maps"),
             Line2D([], [], color=GREY, marker="s", mfc="none", ls="--", lw=0.7, label="solver")], loc="upper left", ncol=2, fontsize=7)
+a.text(0.97, 3e-9, "repeat-run spread", transform=a.get_yaxis_transform(), ha="right", va="center", fontsize=6.5, color=GREY)
 a.set_ylim(1e-9, 1e-2)
 a = ax[1]
 NSB = NSOF(NPYB)
@@ -322,10 +328,11 @@ a.axhspan(*FLOOR, color="#eeeeee", lw=0, zorder=-5)
 a.axhline(disc(PB, NPYB), color=PC[PB], ls=":", lw=0.9)
 a.text(NSB[-1], disc(PB, NPYB) * 2, "discretization error", fontsize=6.5, color=PC[PB], ha="right")
 a.set_xscale("log", base=2); a.set_xticks(NSB); a.set_xticklabels([str(N) for N in NSB]); a.minorticks_off()
-a.set_xlabel("slabs $N$ (%s leaves, $p$ = %d)" % (leaves(NPYB), PB)); a.set_ylabel(r"compression error in $\eta$")
+a.set_xlabel("double slabs $N$ (= interfaces)"); a.set_ylabel(r"rel. error in $\eta$, compressed vs. dense")
 a.legend(handles=[Line2D([], [], color=GREY, ls="-", label="S-maps"), Line2D([], [], color=GREY, ls="--", label="solver"),
                   Line2D([], [], color=GREY, marker="o", ls="", label="rank 8"), Line2D([], [], color=GREY, marker="s", mfc="none", ls="", label="rank 12")],
          loc="upper left", ncol=2, fontsize=7)
+a.text(0.97, 3e-9, "repeat-run spread", transform=a.get_yaxis_transform(), ha="right", va="center", fontsize=6.5, color=GREY)
 a = ax[2]
 for k, mk in (("smap", "o"), ("solver", "s")):
     for p in PS:
@@ -339,15 +346,17 @@ for k, mk in (("smap", "o"), ("solver", "s")):
         if pts:
             a.semilogx(*zip(*sorted(pts)), "-" if k == "smap" else "--", marker=mk, color=PC[p], mfc=PC[p] if k == "smap" else "none", mew=0.9)
 a.axhline(1.0, color=GREY, lw=0.6)
-a.set_xlabel("interface size $n_c$"); a.set_ylabel("run time, compressed / dense  ($N$ = 8)")
+a.set_xlabel("interface size $n_c$"); a.set_ylabel("run time ratio  ($N$ = 8)")
 a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS]
          + [Line2D([], [], color=GREY, ls="-", marker="o", label="S-maps, rank 8"), Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="solver, rank 8")],
          loc="lower left", fontsize=7)
 for a in (ax[0], ax[2]):
     a.set_xticks(NCT); a.set_xticklabels([str(t) for t in NCT], rotation=45, fontsize=6.5)
     a.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+# (b): %s leaves (NPYB), stated in the caption
+F8T = ("rank 8 vs. interface size", "vs. slab count, $p$ = %d" % PB, "compressed / dense run time")
 for i, a in enumerate(ax):
-    tidy(a); panel(a, "(%s)" % "abc"[i])
+    tidy(a); a.set_title("(%s) %s" % ("abc"[i], F8T[i]), fontsize=8.5, loc="left")
 save(fig, "fig8_rank_scaling")
 
 # ---------------------------------------------------------------- numbers quoted with the figures
@@ -371,6 +380,12 @@ for p, n in LAY:
     print("  p=%2d %8s DoF %7d: step %.4f s (rhs %.4f, interface %.5f, recon %.4f) | one-time %.1f s = %.0f steps | run %.0f s: setup %.0f%%, interface solve %.1f%%" % (
         p, leaves(n).replace("$\\times$", "x"), r["dof"], r["step"], r["t_rhs"], r["t_solve"], r["t_recon"], r["once"], r["once"] / r["step"], r["cost"],
         100 * r["once"] / r["cost"], 100 * 800 * r["t_solve"] / r["cost"]))
+_rr = [rbany(n, p) for p, n in LAY]
+print("fitted DoF exponents, all dense N = 8 layouts (DoF > 3e5 in parentheses):",
+      ", ".join("%s %.2f (%.2f)" % (f, *[np.polyfit(np.log([r["dof"] for r in s]), np.log([r[f] for r in s]), 1)[0]
+                                     for s in (_rr, [r for r in _rr if r["dof"] > 3e5])])
+                for f in ("asm", "keep", "fac", "leaf", "t_solve", "once")))
+print("factorization: <= %.2f%% of setup, <= %.2f s" % (max(100 * r["fac"] / r["once"] for r in _rr), max(r["fac"] for r in _rr)))
 print("%s leaves, step [s] for N = %s (dense | HBS rank p) and run time HBS / dense:" % (leaves(NPY5).replace("$\\times$", "x"), "/".join(map(str, NS))))
 for p in PS:
     a_ = [one(sweep="solver", npy=NPY5, p=p, N=N, kind="rb") for N in NS]
