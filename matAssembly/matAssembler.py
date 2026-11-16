@@ -91,10 +91,15 @@ class matAssemblerOptions:
     tree:   if specified, use this cluster tree set-up
     ndim:   dimension of the interfaces (2 if problem is 3D, 1 if problem is 1D)
     reduced: (deprecated, default false)
+    halt:   rkHBS only.  Stop the HBS compression this many levels below the
+            root and keep one dense root block over the remaining skeletons
+            (HBStorch_new.HBSMAT.construct(..., halt=)).  0 (default) is the
+            full tree.  The sample count grows to cover the root, whose size
+            is fac**(halt+1) * maxRank for a complete tree.
 
 
     """
-    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,quad = False,reduced=False):
+    def __init__(self,method:str='dense',tol:np.double=1e-5,leaf_size:int=8,maxRank:int=8,tree=None,ndim=3,quad = False,reduced=False,halt:int=0):
         #todo: add checks of str!='dense'
         self.method     = method
         self.tol        = tol
@@ -104,6 +109,9 @@ class matAssemblerOptions:
         self.ndim       = ndim
         self.reduced    = reduced
         self.quad       = quad
+        if int(halt) != halt or halt < 0:
+            raise ValueError(f"halt must be a non-negative integer, got {halt!r}")
+        self.halt       = int(halt)   # upper bound checked once the tree exists
 class matAssemblerStats:
     """
     Stats of matrix constuction (only for dbg putposes)
@@ -155,7 +163,14 @@ class matAssembler:
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)
-            s = max(2*self.matOpts.maxRank,self.matOpts.leaf_size)+self.matOpts.maxRank + 50
+            rk, halt = self.matOpts.maxRank, self.matOpts.halt
+            s = max(2*rk,self.matOpts.leaf_size)+rk + 200
+            if halt:
+                # the dense root is fitted as D = Y Om^+ from the same s
+                # columns, so s must exceed its size (plus oversampling)
+                n_root = HBStorch._level_shapes(HBSmat.Nb, HBSmat.nl, HBSmat.L,
+                                                rk, HBSmat.fac, halt)[1][1]
+                s = max(s, n_root + 50)
             tic = time.time()
             Om = _standard_normal((linOp.shape[0],s))
             Psi = _standard_normal((linOp.shape[1],s))
@@ -165,13 +180,16 @@ class matAssembler:
             tic = time.time()
             p = HBSmat.perm.numpy()
             Om, Psi, Y, Z = (X[p] for X in (Om, Psi, Y, Z))
-            HBSmat.construct(self.matOpts.maxRank,Om,Psi,Y,Z,fast=False)
+            HBSmat.construct(rk,Om,Psi,Y,Z,fast=False,halt=halt)
             self.stats.timeCompress=HBSmat.tCompress
             self.stats.nbytes = HBSmat.nbytes
             print("compression time = ",time.time()-tic)
             if dbg>0:
                 print("\t Toc solve %d random pdes %.2e s" %(s, self.stats.timeSample))
                 print("\t Toc HBS construction %.2e s"%self.stats.timeCompress)
+                if halt:
+                    print("\t HBS halted %d level(s) early, dense root %d"
+                          % (halt, HBSmat.Dmats[-1].shape[1]))
                 mem = self.stats.nbytes/1e6
                 print("\t HBS mem = %5.2f MB"%mem)
             
@@ -263,8 +281,8 @@ class denseMatAssembler(matAssembler):
         super(denseMatAssembler,self).__init__(matAssemblerOptions())
 
 class rkHMatAssembler(matAssembler):
-    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
-        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad))
+    def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False,halt=0):
+        super(rkHMatAssembler,self).__init__(matAssemblerOptions('rkHBS',0,leaf_size,rk,tree,ndim,quad,halt=halt))
 class rkHMatAssembler_strong(matAssembler):
     def __init__(self,leaf_size,rk,tree=None,ndim=3,quad=False):
         super(rkHMatAssembler_strong,self).__init__(matAssemblerOptions('rkHBS_strong',0,leaf_size,rk,tree,ndim,quad))

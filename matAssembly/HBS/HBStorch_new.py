@@ -190,17 +190,28 @@ def _new_master(layout, dtype):
     return rec, _views(buf.t, layout)
 
 
-def _level_shapes(Nb, nl, L, rk, fac):
-    """([(Nb_i, n_i, k_i) for i = 0..L-2], (Nb_r, n_r)): index 0 is the leaf,
-    the pair is the root.  k_i = min(rk, nl*fac**i, n_i) and the next level
-    has n_{i+1} = fac * k_i rows per block."""
+def _level_shapes(Nb, nl, L, rk, fac, halt=0):
+    """([(Nb_i, n_i, k_i) for i = 0..L-2-halt], (Nb_r, n_r)): index 0 is the
+    leaf, the pair is the root.  k_i = min(rk, nl*fac**i, n_i) and the next
+    level has n_{i+1} = fac * k_i rows per block.
+
+    halt: compress only the first L-1-halt levels.  What is left above them
+    becomes ONE dense root block over the skeletons of all remaining blocks,
+    n_r = (number of blocks left) * (their size), i.e. fac**(halt+1) * k for a
+    complete tree.  Keeping those blocks as separate root blocks instead would
+    drop their mutual couplings.  halt = 0 is the full tree (Nb_r = 1 there,
+    so the root is unchanged)."""
+    halt = int(halt)
+    if not 0 <= halt <= L - 1:
+        raise ValueError(f"halt={halt} must be in 0..{L - 1} for a tree with "
+                         f"{L} levels")
     levels, n = [], nl
-    for i in range(L - 1):
+    for i in range(L - 1 - halt):
         k = min(rk, nl * fac ** i, n)
         levels.append((Nb, n, k))
         Nb //= fac
         n = fac * k
-    return levels, (Nb, n)
+    return levels, (1, Nb * n)
 
 
 def _core_layout(levels, root):
@@ -894,6 +905,7 @@ class HBSMAT:
         self.Nbvec = []
         self.quad  = quad
         self.fac   = 4 if quad else 2
+        self.halt  = 0
 
     def set_Nbvec(self, Nbvec):
         self.Nbvec = Nbvec
@@ -962,11 +974,14 @@ class HBSMAT:
 
 
     def construct(self, rk, Om=None, Psi=None, Y=None, Z=None,
-                  compute_ULV=False, fast=False):
+                  compute_ULV=False, fast=False, halt=0):
         """Compress from samples, or draw them from self.A.
 
         Given samples must already be in tree order (row r is original row
-        perm[r]).  Samples drawn here are permuted into that order."""
+        perm[r]).  Samples drawn here are permuted into that order.
+        halt: stop the compression that many levels below the root (see
+        _level_shapes); the root then needs s > its size, fac**(halt+1) * k
+        for a complete tree."""
         if Om is None:
             if self.A is None:
                 raise ValueError("Samples and LinOP cannot both be None")
@@ -975,6 +990,10 @@ class HBSMAT:
             n_max = max(self.nl, 2*rk)
             p = 10
             s = max(n_max + rk + p , (int)(np.ceil(1.5 * n_max)) )
+            if halt:                        # the dense root is fitted from s
+                n_r = _level_shapes(self.Nb, self.nl, self.L, rk, self.fac,
+                                    halt)[1][1]
+                s = max(s, n_r + p)
             Om  = np.random.standard_normal(size=(self.A.shape[1], s))
             Psi = np.random.standard_normal(size=(self.A.shape[0], s))
             Y   = self.A @ Om
@@ -982,7 +1001,8 @@ class HBSMAT:
             if self.perm is not None:
                 pr = self.perm.numpy()
                 Om, Psi, Y, Z = (np.asarray(X)[pr] for X in (Om, Psi, Y, Z))
-        self.constructHBS(rk, Om, Psi, Y, Z, fast=fast, with_ulv=compute_ULV)
+        self.constructHBS(rk, Om, Psi, Y, Z, fast=fast, with_ulv=compute_ULV,
+                          halt=halt)
 
     def _chunk_blocks(self, Nb, n, s, k=None, depth=1, ulv=False):
         """(blocks per chunk, device bytes of that chunk's working set).
@@ -1027,7 +1047,8 @@ class HBSMAT:
         used = torch.cuda.memory_allocated(dev)
         return used + nbytes + ws > device_budget(dev)
 
-    def constructHBS(self, rk, Om0, Psi0, Y0, Z0, fast=False, with_ulv=False):
+    def constructHBS(self, rk, Om0, Psi0, Y0, Z0, fast=False, with_ulv=False,
+                     halt=0):
         """Compress from samples Y = A Om, Z = A^T Psi.
 
         Samples: numpy arrays or tensors on any device, (m, s) or
@@ -1050,8 +1071,12 @@ class HBSMAT:
         and fac consecutive blocks of the primed samples form one block of
         the next level.  At the root, D = Y Om^+ (unpivoted QR).
 
-        Requires s >= n + k at every level and s >= n at the root; Om blocks
+        Requires s >= n + k at every level and s > n at the root; Om blocks
         are assumed to have full row rank (unpivoted QR).
+
+        halt: compress only the first L-1-halt levels and fit everything
+        above them as one dense root block (see _level_shapes).  apply and
+        solve need no change: they take the root shape from Dmats[-1].
 
         with_ulv: also compute the ULV factorization (Qlist, Wlist, Rlist,
         Uulist, NNvec; see _ulv_chunk), in the same chunks, while each chunk's
@@ -1069,7 +1094,8 @@ class HBSMAT:
         s = leaf[0].shape[1]
         if any(X.shape[1] != s for X in leaf):
             raise ValueError("Om, Psi, Y, Z must have the same number of columns")
-        levels, root = _level_shapes(self.Nb, nl, L, rk, fac)
+        levels, root = _level_shapes(self.Nb, nl, L, rk, fac, halt)
+        self.halt = int(halt)
         for (Nb_i, n, k) in levels:
             if s < n + k:
                 raise ValueError(f"undersampled: s={s} < n+k={n + k} at a "
@@ -1077,6 +1103,13 @@ class HBSMAT:
         Nb_r, n_r = root
         if s < n_r:
             raise ValueError(f"undersampled: s={s} < n={n_r} at the root")
+        if s < n_r + 10:
+            # D = Y Om^+ with a (nearly) square Gaussian Om is interpolation,
+            # not a least-squares fit: conditioning ~ n, no averaging
+            import warnings
+            warnings.warn(f"root fit with s={s} samples for n={n_r} rows: "
+                          "little or no oversampling at the root",
+                          UserWarning, stacklevel=2)
         self.Nbvec    = [lv[0] for lv in levels] + [Nb_r]
         self.nSamples = s
         NN = [0]
@@ -1109,7 +1142,7 @@ class HBSMAT:
         item = torch.finfo(dt).bits // 8
         nD2H = h2d = 0
         spilled = []        # host_pool buffers of spilled samples
-        src = _LeafSrc(leaf, nl, dt, dev, pipe.cuda)
+        src = _LeafSrc(leaf, nl if levels else n_r, dt, dev, pipe.cuda)
         leaf_src = src
         del leaf
 
@@ -1199,8 +1232,11 @@ class HBSMAT:
                 src.Xs = None     # drop the leaf samples (the caller's, if boxed)
             # fac consecutive blocks of this level form one block of the next:
             # (nside, Nb_i, k, s) is (nside, Nb_i/fac, fac*k, s) in place.
-            src = _LevelSrc(nxt[0].view(nside, Nb_i // fac, fac * k, s),
-                            nxt[1].view(nside, Nb_i // fac, fac * k, s),
+            # After the last compressed level the next shape is the root's,
+            # which with halt > 0 merges all Nb_i blocks: (nside, 1, Nb_i*k, s).
+            Nb_nx, n_nx = (levels[i + 1][:2] if i + 1 < len(levels) else root)
+            src = _LevelSrc(nxt[0].view(nside, Nb_nx, n_nx, s),
+                            nxt[1].view(nside, Nb_nx, n_nx, s),
                             spill, dev)
             del nxt, sel
 
@@ -1226,7 +1262,10 @@ class HBSMAT:
                 F = ()
                 if with_ulv:
                     t0 = pipe.tic('comp')
-                    ch = slice(fac * a, fac * b)
+                    # children per root block: fac for the full tree,
+                    # fac**(halt+1) when stopped early
+                    nch = fac if Uhat is None else Uhat.shape[0] // Nb_r
+                    ch = slice(nch * a, nch * b)
                     F = _ulv_root(D, None if Uhat is None else Uhat[ch],
                                   None if R22 is None else R22[ch])
                     pipe.toc('tULV', 'comp', t0)

@@ -21,6 +21,12 @@ from packaging.version import Version
 from scipy.sparse.linalg import LinearOperator, gmres
 
 
+# ---------------------------------------------------------------------------
+# Local discretization: 'hps' (hpsalt) or 'soms'
+# ---------------------------------------------------------------------------
+SOLVER = 'hps'
+
+
 def dense_to_linop(A):
     A = np.array(A)
     n = A.shape[0]
@@ -48,8 +54,9 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-kh = 40.3*np.pi
+kh = (30.+1e-6)*np.pi
 
+# hps form (hpsalt PDO_3d, torch points)
 def c11(p):
     return torch.ones_like(p[:,0])
 def c22(p):
@@ -60,6 +67,12 @@ def c(p):
     return -kh*kh*torch.ones_like(p[:,0])
 Helm=pdoalt.PDO_3d(c11=c11,c22=c22,c33=c33,c=c)
 
+# SOMS form of the same operator, -(Delta + kh^2) u = 0.  SOMS writes
+#     L u = sum_ij c_ij d_i d_j u + sum_i c_i d_i u + c u
+# so the second-order coefficients carry the minus sign explicitly.
+# Constant scalars -> SOMS's constant-coefficient path (3 local S matrices).
+Helm_soms = {'c11': -1., 'c22': -1., 'c33': -1., 'c': -kh*kh}
+
 def bc(p):
     c0 = -1
     c1 = -1
@@ -68,25 +81,51 @@ def bc(p):
     return np.cos(kh*r)/(4*np.pi*r)
 
 
-N = 33
+N = 17
 dSlabs,connectivity,H = cube.dSlabs(N)
-p = 10
-p_disc = p + 2 # To handle different conventions between hps and hpsalt
-a = np.array([H/2,1/64,1/64])
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
-rk0 = 300
+p = 12
+a = np.array([H/2,1/32,1/32])     # hps leaf half-widths
+
+if SOLVER == 'hps':
+    p_disc = p + 2 # To handle different conventions between hps and hpsalt
+    opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True,use_ctxT=False,mumps_stats=True)
+    pdo = Helm
+    gb = lambda p :cube.gb(p,jax_avail=False,torch_avail=True)
+elif SOLVER == 'soms':
+    # One SOMS box per hps leaf (box size 2a): 2 x 32 x 32 boxes per double
+    # slab.  p Legendre points per face direction gives p*p dofs per face,
+    # the same interface size as hpsalt with p_disc = p + 2.
+    soms_tiling = (2, 32, 32)
+    slab_ext = np.ptp(np.asarray(dSlabs[0], dtype=np.float64), axis=0)
+    if not np.allclose(slab_ext, 2*a*np.array(soms_tiling)):
+        raise ValueError("soms_tiling %s does not match a = %s on a slab of "
+                         "extent %s; update soms_tiling"
+                         % (soms_tiling, a, slab_ext))
+    opts = solverWrap.solverOptions('soms',[p,p,p],tiling=soms_tiling)
+    pdo = Helm_soms
+    # SOMS dof coordinates are numpy arrays; go through the same torch path
+    # of cube.gb as hps
+    gb = lambda p :cube.gb(torch.as_tensor(p),jax_avail=False,torch_avail=True)
+else:
+    raise ValueError("SOLVER must be 'hps' or 'soms', got %r" % (SOLVER,))
+print("local solver = ", SOLVER)
+
+rk0 = 100
 leaf_size = 8*p*p
 assembler = mA.rkHMatAssembler(leaf_size,rk0,ndim=3)
-opts = solverWrap.solverOptions('hpsalt',[p_disc,p_disc,p_disc],a,reduced_gpu=True)
 tic_sys = time.time()
 compare_input_hbs = True  # Optional old input-compression accuracy comparison.
-OMS = oms.oms(dSlabs,Helm,lambda p :cube.gb(p,jax_avail=False,torch_avail=True),opts,connectivity,stiff_mat_const=True,constructHBS=compare_input_hbs,keepLU=True,keepDense=False)
+OMS = oms.oms(dSlabs,pdo,gb,opts,connectivity,stiff_mat_const=True,constructHBS=compare_input_hbs,keepLU=True,keepDense=False)
+print(solverWrap.mumps)                     # None -> fallback path
 print("oms built")
 Stot_lu,  rhstot_lu  = OMS.construct_Stot_and_rhstot(bc, assembler,dbg = 0)               # LU operator + LU rhs
+print(OMS.localSolver.ctx)
 print("sys mats done in ",time.time()-tic_sys,"s")
+print("MUMPS COUNT = ",solverWrap.mumps_factorization_count())
 Stot_HBS = OMS.global_operator('hbs') if compare_input_hbs else None
 Ntot, nc = OMS.Ntot,OMS.nc
-step = 50
+print("Ntot = ", Ntot, ", nc = ", nc)
+step = 100
 strat = rkStrat_new.linear(rk0+step,step,skip_first_level=False)
 
 # All three preconditioners sample the same original OMS operators.
@@ -138,7 +177,7 @@ for label, make_solver in variants.items():
     Sinv_ops[label] = make_inv_op(rb)
 
 gInfo = gmres_info()
-stol = 1e-9
+stol = 1e-10
 
 # ---------------------------------------------------------------------------
 # Apply timings (each solver warmed up before its timed apply)
@@ -191,16 +230,26 @@ u_exact = OMS.interface_values(bc)
 u_exact_norm = np.linalg.norm(u_exact)
 
 # GMRES iteration count with each solver as preconditioner
+compare_unprec = False
+if compare_unprec:
+    tol_kw = {"rtol": 1e-7} if Version(scipy.__version__) >= Version("1.12") else {"tol": 1e-7}
+    info_cb = gmres_info(disp=True)
+    tic = benchmark_clock()
+    x, info = gmres(Stot_lu, rhstot_lu, restart=2500,maxiter=1,
+                    callback=info_cb, callback_type = 'pr_norm',**tol_kw)
+    gmres_time = benchmark_clock()-tic
+    interface_error = np.linalg.norm(x - u_exact,ord=np.inf)
+    print("unprec gmres time = ",gmres_time)
+    print("unprec gmres err = ",interface_error)
 tol_kw = {"rtol": 1e-9} if Version(scipy.__version__) >= Version("1.12") else {"tol": 1e-9}
 for label, Sinv in Sinv_ops.items():
-    info_cb = gmres_info()
+    info_cb = gmres_info(disp=True)
     tic = benchmark_clock()
     x, info = gmres(Stot_lu, rhstot_lu, M=Sinv, restart=100,maxiter=1,
                     callback=info_cb,callback_type='pr_norm', **tol_kw)
     gmres_time = benchmark_clock()-tic
-    interface_error = np.linalg.norm(x - u_exact)
-    relative_error = (interface_error / u_exact_norm if u_exact_norm else
-                      (0.0 if interface_error == 0.0 else float("inf")))
+    interface_error = np.linalg.norm(x - u_exact,np.inf)
+    relative_error = interface_error
     accuracy[label]["gmres iterations"] = info_cb.niter
     accuracy[label]["gmres time [s]"] = gmres_time
     accuracy[label]["gmres info"] = info
@@ -220,6 +269,7 @@ rows = [("input preparation [s]", setup_times),
 rows += [(name, {l: accuracy[l][name] for l in labels}) for name in accuracy[labels[0]]]
 name_w = max(len(name) for name, _ in rows)
 print()
+print(f"local solver: {SOLVER}")
 print(f"{'':<{name_w}}" + "".join(f"{l:>16}" for l in labels))
 for name, vals in rows:
     print(f"{name:<{name_w}}" + "".join(f"{vals[l]:>16.3e}" for l in labels))

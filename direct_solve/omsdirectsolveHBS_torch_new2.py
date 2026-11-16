@@ -877,9 +877,17 @@ class _BlockRedBlackSolverHBS(DirectSolver):
                  device='cpu', compute_device=None, work_device='cpu',
                  oversample=None, dbg=0, layout='auto', normalized=False,
                  store_inverse=False, constant_blocks=False,
-                 sample_cache_bytes=None):
+                 sample_cache_bytes=None,dtype = torch.float64, hbs_halt=0):
         super().__init__(m, cyclic)
         self.m, self.cyclic = m, cyclic
+        # Stop every HBS built here hbs_halt levels below the root and keep a
+        # dense root over the remaining fac**(hbs_halt+1) skeletons
+        # (HBSMAT.construct(..., halt=)).  Raises the sample count to that
+        # root size plus oversampling; see _nsamples.
+        self.hbs_halt = int(hbs_halt)
+        if not 0 <= self.hbs_halt <= tree.nlevels - 1:
+            raise ValueError(f"hbs_halt={hbs_halt} must be in "
+                             f"0..{tree.nlevels - 1}")
         self.sample_cache_bytes = sample_cache_bytes
         self.sampling_stats = []
         self.normalized = bool(normalized)
@@ -906,7 +914,7 @@ class _BlockRedBlackSolverHBS(DirectSolver):
         self.work_device = torch.device(work_device)
         self.oversample = oversample
         self.dbg = dbg
-        self.dtype = torch.float64
+        self.dtype = dtype
         pl = tree.perm_leaf
         self.perm = (pl.detach().to('cpu', torch.int64) if torch.is_tensor(pl)
                      else torch.as_tensor(np.asarray(pl), dtype=torch.int64))
@@ -936,11 +944,22 @@ class _BlockRedBlackSolverHBS(DirectSolver):
         return int(round(float(p) * rk))
 
     def _nsamples(self, rk):
-        """s = max(fac*rk, nl) + rk + p: the hard floor (null space of Om
-        large enough for rank rk at the worst level) plus oversampling."""
-        print("oversampling = ",self.oversampling(rk))
-        print("nsamples = ",max(2*rk,self.nl) + rk + 100 )
-        return max(2*rk, self.nl) + rk + 100
+        """s = max(max(fac*rk, nl) + rk, n_root) + 100: the hard floor (null
+        space of Om large enough for rank rk at the worst level; with
+        hbs_halt > 0 also the dense root, n_root = fac**(halt+1) * k for a
+        complete tree) plus oversampling.  hbs_halt = 0 gives the previous count (for a binary
+        tree; with quad=True the level floor now uses fac*rk = 4*rk)."""
+        floor = max(self.fac * rk, self.nl) + rk
+        if self.hbs_halt:
+            n_root = HBSnew._level_shapes(self.tree.nleaves, self.nl,
+                                          self.tree.nlevels, rk, self.fac,
+                                          self.hbs_halt)[1][1]
+            floor = max(floor, n_root)
+        s = floor + 100
+        if self.dbg:
+            print("oversampling = ", self.oversampling(rk))
+            print("nsamples = ", s)
+        return s
 
     # -- the only two operations on blocks ------------------------------------
 
@@ -971,7 +990,7 @@ class _BlockRedBlackSolverHBS(DirectSolver):
     def _compress(self, rk, Om, Psi, Y, Z, ulv):
         h = HBSnew.HBSMAT(device=self.compute_device, tree=self.tree,
                           quad=self.quad)
-        h.construct(rk, Om, Psi, Y, Z, compute_ULV=ulv)
+        h.construct(rk, Om, Psi, Y, Z, compute_ULV=ulv, halt=self.hbs_halt)
         return h
 
     # -- layout ----------------------------------------------------------------

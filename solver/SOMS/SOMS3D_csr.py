@@ -35,17 +35,37 @@ def _cheb_1d(p, scl):
     return D, pts
 
 
+def joined_modes(p):
+    """
+    Number m of Legendre modes fitted along the long (merged) direction of a
+    domino, from the 2p Gauss-Legendre values of its two face panels:
+
+        m = floor(sqrt(2) * p), minus 1 if even   (so m is odd)
+
+    sqrt(2)*p is the stability limit of that fit: each panel's Gauss nodes
+    cluster towards the panel's own ends, so near the domino's outer ends the
+    stacked nodes have only 1/sqrt(2) of the density a single polynomial on
+    the whole edge needs.  Up to m ~ sqrt(2) p the (weighted) least-squares
+    fit is O(1)-conditioned; beyond it the amplification grows like
+    (3 + 2 sqrt(2))^p.  m odd <=> the domino grid has a node on the centerline
+    (see _joined_cheb_1d).
+    """
+    m = int(np.floor(np.sqrt(2.0) * p))
+    if m % 2 == 0:
+        m -= 1
+    return max(m, 1)
+
+
 def _joined_cheb_1d(p, scl):
     """
-    Joined-direction Cheb-with-endpoints grid spanning [0, 2*scl].
-
-    The number of joined points is odd (so the centerline scl is a node).
-    Returns (D, pts, pj) where pj = number of points (odd, ~3p/2).
+    Long-direction Cheb-with-endpoints grid of a domino, spanning [0, 2*scl]:
+    m = joined_modes(p) interior nodes plus the two endpoints, i.e.
+    Chebyshev order m + 1 (even) and pj = m + 2 points (odd), so the
+    centerline scl is a node.  The grid holds polynomials of degree m + 1, so
+    the m-mode fit of _legstack_to_chebjoinedfull_1d is represented exactly.
+    Returns (D, pts, pj).
     """
-    # Want pj = 3p/2 made odd. Equivalently pj-1 = 3p/2 - 1 made even,
-    # so use the existing formula pj-1 = (3p//2) made even, pj = that+1.
-    pjm1 = 2*p#(3 * p) // 2
-    pjm1 -= pjm1 % 2                # ensure pjm1 is even -> pj is odd
+    pjm1 = joined_modes(p) + 1      # even Chebyshev order -> centre node
     pj = pjm1 + 1
     D, pts = _cheb_diff(pjm1)
     pts = (1 + pts[::-1]) * scl     # maps to [0, 2*scl]
@@ -103,20 +123,36 @@ def _chebfull_to_leg_1d(p, scl):
     return _svd_interp(V_src, V_tgt)
 
 
+def _orthonormal_legvander(t, m):
+    """Legendre Vandermonde on [-1, 1], degrees 0..m-1, orthonormal in L2."""
+    return np.polynomial.legendre.legvander(t, m - 1) * \
+        np.sqrt((2 * np.arange(m) + 1) / 2.0)
+
+
 def _legstack_to_chebjoinedfull_1d(p, scl):
     """
-    Map stacked Legendre (length 2p, on (0, 2*scl)) -> joined Cheb-with-endpoints
-    (length pj, on [0, 2*scl]). Shape: (pj, 2p). Exact for polynomials of degree 2p-1.
+    Map stacked Legendre (length 2p: the Gauss nodes of the two face panels
+    (0, scl) and (scl, 2*scl)) -> joined Cheb-with-endpoints (length pj, on
+    [0, 2*scl]).  Shape: (pj, 2p); columns in panel order [panel 0, panel 1].
+
+    Weighted least-squares fit with m = joined_modes(p) Legendre modes (a
+    discrete L2 projection over the whole edge, Gauss weights of both panels),
+    evaluated on the joined grid.  Exact for polynomials of degree m - 1.
+    With orthonormal Legendre modes the weighted Gram matrix is the identity
+    for m <= p and stays close to it up to m ~ sqrt(2) p, so the fit is
+    O(1)-conditioned.  (Exact interpolation through all 2p nodes, i.e.
+    m = 2p, amplifies by ~(3 + 2 sqrt(2))^p.)
     """
-    leg = _legendre_1d(p, scl)[0]
+    leg, w = _legendre_1d(p, scl)
     leg2 = np.concatenate([leg, scl + leg])                # length 2p
+    sw = np.sqrt(np.concatenate([w, w]))
     _, cj_full, pj = _joined_cheb_1d(p, scl)               # length pj
-    nbasis = 2 * p
-    leg2_ref = leg2 / scl - 1                              # in [-1, 1] on [0, 2*scl]
-    cj_ref = cj_full / scl - 1
-    V_src = chebpoly.chebvander(leg2_ref, nbasis - 1)
-    V_tgt = chebpoly.chebvander(cj_ref, nbasis - 1)
-    return _svd_interp(V_src, V_tgt)
+    m = joined_modes(p)
+    A = sw[:, None] * _orthonormal_legvander(leg2 / scl - 1, m)    # (2p, m)
+    V_tgt = _orthonormal_legvander(cj_full / scl - 1, m)           # (pj, m)
+    # pinv(A) via QR (A has full column rank, cond ~ 1)
+    Q, R = np.linalg.qr(A)
+    return (V_tgt @ np.linalg.solve(R, Q.T)) * sw[None, :]
 
 
 def interp_ops(px, py, pz, scl_x, scl_y, scl_z):
@@ -1194,8 +1230,7 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                           scl_x=None, scl_y=None, scl_z=None,
                           geom=None, diffops=None, ops_pkg=None,
                           Ii=None, Ib=None,
-                          Lii_lu_x=None, Lii_lu_y=None, Lii_lu_z=None,
-                          weighted=False):
+                          Lii_lu_x=None, Lii_lu_y=None, Lii_lu_z=None):
     """
     Build Sii and Sib directly in CSR format, and the global forcing vector
     ftild.  Avoids forming the full n_dofs x n_dofs Stot matrix.
@@ -1316,61 +1351,17 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
     sib_indices = np.empty(sib_nnz_max, dtype=np.int32)
     sib_indptr  = np.zeros(n_ii + 1, dtype=np.int32)
 
-    # ------------------------------------------------------------------
-    # GL weight vectors (for weighted=True)
-    # ------------------------------------------------------------------
-    # Each face direction d has a 2D weight vector w[d] = kron(w_a, w_b)
-    # where a/b are the two parametric axes and ordering matches DOF layout.
-    # For the similarity transform: row k of S_local is scaled by sqrt_w_tgt[k],
-    # and source column block j is scaled by inv_sqrt_w_src[j per its md].
-    # The source block md sequence (10 blocks per face) is fixed by the
-    # assembly loop geometry and stored in _src_md_seq below.
-    if weighted:
-        _, wx = _legendre_1d(px, scl_x)
-        _, wy = _legendre_1d(py, scl_y)
-        _, wz = _legendre_1d(pz, scl_z)
-        # 2D weight per face direction: DOF layout is (a outer, b inner) -> kron(w_a, w_b)
-        # md=0 (yz): a=y outer, b=z inner
-        # md=1 (xz): a=x outer, b=z inner
-        # md=2 (xy): a=x outer, b=y inner
-        w_face = {0: np.kron(wy, wz),
-                  1: np.kron(wx, wz),
-                  2: np.kron(wx, wy)}
-        sqrt_w  = {md: np.sqrt(w) for md, w in w_face.items()}
-        isqrt_w = {md: 1.0 / np.sqrt(w) for md, w in w_face.items()}
-        # Source block md sequence for each target md (10 blocks of nface DOFs each)
-        _src_md_seq = {
-            0: [0, 1, 1, 2, 2, 2, 2, 1, 1, 0],
-            1: [0, 0, 1, 2, 2, 2, 2, 1, 0, 0],
-            2: [0, 0, 1, 1, 2, 2, 1, 1, 0, 0],
-        }
-        # Source block sizes for each target md (nyz, nxz, nxy per block)
-        _src_sz_seq = {
-            0: [nyz, nxz, nxz, nxy, nxy, nxy, nxy, nxz, nxz, nyz],
-            1: [nyz, nyz, nxz, nxy, nxy, nxy, nxy, nxz, nyz, nyz],
-            2: [nyz, nyz, nxz, nxz, nxy, nxy, nxz, nxz, nyz, nyz],
-        }
-        # Precompute column scaling vectors (concatenated over 10 source blocks)
-        # for each target md: isqrt_w_src_cols[md] has length = total source DOFs
-        _isqrt_src = {}
-        for md in (0, 1, 2):
-            parts = [isqrt_w[smd] for smd in _src_md_seq[md]]
-            _isqrt_src[md] = np.concatenate(parts)
-
     sii_nnz = 0
     sib_nnz = 0
 
     ftild = np.zeros(n_dofs)
     ctr = 0
 
-    def _write_interior_face(target, source, S_local, sqrt_w_tgt=None, isqrt_w_src=None):
+    def _write_interior_face(target, source, S_local):
         """
         For each row in `target` (all in Ii), scatter the off-diagonal entries
         in `source` into Sii (sources in Ii) or Sib (sources in Ib), and write
         the +1 diagonal into Sii.  All per-row column lists are kept sorted.
-
-        If sqrt_w_tgt and isqrt_w_src are provided (weighted=True), applies the
-        similarity transform W_tgt^{1/2} S W_src^{-1/2} before writing.
         """
         nonlocal sii_nnz, sib_nnz
         nT = len(target)
@@ -1397,18 +1388,9 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
         orig_ii = np.where(in_ii)[0][perm_ii]   # column positions in S_local -> Sii
         orig_ib = np.where(in_ib)[0][perm_ib]   # column positions in S_local -> Sib
 
-        # Apply column scaling W_src^{-1/2} once per face (row-independent).
-        if isqrt_w_src is not None:
-            S_col_scaled = S_local * isqrt_w_src[np.newaxis, :]
-        else:
-            S_col_scaled = S_local
-
         for k in range(nT):
             r_global = int(target[k])
             r_ii     = int(global_to_ii[r_global])   # local Sii row
-
-            # Row scale factor W_tgt^{1/2}
-            row_scale = sqrt_w_tgt[k] if sqrt_w_tgt is not None else 1.0
 
             # --- Sii row: off-diagonal (Ii sources) + diagonal ---
             diag_col = r_ii
@@ -1417,7 +1399,7 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
 
             # left of diag
             sii_indices[sii_nnz : sii_nnz + ins] = src_ii_cols_sorted[:ins]
-            sii_data   [sii_nnz : sii_nnz + ins] = -row_scale * S_col_scaled[k, orig_ii[:ins]]
+            sii_data   [sii_nnz : sii_nnz + ins] = -S_local[k, orig_ii[:ins]]
             sii_nnz += ins
             # diagonal
             sii_indices[sii_nnz] = diag_col
@@ -1425,7 +1407,7 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
             sii_nnz += 1
             # right of diag
             sii_indices[sii_nnz : sii_nnz + n_ii_src - ins] = src_ii_cols_sorted[ins:]
-            sii_data   [sii_nnz : sii_nnz + n_ii_src - ins] = -row_scale * S_col_scaled[k, orig_ii[ins:]]
+            sii_data   [sii_nnz : sii_nnz + n_ii_src - ins] = -S_local[k, orig_ii[ins:]]
             sii_nnz += n_ii_src - ins
 
             sii_indptr[r_ii + 1] = sii_nnz
@@ -1433,7 +1415,7 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
             # --- Sib row: Ib sources only (already sorted) ---
             n_ib_src = len(src_ib_cols_sorted)
             sib_indices[sib_nnz : sib_nnz + n_ib_src] = src_ib_cols_sorted
-            sib_data   [sib_nnz : sib_nnz + n_ib_src] = -row_scale * S_col_scaled[k, orig_ib]
+            sib_data   [sib_nnz : sib_nnz + n_ib_src] = -S_local[k, orig_ib]
             sib_nnz += n_ib_src
             sib_indptr[r_ii + 1] = sib_nnz
 
@@ -1487,14 +1469,9 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             2, geom[2], diffops[2], ops_pkg[2],
                             coeffs, origin, forcing,
                         )
-                    _write_interior_face(target, source, S_local,
-                        sqrt_w_tgt=sqrt_w[2] if weighted else None,
-                        isqrt_w_src=_isqrt_src[2] if weighted else None)
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
-                        if weighted:
-                            ftild[target] += sqrt_w[2] * b_local
-                        else:
-                            ftild[target] += b_local
+                        ftild[target] += b_local
                 else:
                     _write_boundary_face(target)
             case 1:
@@ -1539,14 +1516,9 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             1, geom[1], diffops[1], ops_pkg[1],
                             coeffs, origin, forcing,
                         )
-                    _write_interior_face(target, source, S_local,
-                        sqrt_w_tgt=sqrt_w[1] if weighted else None,
-                        isqrt_w_src=_isqrt_src[1] if weighted else None)
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
-                        if weighted:
-                            ftild[target] += sqrt_w[1] * b_local
-                        else:
-                            ftild[target] += b_local
+                        ftild[target] += b_local
                 else:
                     _write_boundary_face(target)
             case 0:
@@ -1596,14 +1568,9 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
                             0, geom[0], diffops[0], ops_pkg[0],
                             coeffs, origin, forcing,
                         )
-                    _write_interior_face(target, source, S_local,
-                        sqrt_w_tgt=sqrt_w[0] if weighted else None,
-                        isqrt_w_src=_isqrt_src[0] if weighted else None)
+                    _write_interior_face(target, source, S_local)
                     if b_local is not None:
-                        if weighted:
-                            ftild[target] += sqrt_w[0] * b_local
-                        else:
-                            ftild[target] += b_local
+                        ftild[target] += b_local
                 else:
                     _write_boundary_face(target)
 
@@ -1620,7 +1587,7 @@ def construct_SOMS_sparse(nxy, nyz, nxz, md_vec, b_vec, n_dofs, tiling,
 
 def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
                        coeffs=None, ct_pde=True, forcing=None,
-                       weighted=False, dbg=0, check_ordering=False):
+                       dbg=0, check_ordering=False):
     """
     Build the SOMS3D system Sii, Sib (and forcing trace ftild) for a general
     2nd-order elliptic PDE on the cuboid [0, Lx] x [0, Ly] x [0, Lz] tiled
@@ -1721,28 +1688,8 @@ def SOMS_solver_sparse(px, py, pz, nbx, nby, nbz, Lx=1., Ly=1., Lz=1.,
         geom=geom, diffops=diffops, ops_pkg=ops_pkg,
         Ii=Ii, Ib=Ib,
         Lii_lu_x=Lii_lu_x, Lii_lu_y=Lii_lu_y, Lii_lu_z=Lii_lu_z,
-        weighted=weighted,
     )
-    if weighted:
-        _, wx = _legendre_1d(px, scl_x)
-        _, wy = _legendre_1d(py, scl_y)
-        _, wz = _legendre_1d(pz, scl_z)
-        w_face = {0: np.kron(wy, wz),
-                  1: np.kron(wx, wz),
-                  2: np.kron(wx, wy)}
-        w_all = np.empty(n_dofs)
-        off = 0
-        for f in range(len(md_vec)):
-            md = int(md_vec[f])
-            sz = nyz if md == 0 else (nxz if md == 1 else nxy)
-            w_all[off:off + sz] = w_face[md]
-            off += sz
-        w_ii = np.sqrt(w_all[Ii])
-        w_ib = np.sqrt(w_all[Ib])
-    else:
-        w_ii = np.ones((Sii.shape[0]))
-        w_ib = np.ones((Sib.shape[1]))
-    return Sii, Sib, ftild, XYtot, Ii, Ib, w_ii, w_ib
+    return Sii, Sib, ftild, XYtot, Ii, Ib
 
 
 def setup_mumps(Sii):
@@ -1964,9 +1911,9 @@ def SOMS_neumann_solver(px, py, pz, nbx, nby, nbz, gN, Lx=1., Ly=1., Lz=1.,
     if pl is None: pl = 2 * p + 3
     sx, sy, sz = Lx / nbx, Ly / nby, Lz / nbz; s = [sx, sy, sz]; nb = [nbx, nby, nbz]
 
-    Sii, Sib, ftild, XY, Ii, Ib, _, _ = SOMS_solver_sparse(
+    Sii, Sib, ftild, XY, Ii, Ib = SOMS_solver_sparse(
         px, py, pz, nbx, nby, nbz, Lx, Ly, Lz,
-        coeffs=coeffs, ct_pde=True, forcing=forcing, weighted=False)
+        coeffs=coeffs, ct_pde=True, forcing=forcing)
     n = XY.shape[0]
     A = np.zeros((n, n)); rhs = np.zeros(n)
     A[np.ix_(Ii, Ii)] = Sii.toarray(); A[np.ix_(Ii, Ib)] = Sib.toarray(); rhs[Ii] = ftild[Ii]

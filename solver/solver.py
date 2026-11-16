@@ -10,7 +10,6 @@ import solver.stencil.geom as stencilGeom
 import solver.spectral.geom as spectralGeom
 import solver.HPSInterp as interp
 import warnings
-
 try:
     import mumps
 except ImportError:
@@ -141,6 +140,58 @@ def _silence_mumps(ctx):
         ctx.mumps_instance.icntl[i] = 0
 
 
+# Number of MUMPS factorizations done by setup_mumps in this process.  Counts
+# only this module's layer; sparse_utils.SparseSolver factorizations are not
+# included (they print their own "A density" / "Factor nnz" report).
+_N_MUMPS_FACTORIZATIONS = 0
+
+
+def mumps_factorization_count():
+    """Number of setup_mumps factorizations so far in this process."""
+    return _N_MUMPS_FACTORIZATIONS
+
+
+def mumps_factor_report(ctx, A, time_analysis, time_factor):
+    """
+    Factorization statistics of a factored python-mumps context as a dict:
+    N, nnz_A, nnz_factor, fill, density, flops, time_analysis, time_factor,
+    mem_MB (INFOG(22): total memory MUMPS used, MB).  Fields this MUMPS /
+    python-mumps build does not provide are None.
+    """
+    n = int(A.shape[0])
+    nnzA = int(A.nnz) if sp.issparse(A) else int(np.count_nonzero(A))
+    fs = getattr(ctx, "factor_stats", None)
+    nnzF = getattr(fs, "nonzeros", None)
+    flops = getattr(fs, "flops", None)
+    mem = None
+    try:
+        mem = int(ctx.mumps_instance.infog[22])   # 1-based, = INFOG(22)
+    except Exception:
+        pass
+    return dict(
+        N=n, nnz_A=nnzA,
+        nnz_factor=None if nnzF is None else int(nnzF),
+        fill=None if nnzF is None else nnzF / max(nnzA, 1),
+        density=None if nnzF is None else nnzF / float(n) ** 2,
+        flops=None if flops is None else float(flops),
+        time_analysis=time_analysis, time_factor=time_factor, mem_MB=mem)
+
+
+def print_factor_report(rep, label="A"):
+    def f(key, fmt, unit=""):
+        v = rep.get(key)
+        return "n/a" if v is None else format(v, fmt) + unit
+    print("  [solver.py MUMPS #%d: %s]  N=%s, nnz(A)=%s"
+          % (_N_MUMPS_FACTORIZATIONS, label, f("N", ","), f("nnz_A", ",")))
+    print("    Factor nnz:          %s" % f("nnz_factor", ","))
+    print("    Fill ratio:          %s" % f("fill", ".1f", "x"))
+    print("    Factor density:      %s" % f("density", ".4%"))
+    print("    Factorization flops: %s" % f("flops", ".3e"))
+    print("    Analysis time:       %s" % f("time_analysis", ".2f", " s"))
+    print("    Factorization time:  %s" % f("time_factor", ".2f", " s"))
+    print("    MUMPS memory:        %s" % f("mem_MB", ",", " MB"))
+
+
 def setup_mumps(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO, verbose=0):
     """Analyze + factorize A in one MUMPS context.
 
@@ -192,6 +243,8 @@ def setup_mumps(A, ordering="metis", block_size=_BLOCK_SIZE_AUTO, verbose=0):
 
     if verbose < 2:
         _silence_mumps(ctx)
+    global _N_MUMPS_FACTORIZATIONS
+    _N_MUMPS_FACTORIZATIONS += 1
     if isinstance(block_size, int):
         # fixed size; "auto" is applied per call, None leaves MUMPS' default
         ctx.mumps_instance.icntl[_ICNTL_BLOCK_SIZE] = block_size
@@ -576,10 +629,14 @@ class solverOptions:
                 'auto' (default): the column count of each solve call, i.e.
                 one pass over the factors per call.  int: fixed size.
                 None: MUMPS' own small automatic default (previous behaviour).
+    mumps_stats: print a factorization report (nnz, fill, flops, times,
+                memory) for every MUMPS factorization of this layer.  The
+                numbers are also kept in solverWrapper.factor_stats either way.
     """
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
                  mumps_ordering='metis',use_ctxT=False,
-                 mumps_block_size=_BLOCK_SIZE_AUTO,reduced_gpu=False):
+                 mumps_block_size=_BLOCK_SIZE_AUTO,reduced_gpu=False,
+                 mumps_stats=False):
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
@@ -588,6 +645,7 @@ class solverOptions:
         self.use_ctxT         = use_ctxT
         self.mumps_block_size = _check_block_size(mumps_block_size)
         self.reduced_gpu        = reduced_gpu
+        self.mumps_stats        = bool(mumps_stats)
 
 def convertGeom(opts,geom):
     if opts.type=='hpsalt':
@@ -622,6 +680,7 @@ class solverWrapper:
         self.ctxT = None
         self.time_analysis = 0.0
         self.time_factor   = 0.0
+        self.factor_stats  = []
 
     def construct(self,geom,PDE,verbose=False,compute_inverse=True):
         """
@@ -666,6 +725,7 @@ class solverWrapper:
             toc      = time() - tic
             print("\t Toc construct Aii inverse %5.2f s" % toc) if verbose else None
         elif self.type=='hpsalt':
+            tic = time()
             geomHPS = convertGeom(self.opts,geom)
             solver = hpsalt.Domain_Driver(geomHPS, PDE, 0, self.a, p=self.ord, d=len(self.ord)) #verbose=verbose)
             self.solver=solver
@@ -679,6 +739,7 @@ class solverWrapper:
             else:
                 self.solver.build("reduced_cpu", "MUMPS", verbose=verbose)
             self.constructed=True
+            print("A constructed in ",time()-tic,"s")
             '''
             adapt these to fit the notation of custom solver
             '''
@@ -810,6 +871,11 @@ class solverWrapper:
         self.ctx = ctx
         self.time_analysis = t_an
         self.time_factor   = t_fa
+        # one entry per factorization (two with use_ctxT)
+        show = getattr(self.opts, "mumps_stats", False)
+        self.factor_stats = [mumps_factor_report(ctx, A, t_an, t_fa)]
+        if show:
+            print_factor_report(self.factor_stats[-1], "A")
 
         if self.opts.use_ctxT:
             ctxT, t_anT, t_faT = setup_mumps_transpose(
@@ -821,6 +887,9 @@ class solverWrapper:
             self.ctxT = ctxT
             self.time_analysis += t_anT
             self.time_factor   += t_faT
+            self.factor_stats.append(mumps_factor_report(ctxT, A, t_anT, t_faT))
+            if show:
+                print_factor_report(self.factor_stats[-1], "A^T (use_ctxT)")
             print("\t A^-T applies: dedicated A^T factorization "
                   "(use_ctxT)") if verbose else None
         else:
