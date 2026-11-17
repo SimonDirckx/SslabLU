@@ -123,7 +123,7 @@
 #
 #   All outputs go to one directory per configuration (created as needed;
 #   rerunning identical settings overwrites):
-#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb|_rbhbs_rbrk<RB_RK>]_dt<dt>s_nsteps<NSTEPS>[_neumann][_ridgectr][_rng<SEED>]/
+#     run_sslablu_channel_p<p>_N<N>_pan<npan_x>x<npan_y>[_rk<RK>][_rb|_rbhbs_rbrk<RB_RK>]_dt<dt>s_nsteps<NSTEPS>[_neumann][_ridgectr][_bdf2][_ramp<T>h][_rng<SEED>][_vtx]/
 #   dt in seconds, %g-formatted exactly as reentrant_channel_sslablu.jl formats
 #   its Δt, so paired runs share the dt/nsteps tokens; _rk<RK> marks HBS-
 #   compressed S-maps, _rb the dense red-black solver and _rbhbs_rbrk<RB_RK>
@@ -131,7 +131,9 @@
 #   existed), _neumann the true Neumann walls (no token = the emulated or
 #   Dirichlet walls, as in runs made before Neumann walls existed), _ridgectr
 #   marks SSLABLU_RIDGE_MIDPANEL=0, _rng<SEED> a non-zero SSLABLU_RNG_SEED
-#   (randomized runs only, i.e. RK > 0).
+#   (randomized runs only, i.e. RK > 0), _vtx one eta per leaf vertex
+#   (SSLABLU_VERTEX_ETA, the default; no token = per-leaf corner values, as in
+#   runs made before the fix).
 #   channel_timestep_diag.csv        per-step diagnostics
 #   channel_timestep_ssh.npz         eta/u/v samples for channel_ssh_compare.py
 #   channel_timestep_fields.png      eta snapshots at t = 0, T/2, T
@@ -194,6 +196,10 @@
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
+#   SSLABLU_VERTEX_ETA 1 = one eta per leaf vertex: every copy (the leaves and
+#                      overlapping slabs sharing it) gets the mean of the
+#                      leaves' corner extrapolations; 0 = each leaf keeps its
+#                      own, as in runs without _vtx                (default 1)
 #   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
 #   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
@@ -1081,6 +1087,8 @@ class ChannelModel:
                              own_split=n * H) for n in range(self.N)]
         self.t_keep = time.perf_counter() - tic
         self.cache_bytes = sum(getattr(s, "cache_bytes", 0) for s in self.sl)
+        # copies of each leaf vertex over all boxes of all slabs (built once)
+        self.vtx_groups = self.vertex_groups() if VERTEX_ETA else None
 
         # cached leaf path vs hpsalt's get_rhs / solve_dir_full, once, on slab 0
         # with random interface traces, wall data and body load: interface rhs
@@ -1178,6 +1186,43 @@ class ChannelModel:
         if WALL_NOFLUX and SPONGE_RATE > 0.0:
             Eu, Ev = Eu - s.sponge * u, Ev - s.sponge * v
         return Eu, Ev
+
+    def vertex_groups(self):
+        """Every copy of each leaf vertex, over all boxes of all slabs: the up to
+        four leaves meeting there, in each of the overlapping slabs that hold
+        it. Matched by (x mod 1, y) (the channel is 1-periodic in x). Returns
+        per-slab (box, node) index arrays with their group ids, and the copy
+        count of each group."""
+        r9 = lambda v: round(float(v), 9)
+        key2g, per_slab = {}, []
+        for s in self.sl:
+            bb = np.repeat(np.arange(s.nb), s.cfix_idx.shape[1])
+            jj = s.cfix_idx.ravel()
+            gg = np.array([key2g.setdefault((r9(r9(x) % 1.0), r9(y)), len(key2g))
+                           for x, y in s.gx[bb, jj]])
+            per_slab.append((bb, jj, gg))
+        cnt = np.bincount(np.concatenate([g for _, _, g in per_slab]), minlength=len(key2g))
+        return per_slab, cnt.astype(float)
+
+    @staticmethod
+    def average_vertices(etas, groups):
+        """In place: every copy of a leaf vertex gets the mean of all copies.
+
+        Leaf corners are not dofs: each leaf extrapolates its corner eta along
+        its own x-row (SlabSolve.cfix), so a vertex shared by side-by-side
+        leaves gets two values. Their y-derivatives along the shared vertical
+        edge then differ, the two leaves' v copies diverge, Coriolis turns that
+        into diverging u copies, and the normal flux through the x-normal edges
+        stops matching -- most of the low-resolution volume drift (diagnosed
+        with SSLABLU_FLUXBUDGET). One eta per vertex removes those jumps.
+        Equal weights: the slab overlap doubles every leaf alike."""
+        per_slab, cnt = groups
+        tot = np.zeros(len(cnt))
+        for E, (bb, jj, gg) in zip(etas, per_slab):
+            np.add.at(tot, gg, E[bb, jj])
+        mean = tot / cnt
+        for E, (bb, jj, gg) in zip(etas, per_slab):
+            E[bb, jj] = mean[gg]
 
     def solve(self, rhs):
         """Interface system (I + S) u = rhs with the stored factorization."""
@@ -1367,11 +1412,16 @@ class ChannelModel:
 
         # ---- reconstruction + velocity update -----------------------------
         tic = time.perf_counter()
+        etas = []
         for i, s in enumerate(self.sl):
             kl, kr = self.connectivity[i]
             ul = uhat[kl * self.nc:(kl + 1) * self.nc]
             ur = uhat[kr * self.nc:(kr + 1) * self.nc]
-            eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i], load=loads[i])
+            etas.append(s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i], load=loads[i]))
+        if VERTEX_ETA:        # one eta per leaf vertex, before it enters the gradients
+            self.average_vertices(etas, self.vtx_groups)
+        for i, s in enumerate(self.sl):
+            eta_new = etas[i]
             if bdf2:                           # level n becomes level n-1
                 self.eta_p[i], self.u_p[i], self.v_p[i] = self.eta[i], self.u[i], self.v[i]
                 self.E_p[i] = Es[i]
@@ -1584,6 +1634,9 @@ if SOLVER == "rbhbs":
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
+# one eta per leaf vertex (ChannelModel.average_vertices); 0 = the pre-fix
+# per-leaf corner extrapolation, for comparison with older runs
+VERTEX_ETA = os.environ.get("SSLABLU_VERTEX_ETA", "1") != "0"
 # flux_budget() return order, as contributions to the step's volume change dM [m]
 BUDGET_COLS = ["dM", "steric", "res_interior", "res_edge", "res_wall", "res_corner",
                "product_rule", "wall_noncorner", "wall_corner", "jump_noncorner_x",
@@ -1624,14 +1677,15 @@ if FLUXBUDGET and TIMESTEPPER != "be":
 # overwrite each other
 SOLVER_TOKEN = {"rb": "_rb", "rbhbs": "_rbhbs_rbrk%d" % RB_RK, "thomas": ""}[SOLVER]
 SOLVER_NAME  = {"rb": "red-black", "rbhbs": "HBS red-black", "thomas": "Thomas"}[SOLVER]
-graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s%s%s" % (
+graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s%s%s%s" % (
     "fluxbudget" if FLUXBUDGET else "channel",
     p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "", SOLVER_TOKEN,
     dt, NSTEPS, "_neumann" if WALLS == "neumann" else "",
     "" if RIDGE_MIDPANEL else "_ridgectr",
     "" if TIMESTEPPER == "be" else "_" + TIMESTEPPER,
     ("_ramp%gh" % WIND_RAMP_H) if (FORCED and WIND_RAMP_H > 0.0) else "",
-    ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "")
+    ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "",
+    "_vtx" if VERTEX_ETA else "")
 SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
 
 
@@ -1673,6 +1727,8 @@ if RK > 0:
 print("slab leaf ops            = ",
       ("GPU, %s  (SSLABLU_GPU)" % torch.cuda.get_device_name()) if GPU else "CPU",
       " leaf factors %s (SSLABLU_FASTLEAF)" % ("cached" if FASTLEAF else "rebuilt per call"))
+print("leaf-vertex eta          = ",
+      "one per vertex (SSLABLU_VERTEX_ETA)" if VERTEX_ETA else "per-leaf extrapolation")
 print("output directory         = ", graph_directory)
 if WALLS == "neumann":
     wtxt = "closed / no-normal-flow: Neumann walls, d eta/dn = n_y v* L/(g dt)"
