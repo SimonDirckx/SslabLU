@@ -138,6 +138,10 @@ class matAssembler:
     """
     def __init__(self,matOpts:matAssemblerOptions=matAssemblerOptions()):
         self.matOpts    = matOpts
+        # tree given by the user: a tree object (perm_leaf, nleaves, nlevels) used
+        # for every interface, or a factory XXI -> tree called per interface.
+        # None: a slabTree is built on each interface's DOFs, as before.
+        self.user_tree  = matOpts.tree
         self.nbytes       = 0
         self.stats = matAssemblerStats()
     def assemble(self,stMap:solver.stMap,dbg=0):
@@ -159,7 +163,12 @@ class matAssembler:
         if self.matOpts.method == 'rkHBS':
             start = time.time()
             quad = False # currently only binary trees supported
-            self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
+            if self.user_tree is None:
+                self.matOpts.tree = slabTree.slabTree(stMap.XXI,quad,self.matOpts.leaf_size)
+            elif callable(self.user_tree) and not hasattr(self.user_tree,'perm_leaf'):
+                self.matOpts.tree = self.user_tree(stMap.XXI)   # factory, per interface
+            else:
+                self.matOpts.tree = self.user_tree              # tree object
             device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
             HBSmat = HBStorch.HBSMAT(device=device,tree=self.matOpts.tree,quad=quad)

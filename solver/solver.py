@@ -636,7 +636,8 @@ class solverOptions:
     def __init__(self,type:str,ord,a=None,problem_type='Dirichlet',
                  mumps_ordering='metis',use_ctxT=False,
                  mumps_block_size=_BLOCK_SIZE_AUTO,reduced_gpu=False,
-                 mumps_stats=False):
+                 mumps_stats=False,cyl=None):
+        self.cyl    =   {} if cyl is None else dict(cyl)   # 'cylhps': Rc, s, n, m, nz, flux
         self.type   =   type
         self.ord    =   ord
         self.a      =   a
@@ -800,6 +801,31 @@ class solverWrapper:
                         "problem_type must be 'Dirichlet' or 'mixed', got %r"
                         % (self.opts.problem_type,))
 
+        elif self.type=='cylhps':
+            # glued 5-patch HPS double slab on a straight cylinder (axis = w0);
+            # PDE: PDO_3d in OMS coordinates (e.g. transform_helmholtz_pdo)
+            from solver.cylinder_slab import CylinderSlab
+            if self.opts.problem_type != 'Dirichlet':
+                raise ValueError("'cylhps' supports problem_type='Dirichlet' only")
+            tic = time()
+            solver = CylinderSlab(geom, PDE, self.ord, **self.opts.cyl)
+            self.solver=solver
+            self.constructed=True
+            print("A constructed in ",time()-tic,"s")
+            self.XX  = solver.XX
+            self.Ii  = solver.Ii
+            self.Ib  = solver.Ib
+            self.Aib = solver.Aib
+            self.Abi = solver.Abi
+            self.Abb = solver.Abb
+            self.Aii = solver.Aii
+            if compute_inverse:
+                tic      = time()
+                self.solver_ii = self._factor_mumps(self.Aii, verbose)
+                toc      = time() - tic
+                print("\t Toc construct Aii inverse %5.2f s "
+                      "(analysis %5.2f s, factor %5.2f s)"
+                      % (toc, self.time_analysis, self.time_factor)) if verbose else None
         elif self.type=='spectral':
             geomSpectral = convertGeom(self.opts,geom)
             solver = spectral(PDE, geomSpectral, self.ord)

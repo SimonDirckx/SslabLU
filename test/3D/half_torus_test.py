@@ -21,7 +21,7 @@ u_cyl = lambda Xc: u_phys(T.phi(Xc))  # exact solution pulled back to the cylind
 PDE = T.helmholtz(k)
 
 
-def run(p, n=2, m=2, nz=10, flux="normal", verbose=False):
+def run(p, n=4, m=4, nz=40, flux="normal", verbose=False):
     patches = make_cylinder(s=0.5, L=T.L, n=n, m=m, nz=nz, Rc=T.Rc)
     t0 = time.time()
     built = [build_patch(P, p, PDE, flux=flux) for P in patches]
@@ -59,15 +59,3 @@ if __name__ == "__main__":
         r = run(p)
         print("  %2d   %5d    %8d          %.2e             %.2e        %.1f"
               % (p, r["nleaf"], r["ndof"], r["e_if"], r["e_all"], r["t"]))
-
-    print("\nh-refinement along the cylinder (p=8):")
-    for nz in [5, 10, 20]:
-        r = run(8, nz=nz)
-        print("  nz=%2d  leaves %4d  rel.err all nodes %.2e   time %.1f s"
-              % (nz, r["nleaf"], r["e_all"], r["t"]))
-
-    print("\nh-refinement in the cross-section (p=8, nz=10): core n x n, arches n x n")
-    for nl in [1, 2, 3]:
-        r = run(8, n=nl, m=nl, nz=10)
-        print("  n=%d  leaves %4d  rel.err all nodes %.2e   time %.1f s"
-              % (nl, r["nleaf"], r["e_all"], r["t"]))
