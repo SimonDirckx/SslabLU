@@ -808,7 +808,18 @@ class solverWrapper:
             if self.opts.problem_type != 'Dirichlet':
                 raise ValueError("'cylhps' supports problem_type='Dirichlet' only")
             tic = time()
-            solver = CylinderSlab(geom, PDE, self.ord, **self.opts.cyl)
+            import torch
+            cyl = dict(self.opts.cyl)
+            # leaf DtN maps on the GPU with reduced_gpu (gluing, flux conversion
+            # and MUMPS stay on the host); an explicit cyl['device'] wins
+            cyl.setdefault('device', torch.device('cuda') if self.opts.reduced_gpu
+                           else torch.device('cpu'))
+            solver = CylinderSlab(geom, PDE, self.ord, **cyl)
+            if cyl['device'].type == 'cuda':
+                import gc
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()      # free leaf work arrays before HBS sampling
             self.solver=solver
             self.constructed=True
             print("A constructed in ",time()-tic,"s")

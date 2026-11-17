@@ -210,10 +210,12 @@ class Patch:
             cache["xx"], cache["val"] = xx.detach().clone(), val
             return val
 
-        T = lambda arr: torch.from_numpy(np.ascontiguousarray(arr, dtype=float))
-        A_ = lambda k, l, fac=1.0: (lambda xx: T(fac * coeffs(xx)[0][:, k, l]))
-        b_ = lambda k: (lambda xx: T(coeffs(xx)[1][:, k]))
-        c_ = lambda xx: T(coeffs(xx)[2])
+        # coefficients go back to the device hpsmultidomain evaluates on (GPU
+        # for reduced_gpu); the metric itself is evaluated in numpy on the host
+        T = lambda arr, xx: torch.from_numpy(np.ascontiguousarray(arr, dtype=float)).to(xx.device)
+        A_ = lambda k, l, fac=1.0: (lambda xx: T(fac * coeffs(xx)[0][:, k, l], xx))
+        b_ = lambda k: (lambda xx: T(coeffs(xx)[1][:, k], xx))
+        c_ = lambda xx: T(coeffs(xx)[2], xx)
         # c12/c13/c23 always given (possibly zero): keeps the Gauss-node path
         return PDO_3d(c11=A_(0, 0), c22=A_(1, 1), c33=A_(2, 2),
                       c12=A_(0, 1, 2.0), c13=A_(0, 2, 2.0), c23=A_(1, 2, 2.0),
@@ -225,7 +227,7 @@ class Patch:
         if pde.f is None:
             return None
         return lambda xx: torch.from_numpy(np.asarray(
-            pde.f(self.to_phys(xx.detach().cpu().numpy())), float) * np.ones(xx.shape[0]))
+            pde.f(self.to_phys(xx.detach().cpu().numpy())), float) * np.ones(xx.shape[0])).to(xx.device)
 
 
 def make_cylinder(s=0.5, L=1.0, n=2, m=2, nz=2, Rc=1.0):

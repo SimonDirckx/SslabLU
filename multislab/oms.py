@@ -1547,9 +1547,9 @@ class oms:
         # FIX: shapeMatch was printed but its computation was commented out.
         shape_ok = tuple(mat.shape) == tuple(st.A.shape)
         err = None
-        if dbg > 0:
-            err = self._block_error(st, mat, assembler)
-            print("%s ERR = " % label, err)
+        #if dbg > 0:
+        err = self._block_error(st, mat, assembler)
+        print("%s ERR = " % label, err)
         return mat, ratio, err, tC, tS, shape_ok
 
     # ------------------------------------------------------------------ #
@@ -1793,7 +1793,6 @@ class oms:
                     blocks.append(mat)
                     dtypes.append(_dtype_of(mat))
                     errs[side], ratios[side] = err, ratio
-
                 if dbg > 0:
                     if errs.get("l") is not None:
                         relerrl = max(relerrl, errs["l"])

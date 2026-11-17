@@ -26,7 +26,7 @@ from scipy.sparse.linalg import LinearOperator, gmres
 # Local discretization: 'hps' (hpsalt) or 'soms'
 # ---------------------------------------------------------------------------
 SOLVER = 'hps'
-
+torus.s = .55
 
 def dense_to_linop(A):
     A = np.array(A)
@@ -55,7 +55,7 @@ class gmres_info(object):
         if self._disp:
             print('iter %3i\trk = %s' % (self.niter, str(rk)))
 
-kh = (20.+1e-2)*np.pi
+kh = 4.8*np.pi
 
 # Helmholtz -Lap u - kh^2 u = 0 on the full twisted elliptic torus, transformed
 # to the periodic reference cylinder (hps form, PDO_3d in reference coordinates)
@@ -91,11 +91,11 @@ N = 64                            # H = L/N ~ 0.59 (L = 2 pi R0)
 assert N >= 4 and not N & (N - 1), "cyclic red-black needs N = 2^k slabs"
 dSlabs,connectivity,H = torus.dSlabs(N)
 p = 8                            # hpsmultidomain order; q = p-2 face nodes per direction
-n_core, m_arch = 4*(2**4), 2**4             # cross-section leaves (circInterfaceTree: n_core = 4 m_arch)
-cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n_core, m=m_arch, nz=2, flux='normal')
+n_core, m_arch = 16, 4             # cross-section leaves (circInterfaceTree: n_core = 4 m_arch)
+cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n_core, m=m_arch, nz=2, flux='conormal')
 
 if SOLVER == 'hps':
-    opts = solverWrap.solverOptions('cylhps',p,None,use_ctxT=False,mumps_stats=True,cyl=cyl_opts)
+    opts = solverWrap.solverOptions('cylhps',p,None,use_ctxT=False,mumps_stats=True,reduced_gpu=True,cyl=cyl_opts)
     pdo = Helm
     gb = lambda p :torus.gb(p,jax_avail=False,torch_avail=True)
 elif SOLVER == 'soms':
@@ -118,7 +118,7 @@ else:
     raise ValueError("SOLVER must be 'hps' or 'soms', got %r" % (SOLVER,))
 print("local solver = ", SOLVER)
 
-rk0 = 50
+rk0 = 100
 # interface tree: cross-section columns (w1, w2) of the OMS points w = (z, x, y)
 max_level = (int)(np.log2(n_core**2))-2                     # 2**4 tree leaves of 2 HPS leaves each (None: single HPS leaves)
 def make_tree(XXI):
