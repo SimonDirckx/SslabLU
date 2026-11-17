@@ -7,8 +7,9 @@
 # centered) to the production final time over a ladder of time steps, on one or
 # more spatial grids, then compares the time error with the spatial error.
 #
-#   time error     backward Euler is first order, so with the ladder dt, dt/2,
-#                  ... the Richardson estimate X* = 2 X(dt_min) - X(2 dt_min)
+#   time error     with the scheme's order q (SSLABLU_TIMESTEPPER: be q = 1,
+#                  bdf2 q = 2) and the ladder dt, dt/2, ..., the Richardson
+#                  estimate X* = (2^q X(dt_min) - X(2 dt_min)) / (2^q - 1)
 #                  stands in for the dt -> 0 solution of that grid, and
 #                  e_t(dt) = ||X(dt) - X*|| / ||X*||. The observed order
 #                  log2(d(dt) / d(dt/2)), d(dt) = ||X(dt) - X(dt/2)||, checks
@@ -37,6 +38,16 @@
 #   SSLABLU_DTC_OUTDIR   output subdirectory (relative to the repo root)
 #                        (default central_ridge_dtconv_<gpu|cpu>_runs)
 #   SSLABLU_GPU          1 (default) / 0
+#   SSLABLU_WIND_RAMP_H  wind ramp-up time [h], passed to the runs (default 0);
+#                        > 0 adds _ramp<T>h to the run and default output
+#                        directories. The default spatial reference has no ramp,
+#                        so it is skipped then, as for bdf2
+#   SSLABLU_TIMESTEPPER  be (default) | bdf2, passed to the runs. With bdf2 the
+#                        run directories carry _bdf2, the default output
+#                        directory is central_ridge_dtconv_bdf2_<gpu|cpu>_runs,
+#                        and the spatial error is skipped unless SSLABLU_DTC_REF
+#                        names a bdf2 reference: the default reference is a
+#                        backward-Euler run, whose time error would not cancel
 # Runs whose directory already holds channel_timestep_ssh.npz are skipped, so an
 # interrupted study resumes. Outputs in <outdir>: logs/, dt_convergence.csv,
 # dt_convergence.png.
@@ -58,10 +69,19 @@ GRIDS = [tuple(int(x) for x in g.split(":"))
 DTS = [float(v) for v in os.environ.get("SSLABLU_DTC_DTS", "900,450,225,112.5,56.25").split(",") if v]
 T_H = float(os.environ.get("SSLABLU_DTC_T_H", "100"))
 GPU = os.environ.get("SSLABLU_GPU", "1") != "0"
-OUT = REPO / os.environ.get("SSLABLU_DTC_OUTDIR", "central_ridge_dtconv_%s_runs" % ("gpu" if GPU else "cpu"))
+SCHEME = os.environ.get("SSLABLU_TIMESTEPPER", "be").lower()
+if SCHEME not in ("be", "bdf2"):
+    sys.exit("SSLABLU_TIMESTEPPER must be 'be' or 'bdf2', got %r" % SCHEME)
+ORDER = {"be": 1, "bdf2": 2}[SCHEME]
+STOK = "" if SCHEME == "be" else "_" + SCHEME
+RAMP_H = float(os.environ.get("SSLABLU_WIND_RAMP_H", "0"))       # passed to the runs
+if os.environ.get("SSLABLU_FORCED", "1") != "0" and RAMP_H > 0.0:
+    STOK += "_ramp%gh" % RAMP_H
+OUT = REPO / os.environ.get("SSLABLU_DTC_OUTDIR", "central_ridge_dtconv%s_%s_runs" % (STOK, "gpu" if GPU else "cpu"))
 _REFNAME = "run_sslablu_channel_p12_N8_pan64x128_rb_dt450s_nsteps800_neumann_ridgectr"
 _REFCAND = [REPO / d / "central_ridge_rankiso_gpu_runs_fastleaf" / _REFNAME for d in ("central_ridge_runs", ".")]
-REFDIR = Path(os.environ.get("SSLABLU_DTC_REF", str(next((c for c in _REFCAND if c.exists()), _REFCAND[0]))))
+REFDIR = Path(os.environ.get("SSLABLU_DTC_REF", str(next((c for c in _REFCAND if c.exists()), _REFCAND[0]))
+                            if STOK == "" else "no_default_reference_for" + STOK))
 DT_PROD = 450.0
 LOGS = OUT / "logs"
 
@@ -83,8 +103,8 @@ if GPU:
 
 
 def run_dir(p, npy, N, dt, nsteps):
-    return OUT / ("run_sslablu_channel_p%d_N%d_pan%dx%d_rb_dt%gs_nsteps%d_neumann_ridgectr"
-                  % (p, N, 4 * npy // N, npy, dt, nsteps))
+    return OUT / ("run_sslablu_channel_p%d_N%d_pan%dx%d_rb_dt%gs_nsteps%d_neumann_ridgectr%s"
+                  % (p, N, 4 * npy // N, npy, dt, nsteps, STOK))
 
 
 # ---- runs -------------------------------------------------------------------
@@ -103,7 +123,8 @@ for i, (p, npy, N, dt, ns) in enumerate(configs):
     env = dict(os.environ, SSLABLU_N=str(N), SSLABLU_P=str(p), SSLABLU_NPAN_X=str(4 * npy // N),
                SSLABLU_NPAN_Y=str(npy), SSLABLU_SOLVER="rb", SSLABLU_RK="0",
                SSLABLU_DT_H=repr(dt / 3600.0), SSLABLU_NSTEPS=str(ns), SSLABLU_COMPARE_FORMS="0",
-               SSLABLU_GPU="1" if GPU else "0", SSLABLU_RIDGE_MIDPANEL="0", PYTHONUNBUFFERED="1")
+               SSLABLU_GPU="1" if GPU else "0", SSLABLU_RIDGE_MIDPANEL="0", SSLABLU_TIMESTEPPER=SCHEME,
+               PYTHONUNBUFFERED="1")
     env.pop("SSLABLU_RB_RK", None)
     log = LOGS / ("p%d_N%d_pan%dx%d_dt%gs.log" % (p, N, 4 * npy // N, npy, dt))
     print("[%s] %s: running (log: %s)" % (k, lab, log.relative_to(REPO)), flush=True)
@@ -139,7 +160,7 @@ for p, npy, N in GRIDS:
     for t in ("mid", "final"):
         X = {dt: load(run_dir(p, npy, N, dt, int(round(T_H * 3600.0 / dt))), t) for dt in have}
         for f in ("eta", "u", "v"):
-            star = 2.0 * X[have[-1]][f] - X[have[-2]][f]            # Richardson, first order
+            star = (2 ** ORDER * X[have[-1]][f] - X[have[-2]][f]) / (2 ** ORDER - 1)    # Richardson
             d = {dt: rel(X[dt][f], X[dt / 2][f]) for dt in have if dt / 2 in X}
             for dt in have:
                 et = rel(X[dt][f], star)
@@ -151,7 +172,7 @@ for p, npy, N in GRIDS:
 print("")
 print("=============SUMMARY  (dt-convergence to T = %g h; spatial reference %s)============="
       % (T_H, REFDIR.name if ref is not None else "absent"))
-print("  time error e_t(dt) = ||X(dt) - X*|| / ||X*|| (X* Richardson); order from successive differences;")
+print("  scheme %s: time error e_t(dt) = ||X(dt) - X*|| / ||X*|| (X* Richardson, order %d); order from successive differences;" % (SCHEME, ORDER))
 print("  spatial error at dt = %g s vs the reference" % DT_PROD)
 for p, npy, N in GRIDS:
     for t in ("mid", "final"):
@@ -192,7 +213,7 @@ if rows:
             if es == es:
                 a.axhline(es, color=COL[c % 4], ls="--", lw=1, label="spatial error at %g s" % DT_PROD)
         dts = np.array(DTS)
-        a.loglog(dts, 0.5 * pts[0][1] * dts / dts[0], color="0.6", lw=0.8, label="slope 1")
+        a.loglog(dts, 0.5 * pts[0][1] * (dts / dts[0]) ** ORDER, color="0.6", lw=0.8, label="slope %d" % ORDER)
         for x, txt in ((DT_PROD, "SslabLU dt"), (112.5, "Oceananigans dt")):
             if min(DTS) <= x <= max(DTS):
                 a.axvline(x, color="0.8", lw=0.8)

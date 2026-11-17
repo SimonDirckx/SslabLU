@@ -101,7 +101,8 @@
 #           as configured): derivative matrices, skeleton body-rhs sign,
 #           body-load reconstruction; with Neumann walls also the wall rows
 #           and the discrete wall flux.
-#   RUN     NSTEPS of backward-Euler IMEX, both PDO forms (mass comparison).
+#   RUN     NSTEPS of the IMEX scheme (SSLABLU_TIMESTEPPER), both PDO forms
+#           (mass comparison).
 #   OPTIONAL SSLABLU_DTCONV=1: dt-convergence ratios (~2.0 for backward Euler);
 #           rebuilds the operator per dt, so this is slow and off by default.
 #   OPTIONAL SSLABLU_FLUXBUDGET=1: per-step volume budget of the divergence
@@ -166,6 +167,30 @@
 #                      doubles per leaf, ~0.34 GB per double slab of 16 x 32
 #                      leaves at p = 16, per PDO form. 0 = hpsalt's get_rhs /
 #                      solve_dir_full every step (slower; same field to round-off)
+#   SSLABLU_TIMESTEPPER  be (default) | bdf2. be: first-order backward-Euler
+#                      IMEX, as described above. bdf2: second-order semi-implicit
+#                      BDF2 (SBDF2), gamma = 2 dt / 3:
+#                        u*      = (4 u^n - u^{n-1})/3 + gamma (2 E^n - E^{n-1})
+#                        eta^{n+1} solves  -div(D grad eta) + eta = R,
+#                                D = g gamma^2 H / L^2,
+#                                R = (4 eta^n - eta^{n-1})/3 - (gamma/L) div(H u*)
+#                        u^{n+1} = u* - (g gamma/L) grad eta^{n+1}
+#                      with E the explicit terms (Coriolis, wind, drag, sponge;
+#                      the steric relaxation is extrapolated the same way) and
+#                      Neumann wall data d eta/dn = n_y v* L/(g gamma). The
+#                      operator is the backward-Euler one at step gamma, so it is
+#                      still factored once. The first step is one backward-Euler
+#                      step of size dt (locally second order), which needs its
+#                      own operator: a second assembly + factorization per PDO
+#                      form, built and freed during setup. Output directories
+#                      carry a _bdf2 token. The emulated walls keep their
+#                      first-order lagged wall copy; SSLABLU_FLUXBUDGET is
+#                      backward-Euler only.
+#   SSLABLU_WIND_RAMP_H  wind ramp-up time [h] (default 0: full wind from t = 0).
+#                      > 0: the wind stress is multiplied by the C2 smoothstep
+#                      6 s^5 - 15 s^4 + 10 s^3, s = t / T_r, evaluated at the
+#                      explicit-term time level (t_n; bdf2 extrapolates with
+#                      r(t_n), r(t_{n-1})). Output directories carry _ramp<T>h.
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
@@ -176,6 +201,7 @@
 #   SSLABLU_WALL_RELAX under-relaxation of the emulated wall copy   (default 1)
 # =============================================================================
 
+import gc
 import io
 import os
 import sys
@@ -239,6 +265,11 @@ RHO0     =  1025.0        # reference seawater density [kg/m^3]
 # ridge gap. FORCED = 0 recovers the original geostrophic-adjustment bump.
 FORCED     = os.environ.get("SSLABLU_FORCED", "1") != "0"
 TAU0       = float(os.environ.get("SSLABLU_TAU0",   "0.15"))   # wind stress amp [N/m^2]
+# Wind switch-on: 0 (default) = full wind from t = 0, an impulsive start that
+# excites gravity waves the large-dt runs do not resolve. > 0 = the wind ramps
+# up over this many hours with r(s) = 6 s^5 - 15 s^4 + 10 s^3, s = t / T_r
+# (zero first and second derivatives at both ends), r = 1 after T_r.
+WIND_RAMP_H = float(os.environ.get("SSLABLU_WIND_RAMP_H", "0"))
 RDRAG      = float(os.environ.get("SSLABLU_RDRAG",  "1.0e-5")) # linear bottom drag [1/s] default was 1e-5, successful (with dirichlet BC) was 5e-5
 STERIC_AMP = float(os.environ.get("SSLABLU_STERIC", "0.0"))    # steric SSH half-range [m], default 0.5
 GAMMA_S    = float(os.environ.get("SSLABLU_GAMMA_S","0.0")) # steric relaxation rate [1/s], default 1.0e-5
@@ -315,6 +346,15 @@ def dbump_x(x, lib):
     """d/dx of bump_x (analytic)."""
     return (-2.0 * np.pi * RIDGE_KB * lib.sin(2.0 * np.pi * (x - RIDGE_XC))
             * bump_x(x, lib))
+
+
+def wind_ramp(t):
+    """Wind amplitude factor at time t [s]: 1 without a ramp, else the C2
+    smoothstep from 0 at t = 0 to 1 at t = WIND_RAMP_H (hours)."""
+    if WIND_RAMP_H <= 0.0:
+        return 1.0
+    s = min(max(t / (3600.0 * WIND_RAMP_H), 0.0), 1.0)
+    return s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
 
 
 def gapfac(y, lib):
@@ -938,18 +978,24 @@ def gate(ell2, geom, opts):
 ################################################################
 
 class ChannelModel:
-    """Backward-Euler IMEX barotropic channel. Fixed dt -> the elliptic
+    """IMEX barotropic channel, backward Euler ("be") or semi-implicit BDF2
+    ("bdf2"; see SSLABLU_TIMESTEPPER in the header). Fixed dt -> the elliptic
     operator is fixed -> S assembly + cyclic red-black (dense or HBS) or
     Thomas factorization happen ONCE (in __init__); step() rebuilds only the
-    body-load rhs and solves with the stored factors.
+    body-load rhs and solves with the stored factors. The operator's step is
+    self.gam: dt for be, 2 dt / 3 for bdf2. A bdf2 model takes its first step
+    in __init__, with a temporary be model of step dt (its own operator),
+    and hands that step's diagnostics out at the first step() call.
     State eta [m], u, v [m/s] live on the per-slab leaf grids (nboxes, p^2);
     overlapping slabs each carry their own consistent copy, convdiv-style."""
 
     def __init__(self, dt, conservative, assembler, dSlabs, connectivity, H,
-                 opts, label=""):
+                 opts, label="", scheme=None):
         self.dt = dt
         self.label = label
-        self.ell2 = GRAV * H0 * dt * dt / (LCHAN * LCHAN)
+        self.scheme = TIMESTEPPER if scheme is None else scheme
+        self.gam = dt if self.scheme == "be" else 2.0 * dt / 3.0
+        self.ell2 = GRAV * H0 * self.gam * self.gam / (LCHAN * LCHAN)
         self.diff_op = make_pdo(self.ell2, conservative)
         self.connectivity = connectivity
         self.N = len(dSlabs)
@@ -1096,6 +1142,43 @@ class ChannelModel:
         self.fgb_prev = [np.zeros(len(s.Igb)) for s in self.sl]
         self.t = 0.0
 
+        # bdf2 start-up: level n-1 = the initial state, level n = one
+        # backward-Euler step of size dt from it (local error O(dt^2), so the
+        # scheme stays second order). That step needs the be operator, so a
+        # temporary be model is built, stepped once and freed here.
+        self._first, self.t_start = None, 0.0
+        if self.scheme == "bdf2":
+            tic = time.perf_counter()
+            self.eta_p = [e.copy() for e in self.eta]
+            self.u_p = [e.copy() for e in self.u]
+            self.v_p = [e.copy() for e in self.v]
+            self.E_p = [self.explicit_terms(i, self.u[i], self.v[i], self.t) for i in range(self.N)]
+            self.s_p = -GAMMA_S * self.relax_integral() if FORCED else 0.0
+            st = ChannelModel(dt, conservative, make_assembler(), dSlabs, connectivity, H,
+                              opts, label=label, scheme="be")
+            self._first = st.step()
+            self.eta, self.u, self.v, self.fgb_prev = st.eta, st.u, st.v, st.fgb_prev
+            self.dM_exp = self._first["relax_src"]
+            del st
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.t_start = time.perf_counter() - tic
+
+    def explicit_terms(self, i, u, v, t):
+        """E(u, v) on slab i at time t: the explicitly treated momentum
+        tendencies (rotation; if forced, the (ramped) wind and bottom drag; the
+        wall sponge)."""
+        s = self.sl[i]
+        if FORCED:
+            Eu = FCOR * v + self.a_wind[i] * wind_ramp(t) - RDRAG * u
+            Ev = -FCOR * u - RDRAG * v
+        else:
+            Eu, Ev = FCOR * v, -FCOR * u
+        if WALL_NOFLUX and SPONGE_RATE > 0.0:
+            Eu, Ev = Eu - s.sponge * u, Ev - s.sponge * v
+        return Eu, Ev
+
     def solve(self, rhs):
         """Interface system (I + S) u = rhs with the stored factorization."""
         if SOLVER == "rb":
@@ -1180,32 +1263,52 @@ class ChannelModel:
         return tot
 
     def step(self):
-        dt = self.dt
-        gdtL = GRAV * dt / LCHAN
+        if self._first is not None:
+            # bdf2: step 1 was the backward-Euler start-up step taken in __init__
+            d, self._first = self._first, None
+            self.t = self.dt
+            return d
+        dt, gam = self.dt, self.gam
+        bdf2 = self.scheme == "bdf2"
+        gdtL = GRAV * gam / LCHAN
         tnew = self.t + dt
 
         # expected mass change from the steric source this step (eta^n), used to
         # separate the physical relaxation source from spurious wall leakage
-        relax_src = -dt * GAMMA_S * self.relax_integral() if FORCED else 0.0
+        if not bdf2:
+            relax_src = -dt * GAMMA_S * self.relax_integral() if FORCED else 0.0
+        else:
+            # BDF2 volume: M^{n+1} - M^n = (M^n - M^{n-1})/3 + gam (2 s^n - s^{n-1}),
+            # s = -GAMMA_S int (eta - eta_s), followed for the expected increments
+            s_n = -GAMMA_S * self.relax_integral() if FORCED else 0.0
+            relax_src = self.dM_exp / 3.0 + gam * (2.0 * s_n - self.s_p)
+            self.dM_exp, self.s_p = relax_src, s_n
 
         # ---- explicit predictor + body load R^n, per slab -----------------
         tic = time.perf_counter()
         fgbs, gNs, fvecs, loads, ustars, vstars = [], [], [], [], [], []
+        Es = []
         rhstot = np.zeros(self.Ntot)
         for i, s in enumerate(self.sl):
             Hp, Hpx, Hpy = s.Hp, s.Hpx, s.Hpy   # Hpy: nonzero across the gap band
 
             # explicit momentum predictor: rotation, and (if forced) eastward
             # wind stress tau/(rho0 H) and linear bottom drag -r u
-            if FORCED:
+            if bdf2:
+                # (4 u^n - u^{n-1})/3 + gam (2 E^n - E^{n-1}); E includes the sponge
+                Eu, Ev = self.explicit_terms(i, self.u[i], self.v[i], self.t)
+                Es.append((Eu, Ev))
+                us = (4.0 * self.u[i] - self.u_p[i]) / 3.0 + gam * (2.0 * Eu - self.E_p[i][0])
+                vs = (4.0 * self.v[i] - self.v_p[i]) / 3.0 + gam * (2.0 * Ev - self.E_p[i][1])
+            elif FORCED:
                 us = self.u[i] + dt * (FCOR * self.v[i]
-                                       + self.a_wind[i] - RDRAG * self.u[i])
+                                       + self.a_wind[i] * wind_ramp(self.t) - RDRAG * self.u[i])
                 vs = self.v[i] + dt * (-FCOR * self.u[i] - RDRAG * self.v[i])
             else:
                 us = self.u[i] + dt * (FCOR * self.v[i])
                 vs = self.v[i] - dt * (FCOR * self.u[i])
 
-            if WALL_NOFLUX:
+            if WALL_NOFLUX and not bdf2:
                 # (i) sponge (closed walls; off unless SPONGE_RATE > 0): Rayleigh
                 # friction absorbing layer near the walls, damping the
                 # wall-trapped instability of the emulated walls (both components)
@@ -1220,13 +1323,18 @@ class ChannelModel:
 
             # div(H u*) = H (u*_x + v*_y) + H_x u* + H_y v*
             divHu = Hp * (s.gradx(us) + s.grady(vs)) + Hpx * us + Hpy * vs
-            R = self.eta[i] - (dt / LCHAN) * divHu
+            eta_bar = (4.0 * self.eta[i] - self.eta_p[i]) / 3.0 if bdf2 else self.eta[i]
+            R = eta_bar - (gam / LCHAN) * divHu
             if FORCED:
                 # steric buoyancy: explicit Newtonian relaxation of the free
                 # surface toward eta_s(y). Explicit -> screening coefficient (and
                 # the reused factorization / gate) unchanged; stable for
-                # GAMMA_S*dt << 1.
-                R = R - dt * GAMMA_S * (self.eta[i] - self.eta_s[i])
+                # GAMMA_S*dt << 1. bdf2: extrapolated, 2 S^n - S^{n-1}.
+                if bdf2:
+                    R = R - gam * GAMMA_S * (2.0 * (self.eta[i] - self.eta_s[i])
+                                             - (self.eta_p[i] - self.eta_s[i]))
+                else:
+                    R = R - dt * GAMMA_S * (self.eta[i] - self.eta_s[i])
 
             gN = None
             if WALLS == "neumann":
@@ -1264,6 +1372,9 @@ class ChannelModel:
             ul = uhat[kl * self.nc:(kl + 1) * self.nc]
             ur = uhat[kr * self.nc:(kr + 1) * self.nc]
             eta_new = s.reconstruct(ul, ur, fgbs[i], fvecs[i], gNs[i], load=loads[i])
+            if bdf2:                           # level n becomes level n-1
+                self.eta_p[i], self.u_p[i], self.v_p[i] = self.eta[i], self.u[i], self.v[i]
+                self.E_p[i] = Es[i]
             self.u[i] = ustars[i] - gdtL * s.gradx(eta_new)
             self.v[i] = vstars[i] - gdtL * s.grady(eta_new)
             self.eta[i] = eta_new
@@ -1440,6 +1551,9 @@ RB_RK    = int(os.environ.get("SSLABLU_RB_RK", str(p)))  # rbhbs SOLVER rank (no
 RNG_SEED = int(os.environ.get("SSLABLU_RNG_SEED", "0"))
 GPU      = os.environ.get("SSLABLU_GPU", "0") != "0"     # hpsalt reduced_gpu
 FASTLEAF = os.environ.get("SSLABLU_FASTLEAF", "1") != "0"  # cached leaf factors
+TIMESTEPPER = os.environ.get("SSLABLU_TIMESTEPPER", "be").lower()   # be | bdf2
+if TIMESTEPPER not in ("be", "bdf2"):
+    raise ValueError("SSLABLU_TIMESTEPPER must be 'be' or 'bdf2', got %r" % TIMESTEPPER)
 if GPU and not torch.cuda.is_available():
     raise ValueError("SSLABLU_GPU=1 but torch.cuda.is_available() is False")
 if SOLVER not in ("rb", "rbhbs", "thomas"):
@@ -1499,18 +1613,24 @@ opts = solverWrap.solverOptions("hpsalt", [p_disc, p_disc], a, reduced_gpu=GPU,
                                 bc_types=NEUMANN_WALLS if WALLS == "neumann" else None)
 
 dt   = 3600.0 * dt_hours
-ell  = np.sqrt(GRAV * H0) * dt / LCHAN
+# the operator's step: dt (be) or 2 dt / 3 (bdf2), as ChannelModel.gam
+ell  = np.sqrt(GRAV * H0) * (dt if TIMESTEPPER == "be" else 2.0 * dt / 3.0) / LCHAN
 ell2 = ell * ell
+if FLUXBUDGET and TIMESTEPPER != "be":
+    raise ValueError("SSLABLU_FLUXBUDGET=1 assumes the backward-Euler continuity "
+                     "equation: use SSLABLU_TIMESTEPPER=be")
 
 # one output directory per configuration (see the header), so runs don't
 # overwrite each other
 SOLVER_TOKEN = {"rb": "_rb", "rbhbs": "_rbhbs_rbrk%d" % RB_RK, "thomas": ""}[SOLVER]
 SOLVER_NAME  = {"rb": "red-black", "rbhbs": "HBS red-black", "thomas": "Thomas"}[SOLVER]
-graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s" % (
+graph_directory = "run_sslablu_%s_p%d_N%d_pan%dx%d%s%s_dt%gs_nsteps%d%s%s%s%s%s" % (
     "fluxbudget" if FLUXBUDGET else "channel",
     p, N, npan_x, npan_y, ("_rk%d" % RK) if RK > 0 else "", SOLVER_TOKEN,
     dt, NSTEPS, "_neumann" if WALLS == "neumann" else "",
     "" if RIDGE_MIDPANEL else "_ridgectr",
+    "" if TIMESTEPPER == "be" else "_" + TIMESTEPPER,
+    ("_ramp%gh" % WIND_RAMP_H) if (FORCED and WIND_RAMP_H > 0.0) else "",
     ("_rng%d" % RNG_SEED) if (RNG_SEED != 0 and RK > 0) else "")
 SSH_OUT = SSH_OUT or os.path.join(graph_directory, "channel_timestep_ssh.npz")
 
@@ -1535,6 +1655,10 @@ print("ridge crest x/L          = ", '%.5f' % RIDGE_XC,
                                       else "centered, on slab/panel edge"))
 print("dt                       = ", '%6.3f h' % dt_hours,
       " ell/L = %.3f  ell^2 = %.4f" % (ell, ell2))
+print("time stepper             = ", {"be": "backward-Euler IMEX (first order)",
+                                      "bdf2": "semi-implicit BDF2 (second order; operator step 2 dt / 3; "
+                                              "backward-Euler first step)"}[TIMESTEPPER],
+      " (SSLABLU_TIMESTEPPER)")
 print("steps / total time       = ", NSTEPS, "/ %.2f h" % (NSTEPS * dt_hours))
 print("f*dt (explicit Coriolis) = ", '%6.3f' % (FCOR * dt))
 print("S-map assembler          = ",
@@ -1563,6 +1687,8 @@ else:
 if FORCED:
     print("scenario                 =  FORCED (wind + drag + steric)")
     print("wind stress amp TAU0     = ", '%6.3f N/m^2' % TAU0)
+    print("wind ramp-up             = ", ("%.2f h, C2 smoothstep  (SSLABLU_WIND_RAMP_H)" % WIND_RAMP_H)
+          if WIND_RAMP_H > 0.0 else "none, full wind from t = 0")
     print("bottom drag RDRAG        = ", '%8.2E /s  (1/r = %5.1f h)'
           % (RDRAG, 1.0 / RDRAG / 3600.0))
     print("steric half-range        = ", '%6.3f m' % STERIC_AMP)
@@ -1594,6 +1720,9 @@ if SOLVER in ("rb", "rbhbs"):
 if FASTLEAF:
     print("[divergence form]     cached leaf path vs hpsalt, random data: rel. diff = %.3E"
           "  (cache %.2f GB)" % (modC.leaf_check, modC.cache_bytes / 1e9))
+if TIMESTEPPER == "bdf2":
+    print("[divergence form]     bdf2 start-up (backward-Euler operator + first step) = %.2f s"
+          % modC.t_start)
 modN = None
 if CMP_FORM:
     modN = ChannelModel(dt, False, make_assembler(), dSlabs, connectivity, H,
@@ -1603,6 +1732,9 @@ if CMP_FORM:
     if FASTLEAF:
         print("[non-conservative]    cached leaf path vs hpsalt, random data: rel. diff = %.3E"
               "  (cache %.2f GB)" % (modN.leaf_check, modN.cache_bytes / 1e9))
+    if TIMESTEPPER == "bdf2":
+        print("[non-conservative]    bdf2 start-up (backward-Euler operator + first step) = %.2f s"
+              % modN.t_start)
 t_setup = time.perf_counter() - tic
 
 M0C = modC.mass()
@@ -1789,7 +1921,8 @@ np.savez(SSH_OUT, ns=np.array(SSH_NS), dt=dt, nsteps=NSTEPS, nmid=NSTEPS // 2,
          forced=FORCED, steric_amp=STERIC_AMP, gamma_s=GAMMA_S, tau0=TAU0,
          rdrag=RDRAG, walls=WALLS, wall_band=wall_band, wall_noflux=WALL_NOFLUX,
          sponge_w=SPONGE_W, sponge_rate=SPONGE_RATE, solver=SOLVER, rk=RK, rb_rk=RB_RK,
-         rng_seed=RNG_SEED, solver_check=modC.solver_check, **ssh_export)
+         rng_seed=RNG_SEED, solver_check=modC.solver_check, timestepper=TIMESTEPPER, wind_ramp_h=WIND_RAMP_H,
+         **ssh_export)
 print("Wrote %s  (eta/u/v at %s-squared cell centers)" % (SSH_OUT, SSH_NS))
 
 # ---- optional dt-convergence (rebuilds the operator per dt: slow) ----------
@@ -1809,7 +1942,7 @@ if DO_DTCNV:
 
     eref = run_final(dt / 8.0, nbase * 8)
     print(" reference: dt/8, %d steps, T = %.3f h" % (nbase * 8, Tfin / 3600.0))
-    print("     dt        N     rel-l2 vs ref     ratio   (O(dt) -> ~2.0)")
+    print("     dt        N     rel-l2 vs ref     ratio   (be -> ~2, bdf2 -> ~4)")
     prev = None
     for k in (1, 2, 4):
         e = run_final(dt / k, nbase * k)
