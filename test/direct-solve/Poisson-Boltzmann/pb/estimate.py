@@ -1,40 +1,53 @@
 """
-Components of the a-posteriori bound of pb_fixed_operator.tex (Verification, 2):
+Components of the a-posteriori bound of pb_fixed_operator.tex (Verification, 2),
+completed with the value jumps:
 
-    |phi~ - phi|_inf <= C_P max_leaves |eta| + C_Gamma max_faces |[d_n phi~]|
-                        + max_wall |phi~ - phi_b|,
-    eta = -Lap phi~ + G[phi~] - f*,
+    e = phi~ - phi solves -Lap e + c e = (continuous residual of phi~), c >= 0, with
+      volume part   eta = -Lap phi~ + G[phi~] - f*   inside the leaves,
+      face parts    [d_n phi~] (single layer) and [phi~] (double layer) on leaf
+                    faces -- HPS matches values and fluxes at the Gauss face
+                    nodes only, so both jump off-node,
+      boundary part phi~ - phi_b on the wall;
+    |e|_inf <= C_P max|eta| + C_Gamma max|[d_n phi~]| + C_D max|[phi~]| + max|phi~ - phi_b|.
 
-evaluated at random OFF-NODE points of the reconstructed leaf polynomials
-(collocation makes eta vanish at the interior nodes, and the flux / boundary
-conditions hold at the Gauss face nodes only).  The constants depend on the
-geometry and the leaf size only, so for p-convergence the components are
-reported as they are.
+All components are evaluated at random OFF-NODE points of the reconstructed
+leaf polynomials.  The constants depend on the geometry and leaf size only, so
+for p-convergence the components are reported as they are.
 
-  eta      : at random points inside the leaves, via the reference-coordinate
-             coefficients of each patch (Patch.ref_coeffs on the geometry PDO,
-             i.e. exactly the operator the leaves discretize);
-  jumps    : physical normal derivative, outward from both sides, summed:
-                 [d_n phi] = sum_sides s e_a . A~ grad_X phi / sqrt(e_a . A~ e_a)
-             (A~ = reference metric, e_a the reference normal), on leaf faces
-             inside a patch and on patch-patch faces (the other side found by
-             Newton on its patch map);
-  wall     : phi~ - phi_b at random points on the wall faces.
+  eta          : random points inside the leaves, with the reference-coordinate
+                 coefficients of each patch (Patch.ref_coeffs on the geometry
+                 PDO: exactly the operator the leaves discretize);
+  jump_flux_*  : physical normal derivative, outward from both sides, summed:
+                     sum_sides s e_a . A~ grad_X phi / sqrt(e_a . A~ e_a)
+                 (A~ reference metric, e_a the reference normal);
+  jump_val_*   : phi_A - phi_B at the same points;
+                 *_leaf on leaf faces inside a patch, *_patch on patch-patch
+                 faces.  The patches are conforming: the gluing pairs every
+                 Gauss slot of a patch-patch leaf face with one slot of the
+                 other patch, and the tangential reference coordinates of the
+                 two sides are related by an affine map, fitted from those
+                 slots (residual checked) and verified at the random points in
+                 physical space -- no map inversion, failure is an error;
+  wall         : phi~ - phi_b at random points on the wall faces.
 
-Each slab contributes only its own single slab around the midplane, t in
-[t0 + H/2, t0 + 3H/2), so every point of the torus is counted once.
+Every maximum is returned with its location (patch, psi, t, position inside the
+leaf, face axis).  Each slab contributes only its own single slab around the
+midplane, t in [t0 + H/2, t0 + 3H/2), so every point of the torus counts once.
 
-Sanity checks returned alongside (both should be small):
-  eta_nodes  : eta at the leaf-interior collocation nodes (~ the local chord
-               tolerance times c: checks the operator, signs and G);
-  wall_gauss : phi~ - phi_b at the Gauss wall nodes (~ rounding: checks the
-               leaf evaluation and the face geometry).
+Sanity checks (both should be small):
+  eta_nodes  : eta at (a sample of) the leaf-interior collocation nodes
+               (~ local chord tolerance times c: checks operator, signs, G);
+  wall_gauss : phi~ - phi_b at the Gauss wall nodes (<< the off-node wall value).
 """
 import numpy as np
 from numpy.polynomial import chebyshev as C
 from scipy.spatial import cKDTree
 
 from solver.cylinder_slab import pdo3d_to_cyl
+
+COMPONENTS = ("eta", "jump_flux_leaf", "jump_flux_patch", "jump_val_leaf", "jump_val_patch",
+              "wall", "eta_nodes", "wall_gauss")
+_AXIS_NAME = {"core": ("x", "y", "t"), "arch": ("radial", "tangential", "t")}
 
 
 def _axis_basis(u, x):
@@ -71,6 +84,9 @@ class _PatchField:
                                * self.nleaf[a]).astype(int), 0, self.nleaf[a] - 1) for a in range(3)]
         return np.ravel_multi_index(tuple(ia), self.nleaf)
 
+    def rel(self, X, b):
+        return (X - self.lo[b]) / (self.hi[b] - self.lo[b])
+
     def eval(self, X, b, chunk=4096):
         """value (N,), gradient (N,3), Hessian (N,3,3) in patch reference coords."""
         if len(X) <= chunk:
@@ -103,12 +119,30 @@ def _oms(P, X):
     return P.to_phys(X)[:, [2, 0, 1]]
 
 
+def patch_label(P):
+    return "core" if P.kind == "core" else "arch[rot %d]" % P.rot
+
+
+def format_loc(loc):
+    if not loc:
+        return "-"
+    s = "%s psi %.3f t %.3f leaf-rel (%.2f, %.2f, %.2f)" % (
+        loc["patch"], loc["psi"], loc["t"], *loc["rel"])
+    if loc.get("axis") is not None:
+        s += ", face normal %s" % loc["axis"]
+    return s
+
+
 class ResidualEstimator:
-    def __init__(self, pdo_geo, model, Rc, nsamp=3, wall_tol=1e-9):
+    def __init__(self, pdo_geo, model, Rc, nsamp=3, node_samples=8, wall_tol=1e-9, dump=False):
         """pdo_geo: geometry PDO in OMS coordinates (the one given to OMS);
-        model: PBProfiles / PBManufactured (g, fstar, phi_b or phistar)."""
+        model: PBProfiles / PBManufactured (g, fstar, psi, phi_b or phistar).
+        nsamp: random points per leaf / leaf face; node_samples: collocation
+        nodes per leaf for the eta_nodes check."""
         self.pde = pdo3d_to_cyl(pdo_geo)
-        self.model, self.Rc, self.nsamp, self.wall_tol = model, Rc, nsamp, wall_tol
+        self.model, self.Rc, self.wall_tol = model, Rc, wall_tol
+        self.nsamp, self.node_samples = nsamp, node_samples
+        self.dump = dump               # keep every eta sample (coords, psi, patch, leaf position)
         self.phib = model.phi_b if hasattr(model, "phi_b") else model.phistar
 
     # ---------------------------------------------------------- pieces
@@ -119,10 +153,11 @@ class ResidualEstimator:
         W = _oms(F.P, X)
         return lap + self.model.g(W, val) - self.model.fstar(W)
 
-    def _flux_out(self, F, X, b, a, s):
-        _, grad, _ = F.eval(X, b)
+    def _side(self, F, X, b, a, s):
+        """(value, outward physical normal derivative) on face axis a, sign s."""
+        val, grad, _ = F.eval(X, b)
         At = F.P.ref_a(X, self.pde)
-        return s * np.einsum("nk,nk->n", At[:, a, :], grad) / np.sqrt(At[:, a, a])
+        return val, s * np.einsum("nk,nk->n", At[:, a, :], grad) / np.sqrt(At[:, a, a])
 
     def _is_wall(self, P, X):
         x = P.to_phys(X)
@@ -130,13 +165,12 @@ class ResidualEstimator:
 
     @staticmethod
     def _face_leaves(F, a, side):
-        """Leaves of F touching its box face (axis a, side 0 = lo / 1 = hi)."""
         I = np.unravel_index(np.arange(int(np.prod(F.nleaf))), F.nleaf)
         return np.flatnonzero(I[a] == (F.nleaf[a] - 1 if side else 0))
 
     def _face_points(self, F, leaves, a, side, rng, gauss=None):
         """Points on face (a, side) of the given leaves: random tangential
-        coordinates, or the Gauss-Legendre tensor nodes (gauss = (qt1, qt2))."""
+        coordinates, or the Gauss-Legendre tensor nodes (gauss = (q1, q2))."""
         tang = [t for t in range(3) if t != a]
         if gauss is None:
             r = rng.uniform(size=(len(leaves), self.nsamp, 3))
@@ -147,9 +181,40 @@ class ResidualEstimator:
             r[..., tang[0]], r[..., tang[1]] = G0.ravel(), G1.ravel()
         r[..., a] = float(side)
         lo, hi = F.lo[leaves][:, None, :], F.hi[leaves][:, None, :]
-        X = (lo + r * (hi - lo)).reshape(-1, 3)
-        b = np.repeat(leaves, r.shape[1])
-        return X, b
+        return (lo + r * (hi - lo)).reshape(-1, 3), np.repeat(leaves, r.shape[1])
+
+    # ---------------------------------------------------------- bookkeeping
+    def _record(self, out, key, vals, F, X, b, axis=None):
+        if not len(vals):
+            return
+        a = np.abs(vals)
+        i = int(np.argmax(a))
+        if a[i] > out[key]:
+            out[key] = float(a[i])
+            W = _oms(F.P, X[i:i + 1])
+            out["loc"][key] = dict(patch=patch_label(F.P), psi=float(self.model.psi(W)[0]),
+                                   t=float(W[0, 0]), rel=tuple(F.rel(X[i:i + 1], b[i:i + 1])[0]),
+                                   axis=None if axis is None else _AXIS_NAME[F.P.kind][axis])
+
+    @staticmethod
+    def merge(total, part):
+        """Combine per-slab results: max (with location) / sums of counts."""
+        if total is None:
+            total = {k: (0 if k.startswith("n_") or k.endswith("fail") else 0.0) for k in part
+                     if k not in ("loc", "dump")}
+            total["loc"] = {}
+        if "dump" in part:
+            total.setdefault("dump", []).extend(part["dump"])
+        for k, v in part.items():
+            if k in ("loc", "dump"):
+                continue
+            if k.startswith("n_") or k.endswith("fail"):
+                total[k] += v
+            elif v > total[k]:
+                total[k] = v
+                if k in part["loc"]:
+                    total["loc"][k] = part["loc"][k]
+        return total
 
     # ---------------------------------------------------------- one slab
     def slab(self, ops, phi, t_own, seed=0):
@@ -159,33 +224,34 @@ class ResidualEstimator:
         imask = ops.interior_mask()
         Fs = [_PatchField(P, grid, off, phi, imask) for P, grid, off in ops.leaf_grids()]
         own = lambda X: (X[:, 2] >= t_own[0]) & (X[:, 2] < t_own[1])
-        out = dict(eta=0.0, jump_leaf=0.0, jump_patch=0.0, wall=0.0, eta_nodes=0.0,
-                   wall_gauss=0.0, n_eta=0, n_jump_leaf=0, n_jump_patch=0, n_wall=0,
-                   patch_newton_fail=0)
-        upd = lambda k, v: out.__setitem__(k, max(out[k], float(np.max(np.abs(v))) if len(v) else 0.0))
-
-        trees = []
-        for k, F in enumerate(Fs):
-            others = [j for j in range(len(Fs)) if j != k]
-            pts = [Fs[j].P.to_phys(Fs[j].grid.reshape(-1, 3)) for j in others]
-            lab = np.concatenate([np.full(len(q), j) for j, q in zip(others, pts)])
-            ref = np.vstack([Fs[j].grid.reshape(-1, 3) for j in others])
-            trees.append((cKDTree(np.vstack(pts)), lab, ref))
+        out = {k: 0.0 for k in COMPONENTS}
+        out.update(n_eta=0, n_face_leaf=0, n_face_patch=0, n_wall=0, face_map_err=0.0, loc={})
 
         for k, F in enumerate(Fs):
             nb = F.V.shape[0]
-            # -- interior residual: random points, and the collocation nodes (check)
+            # -- interior residual at random points
             r = rng.uniform(size=(nb, self.nsamp, 3))
             X = (F.lo[:, None, :] + r * (F.hi - F.lo)[:, None, :]).reshape(-1, 3)
             b = np.repeat(np.arange(nb), self.nsamp)
             m = own(X)
             if m.any():
-                upd("eta", self._eta(F, X[m], b[m])); out["n_eta"] += int(m.sum())
-            Xn = F.grid[:, F.Jc, :].reshape(-1, 3)
-            bn = np.repeat(np.arange(nb), int(F.Jc.sum()))
+                eta = self._eta(F, X[m], b[m])
+                self._record(out, "eta", eta, F, X[m], b[m])
+                out["n_eta"] += int(m.sum())
+                if self.dump:
+                    W = _oms(F.P, X[m])
+                    out.setdefault("dump", []).append(dict(
+                        W=W, psi=self.model.psi(W), patch=np.full(len(W), k), rot=np.full(len(W), F.P.rot),
+                        leaf=b[m], rel=F.rel(X[m], b[m]), eta=eta))
+            # -- check: eta at a sample of the collocation nodes
+            Jc = np.flatnonzero(F.Jc)
+            pick = np.stack([rng.choice(Jc, size=min(self.node_samples, len(Jc)), replace=False)
+                             for _ in range(nb)])
+            Xn = F.grid[np.arange(nb)[:, None], pick].reshape(-1, 3)
+            bn = np.repeat(np.arange(nb), pick.shape[1])
             m = own(Xn)
             if m.any():
-                upd("eta_nodes", self._eta(F, Xn[m], bn[m]))
+                self._record(out, "eta_nodes", self._eta(F, Xn[m], bn[m]), F, Xn[m], bn[m])
 
             # -- leaf-leaf faces inside the patch
             I = np.unravel_index(np.arange(nb), F.nleaf)
@@ -199,69 +265,118 @@ class ResidualEstimator:
                 X, b = self._face_points(F, sel, a, 1, rng)
                 b2 = np.repeat(nbr, self.nsamp)
                 m = own(X)
-                if m.any():
-                    j = self._flux_out(F, X[m], b[m], a, 1.0) + self._flux_out(F, X[m], b2[m], a, -1.0)
-                    upd("jump_leaf", j); out["n_jump_leaf"] += int(m.sum())
+                if not m.any():
+                    continue
+                X, b, b2 = X[m], b[m], b2[m]
+                vA, fA = self._side(F, X, b, a, 1.0)
+                vB, fB = self._side(F, X, b2, a, -1.0)
+                self._record(out, "jump_flux_leaf", fA + fB, F, X, b, axis=a)
+                self._record(out, "jump_val_leaf", vA - vB, F, X, b, axis=a)
+                out["n_face_leaf"] += len(X)
 
-            # -- box faces of the patch: wall or another patch
-            for a in range(2):                                     # cross-section axes
+            # -- wall faces of the patch (cross-section box faces on the wall)
+            for a in range(2):
                 for side in (0, 1):
                     leaves = self._face_leaves(F, a, side)
                     X, b = self._face_points(F, leaves, a, side, rng)
-                    m = own(X)
-                    X, b = X[m], b[m]
-                    if not len(X):
+                    m = own(X) & self._is_wall(F.P, X)
+                    if not m.any():
                         continue
-                    wall = self._is_wall(F.P, X)
-                    if wall.any():
-                        Xw = X[wall]
-                        v, _, _ = F.eval(Xw, b[wall])
-                        upd("wall", v - self.phib(_oms(F.P, Xw))); out["n_wall"] += len(Xw)
-                        tang = [t for t in range(3) if t != a]
-                        Xg, bg = self._face_points(F, leaves, a, side, rng,
-                                                   gauss=[len(F.nodes[t]) - 2 for t in tang])
-                        mg = own(Xg) & self._is_wall(F.P, Xg)
-                        if mg.any():
-                            vg, _, _ = F.eval(Xg[mg], bg[mg])
-                            upd("wall_gauss", vg - self.phib(_oms(F.P, Xg[mg])))
-                    if (~wall).any():
-                        j, nfail = self._patch_jump(Fs, trees[k], F, X[~wall], b[~wall], a, side)
-                        upd("jump_patch", j); out["n_jump_patch"] += len(j)
-                        out["patch_newton_fail"] += nfail
+                    Xw, bw = X[m], b[m]
+                    v, _, _ = F.eval(Xw, bw)
+                    self._record(out, "wall", v - self.phib(_oms(F.P, Xw)), F, Xw, bw, axis=a)
+                    out["n_wall"] += len(Xw)
+                    tang = [t for t in range(3) if t != a]
+                    Xg, bg = self._face_points(F, leaves, a, side, rng,
+                                               gauss=[len(F.nodes[t]) - 2 for t in tang])
+                    mg = own(Xg) & self._is_wall(F.P, Xg)
+                    if mg.any():
+                        vg, _, _ = F.eval(Xg[mg], bg[mg])
+                        self._record(out, "wall_gauss", vg - self.phib(_oms(F.P, Xg[mg])),
+                                     F, Xg[mg], bg[mg], axis=a)
+
+        # -- patch-patch faces, through the gluing correspondence
+        for g in self._patch_faces(ops, Fs):
+            FA, FB = Fs[g["kA"]], Fs[g["kB"]]
+            n = self.nsamp
+            rA = np.zeros((n, 3)); rA[:, g["tA"]] = rng.uniform(size=(n, 2)); rA[:, g["aA"]] = g["sA"]
+            rB = np.zeros((n, 3)); rB[:, g["tB"]] = np.c_[rA[:, g["tA"]], np.ones(n)] @ g["M"]
+            rB[:, g["aB"]] = g["sB"]
+            bA, bB = np.full(n, g["bA"]), np.full(n, g["bB"])
+            XA = FA.lo[bA] + rA * (FA.hi[bA] - FA.lo[bA])
+            XB = FB.lo[bB] + rB * (FB.hi[bB] - FB.lo[bB])
+            m = own(XA)
+            if not m.any():
+                continue
+            XA, XB, bA, bB = XA[m], XB[m], bA[m], bB[m]
+            err = float(np.max(np.abs(FA.P.to_phys(XA) - FB.P.to_phys(XB))))
+            out["face_map_err"] = max(out["face_map_err"], err)
+            if err > 1e-9:
+                raise RuntimeError("patch face map %s leaf %d -> %s leaf %d: physical mismatch %.2e"
+                                   % (patch_label(FA.P), g["bA"], patch_label(FB.P), g["bB"], err))
+            vA, fA = self._side(FA, XA, bA, g["aA"], 1.0 if g["sA"] else -1.0)
+            vB, fB = self._side(FB, XB, bB, g["aB"], 1.0 if g["sB"] else -1.0)
+            self._record(out, "jump_flux_patch", fA + fB, FA, XA, bA, axis=g["aA"])
+            self._record(out, "jump_val_patch", vA - vB, FA, XA, bA, axis=g["aA"])
+            out["n_face_patch"] += len(XA)
         return out
 
-    def _patch_jump(self, Fs, tree, F, X, b, a, side, tol=1e-9):
-        """Flux jump across a patch-patch face: locate the points in the other
-        patch (nearest node, then Newton on its map), sum the outward fluxes."""
-        x = F.P.to_phys(X)
-        kd, lab, ref = tree
-        _, nn = kd.query(x)
-        fA = self._flux_out(F, X, b, a, 1.0 if side else -1.0)
-        jumps, nfail = np.full(len(X), np.nan), 0
-        for j in np.unique(lab[nn]):
-            s = np.flatnonzero(lab[nn] == j)
-            G = Fs[j]
-            Y = ref[nn[s]].copy()
-            for _ in range(50):
-                res = G.P.to_phys(Y) - x[s]
-                if np.max(np.abs(res)) < 1e-13:
-                    break
-                Y -= np.einsum("nkj,nj->nk", G.P.grad_ref(Y), res)
-            ok = np.max(np.abs(G.P.to_phys(Y) - x[s]), axis=1) < 1e-10
-            # which face of G: the cross-section coordinate at its box bound
-            dlo = np.abs(Y[:, :2] - G.box[:2, 0]); dhi = np.abs(Y[:, :2] - G.box[:2, 1])
-            dmin = np.minimum(dlo, dhi)
-            aB = np.argmin(dmin, axis=1)
-            ok &= dmin[np.arange(len(Y)), aB] < tol * max(1.0, np.abs(G.box).max())
-            nfail += int(np.sum(~ok))
-            for ax in (0, 1):
-                t = np.flatnonzero(ok & (aB == ax))
-                if not len(t):
-                    continue
-                sideB = dhi[t, ax] < dlo[t, ax]
-                Yt = Y[t].copy()
-                Yt[:, ax] = np.where(sideB, G.box[ax, 1], G.box[ax, 0])   # snap onto the face
-                bB = G.leaf_of(Yt)
-                fB = self._flux_out(G, Yt, bB, ax, np.where(sideB, 1.0, -1.0))
-                jumps[s[t]] = fA[s[t]] + fB
-        return jumps[np.isfinite(jumps)], nfail
+    @staticmethod
+    def _patch_faces(ops, Fs, tol=1e-9, fit_tol=1e-10):
+        """Leaf-face pairs between different patches from the gluing
+        (ops.dof_of_slot): per pair the leaves, face axes/sides and the affine
+        map M (3x2) with  rB_tang = [rA_tang, 1] @ M  (relative leaf coords)."""
+        pk, lf, ax, sd, rel = [], [], [], [], []
+        for k, (F, d) in enumerate(zip(Fs, ops.patches)):
+            nb, se = d["nb"], d["se"]
+            Xs = np.asarray(d["Xref"]).reshape(nb, se, 3)
+            r = (Xs - F.lo[:, None, :]) / (F.hi - F.lo)[:, None, :]
+            r = r.reshape(-1, 3)
+            d0, d1 = np.abs(r), np.abs(r - 1.0)
+            on = np.minimum(d0, d1) < tol
+            if not np.all(on.sum(axis=1) == 1):
+                raise RuntimeError("Gauss slot not on exactly one leaf face (patch %s)" % patch_label(F.P))
+            a = np.argmax(on, axis=1)
+            rows = np.arange(len(r))
+            pk.append(np.full(len(r), k)); lf.append(np.repeat(np.arange(nb), se))
+            ax.append(a); sd.append((d1[rows, a] < d0[rows, a]).astype(int)); rel.append(r)
+        pk, lf, ax, sd, rel = map(np.concatenate, (pk, lf, ax, sd, rel))
+        dof = np.asarray(ops.dof_of_slot)
+        if len(dof) != len(pk):
+            raise RuntimeError("slot bookkeeping mismatch (%d slots vs %d dofs)" % (len(pk), len(dof)))
+        o = np.argsort(dof, kind="stable")
+        same = dof[o[1:]] == dof[o[:-1]]
+        s1, s2 = o[:-1][same], o[1:][same]
+        cross = pk[s1] != pk[s2]
+        s1, s2 = s1[cross], s2[cross]
+        swap = pk[s1] > pk[s2]
+        s1[swap], s2[swap] = s2[swap], s1[swap].copy()
+        key = np.stack([pk[s1], lf[s1], ax[s1], sd[s1], pk[s2], lf[s2], ax[s2], sd[s2]], axis=1)
+        uk, inv = np.unique(key, axis=0, return_inverse=True)
+        inv = np.asarray(inv).reshape(-1)
+        groups = []
+        for gi, kk in enumerate(uk):
+            idx = np.flatnonzero(inv == gi)
+            kA, bA, aA, sA, kB, bB, aB, sB = (int(x) for x in kk)
+            tA = [t for t in range(3) if t != aA]; tB = [t for t in range(3) if t != aB]
+            RA, RB = rel[s1[idx]][:, tA], rel[s2[idx]][:, tB]
+            if len(idx) < 3:
+                raise RuntimeError("patch face pair with %d matched slots" % len(idx))
+            A1 = np.c_[RA, np.ones(len(idx))]
+            M = np.linalg.lstsq(A1, RB, rcond=None)[0]
+            res = np.max(np.abs(A1 @ M - RB))
+            if res > fit_tol:
+                raise RuntimeError("patch face %s leaf %d / %s leaf %d: tangential map not affine "
+                                   "(fit residual %.2e)" % (patch_label(Fs[kA].P), bA,
+                                                            patch_label(Fs[kB].P), bB, res))
+            groups.append(dict(kA=kA, bA=bA, aA=aA, sA=sA, tA=tA, kB=kB, bB=bB, aB=aB, sB=sB,
+                               tB=tB, M=M))
+        return groups
+
+
+def save_dump(path, total):
+    """All eta samples of a merged result (ResidualEstimator(dump=True)) to .npz:
+    W (t, x, y), psi, patch (0 core, 1-4 arches), rot, leaf, rel (position in
+    the leaf, patch-reference axis order), eta."""
+    parts = total.get("dump", [])
+    np.savez(path, **{k: np.concatenate([d[k] for d in parts]) for k in parts[0]})

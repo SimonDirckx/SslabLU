@@ -48,7 +48,7 @@ from pb.prolong import Prolongation, check_prolongation
 from pb.coarse import coarse_newton_fast
 from pb.interface_iter import InterfaceIteration
 from pb import diagnostics as diag
-from pb.estimate import ResidualEstimator
+from pb.estimate import ResidualEstimator, COMPONENTS, format_loc, save_dump
 
 import scipy
 from packaging.version import Version
@@ -99,7 +99,9 @@ def parse():
     ap.add_argument("--psi-max", type=float, default=0.8, help="flux-function fit on psi <= psi_max")
     ap.add_argument("--nprobe", type=int, default=200, help="probe points per patch")
     ap.add_argument("--est-samples", type=int, default=3, help="estimator: random points per leaf / leaf face")
+    ap.add_argument("--est-node-samples", type=int, default=8, help="estimator check: collocation nodes per leaf")
     ap.add_argument("--no-estimate", action="store_true", help="skip the a-posteriori components")
+    ap.add_argument("--est-dump", action="store_true", help="save every eta sample (coords, psi, patch) to --out")
     ap.add_argument("--compare", type=str, nargs="*", default=[], help="probe .npz files of other runs")
     ap.add_argument("--out", type=str, default="results_test_periodic_vanishing_edge")
     return ap.parse_args()
@@ -313,26 +315,32 @@ def main():
                  " ".join("%.5f" % x for x in F)))
         if not args.no_estimate:
             t0 = time.perf_counter()
-            est = ResidualEstimator(pdo_geo, model, torus.Rc, nsamp=args.est_samples)
-            comp = {}
+            est = ResidualEstimator(pdo_geo, model, torus.Rc, nsamp=args.est_samples,
+                                    node_samples=args.est_node_samples, dump=args.est_dump)
+            comp = None
             for i, s in enumerate(S):
                 z0 = float(s.ops.zbounds[0])
-                ci = est.slab(s.ops, s.phi, (z0 + 0.5 * H, z0 + 1.5 * H), seed=i)
-                for k, v in ci.items():
-                    comp[k] = comp.get(k, 0) + v if k.startswith("n_") or k.endswith("fail") \
-                        else max(comp.get(k, 0.0), v)
-            print("  a-posteriori components (off-node, max): interior |eta| %.2e (%d pts), "
-                  "flux jumps: leaf faces %.2e (%d), patch faces %.2e (%d), wall %.2e (%d)  [%.1fs]"
-                  % (comp["eta"], comp["n_eta"], comp["jump_leaf"], comp["n_jump_leaf"],
-                     comp["jump_patch"], comp["n_jump_patch"], comp["wall"], comp["n_wall"],
+                comp = ResidualEstimator.merge(
+                    comp, est.slab(s.ops, s.phi, (z0 + 0.5 * H, z0 + 1.5 * H), seed=i))
+            print("  a-posteriori components (off-node max; %d interior pts, %d leaf-face, "
+                  "%d patch-face, %d wall)  [%.1fs]"
+                  % (comp["n_eta"], comp["n_face_leaf"], comp["n_face_patch"], comp["n_wall"],
                      time.perf_counter() - t0))
-            print("    sanity: eta at collocation nodes %.2e (small, ~ c x local tol), "
-                  "wall at Gauss nodes %.2e (<< off-node wall), patch Newton failures %d (expect 0)"
-                  % (comp["eta_nodes"], comp["wall_gauss"], comp["patch_newton_fail"]))
-            row.update(est_eta=comp["eta"], est_jump_leaf=comp["jump_leaf"],
-                       est_jump_patch=comp["jump_patch"], est_wall=comp["wall"],
-                       est_eta_nodes=comp["eta_nodes"], est_wall_gauss=comp["wall_gauss"],
-                       est_newton_fail=comp["patch_newton_fail"])
+            labels = dict(eta="interior |eta|", jump_flux_leaf="flux jump, leaf faces",
+                          jump_flux_patch="flux jump, patch faces", jump_val_leaf="value jump, leaf faces",
+                          jump_val_patch="value jump, patch faces", wall="wall |phi - phi_b|",
+                          eta_nodes="check: eta at nodes", wall_gauss="check: wall at Gauss nodes")
+            for key in COMPONENTS:
+                print("    %-26s %.2e  at %s" % (labels[key], comp[key], format_loc(comp["loc"].get(key))))
+            print("    check: patch face map, max physical mismatch %.2e (expect ~1e-15; >1e-9 raises)" % comp["face_map_err"])
+            row.update({"est_" + key: comp[key] for key in COMPONENTS})
+            row.update({"est_loc_" + key: format_loc(comp["loc"].get(key)) for key in COMPONENTS})
+            row["est_face_map_err"] = comp["face_map_err"]
+            if args.est_dump:
+                dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s.npz" % (
+                    Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam, args.N))
+                save_dump(dpath, comp)
+                print("    eta samples saved to", dpath)
         row.update(phi_min=phi_all.min(), phi_max=phi_all.max(), coarse_vs_fine=d_cf,
                    coarse_vs_fine_probes=np.max(np.abs(pv - pv_c)), overlap=ov,
                    overlap_unmatched=unmatched, flux_dev=res_ff, F_axis=F[0])
