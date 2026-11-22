@@ -82,8 +82,10 @@ def parse():
     ap.add_argument("--eta", type=float, default=0.1, help="local tol = eta |R|")
     ap.add_argument("--local-tol-min", type=float, default=1e-13)
     ap.add_argument("--local-maxit", type=int, default=50)
-    ap.add_argument("--rk0", type=int, default=100)
-    ap.add_argument("--step", type=int, default=50)
+    ap.add_argument("--rk0", type=int, default=100, help="OMS block compression rank (assembler)")
+    ap.add_argument("--rk-start", type=int, default=150, help="red-black rank at stage 0")
+    ap.add_argument("--rk-step", type=int, default=50, help="red-black rank increment per stage")
+    ap.add_argument("--rk-max", type=int, default=None, help="cap on the red-black rank")
     ap.add_argument("--device", type=str, default="cpu", help="leaf operators")
     ap.add_argument("--compute-device", type=str, default="cuda", help="red-black solver")
     ap.add_argument("--check", action="store_true", help="check (I-K) of P against the local solves")
@@ -230,7 +232,12 @@ def main():
         row.update(t_oms=t_oms, Ntot=OMS.Ntot, P_exact=info.get("P_exact"))
 
         t0 = clock(args.compute_device)
-        strat = rkStrat_new.linear(args.rk0 + args.step, args.step, skip_first_level=False)
+        kw = {} if args.rk_max is None else dict(rk_max=args.rk_max)
+        strat = rkStrat_new.linear(args.rk_start, args.rk_step, skip_first_level=False, **kw)
+        ranks = [int(strat.rank(st)) for st in range(int(np.log2(Ns)))]
+        print("  red-black ranks per stage %s (HBS leaf size %d)" % (ranks, leaf_size))
+        row.update(rk_asm=args.rk0, rk_start=args.rk_start, rk_step=args.rk_step,
+                   rk_max=args.rk_max, rk_stages=str(ranks))
         rb = omsdirectHBS_new.RedBlackSolverHBS(
             strat, OMS, tree=make_tree(OMS.interface_points), quad=False,
             compute_device=args.compute_device, seed=None, dbg=0, normalized=False,
