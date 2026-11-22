@@ -560,6 +560,19 @@ class BodyLoadReducer:
         raise NotImplementedError
 
 
+class CylOpsHandle(BodyLoadReducer):
+    """Keeps a CylinderSlabOps (cylhps, fast=True) on oms' slimmed solvers:
+    .ops gives the leaf operators (reduce_body / reconstruct with nodal body
+    loads).  Callable body loads are not supported."""
+    typestr = "cylhps-ops"
+
+    def __init__(self, ops):
+        self.ops = ops
+
+    def reduce(self, body_load, offset=None):
+        raise NotImplementedError("cylhps fast: use .ops.reduce_body(h) with nodal h")
+
+
 class HPSaltBodyReducer(BodyLoadReducer):
     """
     Static condensation of a body load for one hpsalt (Domain_Driver) slab.
@@ -814,7 +827,21 @@ class solverWrapper:
             # and MUMPS stay on the host); an explicit cyl['device'] wins
             cyl.setdefault('device', torch.device('cuda') if self.opts.reduced_gpu
                            else torch.device('cpu'))
-            solver = CylinderSlab(geom, PDE, self.ord, **cyl)
+            # fast=True: CylinderSlabOps (geometry once, zero-order coefficient
+            # c_nodal(ops, geom) given at the leaf nodes; PDE = geometry only).
+            # Its leaf operators stay reachable through body_reducer.ops.
+            fast = cyl.pop('fast', False)
+            c_nodal = cyl.pop('c_nodal', None)
+            keep_geometry = cyl.pop('keep_geometry', True)
+            if fast:
+                from solver.cylinder_slab import CylinderSlabOps
+                solver = CylinderSlabOps(geom, PDE, self.ord, **cyl)
+                solver.set_c(np.zeros(len(solver.nodes())) if c_nodal is None
+                             else c_nodal(solver, geom))
+                if not keep_geometry:
+                    solver.release_geometry()
+            else:
+                solver = CylinderSlab(geom, PDE, self.ord, **cyl)
             if cyl['device'].type == 'cuda':
                 import gc
                 gc.collect()
@@ -837,6 +864,10 @@ class solverWrapper:
                 print("\t Toc construct Aii inverse %5.2f s "
                       "(analysis %5.2f s, factor %5.2f s)"
                       % (toc, self.time_analysis, self.time_factor)) if verbose else None
+            if fast:
+                # the ops object stays alive through body_reducer; drop its Aii
+                # reference so the matrix goes with this wrapper when oms slims it
+                solver.Aii = None
         elif self.type=='spectral':
             geomSpectral = convertGeom(self.opts,geom)
             solver = spectral(PDE, geomSpectral, self.ord)
@@ -978,6 +1009,10 @@ class solverWrapper:
         """
         red = self.__dict__.get("_body_reducer")
         if red is not None or not self.constructed:
+            return red
+        if self.type == "cylhps" and hasattr(self.solver, "set_c"):
+            red = CylOpsHandle(self.solver)
+            self._body_reducer = red
             return red
         if self.type == "hpsalt":
             try:

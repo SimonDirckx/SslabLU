@@ -1,0 +1,635 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,mathtools,amsthm}
+\usepackage{booktabs,array}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=MidnightBlue,citecolor=MidnightBlue,urlcolor=MidnightBlue]{hyperref}
+\usepackage{cleveref}
+
+\newtheorem{proposition}{Proposition}
+\theoremstyle{remark}\newtheorem{remark}{Remark}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\cR}{c_{\mathrm{ref}}}
+\newcommand{\SolveM}{\mathcal{M}}
+\DeclareMathOperator{\diag}{diag}
+
+\title{The nonlinear Poisson--Boltzmann equation on a twisted elliptic torus:\\
+two fixed-operator iterations for an OMS / HBS solver}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We state the normalized nonlinear Poisson--Boltzmann (PB) equation for a pure
+electron plasma confined on magnetic surfaces, pose it on a twisted elliptic
+torus with prescribed profiles, and construct a manufactured solution for
+verification. We then describe two iterations that solve it while keeping a
+\emph{single} linear operator $M=-\Delta+\cR(x)$: a fixed-point
+iteration on the OMS interface system, whose state is only the interface
+traces, and a volumetric Newton--Krylov method preconditioned by $M$. In both, the
+slab factorizations, the hierarchical (HBS) compressions and the red--black
+preconditioner of the overlapping multi-slab (OMS) solver are built once; every
+iteration only changes right-hand sides and pointwise (diagonal) volume
+coefficients. No slab factorization is repeated.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{The model}
+%======================================================================
+
+\subsection{Physical equation}
+For a pure electron plasma confined on magnetic surfaces (Costello \& Helander,
+following Pedersen \& Boozer), the electrostatic potential $\Phi$ obeys
+Poisson's equation with the electron charge density,
+\begin{equation}
+  \varepsilon_0\nabla^2\Phi = e\,n_e ,
+\end{equation}
+and force balance along the magnetic field, with isothermal flux surfaces
+$T_e=T_e(\psi)$, gives a Boltzmann relation on each surface,
+\begin{equation}
+  n_e = N(\psi)\exp\!\Big(\frac{e\Phi}{T_e(\psi)}\Big).
+\end{equation}
+Here $e>0$ is the elementary charge, $\psi$ labels the flux surfaces and
+$N(\psi)$ is a flux function. Combining,
+\begin{equation}\label{eq:pb-dim}
+  \nabla^2\Phi = \frac{e}{\varepsilon_0}\,N(\psi)\exp\!\Big(\frac{e\Phi}{T_e(\psi)}\Big).
+\end{equation}
+(The paper prints this as $\nabla^2\Phi=N(\psi)\exp(e\Phi/T_e)$; the factor
+$e/\varepsilon_0$ follows from the Poisson equation stated with it.)
+
+\subsection{Normalization}
+With a length scale $a$, a reference temperature $T_{\mathrm{ref}}$ and a
+reference density $n_{\mathrm{ref}}$, set
+\begin{equation}
+  x = a\hat x,\qquad \phi=\frac{e\Phi}{T_{\mathrm{ref}}},\qquad
+  \hat N=\frac{N}{n_{\mathrm{ref}}},\qquad \tau=\frac{T_e}{T_{\mathrm{ref}}},\qquad
+  \lambda_D=\sqrt{\frac{\varepsilon_0T_{\mathrm{ref}}}{e^2n_{\mathrm{ref}}}},\qquad
+  \Lambda=\frac{a}{\lambda_D}.
+\end{equation}
+Then \eqref{eq:pb-dim} becomes (dropping hats)
+\begin{equation}\label{eq:pb}
+  \boxed{\;-\Delta\phi + \Lambda^2 N(\psi)\,e^{\phi/\tau(\psi)} = 0\quad\text{in }\Omega,
+  \qquad \phi=\phi_b\ \text{on }\partial\Omega.\;}
+\end{equation}
+$\Lambda$ is the number of Debye lengths across the device; the regime of
+interest is $\Lambda\gg1$, where the exponential term is stiff.
+
+We use \emph{model (A)}: $\Lambda$, the flux label $\psi(x)$, and the profiles
+$N(\psi)>0$, $\tau(\psi)>0$ are prescribed, with Dirichlet data on the plasma
+boundary. (The alternative, prescribing the surface-averaged density
+$\langle n_e\rangle_\psi$ and solving for $N$, makes the equation nonlocal on
+each surface; it is not considered here.)
+
+\paragraph{Notation for the nonlinearity.} The nonlinear term is a pointwise
+function of the position $x\in\Omega$ and of the \emph{scalar} value $s\in\R$
+of the potential there:
+\begin{equation}\label{eq:g}
+  g(x,s)=\Lambda^2N(\psi(x))\,e^{s/\tau(\psi(x))},\qquad
+  \partial_sg(x,s)=\frac{g(x,s)}{\tau(\psi(x))}>0 .
+\end{equation}
+For a field $\phi$ on $\Omega$ we write the nonlinear term and the coefficient
+of its linearization as fields,
+\begin{equation}\label{eq:Gc}
+  G[\phi](x)=g\big(x,\phi(x)\big),\qquad c[\phi](x)=\partial_sg\big(x,\phi(x)\big),
+  \qquad G[\phi+\delta]=G[\phi]+c[\phi]\,\delta+\mathcal O(\delta^2).
+\end{equation}
+Only $G[\cdot]$ and $c[\cdot]$ appear below, except in contraction factors,
+where $\partial_sg$ is evaluated at intermediate values. With this notation
+\eqref{eq:pb} reads $-\Delta\phi+G[\phi]=0$. Since $g$ is increasing in $s$, it
+is the Euler--Lagrange equation of a strictly convex energy and has exactly one
+solution.
+
+\subsection{Maximum-principle estimate}
+The following elementary bound is used repeatedly.
+\begin{proposition}\label{prop:maxp}
+Let $c\ge0$ and let $w$ solve $-\Delta w+c(x)w=h$ in $\Omega$, $w=0$ on $\partial\Omega$. Then
+\[
+\|w\|_\infty\le C_P\,\|h\|_\infty,\qquad C_P=\max_\Omega w_0,\ \ -\Delta w_0=1,\ w_0|_{\partial\Omega}=0,
+\]
+and, if $c>0$, also $\|w\|_\infty\le\|h/c\|_\infty$. If $\Omega$ lies between
+two parallel planes a distance $d$ apart, $C_P\le d^2/8$.
+\end{proposition}
+\begin{proof}[Sketch]
+At a positive interior maximum $x_0$ of $w$, $-\Delta w(x_0)\ge0$, so
+$c\,w(x_0)\le h(x_0)$; the same at a negative minimum. The first bound follows
+by comparison with $\|h\|_\infty w_0$, and $w_0$ is dominated by the
+one-dimensional torsion function of the slab.
+\end{proof}
+
+%======================================================================
+\section{Geometry}
+%======================================================================
+The domain is a twisted elliptic torus, parametrized over a straight periodic
+cylinder $C=[0,L)\times D_{R_c}$, $D_{R_c}$ the disk of radius $R_c$. With
+reference coordinates $p=(t,x,y)$, major radius $R_0$, ellipse semi-axes
+$a_e,b_e$ and an integer twist $\mathrm{tw}$,
+\begin{equation}
+\begin{gathered}
+  R_c=\sqrt{a_eb_e},\quad L=2\pi R_0,\quad \zeta=\frac{t}{R_0},\quad
+  X=\frac{a_e}{R_c}x,\quad Y=\frac{b_e}{R_c}y,\quad \alpha=\mathrm{tw}\,\zeta,\\
+  R=R_0+X\cos\alpha-Y\sin\alpha,\qquad
+  \chi(p)=\big(R\cos\zeta,\;R\sin\zeta,\;X\sin\alpha+Y\cos\alpha\big).
+\end{gathered}
+\end{equation}
+The map preserves the centreline length and the cross-sectional area. Its
+inverse $y=\chi^{-1}$ and the derivatives $\nabla y_k$, $\Delta y_k$ are
+available in closed form. In reference coordinates the Laplacian becomes
+\begin{equation}
+  -\Delta u = -\sum_{k,l}\nabla y_k\!\cdot\!\nabla y_l\;\partial_k\partial_l\tilde u
+  \;-\;\sum_k(\Delta y_k)\,\partial_k\tilde u,\qquad \tilde u=u\circ\chi,
+\end{equation}
+and zero-order terms and body loads are simply evaluated at $\chi(p)$. We use
+the toy flux label
+\begin{equation}
+  \psi(\chi(t,x,y))=\frac{x^2+y^2}{R_c^2}\in[0,1],
+\end{equation}
+whose level sets are nested twisted elliptic tori, $\psi=1$ being the plasma
+boundary.
+
+The cylinder is discretized by a five-patch high-order (HPS) discretization of
+the cross-section (a square core and four arched patches), extruded along $t$,
+and the solver is the overlapping multi-slab method (OMS): $t$ is split into
+$N_s$ double slabs, the unknowns are the traces on the slab midplanes, and the
+reduced system $(I+S)u=r$ couples neighbouring interfaces through the local
+solution maps $S$. The blocks of $S$ are compressed as HBS matrices, and a
+red--black (cyclic) reduction of the compressed system serves as preconditioner.
+
+%======================================================================
+\section{Manufactured solution}
+%======================================================================
+Choose a smooth $\phi^*$ in physical coordinates and define the source
+\begin{equation}
+  f^*= -\Delta\phi^*+G[\phi^*].
+\end{equation}
+Then $\phi^*$ is the unique solution of
+\begin{equation}\label{eq:mms}
+  F(\phi):=-\Delta\phi+G[\phi]-f^*=0\ \text{in }\Omega,\qquad \phi=\phi^*\ \text{on }\partial\Omega .
+\end{equation}
+A convenient choice has a closed-form Laplacian:
+\begin{equation}
+  \phi^*(x)=A\,\sin(\kappa_1x_1+\theta)\cos(\kappa_2x_2)\,e^{\kappa_3x_3}+B,
+  \qquad -\Delta\phi^*=(\kappa_1^2+\kappa_2^2-\kappa_3^2)\,(\phi^*-B),
+\end{equation}
+with profiles, e.g.,
+\begin{equation}
+  N(\psi)=1-\tfrac12\psi,\qquad \tau(\psi)=1-0.4\,\psi .
+\end{equation}
+Pick $A$ so that $\phi^*/\tau$ varies by a few units over $\Omega$; then
+the coefficient $c[\phi^*]$ varies by a factor $e^{\mathcal O(\text{few})}$ and the nonlinearity matters.
+Sweep $\Lambda\in\{1,10,30\}$. The body load is $f^*\circ\chi$ on reference
+points, and the boundary data $\phi^*\circ\chi$ on the tube wall $x^2+y^2=R_c^2$.
+
+%======================================================================
+\section{The fixed reference operator}
+%======================================================================
+\subsection{What is built once}
+Fix a smooth $\cR(x)\ge0$ and the linear operator
+\begin{equation}
+  M=-\Delta+\cR(x).
+\end{equation}
+For $M$ the OMS solver builds, once:
+\begin{enumerate}
+  \item per double slab, the sparse factorization (MUMPS) of the reduced local system $A_{ii}$;
+  \item the interface maps $S$ (applied exactly through these factorizations) and their HBS compressions;
+  \item the red--black preconditioner from the compressed blocks.
+\end{enumerate}
+In terms of these, define the volumetric solve
+\begin{equation}
+  w=\SolveM(h,b)\quad\Longleftrightarrow\quad Mw=h\ \text{in }\Omega,\ \ w=b\ \text{on }\partial\Omega ,
+\end{equation}
+carried out as: reduce the body load $h$ on every slab (leaf-level static
+condensation), form the local right-hand sides with the kept factorizations,
+solve the interface system by GMRES preconditioned by red--black, and
+reconstruct $w$ on the leaf grids (kept factorizations plus leaf solves);
+the slab-level steps are those of \Cref{prop:condense}. $\SolveM$ involves no factorization.
+
+\subsection{Why the coefficient cannot be changed on the interface system}
+The interface blocks are $S=-(A_{ii}^{-1}A_{ib})|_{\text{midplane},\,\text{faces}}$.
+The coefficient $c$ enters every leaf map and $A_{ii}^{-1}$, so $S$ depends on
+$c$ nonlinearly and non-locally: changing $c$ is \emph{not} a diagonal shift of
+the interface operator. In one dimension, for $-u''+cu=0$ on a double slab of
+half-width $H$,
+\begin{equation}
+  u(0)=\frac{u(-H)+u(H)}{2\cosh(\sqrt c\,H)}\qquad\text{versus}\qquad \frac{u(-H)+u(H)}{2}\ \ (c=0).
+\end{equation}
+A new $c$ would therefore require refactoring and recompressing every slab. On
+the \emph{volumetric} operator, however, $-\Delta+c$ is the Laplacian plus a
+diagonal. Both approaches below exploit that while keeping $S$ fixed: the
+interface iteration through local slab solves with the kept factorizations,
+Newton--Krylov through $\SolveM$.
+
+%======================================================================
+\section{Approach 1: fixed-point iteration on the interface system}\label{sec:iface}
+%======================================================================
+The state of this iteration is only the vector of interface traces
+$u=(u_0,\dots,u_{N_s-1})$ on the slab midplanes $\Gamma_i$, the same unknowns
+as the linear OMS system. Volumetric fields exist only transiently, inside
+one slab at a time.
+
+\subsection{Nonlinear interface system}
+Let $\Omega_i$ be double slab $i$. Its end faces are the neighbouring midplanes
+$\Gamma_{i-1}$ and $\Gamma_{i+1}$, its lateral boundary $W_i$ is part of the
+tube wall, and its midplane is $\Gamma_i$. Given the neighbours' traces, the
+\emph{local nonlinear problem} is
+\begin{equation}\label{eq:local}
+  -\Delta\phi^{(i)}+G[\phi^{(i)}]=f^*\ \text{in }\Omega_i,\qquad
+  \phi^{(i)}=u_{i\mp1}\ \text{on }\Gamma_{i\mp1},\qquad \phi^{(i)}=\phi^*\ \text{on }W_i .
+\end{equation}
+By monotonicity it has exactly one solution. Define the local trace maps $\mathcal E_i$ (solve on $\Omega_i$, then restrict
+to $\Gamma_i$) and the interface residual
+\begin{equation}
+  \mathcal E_i(u)=\phi^{(i)}\big|_{\Gamma_i},\qquad
+  \mathcal R(u)=u-\mathcal E(u).
+\end{equation}
+
+\begin{proposition}\label{prop:equiv}
+$\mathcal R(u)=0$ if and only if $u$ is the trace on the midplanes of the
+solution $\phi^*$ of \eqref{eq:mms}.
+\end{proposition}
+\begin{proof}[Sketch]
+The traces of $\phi^*$ satisfy \eqref{eq:local} on every slab, so $\mathcal R=0$.
+Conversely, let $\mathcal R(u)=0$ and consider the overlap cell between
+$\Gamma_i$ and $\Gamma_{i+1}$, which belongs to both $\Omega_i$ and
+$\Omega_{i+1}$. On it, $\phi^{(i)}$ and $\phi^{(i+1)}$ solve the same equation
+with the same wall data and the same values $u_i$ and $u_{i+1}$ at its two
+ends. By uniqueness they coincide, so the local solutions patch together into
+a global solution, which is $\phi^*$.
+\end{proof}
+
+This is the nonlinear counterpart of the linear OMS system, and in the
+discrete setting the same argument applies slab by slab. Linearizing the local problems shows that
+\begin{equation}
+  \mathcal E'(u)=-S\big(c[\phi_u]\big),
+\end{equation}
+where, for a coefficient field $c\ge0$, $S(c)$ denotes the OMS interface
+operator of the \emph{linear} operator $-\Delta+c$, and $\phi_u$ is the field
+assembled from the local solutions for the data $u$. So the
+linear OMS system built once for $c=\cR$, $I+S_{\mathrm{ref}}=I+S(\cR)$, is a
+frozen Jacobian of $\mathcal R$.
+
+\subsection{Iteration}
+With $P\approx(I+S_{\mathrm{ref}})^{-1}$, for example one application of the
+red--black preconditioner or $(I+S_{\mathrm{ref}})^{-1}$ applied by
+preconditioned GMRES,
+\begin{equation}\label{eq:ichord}
+  \boxed{\;u_{k+1}=u_k-P\,\mathcal R(u_k).\;}
+\end{equation}
+The fixed point is exact for any choice of $P$; $P$ only sets the rate.
+Linearizing about the solution,
+\begin{equation}\label{eq:irate}
+  e_{k+1}\approx\big[I-P\,(I+S(c_*))\big]e_k
+  =P\Big[\big(P^{-1}-(I+S_{\mathrm{ref}})\big)+\big(S_{\mathrm{ref}}-S(c_*)\big)\Big]e_k,
+  \qquad c_*=c[\phi^*].
+\end{equation}
+The rate is therefore governed by two quantities:
+\begin{itemize}
+  \item the accuracy of the preconditioner, $P^{-1}\approx I+S_{\mathrm{ref}}$;
+  \item the mismatch of the linearized local maps, $S(\cR)$ against $S(c_*)$.
+\end{itemize}
+The interface maps measure how boundary data propagates to the midplane.
+Under strong screening ($\Lambda\gg1$, $\lambda_D\ll H$) both decay like
+$e^{-\sqrt{c_{\min}}\,H}$, so $I+S$ is close to the identity, the outer
+iteration needs few steps, and almost all the work is local.
+
+\subsection{Local nonlinear solves in statically condensed form}\label{sec:local}
+$\mathcal E_i(u_k)$ is evaluated on slab $i$ alone. What is kept for the slab
+is not the volumetric operator $M_i=-\Delta+\cR$ on $\Omega_i$ but its static
+condensation onto the leaf skeleton, together with the leaf operators that
+produced it. We first write the application of $M_i^{-1}$ in these terms, then
+the local iteration.
+
+\paragraph{Leaf operators.} Let $\mathcal L_i$ be the leaves of slab $i$. On
+leaf $\ell$ the unknowns are the values $\phi_{I,\ell}$ at interior collocation
+nodes and $x_\ell$ at face nodes. Write the leaf discretization of $-\Delta$ as
+$[K_{II,\ell}\ K_{IF,\ell}]$ (rows at interior nodes) and let $C_\ell$ be the
+diagonal of $\cR$ at the interior nodes, so the leaf rows of $M_i$ are
+$[K_{II,\ell}+C_\ell\ \ K_{IF,\ell}]=:[L_{II,\ell}\ L_{IF,\ell}]$. Let $D_\ell$
+map a leaf field $(\phi_{I,\ell},x_\ell)$ to its outgoing (conormal) flux on
+the leaf faces. Define
+\begin{equation}\label{eq:leafops}
+  Y_\ell=-L_{II,\ell}^{-1}L_{IF,\ell},\qquad
+  T_\ell=D_\ell\begin{bmatrix}Y_\ell\\ I\end{bmatrix},\qquad
+  q_\ell(h)=D_\ell\begin{bmatrix}L_{II,\ell}^{-1}h_\ell\\ 0\end{bmatrix}:
+\end{equation}
+$Y_\ell$ extends face data into the leaf, $T_\ell$ is the leaf
+Dirichlet-to-Neumann map, and $q_\ell(h)$ is the flux of the particular
+solution for the body load $h_\ell$ (the restriction of $h$ to the interior
+nodes of $\ell$) with zero face data.
+
+\paragraph{Skeleton system.} With $E_\ell$ the restriction from the slab
+skeleton to the faces of $\ell$, flux continuity on every skeleton face gives
+\begin{equation}\label{eq:skel}
+  A\,x=-Q\,h,\qquad A=\sum_\ell E_\ell^{\mathsf T}T_\ell E_\ell,\qquad
+  Q\,h=\sum_\ell E_\ell^{\mathsf T}q_\ell(h).
+\end{equation}
+Splitting the skeleton into interior faces ($I$) and faces on
+$\partial\Omega_i=\Gamma_{i-1}\cup\Gamma_{i+1}\cup W_i$ ($b$), where the
+Dirichlet data $b_i=(u_{i-1},u_{i+1},\phi^*|_{W_i})$ is prescribed,
+$A_{ii}x_I=-(Qh)_I-A_{ib}b_i$. $A_{ii}$ is the matrix whose factorization is
+kept. (For the five-patch cylinder, the leaf flux is converted to the physical
+conormal flux and the patches are glued before this split; the body-load
+reduction must use the same conversion, or it applies a different $M_i$.)
+
+\begin{proposition}\label{prop:condense}
+For any body load $h$, the three steps
+\begin{enumerate}
+  \item \emph{reduce:} $\beta=-(Qh)_I-A_{ib}b_i$ (one batch of leaf interior solves);
+  \item \emph{skeleton solve:} $x_I=A_{ii}^{-1}\beta$ (kept factorization), $x_b=b_i$;
+  \item \emph{reconstruct:} $\phi|_\ell=Y_\ell E_\ell x+L_{II,\ell}^{-1}h_\ell$ (one batch of leaf interior solves)
+\end{enumerate}
+return exactly the solution $\phi$ of $M_i\phi=h$ with Dirichlet data $b_i$.
+\end{proposition}
+\begin{proof}[Sketch]
+Static condensation is block Gaussian elimination of the interior nodes of each
+leaf, followed by elimination of the interior skeleton; both are exact.
+\end{proof}
+
+\paragraph{Local chord iteration.} Hence the chord iteration
+$\phi_{j+1}=M_i^{-1}(f^*-G[\phi_j]+\cR\phi_j)$ on $\Omega_i$ (with the data of
+\eqref{eq:local}) is carried out as
+\begin{equation}\label{eq:lchord}
+\boxed{\;
+\begin{aligned}
+  h_j&=f^*-G[\phi_j]+\cR\,\phi_j &&\text{pointwise at the leaf interior nodes},\\
+  x_{j+1,I}&=A_{ii}^{-1}\big(-(Qh_j)_I-A_{ib}b_i\big),\quad x_{j+1,b}=b_i,\\
+  \phi_{j+1}|_\ell&=Y_\ell E_\ell\,x_{j+1}+L_{II,\ell}^{-1}h_{j,\ell}
+  &&\text{for every }\ell\in\mathcal L_i .
+\end{aligned}\;}
+\end{equation}
+(Superscripts $(i)$ are dropped.) By \Cref{prop:condense} this is the same
+iteration as applying $M_i^{-1}$, so its fixed point and its rate are
+unchanged. The error $e_j=\phi_j-\phi^{(i)}$ satisfies
+$(M_ie_{j+1})(x)=\big(\cR(x)-\partial_sg(x,\xi_j(x))\big)\,e_j(x)$ with zero
+Dirichlet data, for some $\xi_j(x)$ between $\phi_j(x)$ and $\phi^{(i)}(x)$
+(mean value theorem). If $\cR>0$, \Cref{prop:maxp} on $\Omega_i$ gives
+contraction with factor
+\begin{equation}\label{eq:rho}
+  \rho_i=\sup_{x\in\Omega_i,\ s\in I(x)}\Big|1-\frac{\partial_sg(x,s)}{\cR(x)}\Big|,
+\end{equation}
+where $I(x)$ is the interval spanned by the iterates and the solution at $x$.
+(The supremum must be restricted to such an interval: over all $s\in\R$ it is
+infinite.) \Cref{prop:maxp} is a statement about the continuous problem; for
+the spectral discretization it holds up to discretization error for resolved
+fields, and the observed rate should be checked against \eqref{eq:rho}.
+
+\paragraph{What one local step costs and needs.}
+\begin{itemize}
+  \item Two batches of small dense leaf solves (reduction and reconstruction)
+    and one solve with the kept MUMPS factorization. No factorization of any
+    kind.
+  \item The reconstruction cannot be skipped: $G[\phi_j]$ is needed at every
+    leaf interior node, so the state of the local iteration is the
+    collocation field on the slab's leaves, not the skeleton values alone.
+    The midplane trace $\mathcal E_i(u)$, by contrast, is read directly from
+    the skeleton solution $x$ on the faces of $\Gamma_i$.
+  \item Per leaf, the factors of $L_{II,\ell}$ (or $L_{II,\ell}^{-1}$), $Y_\ell$ and
+    $D_\ell$ must be kept, built with the same $\cR$ as $A_{ii}$. They are small,
+    but in the present slab builder they are discarded after gluing.
+  \item The slabs are independent, so they can be processed in parallel or one
+    at a time, each with one transient volumetric field. The previous outer
+    iteration's local field, if kept, is a good starting guess. The local
+    tolerance can be loose in early outer iterations and tightened as
+    $\mathcal R(u_k)\to0$ (inexact evaluation of $\mathcal R$).
+\end{itemize}
+
+\begin{remark}[Nonlinear elimination at leaf level]\label{rem:leafelim}
+Because leaf solves are small and dense, the leaves can absorb the
+nonlinearity exactly, leaving a frozen condensed operator only on the
+skeleton. For face data $x$, let $\phi_{I,\ell}(x)$ solve the nonlinear leaf
+problem
+\begin{equation}
+  K_{II,\ell}\,\phi_{I,\ell}+K_{IF,\ell}\,E_\ell x+G[\phi]_{I,\ell}=f^*_{I,\ell},
+\end{equation}
+by a few Newton steps with the exact leaf Jacobian $K_{II,\ell}+\diag(c[\phi]_{I,\ell})$
+(new small dense factorizations, batched, no MUMPS), warm-started from the
+previous leaf field. This defines nonlinear leaf fluxes
+$\mathcal T_\ell(x)=D_\ell\big(\phi_{I,\ell}(x),E_\ell x\big)$ and the skeleton
+residual
+\begin{equation}
+  \mathcal R_{\mathrm{skel}}(x_I)=\Big(\sum_\ell E_\ell^{\mathsf T}\mathcal T_\ell(x)\Big)_I,
+  \qquad x_b=b_i ,
+\end{equation}
+whose Jacobian is the condensed operator of the linearization,
+$A_{ii}(c[\phi_x])$. The kept $A_{ii}=A_{ii}(\cR)$ is a frozen Jacobian, and
+\begin{equation}
+  x_{j+1,I}=x_{j,I}-A_{ii}(\cR)^{-1}\mathcal R_{\mathrm{skel}}(x_{j,I}),\qquad
+  e_{j+1}\approx\big[I-A_{ii}(\cR)^{-1}A_{ii}(c_*)\big]e_j .
+\end{equation}
+This is the construction of \Cref{sec:iface} applied one level down: the
+residual is evaluated exactly, so the fixed point is the same as that of
+\eqref{eq:lchord}, and the frozen operator only sets the rate. The rate is
+governed by the mismatch of the condensed operators rather than pointwise by
+$\rho_i$; there is no a priori guarantee that it is smaller, but the
+nonlinearity inside each leaf is resolved exactly, which is where the plain
+chord iteration is expected to suffer at large $\Lambda$, when $c[\phi]$ varies
+strongly within single leaves. A step costs one Newton solve per leaf and one
+MUMPS solve, and no separate reconstruction: the leaf solutions are the field.
+\end{remark}
+
+\subsection{Choice of \texorpdfstring{$\cR$}{c\_ref}}
+\begin{itemize}
+  \item \emph{Constant} $\cR=\bar c$: simplest, but $c[\phi^*]$ varies like
+    $e^{\phi^*/\tau}$ across $\Omega$, so at large $\Lambda$ no constant makes
+    the local rates $\rho_i$ small.
+  \item \emph{From a coarse solution} $\phi_c$: $\cR=c[\phi_c]$.
+    Since $c[\phi]/c[\phi_c]=e^{(\phi-\phi_c)/\tau}$, to first order (iterates
+    near $\phi^*$)
+    \begin{equation}
+      \rho_i\approx\sup_{\Omega_i}\frac{|\phi^*-\phi_c|}{\tau(\psi)},
+    \end{equation}
+    and the mismatch $S(\cR)-S(c_*)$ in \eqref{eq:irate} is small too. $\phi_c$
+    is computed by the same algorithm on a cheap discretization (fewer slabs,
+    lower order) with a constant $\bar c$, possibly with continuation in
+    $\Lambda$.
+\end{itemize}
+The outer iterates are short vectors (one trace per interface), so Anderson
+acceleration of \eqref{eq:ichord} costs almost nothing. So does an interface
+Newton--Krylov method preconditioned by $P$ with finite-difference Jacobian
+products: each product is one more evaluation of $\mathcal E$, which needs only
+local solves.
+
+\begin{algorithm}[h]
+\caption{Fixed-point iteration on the interface system}\label{alg:chord}
+\begin{algorithmic}[1]
+\State Choose $\cR$; build the slab factorizations, HBS blocks and red--black preconditioner $P$ for $-\Delta+\cR$ \Comment{once}
+\State $u_0\gets$ traces of a coarse solution, or the solution of the linear OMS system for $-\Delta+\cR$
+\For{$k=0,1,2,\dots$}
+  \For{each slab $i$} \Comment{independent, local}
+    \State solve \eqref{eq:local} with data $u_{k,i\pm1}$ by \eqref{eq:lchord} (or \Cref{rem:leafelim})
+    \State $\mathcal E_i(u_k)\gets x|_{\Gamma_i}$ \Comment{read from the skeleton solution}
+  \EndFor
+  \State $\mathcal R_k\gets u_k-\mathcal E(u_k)$; \textbf{if} $\|\mathcal R_k\|_\infty<\mathrm{tol}$ \textbf{then stop}
+  \State $u_{k+1}\gets u_k-P\,\mathcal R_k$ \Comment{one red--black application; optionally Anderson}
+\EndFor
+\State the volumetric solution is given by the last local fields $\phi^{(i)}$ (no extra reconstruction)
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}
+With exactly one local chord step per slab, each started from the previous
+local field, and $P=(I+S_{\mathrm{ref}})^{-1}$ exact, \Cref{alg:chord}
+gives $u_{k+1}=(I+S_{\mathrm{ref}})^{-1}b_{\mathrm{OMS}}(h_k)$, with $b_{\mathrm{OMS}}(h_k)$ the linear OMS
+right-hand side for the body load $h_k=f^*-G[\phi_k]+\cR\phi_k$, $\phi_k$ the
+current local fields. This is the
+volumetric chord iteration $\phi\mapsto T(\phi)$ of \Cref{sec:nk}, except that
+the local fields lag one interface update behind. Solving the local problems accurately removes the local
+nonlinearity from the outer iteration: the outer rate then depends on the
+interface mismatch $S(\cR)-S(c_*)$ instead of on $\rho$.
+\end{remark}
+
+%======================================================================
+\section{Approach 2: Newton--Krylov preconditioned by \texorpdfstring{$M$}{M}}\label{sec:nk}
+%======================================================================
+\subsection{Newton system in preconditioned form}
+This approach works with volumetric fields. Define the volumetric chord map
+\begin{equation}\label{eq:T}
+  T(\phi):=\SolveM\big(f^*-G[\phi]+\cR\,\phi,\ \phi^*\big),
+\end{equation}
+whose fixed point is the solution of \eqref{eq:mms}. Iterating
+$\phi_{k+1}=T(\phi_k)$ converges with factor $\rho$, defined as in \eqref{eq:rho}
+with the supremum over $\Omega$, by the same argument; Newton's method accelerates it.
+Newton's method for \eqref{eq:mms} solves
+\begin{equation}
+  J_k\delta=-F(\phi_k),\qquad J_k=-\Delta+c_k,\quad c_k=c[\phi_k],\qquad \delta=0\ \text{on }\partial\Omega .
+\end{equation}
+Let $M_0^{-1}$ denote $\SolveM(\cdot,0)$. Two identities make this system
+solvable with $M$ alone. For any $\phi$ with $\phi=\phi^*$ on $\partial\Omega$,
+\begin{align}
+  M_0^{-1}F(\phi)&=\phi-T(\phi), \label{eq:id1}\\
+  M_0^{-1}J_k&=I+M_0^{-1}D_k,\qquad D_k=\diag(c_k-\cR). \label{eq:id2}
+\end{align}
+(For \eqref{eq:id1}: $M(\phi-T(\phi))=-\Delta\phi+\cR\phi-f^*+G[\phi]-\cR\phi=F(\phi)$,
+and $\phi-T(\phi)$ vanishes on $\partial\Omega$.) The preconditioned Newton
+system is therefore
+\begin{equation}\label{eq:nk}
+  \boxed{\;\big(I+M_0^{-1}D_k\big)\,\delta=T(\phi_k)-\phi_k,\qquad \phi_{k+1}=\phi_k+\delta .\;}
+\end{equation}
+The right-hand side costs one $\SolveM$. Each
+operator application costs a pointwise multiplication by $c_k-\cR$ (the
+diagonal update) and one $\SolveM$ with zero boundary data.
+
+\subsection{Properties}
+\begin{itemize}
+  \item By \Cref{prop:maxp}, $\|M_0^{-1}D_k\|_\infty\le\sup_x|c_k-\cR|/\cR$:
+    the preconditioned operator is a perturbation of the identity, and GMRES
+    needs few iterations when $\cR$ is close to $c_k$, for instance when it comes from a coarse
+    solution.
+  \item The outer iteration converges quadratically near the solution; damping
+    or a line search on $\|\phi-T(\phi)\|$ can be added for robustness, and the
+    inner tolerance can follow an inexact-Newton (Eisenstat--Walker) rule.
+  \item One Richardson step on \eqref{eq:nk} from $\delta=0$ gives
+    $\delta=T(\phi_k)-\phi_k$, i.e.\ the volumetric chord step $\phi_{k+1}=T(\phi_k)$.
+  \item $M_0^{-1}$ may be applied inexactly, e.g.\ with a single red--black
+    application in place of the preconditioned interface GMRES. The outer
+    Krylov method is then flexible GMRES.
+  \item Krylov vectors are volumetric fields, stored on a non-overlapping set
+    of leaf grids (each point owned by one slab).
+\end{itemize}
+
+\begin{algorithm}[h]
+\caption{Newton--Krylov with a shared preconditioner}\label{alg:nk}
+\begin{algorithmic}[1]
+\State Build OMS, HBS and red--black for $M=-\Delta+\cR$ \Comment{once}
+\State $\phi_0\gets\phi_c$ (or a chord iterate)
+\For{$k=0,1,2,\dots$}
+  \State $r_k\gets T(\phi_k)-\phi_k$ \Comment{one $\SolveM$}
+  \State \textbf{if} $\|r_k\|_\infty<\mathrm{tol}$ \textbf{then stop}
+  \State $c_k\gets c[\phi_k]$
+  \State Solve $(I+M_0^{-1}D_k)\,\delta=r_k$ by (F)GMRES, with
+         $v\mapsto v+\SolveM\big((c_k-\cR)\,v,\,0\big)$
+  \State $\phi_{k+1}\gets\phi_k+\delta$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%======================================================================
+\section{What is reused and what is new}
+%======================================================================
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{4.6cm}p{6.2cm}c@{}}
+\toprule
+Step & Uses & New factorization?\\
+\midrule
+Body-load reduction & leaf-level static condensation (small dense leaf solves; GPU) & no\\
+Local solves & kept slab factorizations of $A_{ii}(\cR)$ & no\\
+Leaf-level nonlinear elimination (\Cref{rem:leafelim}, optional) & small dense leaf Newton solves & leaf only\\
+Interface solve & red--black application (\Cref{alg:chord}); GMRES on exact $I+S$ with red--black preconditioner (\Cref{alg:nk}) & no\\
+Volumetric reconstruction & kept factorizations plus leaf solves & no\\
+\bottomrule
+\end{tabular}
+\caption{Every iteration of both approaches consists of these steps and pointwise operations; the slab factorizations, HBS compressions and red--black preconditioner are never rebuilt.}
+\end{table}
+
+\paragraph{Requirements.} All slab factorizations are kept in memory
+(\texttt{keepLU=True}), together with each slab's leaf operators
+$L_{II,\ell}^{-1}$, $Y_\ell$, $D_\ell$ of \eqref{eq:leafops} (and $K_{II,\ell}$,
+$K_{IF,\ell}$ for \Cref{rem:leafelim}), which are needed for body-load reduction
+and reconstruction. For the five-patch
+cylinder this means adding to the local slab solver (i) a body-load reducer
+(per-patch leaf reduction, converted to the physical flux, glued and split into
+interior and boundary parts) and (ii) a volumetric reconstruction with point
+evaluation (patch classification, inverse patch map, interpolation on the leaf
+grid). The OMS layer, the HBS compression and the red--black solver are used as
+they are.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & Interface fixed point (\Cref{alg:chord}) & Newton--Krylov (\Cref{alg:nk})\\
+\midrule
+State & interface traces $u$ (size $N_s n_c$) & volumetric fields\\
+Global work per outer iteration & one red--black application & $1+n_{\mathrm{GMRES}}$ calls to $\SolveM$\\
+Local work per outer iteration & local chord solves on every slab & leaf reduction and reconstruction per $\SolveM$\\
+Convergence & linear; rate from $P$ and $S(\cR)-S(c_*)$ & quadratic (outer)\\
+Sensitivity to $\cR$ & local rates $\rho_i$, interface mismatch & sets $n_{\mathrm{GMRES}}$\\
+Extra memory & a few interface vectors & Krylov basis of volumetric fields\\
+\bottomrule
+\end{tabular}
+\caption{Comparison of the two approaches.}
+\end{table}
+
+The interface iteration is the natural first choice: it keeps the OMS
+unknowns as its state, needs no global volumetric storage, replaces the global
+GMRES by one red--black application per outer iteration, and gets faster as
+$\Lambda$ grows, because screening weakens the interface coupling. Both
+approaches use exactly the same precomputed building blocks.
+
+%======================================================================
+\section{Verification}
+%======================================================================
+\begin{enumerate}
+  \item \emph{Error against the manufactured solution} at points off the
+    discretization grid, evaluated from the reconstructed field.
+  \item \emph{Continuous residual.} For the reconstructed approximation
+    $\tilde\phi$, evaluate $\eta=-\Delta\tilde\phi+G[\tilde\phi]-f^*$ inside
+    leaves, the jumps of the normal derivative across leaf faces, and the
+    boundary mismatch. Since $g$ is increasing in $s$, \Cref{prop:maxp} gives
+    \begin{equation}
+      \|\tilde\phi-\phi^*\|_\infty\le C_P\max_{\text{leaves}}|\eta|
+      +C_\Gamma\max_{\text{faces}}\big|[\partial_n\tilde\phi]\big|
+      +\max_{\partial\Omega}|\tilde\phi-\phi^*| ,
+    \end{equation}
+    with $C_P\le d^2/8$ for any slab of width $d$ containing $\Omega$ (for the
+    torus above, $|x_3|\le\max(a_e,b_e)$ gives $d=2\max(a_e,b_e)$), and
+    $C_\Gamma\approx C_P/h$ for leaf spacing $h$.
+  \item \emph{Convergence studies:} the error and the residual bound against
+    the polynomial order $p$ at fixed leaves, and outer and inner iteration
+    counts against $\Lambda$, for constant and coarse-solution $\cR$.
+\end{enumerate}
+
+Unlike the interior Helmholtz problem, $M$ is coercive ($\cR\ge0$): there is no
+resonance amplification of discretization errors, the interface operators have
+low numerical rank, and the inner solves need few iterations.
+
+\end{document}

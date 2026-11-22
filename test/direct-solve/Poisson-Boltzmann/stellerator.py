@@ -182,6 +182,14 @@ class Patch:
             H[:, k, :2, :2] = R @ Hp @ R.T / self.Rc ** 2
         return H
 
+    def ref_a(self, X, pde):
+        """Reference-coordinate second-order coefficient A~ (N,3,3) only (no b,
+        c, f evaluation: used for the flux conversion at face slots, where the
+        zero-order term may not be defined, e.g. a nodal c)."""
+        X = np.asarray(X)
+        Gr = self.grad_ref(X)
+        return Gr @ np.asarray(pde.a(self.to_phys(X)), float) @ Gr.transpose(0, 2, 1)
+
     def ref_coeffs(self, X, pde):
         """Reference-coordinate coefficients at reference points X:
         A~ (N,3,3), b~ (N,3), c (N,), f (N,)."""
@@ -280,6 +288,44 @@ def _tangential_patterns(Xleaf, offs):
 
 
 # ----------------------------------------------------------------- patch build
+def flux_conversion(P, X, q, nb, pde, flux):
+    """Row conversion of a patch's leaf DtN maps (reference normal derivative)
+    to a physical flux:  Aphys = diag(w) A + B.  Independent of the zero-order
+    coefficient.  X: reference slot coordinates (nb * size_ext, 3), q: face
+    node counts per axis.  flux: "normal" or "conormal".
+
+    flux = sigma * (M_kk d_k u + sum_{j!=k} M_kj d_j u) / sqrt(g^kk)."""
+    _, offs = face_layout(q)
+    size_ext = offs[-1]
+    g = P.ginv(X)
+    if flux == "normal":
+        M = g
+    elif flux == "conormal":
+        M = P.ref_a(X, pde)
+    else:
+        raise ValueError(flux)
+    loc = np.arange(len(X)) % size_ext
+    face = np.searchsorted(offs, loc, side="right") - 1
+    kax = np.array(FACE_AXIS)[face]
+    n_ = np.arange(len(X))
+    sq = np.sqrt(g[n_, kax, kax])
+    w = M[n_, kax, kax] / sq                     # multiplies the DtN row (= sigma d_k u)
+
+    pat = _tangential_patterns(X[:size_ext], offs)
+    rows, cols, vals = [], [], []
+    base = np.arange(nb) * size_ext
+    for (f, j), (r, c, d) in pat.items():
+        k = FACE_AXIS[f]
+        R = (base[:, None] + r[None, :]).ravel()
+        C = (base[:, None] + c[None, :]).ravel()
+        coef = FACE_SIGN[f] * M[R, k, j] / sq[R]
+        rows.append(R); cols.append(C); vals.append(coef * np.tile(d, nb))
+    B = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(len(X), len(X)))
+    B.eliminate_zeros()
+    return w, B
+
+
 def build_patch(P, p, pde, device=torch.device("cpu"), flux="normal", convert=None):
     """Leaf DtN maps of one patch with rows converted to a physical flux.
 
@@ -291,7 +337,8 @@ def build_patch(P, p, pde, device=torch.device("cpu"), flux="normal", convert=No
     if convert is not None:
         flux = "normal" if convert else "reference"
     pde = as_pdophys(pde)
-    pv = np.array([p, p, p])
+    # p: one order for all three reference axes, or (p0, p1, p2) per axis
+    pv = np.array([p, p, p]) if np.ndim(p) == 0 else np.asarray(p, dtype=int).reshape(3)
     hps = HPS_Multidomain(P.pdo(pde), torch.tensor(P.box), P.a, pv, 3)
     assert hps.interpolate, "Gauss face nodes required for gluing"
     A, _ = hps.sparse_mat(device)
@@ -313,38 +360,14 @@ def build_patch(P, p, pde, device=torch.device("cpu"), flux="normal", convert=No
         h = np.zeros(len(X))
 
     if flux == "reference":
-        return dict(A=A, h=h, Xref=X, hps=hps, P=P, ffun=ffun, flux=flux)
+        return dict(A=A, h=h, Xref=X, hps=hps, P=P, ffun=ffun, flux=flux, w=np.ones(len(X)))
 
-    # flux = sigma * (M_kk d_k u + sum_{j!=k} M_kj d_j u) / sqrt(g^kk)
-    g = P.ginv(X)
-    if flux == "normal":
-        M = g
-    elif flux == "conormal":
-        M = P.ref_coeffs(X, pde)[0]
-    else:
-        raise ValueError(flux)
-    loc = np.arange(len(X)) % size_ext
-    face = np.searchsorted(offs, loc, side="right") - 1
-    kax = np.array(FACE_AXIS)[face]; sg = np.array(FACE_SIGN)[face]
-    n_ = np.arange(len(X))
-    sq = np.sqrt(g[n_, kax, kax])
-    w = M[n_, kax, kax] / sq                     # multiplies the DtN row (= sigma d_k u)
-
-    pat = _tangential_patterns(X[:size_ext], offs)
-    rows, cols, vals = [], [], []
-    base = np.arange(nb) * size_ext
-    for (f, j), (r, c, d) in pat.items():
-        k = FACE_AXIS[f]
-        R = (base[:, None] + r[None, :]).ravel()
-        C = (base[:, None] + c[None, :]).ravel()
-        coef = FACE_SIGN[f] * M[R, k, j] / sq[R]
-        rows.append(R); cols.append(C); vals.append(coef * np.tile(d, nb))
-    B = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                      shape=A.shape)
-    B.eliminate_zeros()
+    w, B = flux_conversion(P, X, q, nb, pde, flux)
     Aphys = sp.diags(w) @ A + B
     # particular solution has zero face data: only the normal part survives
-    return dict(A=Aphys.tocsr(), h=w * h, Xref=X, hps=hps, P=P, ffun=ffun, flux=flux)
+    # w: per-slot weight converting a reference body-load reduction to the
+    # physical flux (used by CylinderSlab(keep_leaf=True).reduce_body)
+    return dict(A=Aphys.tocsr(), h=w * h, Xref=X, hps=hps, P=P, ffun=ffun, flux=flux, w=w)
 
 
 # ----------------------------------------------------------------- gluing
