@@ -109,10 +109,13 @@ def coarse_newton_fast(mms, cs, lam_schedule=None, tol=1e-10, maxit=30, phi0=Non
     t_setc = t_fact = t_solve = 0.0
     n_reused = 0
     for Lam in lam_schedule:
-        mk = PBManufactured(mms.geom, Lam=Lam, A=mms.A, B=mms.B, kappa=mms.kappa, theta=mms.theta)
+        if hasattr(mms, "with_Lam"):                     # e.g. pb.profiles.PBProfiles
+            mk = mms.with_Lam(Lam)
+        else:
+            mk = PBManufactured(mms.geom, Lam=Lam, A=mms.A, B=mms.B, kappa=mms.kappa, theta=mms.theta)
         psi = mk.psi(W)
         fst = mk.fstar(W)
-        b = mk.phistar(cs.Wb)
+        b = mk.phi_b(cs.Wb) if hasattr(mk, "phi_b") else mk.phistar(cs.Wb)
         for k in range(maxit):
             c = mk.dg(W, phi, psi)
             t0 = time.perf_counter()
