@@ -11,7 +11,19 @@ completed with the value jumps:
     |e|_inf <= C_P max|eta| + C_Gamma max|[d_n phi~]| + C_D max|[phi~]| + max|phi~ - phi_b|.
 
 All components are evaluated at random OFF-NODE points of the reconstructed
-leaf polynomials.  The constants depend on the geometry and leaf size only, so
+leaf polynomials.  Face components are evaluated FACE-WISE: the restriction of a
+leaf polynomial (and of its normal derivative) to a leaf face is an exact
+tangential polynomial, built once per face and interpolated to the points (no
+volume evaluation, no Hessian):
+  leaf faces  (both leaves in one patch): one map, so one A~ at each point; the
+              jump traces [phi], [d_Xa phi] form one face polynomial, giving
+              [phi] and the reference-gradient jump; conormal applied once;
+  patch faces (leaves in two patches): per side the traces of its own leaf, at
+              the matched points (affine tangential correspondence), conormal
+              with that side's A~, outward fluxes summed;
+  wall        value trace only.
+check_points per batch are re-evaluated with the volume polynomial
+(face_eval_err).  The constants depend on the geometry and leaf size only, so
 for p-convergence the components are reported as they are.
 
   eta          : random points inside the leaves, with the reference-coordinate
@@ -21,10 +33,15 @@ for p-convergence the components are reported as they are.
                      sum_sides s e_a . A~ grad_X phi / sqrt(e_a . A~ e_a)
                  (A~ reference metric, e_a the reference normal);
   jump_val_*   : phi_A - phi_B at the same points;
-                 *_leaf on leaf faces inside a patch, *_patch on patch-patch
-                 faces.  The patches are conforming: the gluing pairs every
-                 Gauss slot of a patch-patch leaf face with one slot of the
-                 other patch, and the tangential reference coordinates of the
+                 All are leaf faces; the suffix says which kind:
+                   *_leaf   within-patch faces: both leaves in one patch (one
+                            reference map, points shared directly);
+                   *_patch  between-patch faces: the leaves belong to two
+                            patches (two maps, glued).
+                 (Suffixes kept for CSV compatibility; printed as "within-patch"
+                 / "between-patch".)  The patches are conforming: the gluing
+                 pairs every Gauss slot of a between-patch face with one slot
+                 of the other patch, and the tangential reference coordinates of the
                  two sides are related by an affine map, fitted from those
                  slots (residual checked) and verified at the random points in
                  physical space -- no map inversion, failure is an error;
@@ -39,14 +56,17 @@ Sanity checks (both should be small):
                (~ local chord tolerance times c: checks operator, signs, G);
   wall_gauss : phi~ - phi_b at the Gauss wall nodes (<< the off-node wall value).
 """
+import time
+
 import numpy as np
 from numpy.polynomial import chebyshev as C
 from scipy.spatial import cKDTree
 
 from solver.cylinder_slab import pdo3d_to_cyl
 
-COMPONENTS = ("eta", "jump_flux_leaf", "jump_flux_patch", "jump_val_leaf", "jump_val_patch",
+COMPONENTS = ("eta", "jump_flux_leaf", "jump_val_leaf", "jump_flux_patch", "jump_val_patch",
               "wall", "eta_nodes", "wall_gauss")
+TIMERS = ("t_interior", "t_leaf_faces", "t_patch_faces", "t_wall")
 _AXIS_NAME = {"core": ("x", "y", "t"), "arch": ("radial", "tangential", "t")}
 
 
@@ -78,6 +98,16 @@ class _PatchField:
             self.nodes.append(u); self.idx.append(inv)
         self.V = np.asarray(phi)[off:off + nb * self.npl].reshape(nb, self.npl)
         self.Jc = np.asarray(imask[off:off + self.npl], bool)      # same in every leaf
+        # tensor form T[leaf, i0, i1, i2] (axis nodes sorted) for face traces
+        q = tuple(len(u) for u in self.nodes)
+        if self.npl != int(np.prod(q)):
+            raise RuntimeError("leaf grid is not a full tensor grid (%d nodes, %s per axis)" % (self.npl, q))
+        for a in range(3):
+            if abs(self.nodes[a][0]) > 1e-10 or abs(self.nodes[a][-1] - 1.0) > 1e-10:
+                raise RuntimeError("leaf nodes do not include the leaf faces (axis %d)" % a)
+        self.T = np.empty((nb,) + q)
+        self.T[:, self.idx[0], self.idx[1], self.idx[2]] = self.V
+        self.dend = [_axis_basis(u, np.array([0.0, 1.0]))[1] for u in self.nodes]   # d/dr at r = 0, 1
 
     def leaf_of(self, X):
         ia = [np.clip(np.floor((X[:, a] - self.box[a, 0]) / (self.box[a, 1] - self.box[a, 0])
@@ -93,6 +123,38 @@ class _PatchField:
             return self._eval(X, b)
         parts = [self._eval(X[i:i + chunk], b[i:i + chunk]) for i in range(0, len(X), chunk)]
         return tuple(np.concatenate([q[j] for q in parts]) for j in range(3))
+
+    def face_trace(self, leaves, a, side, deriv=True):
+        """Traces of the leaf polynomials on face (axis a, side 0/1) of the given
+        leaves, as tensors on the tangential nodes (tangential axes in increasing
+        order): value (nl, q0, q1) and the reference normal derivative d/dX_a
+        (nl, q0, q1), or None without deriv.  Exact: restriction of a tensor
+        polynomial to a face, and of its derivative."""
+        T = self.T[leaves]
+        val = np.take(T, -1 if side else 0, axis=a + 1)
+        if not deriv:
+            return val, None
+        dn = np.moveaxis(T, a + 1, -1) @ self.dend[a][1 if side else 0]
+        return val, dn / (self.hi[leaves, a] - self.lo[leaves, a])[:, None, None]
+
+    def face_eval(self, Tv, Tn, j, a, rt, span_t):
+        """Face polynomials at N points of faces with normal axis a.
+        Tv, Tn (nf, q0, q1): value and normal-derivative traces (Tn may be None);
+        j (N,) face index; rt (N, 2) relative tangential coordinates; span_t (N, 2)
+        tangential leaf widths.  Returns value (N,) and the reference gradient
+        (N, 3) (normal component from Tn, tangential ones by differentiating Tv),
+        or None without Tn."""
+        tang = [t for t in range(3) if t != a]
+        B = [_axis_basis(self.nodes[t], rt[:, c])[:2] for c, t in enumerate(tang)]
+        V = Tv[j]
+        val = np.einsum("nij,ni,nj->n", V, B[0][0], B[1][0])
+        if Tn is None:
+            return val, None
+        g = np.empty((len(j), 3))
+        g[:, a] = np.einsum("nij,ni,nj->n", Tn[j], B[0][0], B[1][0])
+        g[:, tang[0]] = np.einsum("nij,ni,nj->n", V, B[0][1], B[1][0]) / span_t[:, 0]
+        g[:, tang[1]] = np.einsum("nij,ni,nj->n", V, B[0][0], B[1][1]) / span_t[:, 1]
+        return val, g
 
     def _eval(self, X, b):
         span = self.hi[b] - self.lo[b]
@@ -134,11 +196,15 @@ def format_loc(loc):
 
 
 class ResidualEstimator:
-    def __init__(self, pdo_geo, model, Rc, nsamp=3, node_samples=8, wall_tol=1e-9, dump=False):
+    def __init__(self, pdo_geo, model, Rc, nsamp=3, node_samples=8, wall_tol=1e-9, dump=False,
+                 check_points=16):
         """pdo_geo: geometry PDO in OMS coordinates (the one given to OMS);
         model: PBProfiles / PBManufactured (g, fstar, psi, phi_b or phistar).
         nsamp: random points per leaf / leaf face; node_samples: collocation
-        nodes per leaf for the eta_nodes check."""
+        nodes per leaf for the eta_nodes check; check_points: per batch of face
+        points, how many are re-evaluated with the full volume polynomial
+        (face_eval_err, expect ~1e-13; 0 = off)."""
+        self.check_points = int(check_points)
         self.pde = pdo3d_to_cyl(pdo_geo)
         self.model, self.Rc, self.wall_tol = model, Rc, wall_tol
         self.nsamp, self.node_samples = nsamp, node_samples
@@ -153,11 +219,19 @@ class ResidualEstimator:
         W = _oms(F.P, X)
         return lap + self.model.g(W, val) - self.model.fstar(W)
 
-    def _side(self, F, X, b, a, s):
-        """(value, outward physical normal derivative) on face axis a, sign s."""
-        val, grad, _ = F.eval(X, b)
-        At = F.P.ref_a(X, self.pde)
-        return val, s * np.einsum("nk,nk->n", At[:, a, :], grad) / np.sqrt(At[:, a, a])
+    def _conormal(self, P, X, a, g):
+        """e_a . A~ g / sqrt(e_a . A~ e_a) at reference points X of patch P, for
+        reference gradients (or gradient jumps) g: the physical normal
+        derivative along +grad(X_a) (A~ = inverse metric of the patch coords)."""
+        At = P.ref_a(X, self.pde)
+        return np.einsum("nk,nk->n", At[:, a, :], g) / np.sqrt(At[:, a, a])
+
+    @staticmethod
+    def _check(out, ref, got):
+        """face-wise vs volume evaluation, relative to 1 + |value|."""
+        if len(ref):
+            d = np.abs(np.asarray(ref) - np.asarray(got)) / (1.0 + np.abs(ref))
+            out["face_eval_err"] = max(out["face_eval_err"], float(np.max(d)))
 
     def _is_wall(self, P, X):
         x = P.to_phys(X)
@@ -208,7 +282,7 @@ class ResidualEstimator:
         for k, v in part.items():
             if k in ("loc", "dump"):
                 continue
-            if k.startswith("n_") or k.endswith("fail"):
+            if k.startswith(("n_", "t_")) or k.endswith("fail"):
                 total[k] += v
             elif v > total[k]:
                 total[k] = v
@@ -224,11 +298,15 @@ class ResidualEstimator:
         imask = ops.interior_mask()
         Fs = [_PatchField(P, grid, off, phi, imask) for P, grid, off in ops.leaf_grids()]
         own = lambda X: (X[:, 2] >= t_own[0]) & (X[:, 2] < t_own[1])
-        out = {k: 0.0 for k in COMPONENTS}
-        out.update(n_eta=0, n_face_leaf=0, n_face_patch=0, n_wall=0, face_map_err=0.0, loc={})
+        out = {k: 0.0 for k in COMPONENTS + TIMERS}
+        out.update(n_eta=0, n_face_leaf=0, n_face_patch=0, n_wall=0, face_map_err=0.0,
+                   face_eval_err=0.0, loc={})
+        ncheck = slice(0, self.check_points)
 
         for k, F in enumerate(Fs):
             nb = F.V.shape[0]
+            span = F.hi - F.lo
+            t0 = time.perf_counter()
             # -- interior residual at random points
             r = rng.uniform(size=(nb, self.nsamp, 3))
             X = (F.lo[:, None, :] + r * (F.hi - F.lo)[:, None, :]).reshape(-1, 3)
@@ -253,73 +331,163 @@ class ResidualEstimator:
             if m.any():
                 self._record(out, "eta_nodes", self._eta(F, Xn[m], bn[m]), F, Xn[m], bn[m])
 
-            # -- leaf-leaf faces inside the patch
+            out["t_interior"] += time.perf_counter() - t0
+
+            # -- LEAF FACES (both leaves in this patch): one map, one A~, so the
+            #    jump of the two leaf polynomials is itself a face polynomial:
+            #    [phi] and [grad_X phi] from the jump traces, conormal applied once.
+            t0 = time.perf_counter()
             I = np.unravel_index(np.arange(nb), F.nleaf)
             for a in range(3):
+                tang = [t for t in range(3) if t != a]
                 sel = np.flatnonzero(I[a] < F.nleaf[a] - 1)
                 if not len(sel):
                     continue
                 J = [I[c][sel].copy() for c in range(3)]
                 J[a] += 1
-                nbr = np.ravel_multi_index(tuple(J), F.nleaf)
+                nbr = np.ravel_multi_index(tuple(J), F.nleaf)    # neighbour across the +a face
                 X, b = self._face_points(F, sel, a, 1, rng)
-                b2 = np.repeat(nbr, self.nsamp)
+                jf = np.repeat(np.arange(len(sel)), self.nsamp)
                 m = own(X)
                 if not m.any():
                     continue
-                X, b, b2 = X[m], b[m], b2[m]
-                vA, fA = self._side(F, X, b, a, 1.0)
-                vB, fB = self._side(F, X, b2, a, -1.0)
-                self._record(out, "jump_flux_leaf", fA + fB, F, X, b, axis=a)
-                self._record(out, "jump_val_leaf", vA - vB, F, X, b, axis=a)
+                X, b, jf = X[m], b[m], jf[m]
+                used, j = np.unique(jf, return_inverse=True)
+                j = np.asarray(j).reshape(-1)
+                vA, nA = F.face_trace(sel[used], a, 1)
+                vB, nB = F.face_trace(nbr[used], a, 0)
+                jv, jg = F.face_eval(vA - vB, nA - nB, j, a, F.rel(X, b)[:, tang], span[b][:, tang])
+                self._record(out, "jump_flux_leaf", self._conormal(F.P, X, a, jg), F, X, b, axis=a)
+                self._record(out, "jump_val_leaf", jv, F, X, b, axis=a)
                 out["n_face_leaf"] += len(X)
+                if self.check_points:
+                    Xc, bc, b2 = X[ncheck], b[ncheck], nbr[jf[ncheck]]
+                    VA, GA, _ = F.eval(Xc, bc)
+                    VB, GB, _ = F.eval(Xc, b2)
+                    self._check(out, VA - VB, jv[ncheck])
+                    self._check(out, GA - GB, jg[ncheck])
+            out["t_leaf_faces"] += time.perf_counter() - t0
 
             # -- wall faces of the patch (cross-section box faces on the wall)
+            t0 = time.perf_counter()
             for a in range(2):
+                tang = [t for t in range(3) if t != a]
                 for side in (0, 1):
                     leaves = self._face_leaves(F, a, side)
                     X, b = self._face_points(F, leaves, a, side, rng)
+                    jf = np.repeat(np.arange(len(leaves)), self.nsamp)
                     m = own(X) & self._is_wall(F.P, X)
                     if not m.any():
                         continue
-                    Xw, bw = X[m], b[m]
-                    v, _, _ = F.eval(Xw, bw)
+                    Tv, _ = F.face_trace(leaves, a, side, deriv=False)
+                    Xw, bw, jw = X[m], b[m], jf[m]
+                    v, _ = F.face_eval(Tv, None, jw, a, F.rel(Xw, bw)[:, tang], span[bw][:, tang])
                     self._record(out, "wall", v - self.phib(_oms(F.P, Xw)), F, Xw, bw, axis=a)
                     out["n_wall"] += len(Xw)
-                    tang = [t for t in range(3) if t != a]
-                    Xg, bg = self._face_points(F, leaves, a, side, rng,
-                                               gauss=[len(F.nodes[t]) - 2 for t in tang])
+                    if self.check_points:
+                        self._check(out, F.eval(Xw[ncheck], bw[ncheck])[0], v[ncheck])
+                    q = [len(F.nodes[t]) - 2 for t in tang]
+                    Xg, bg = self._face_points(F, leaves, a, side, rng, gauss=q)
+                    jg = np.repeat(np.arange(len(leaves)), q[0] * q[1])
                     mg = own(Xg) & self._is_wall(F.P, Xg)
                     if mg.any():
-                        vg, _, _ = F.eval(Xg[mg], bg[mg])
-                        self._record(out, "wall_gauss", vg - self.phib(_oms(F.P, Xg[mg])),
-                                     F, Xg[mg], bg[mg], axis=a)
+                        Xg, bg, jg = Xg[mg], bg[mg], jg[mg]
+                        vg, _ = F.face_eval(Tv, None, jg, a, F.rel(Xg, bg)[:, tang], span[bg][:, tang])
+                        self._record(out, "wall_gauss", vg - self.phib(_oms(F.P, Xg)),
+                                     F, Xg, bg, axis=a)
+            out["t_wall"] += time.perf_counter() - t0
 
-        # -- patch-patch faces, through the gluing correspondence
-        for g in self._patch_faces(ops, Fs):
-            FA, FB = Fs[g["kA"]], Fs[g["kB"]]
-            n = self.nsamp
+        # -- PATCH FACES (the two leaves belong to different patches): two maps,
+        #    two A~.  Per side: value and normal-derivative traces of its own leaf
+        #    polynomial, evaluated at the matched points (the tangential
+        #    correspondence is affine, so still a polynomial), conormal with that
+        #    side's A~; the jump is the sum of the two outward fluxes.
+        t0 = time.perf_counter()
+        groups = self._patch_faces(ops, Fs)
+        n = self.nsamp
+        cols = {key: [] for key in ("kA", "bA", "aA", "sA", "rA", "kB", "bB", "aB", "sB", "rB")}
+        for g in groups:
             rA = np.zeros((n, 3)); rA[:, g["tA"]] = rng.uniform(size=(n, 2)); rA[:, g["aA"]] = g["sA"]
             rB = np.zeros((n, 3)); rB[:, g["tB"]] = np.c_[rA[:, g["tA"]], np.ones(n)] @ g["M"]
             rB[:, g["aB"]] = g["sB"]
-            bA, bB = np.full(n, g["bA"]), np.full(n, g["bB"])
-            XA = FA.lo[bA] + rA * (FA.hi[bA] - FA.lo[bA])
-            XB = FB.lo[bB] + rB * (FB.hi[bB] - FB.lo[bB])
+            for key in ("kA", "bA", "aA", "sA", "kB", "bB", "aB", "sB"):
+                cols[key].append(np.full(n, g[key]))
+            cols["rA"].append(rA); cols["rB"].append(rB)
+        if groups:
+            c = {key: np.concatenate(v) for key, v in cols.items()}
+            XA = self._ref_points(Fs, c["kA"], c["bA"], c["rA"])
             m = own(XA)
-            if not m.any():
-                continue
-            XA, XB, bA, bB = XA[m], XB[m], bA[m], bB[m]
-            err = float(np.max(np.abs(FA.P.to_phys(XA) - FB.P.to_phys(XB))))
-            out["face_map_err"] = max(out["face_map_err"], err)
-            if err > 1e-9:
-                raise RuntimeError("patch face map %s leaf %d -> %s leaf %d: physical mismatch %.2e"
-                                   % (patch_label(FA.P), g["bA"], patch_label(FB.P), g["bB"], err))
-            vA, fA = self._side(FA, XA, bA, g["aA"], 1.0 if g["sA"] else -1.0)
-            vB, fB = self._side(FB, XB, bB, g["aB"], 1.0 if g["sB"] else -1.0)
-            self._record(out, "jump_flux_patch", fA + fB, FA, XA, bA, axis=g["aA"])
-            self._record(out, "jump_val_patch", vA - vB, FA, XA, bA, axis=g["aA"])
-            out["n_face_patch"] += len(XA)
+            if m.any():
+                c = {key: v[m] for key, v in c.items()}
+                XA = XA[m]
+                XB = self._ref_points(Fs, c["kB"], c["bB"], c["rB"])
+                err = np.max(np.abs(self._phys(Fs, c["kA"], XA) - self._phys(Fs, c["kB"], XB)), axis=1)
+                out["face_map_err"] = max(out["face_map_err"], float(err.max()))
+                if err.max() > 1e-9:
+                    i = int(np.argmax(err))
+                    raise RuntimeError("patch face map %s leaf %d -> %s leaf %d: physical mismatch %.2e"
+                                       % (patch_label(Fs[c["kA"][i]].P), c["bA"][i],
+                                          patch_label(Fs[c["kB"][i]].P), c["bB"][i], err[i]))
+                vA, fA, gA = self._side_eval(Fs, c["kA"], c["bA"], c["aA"], c["sA"], c["rA"], XA)
+                vB, fB, gB = self._side_eval(Fs, c["kB"], c["bB"], c["aB"], c["sB"], c["rB"], XB)
+                self._record_at(out, "jump_flux_patch", fA + fB, Fs, c["kA"], XA, c["bA"], c["aA"])
+                self._record_at(out, "jump_val_patch", vA - vB, Fs, c["kA"], XA, c["bA"], c["aA"])
+                out["n_face_patch"] += len(XA)
+                for i in range(min(self.check_points, len(XA))):
+                    for k_, X_, b_, v_, g_ in ((c["kA"], XA, c["bA"], vA, gA), (c["kB"], XB, c["bB"], vB, gB)):
+                        V, G, _ = Fs[k_[i]].eval(X_[i:i + 1], b_[i:i + 1])
+                        self._check(out, V, v_[i:i + 1])
+                        self._check(out, G, g_[i:i + 1])
+        out["t_patch_faces"] += time.perf_counter() - t0
         return out
+
+    @staticmethod
+    def _ref_points(Fs, k, b, r):
+        """Reference points from (patch, leaf, relative position) per point."""
+        X = np.empty_like(r)
+        for kk in np.unique(k):
+            s = k == kk
+            F = Fs[kk]
+            X[s] = F.lo[b[s]] + r[s] * (F.hi[b[s]] - F.lo[b[s]])
+        return X
+
+    @staticmethod
+    def _phys(Fs, k, X):
+        Y = np.empty_like(X)
+        for kk in np.unique(k):
+            s = k == kk
+            Y[s] = Fs[kk].P.to_phys(X[s])
+        return Y
+
+    def _side_eval(self, Fs, k, b, a, side, r, X):
+        """One side of patch-face points (patch k, leaf b, face axis a / side,
+        relative position r, reference point X): value, OUTWARD conormal flux,
+        reference gradient.  Face traces per (patch, axis, side), each leaf once."""
+        N = len(k)
+        val, flux, grad = np.empty(N), np.empty(N), np.empty((N, 3))
+        for kk in np.unique(k):
+            F = Fs[kk]
+            span = F.hi - F.lo
+            for aa in range(3):
+                tang = [t for t in range(3) if t != aa]
+                for ss in (0, 1):
+                    sel = np.flatnonzero((k == kk) & (a == aa) & (side == ss))
+                    if not len(sel):
+                        continue
+                    ul, j = np.unique(b[sel], return_inverse=True)
+                    Tv, Tn = F.face_trace(ul, aa, ss)
+                    v, g = F.face_eval(Tv, Tn, np.asarray(j).reshape(-1), aa,
+                                       r[sel][:, tang], span[b[sel]][:, tang])
+                    val[sel], grad[sel] = v, g
+                    flux[sel] = (1.0 if ss else -1.0) * self._conormal(F.P, X[sel], aa, g)
+        return val, flux, grad
+
+    def _record_at(self, out, key, vals, Fs, k, X, b, axis):
+        """_record for points of mixed patches: location from the maximizer's patch."""
+        if not len(vals):
+            return
+        i = int(np.argmax(np.abs(vals)))
+        self._record(out, key, vals[i:i + 1], Fs[k[i]], X[i:i + 1], b[i:i + 1], axis=int(axis[i]))
 
     @staticmethod
     def _patch_faces(ops, Fs, tol=1e-9, fit_tol=1e-10):
@@ -355,8 +523,10 @@ class ResidualEstimator:
         uk, inv = np.unique(key, axis=0, return_inverse=True)
         inv = np.asarray(inv).reshape(-1)
         groups = []
+        order = np.argsort(inv, kind="stable")                  # slots grouped, ascending within
+        ends = np.cumsum(np.bincount(inv, minlength=len(uk)))
         for gi, kk in enumerate(uk):
-            idx = np.flatnonzero(inv == gi)
+            idx = order[(ends[gi - 1] if gi else 0):ends[gi]]
             kA, bA, aA, sA, kB, bB, aB, sB = (int(x) for x in kk)
             tA = [t for t in range(3) if t != aA]; tB = [t for t in range(3) if t != aB]
             RA, RB = rel[s1[idx]][:, tA], rel[s2[idx]][:, tB]

@@ -51,7 +51,7 @@ from pb.prolong import Prolongation, check_prolongation
 from pb.coarse import coarse_newton_fast
 from pb.interface_iter import InterfaceIteration
 from pb import diagnostics as diag
-from pb.estimate import ResidualEstimator, COMPONENTS, format_loc, save_dump
+from pb.estimate import ResidualEstimator, COMPONENTS, TIMERS, format_loc, save_dump
 
 import scipy
 from packaging.version import Version
@@ -111,6 +111,8 @@ def parse():
     ap.add_argument("--est-samples", type=int, default=3, help="estimator: random points per leaf / leaf face")
     ap.add_argument("--est-node-samples", type=int, default=8, help="estimator check: collocation nodes per leaf")
     ap.add_argument("--no-estimate", action="store_true", help="skip the a-posteriori components")
+    ap.add_argument("--est-check-points", type=int, default=16,
+                    help="estimator check: face points per batch re-evaluated with the volume polynomial (0 = off)")
     ap.add_argument("--est-dump", action="store_true", help="save every eta sample (coords, psi, patch) to --out")
     ap.add_argument("--compare", type=str, nargs="*", default=[], help="probe .npz files of other runs")
     ap.add_argument("--out", type=str, default="results_test_periodic_vanishing_edge")
@@ -333,7 +335,8 @@ def main():
         if not args.no_estimate:
             t0 = time.perf_counter()
             est = ResidualEstimator(pdo_geo, model, torus.Rc, nsamp=args.est_samples,
-                                    node_samples=args.est_node_samples, dump=args.est_dump)
+                                    node_samples=args.est_node_samples, dump=args.est_dump,
+                                    check_points=args.est_check_points)
             comp = None
             for i, s in enumerate(S):
                 z0 = float(s.ops.zbounds[0])
@@ -343,16 +346,28 @@ def main():
                   "%d patch-face, %d wall)  [%.1fs]"
                   % (comp["n_eta"], comp["n_face_leaf"], comp["n_face_patch"], comp["n_wall"],
                      time.perf_counter() - t0))
-            labels = dict(eta="interior |eta|", jump_flux_leaf="flux jump, leaf faces",
-                          jump_flux_patch="flux jump, patch faces", jump_val_leaf="value jump, leaf faces",
-                          jump_val_patch="value jump, patch faces", wall="wall |phi - phi_b|",
-                          eta_nodes="check: eta at nodes", wall_gauss="check: wall at Gauss nodes")
-            for key in COMPONENTS:
-                print("    %-26s %.2e  at %s" % (labels[key], comp[key], format_loc(comp["loc"].get(key))))
-            print("    check: patch face map, max physical mismatch %.2e (expect ~1e-15; >1e-9 raises)" % comp["face_map_err"])
+            sections = (("interior", (("eta", "|eta|"),)),
+                        ("leaf faces (both leaves in one patch)",
+                         (("jump_flux_leaf", "flux jump"), ("jump_val_leaf", "value jump"))),
+                        ("patch faces (leaves in two patches)",
+                         (("jump_flux_patch", "flux jump"), ("jump_val_patch", "value jump"))),
+                        ("wall", (("wall", "|phi - phi_b|"),)),
+                        ("checks", (("eta_nodes", "eta at nodes"), ("wall_gauss", "wall at Gauss nodes"))))
+            for head, items in sections:
+                print("    %s" % head)
+                for key, lab in items:
+                    print("      %-20s %.2e  at %s" % (lab, comp[key], format_loc(comp["loc"].get(key))))
+            print("      patch face map, max physical mismatch %.2e (expect ~1e-15; >1e-9 raises)"
+                  % comp["face_map_err"])
+            print("      face-wise vs volume evaluation, max rel. difference %.2e (expect ~1e-12)"
+                  % comp["face_eval_err"])
+            print("    time: interior + node check %.1fs, leaf faces %.1fs, patch faces %.1fs, wall %.1fs"
+                  % tuple(comp[t] for t in TIMERS))
             row.update({"est_" + key: comp[key] for key in COMPONENTS})
             row.update({"est_loc_" + key: format_loc(comp["loc"].get(key)) for key in COMPONENTS})
             row["est_face_map_err"] = comp["face_map_err"]
+            row["est_face_eval_err"] = comp["face_eval_err"]
+            row.update({"est_" + t: comp[t] for t in TIMERS})
             if args.est_dump:
                 dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s.npz" % (
                     Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam, args.N, st_tag))
