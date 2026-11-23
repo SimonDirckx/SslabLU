@@ -32,10 +32,14 @@ def make_probes(L, n_per_patch=200, npatch=5, seed=12345):
 
 def _eval_patch(P, grid, off, phi, u, tloc):
     """Leaf polynomial of patch P (leaf grid `grid`, field phi[off:]) at the
-    patch-reference points (box[:2] scaled by u, axial tloc)."""
+    patch-reference points (box[:2] scaled by u, axial tloc).  For an arch, u[:, 0]
+    is the UNSTRETCHED radial blend parameter (arch_stretch.py), so a probe is the
+    same physical point for every radial stretch."""
     box = np.asarray(P.box, float)
     X = np.c_[box[0, 0] + u[:, 0] * (box[0, 1] - box[0, 0]),
               box[1, 0] + u[:, 1] * (box[1, 1] - box[1, 0]), tloc]
+    if hasattr(P, "ref_from_blend"):
+        X = P.ref_from_blend(X)
     nleaf = np.asarray(P.nleaf, int)
     ia = [np.clip(np.floor((X[:, a] - box[a, 0]) / (box[a, 1] - box[a, 0]) * nleaf[a]).astype(int),
                   0, nleaf[a] - 1) for a in range(3)]

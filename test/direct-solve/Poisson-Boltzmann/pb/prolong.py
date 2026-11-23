@@ -4,7 +4,8 @@ patch maps (same geom, Rc, s), coarsened in h and/or p independently in the
 three directions (tangential n/p_n, radial m/p_m, axial nz/p_z).
 
 Every fine leaf lies inside one coarse leaf in patch reference space (uniform
-leaves per patch, integer leaf ratios), so P is: for each fine leaf, evaluate
+leaves per patch, integer leaf ratios, the same arch radial stretch for both,
+see arch_stretch.py), so P is: for each fine leaf, evaluate
 the parent leaf's tensor Lagrange interpolant (on the coarse Chebyshev nodes)
 at the fine leaf's nodes.  One small matrix per child position, applied in
 batches; no inverse maps, no point search.
@@ -26,10 +27,10 @@ class LeafGrid:
     """Leaf-grid nodes of a slab discretization WITHOUT building it, in the
     same order as CylinderSlab(..., keep_leaf=True).nodes()."""
 
-    def __init__(self, geom, p, Rc, s, n, m, nz):
-        self.spec = dict(p=p, n=n, m=m, nz=nz)
+    def __init__(self, geom, p, Rc, s, n, m, nz, stretch=0.0):
+        self.spec = dict(p=p, n=n, m=m, nz=nz, stretch=stretch)
         self.patches = []
-        for P in slab_patches(geom, Rc, s, n, m, nz):
+        for P in slab_patches(geom, Rc, s, n, m, nz, stretch):
             pv = np.array(patch_order(p, P.kind))
             hps = HPS_Multidomain(_DUMMY_PDO, torch.tensor(P.box), P.a, pv, 3)
             self.patches.append(dict(P=P, grid=hps.grid_xx.numpy(),
@@ -81,6 +82,10 @@ class Prolongation:
         for pc, pf in zip(coarse.patches, fine.patches):
             assert pc["P"].kind == pf["P"].kind and pc["P"].rot == pf["P"].rot
             assert np.allclose(pc["P"].box[:2], pf["P"].box[:2]), "cross-sections must coincide"
+            if getattr(pc["P"], "stretch", 0.0) != getattr(pf["P"], "stretch", 0.0):
+                raise ValueError("coarse and fine arch stretch differ (%g vs %g): leaves are "
+                                 "only nested in xi for the same map"
+                                 % (getattr(pc["P"], "stretch", 0.0), getattr(pf["P"], "stretch", 0.0)))
             nfg = pf["nleaf"].copy()
             if nt_global is not None:
                 nfg[2] = int(nt_global)

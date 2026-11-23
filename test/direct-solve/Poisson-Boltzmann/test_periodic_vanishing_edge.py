@@ -23,6 +23,8 @@ No exact solution, so it reports instead:
 
 Run from this folder with the repo root on PYTHONPATH, e.g.
     PYTHONPATH=../../.. python test_periodic_vanishing_edge.py --Ns 32 --nz 2 --nm 8,2 --p 8 --coarsen 2,2,1 --pc 6 --Lam 20
+  radially clustered arch leaves (graded toward the wall, ratio 0.5 per leaf):
+    ... --nm 16,4 --arch-ratio 0.5        (or --arch-stretch <beta>)
 """
 import argparse
 import csv
@@ -40,6 +42,7 @@ import multislab.oms as oms
 import direct_solve.omsdirectsolveHBS_torch_new2 as omsdirectHBS_new
 from direct_solve.omsdirectsolveHBS_torch_new2 import rkStrat as rkStrat_new
 from circInterfaceTree import circInterfaceTree
+import arch_stretch
 
 from pb.manufactured import transform_pdo
 from pb.profiles import PBProfiles
@@ -73,6 +76,13 @@ def parse():
     ap.add_argument("--Ns", type=int, default=32, help="slabs around the torus (2^k, cyclic red-black)")
     ap.add_argument("--nz", type=int, default=2)
     ap.add_argument("--nm", type=str, default="8,2", help="fine n,m (circInterfaceTree: n = 4m)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--arch-stretch", type=float, default=0.0,
+                   help="radial clustering of the arch leaves toward the wall (arch_stretch.py): "
+                        "beta > 0, leaf widths ~ exp(-beta k / m); 0 = uniform")
+    g.add_argument("--arch-ratio", type=float, default=None,
+                   help="alternative to --arch-stretch: ratio sigma of successive radial leaf "
+                        "widths on the FINE grid (beta = -m ln sigma; e.g. 0.5)")
     ap.add_argument("--p", type=ints, default=8, help="fine order: p or p_n,p_m,p_z")
     ap.add_argument("--coarsen", type=ints, default=(2, 2, 1), help="leaf ratios r_n,r_m,r_z")
     ap.add_argument("--pc", type=ints, default=6, help="coarse order: p or p_n,p_m,p_z")
@@ -147,6 +157,8 @@ def main():
     assert Ns >= 4 and not Ns & (Ns - 1), "cyclic red-black needs Ns = 2^k"
     dSlabs, connectivity, H = torus.dSlabs(Ns)
     n, m = map(int, args.nm.split(","))
+    beta = (arch_stretch.beta_for_ratio(args.arch_ratio, m) if args.arch_ratio is not None
+            else args.arch_stretch)
     rn, rm, rz = triple(args.coarsen)
     p_f, p_c = args.p, args.pc
     nt_f = Ns * nz // 2                                  # fine axial leaves around the torus
@@ -164,11 +176,15 @@ def main():
           % (n, m, nz, triple(p_f), n_iface, Ns * n_iface))
     print("coarse: periodic, n=%d m=%d axial leaves=%d p=%s"
           % (n // rn, m // rm, nt_c, triple(p_c)))
+    if beta != 0:
+        print("arch radial stretch beta = %.4g\n  fine   %s\n  coarse %s"
+              % (beta, arch_stretch.describe(beta, m), arch_stretch.describe(beta, m // rm)))
     print("rough memory: leaf factors %.1f GB total (+ MUMPS factors + HBS blocks)" % (Ns * mem_slab))
 
     pg = torus.param_geom(jax_avail=False, torch_avail=True, hpsalt=True)
     pdo_geo = transform_pdo(pg, None)                   # geometry only; c via set_c
     dev = torch.device(args.device)
+    st_tag = "" if beta == 0 else "_st%.3g" % beta            # output names of stretched runs
     probes = diag.make_probes(torus.L, n_per_patch=args.nprobe)
 
     # ---- coarse geometry (once)
@@ -176,7 +192,7 @@ def main():
     geom_c = [[0.0, -torus.Rc, -torus.Rc], [torus.L, torus.Rc, torus.Rc]]
     cs_c = CondensedSlab(geom_c, pdo_geo, p_c,
                          dict(Rc=torus.Rc, s=torus.s, n=n // rn, m=m // rm, nz=nt_c,
-                              flux="conormal", device=dev, periodic=True),
+                              flux="conormal", device=dev, periodic=True, stretch=beta),
                          fast=True, verbose=False)
     print("coarse geometry: %.2fs, N_skel %d (periodic: Ib = wall only, %d dofs)"
           % (time.perf_counter() - t0, len(cs_c.slab.Ii), len(cs_c.slab.Ib)))
@@ -188,7 +204,7 @@ def main():
     def make_tree(XXI):
         XXI = XXI.detach().cpu().numpy() if torch.is_tensor(XXI) else np.asarray(XXI)
         return circInterfaceTree(XXI[:, 1:3], Rc=torus.Rc, s=torus.s, n_core=n,
-                                 m_arch=m, max_level=max_level)
+                                 m_arch=m, max_level=max_level, stretch=beta)
     leaf_size = n_iface // 2 ** max_level
     gb = lambda p: torus.gb(p, jax_avail=False, torch_avail=True)
 
@@ -198,7 +214,7 @@ def main():
         print("== %s" % model.describe())
         row = dict(Ns=Ns, H=H, n=n, m=m, nz=nz, p=str(triple(p_f)), nc=n // rn, mc=m // rm,
                    ntc=nt_c, pc=str(triple(p_c)), Lam=Lam, N=args.N, tau_slope=args.tau_slope,
-                   precond=args.precond)
+                   precond=args.precond, arch_stretch=beta)
 
         # ---- 1. global coarse Newton.  phi = 0 and the solution at any smaller
         # Lam are supersolutions, from which Newton on this convex problem
@@ -235,7 +251,8 @@ def main():
             return model.phi_b(pts)
 
         cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n, m=m, nz=nz, flux="conormal",
-                        fast=True, c_nodal=c_nodal, keep_geometry=False, device=dev)
+                        fast=True, c_nodal=c_nodal, keep_geometry=False, device=dev,
+                        stretch=beta)
         opts = solverWrap.solverOptions("cylhps", p_f, None, use_ctxT=False, mumps_stats=False,
                                         reduced_gpu=False, cyl=cyl_opts)
         assembler = mA.rkHMatAssembler(leaf_size, args.rk0, ndim=3, tree=make_tree)
@@ -337,20 +354,20 @@ def main():
             row.update({"est_loc_" + key: format_loc(comp["loc"].get(key)) for key in COMPONENTS})
             row["est_face_map_err"] = comp["face_map_err"]
             if args.est_dump:
-                dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s.npz" % (
-                    Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam, args.N))
+                dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s.npz" % (
+                    Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam, args.N, st_tag))
                 save_dump(dpath, comp)
                 print("    eta samples saved to", dpath)
         row.update(phi_min=phi_all.min(), phi_max=phi_all.max(), coarse_vs_fine=d_cf,
                    coarse_vs_fine_probes=np.max(np.abs(pv - pv_c)), overlap=ov,
                    overlap_unmatched=unmatched, flux_dev=res_ff, F_axis=F[0])
 
-        tag = "Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s" % (Ns, nz, n, m, "-".join(map(str, triple(p_f))),
-                                                  Lam, args.N)
+        tag = "Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s" % (Ns, nz, n, m, "-".join(map(str, triple(p_f))),
+                                                    Lam, args.N, st_tag)
         npz = os.path.join(args.out, "probes_%s.npz" % tag)
         np.savez(npz, values=pv, coarse=pv_c, **probes,
                  meta_Ns=Ns, meta_nz=nz, meta_n=n, meta_m=m, meta_p=np.array(triple(p_f)),
-                 meta_Lam=Lam, meta_N=args.N, meta_tau_slope=args.tau_slope)
+                 meta_Lam=Lam, meta_N=args.N, meta_tau_slope=args.tau_slope, meta_stretch=beta)
         print("  probes saved to", npz)
         for path in args.compare:
             try:

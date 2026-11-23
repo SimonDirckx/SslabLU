@@ -39,8 +39,10 @@ from scipy.spatial import cKDTree
 import sympy as sym
 import torch
 
+import functools
 import types
 from numpy.polynomial import legendre as _leg
+from arch_stretch import blend_sym, xi_of_blend
 import solver.hpsmultidomain.hpsmultidomain.hps_leaf_disc as leaf
 from solver.hpsmultidomain.hpsmultidomain.hps_multidomain_disc import HPS_Multidomain   # noqa: E402
 from solver.hpsmultidomain.hpsmultidomain.pdo import PDO_3d                              # noqa: E402
@@ -89,11 +91,15 @@ def as_pdophys(pde):
 
 
 # ----------------------------------------------------------------- geometry
-def _arch_symbolic(s):
+@functools.lru_cache(maxsize=None)
+def _arch_symbolic(s, stretch=0.0):
+    """Arch map and metric.  stretch: radial clustering parameter beta
+    (arch_stretch.py); the blend parameter is x = g(xi), x = xi for 0."""
     xi, eta = sym.symbols("xi eta", real=True)
     th = sym.pi * eta / 4
-    u = (1 - xi) / 2 * s + (1 + xi) / 2 * sym.cos(th)
-    v = (1 - xi) / 2 * s * eta + (1 + xi) / 2 * sym.sin(th)
+    x = blend_sym(xi, stretch)
+    u = (1 - x) / 2 * s + (1 + x) / 2 * sym.cos(th)
+    v = (1 - x) / 2 * s * eta + (1 + x) / 2 * sym.sin(th)
     J = sym.Matrix([[sym.diff(u, xi), sym.diff(u, eta)],
                     [sym.diff(v, xi), sym.diff(v, eta)]])
     detJ = J.det()
@@ -123,8 +129,10 @@ def _arch_symbolic(s):
 class Patch:
     """One patch: reference box, map to physical space, metric, PDO."""
 
-    def __init__(self, kind, s, L, rot=0, nleaf=(2, 2, 2), sym_arch=None, Rc=1.0):
+    def __init__(self, kind, s, L, rot=0, nleaf=(2, 2, 2), sym_arch=None, Rc=1.0, stretch=0.0):
         self.kind, self.s, self.L, self.rot, self.Rc = kind, s, L, rot, Rc
+        # radial clustering of the arch (arch_stretch.py); 0 for the core
+        self.stretch = 0.0 if kind == "core" else float(stretch)
         if kind == "core":
             self.box = np.array([[-s * Rc, s * Rc], [-s * Rc, s * Rc], [0.0, L]])
         else:
@@ -132,6 +140,16 @@ class Patch:
             self.S = sym_arch
         self.nleaf = np.array(nleaf)
         self.a = (self.box[:, 1] - self.box[:, 0]) / (2 * self.nleaf)
+
+    def ref_from_blend(self, X):
+        """Copy of reference points X (N,3) whose arch axis 0 is given as the
+        UNSTRETCHED blend parameter x, converted to xi = g^{-1}(x).  Lets
+        resolution-independent point sets (probes) refer to the same physical
+        points for any stretch.  Identity for the core / stretch 0."""
+        X = np.array(X, float)
+        if self.kind != "core" and self.stretch != 0:
+            X[:, 0] = xi_of_blend(X[:, 0], self.stretch)
+        return X
 
     def _R(self):
         c, sn = np.cos(self.rot * np.pi / 2), np.sin(self.rot * np.pi / 2)
@@ -238,12 +256,14 @@ class Patch:
             pde.f(self.to_phys(xx.detach().cpu().numpy())), float) * np.ones(xx.shape[0])).to(xx.device)
 
 
-def make_cylinder(s=0.5, L=1.0, n=2, m=2, nz=2, Rc=1.0):
+def make_cylinder(s=0.5, L=1.0, n=2, m=2, nz=2, Rc=1.0, stretch=0.0):
     """Cylinder of radius Rc and length L.  Core n x n x nz leaves; arches: m
-    leaves radially (xi), n along eta, nz in z."""
-    S = _arch_symbolic(s)
+    leaves radially (xi), n along eta, nz in z.  stretch: radial clustering of
+    the arch leaves toward the wall (arch_stretch.py; uniform in xi, graded
+    physically with ratio exp(-stretch/m))."""
+    S = _arch_symbolic(float(s), float(stretch))
     core = Patch("core", s, L, nleaf=(n, n, nz), Rc=Rc)
-    arches = [Patch("arch", s, L, rot=k, nleaf=(m, n, nz), sym_arch=S, Rc=Rc)
+    arches = [Patch("arch", s, L, rot=k, nleaf=(m, n, nz), sym_arch=S, Rc=Rc, stretch=stretch)
               for k in range(4)]
     return [core] + arches
 

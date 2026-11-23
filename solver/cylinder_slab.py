@@ -73,10 +73,11 @@ def patch_order(p, kind):
     return (pn, pn, pz) if kind == "core" else (pm, pn, pz)
 
 
-def slab_patches(geom, Rc, s, n, m, nz):
-    """The five patches of the double slab w0 in [geom[0][0], geom[1][0]]."""
+def slab_patches(geom, Rc, s, n, m, nz, stretch=0.0):
+    """The five patches of the double slab w0 in [geom[0][0], geom[1][0]].
+    stretch: radial clustering of the arch leaves (arch_stretch.py)."""
     z0, z1 = float(geom[0][0]), float(geom[1][0])
-    patches = make_cylinder(s=s, L=z1 - z0, n=n, m=m, nz=nz, Rc=Rc)
+    patches = make_cylinder(s=s, L=z1 - z0, n=n, m=m, nz=nz, Rc=Rc, stretch=stretch)
     for P in patches:
         P.box[2] = [z0, z1]
         P.a = (P.box[:, 1] - P.box[:, 0]) / (2 * P.nleaf)
@@ -137,7 +138,7 @@ def pdo3d_to_cyl(pdo):
 class CylinderSlab:
     def __init__(self, geom, pde, p, Rc=1.0, s=0.5, n=4, m=1, nz=2,
                  flux="normal", device=torch.device("cpu"), glue_tol=1e-9,
-                 keep_leaf=False):
+                 keep_leaf=False, stretch=0.0):
         geom = np.asarray(geom, dtype=np.float64)
         z0, z1 = float(geom[0][0]), float(geom[1][0])
         if not isinstance(pde, PDOPhys):
@@ -148,7 +149,7 @@ class CylinderSlab:
 
         # ---- patches of this double slab: z in [z0, z1] --------------------
         # p: int, or (p_n, p_m, p_z) per direction (see patch_order)
-        patches = slab_patches(geom, Rc, s, n, m, nz)
+        patches = slab_patches(geom, Rc, s, n, m, nz, stretch)
         built = [build_patch(P, patch_order(p, P.kind), pde, device=device, flux=flux)
                  for P in patches]
         gl = glue(built, tol=glue_tol * max(1.0, Rc, abs(z0), abs(z1)))
@@ -311,7 +312,7 @@ class CylinderSlabOps:
 
     def __init__(self, geom, pde, p, Rc=1.0, s=0.5, n=4, m=1, nz=2,
                  flux="conormal", device=torch.device("cpu"), glue_tol=1e-9,
-                 chunk_bytes=2e8, periodic=False):
+                 chunk_bytes=2e8, periodic=False, stretch=0.0):
         """periodic=True: glue the end faces w0 = geom[0][0] and geom[1][0]
         (periodic tube, e.g. the whole torus for the coarse problem); Ib is
         then the wall only."""
@@ -334,7 +335,7 @@ class CylinderSlabOps:
 
         # ---- per patch: geometry-only leaf operators ------------------------
         self.patches, Xslot = [], []
-        for P in slab_patches(geom, Rc, s, n, m, nz):
+        for P in slab_patches(geom, Rc, s, n, m, nz, stretch):
             pv = np.array(patch_order(p, P.kind))
             hps = HPS_Multidomain(P.pdo(pde), torch.tensor(P.box), P.a, pv, 3)
             assert hps.interpolate, "Gauss face nodes required for gluing"

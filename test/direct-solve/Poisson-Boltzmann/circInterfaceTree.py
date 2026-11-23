@@ -7,7 +7,13 @@ Geometry of the cross-section (radius Rc, core half-width s*Rc):
     core     : (x, y) in [-s Rc, s Rc]^2, n_core x n_core HPS leaves
     arch k   : unit-disk blending map, rotated by k*pi/2 (k = 0: east, 1: north,
                2: west, 3: south), reference (xi, eta) in [-1, 1]^2 with
-               m_arch HPS leaves radially (xi) and n_core leaves tangentially (eta)
+               m_arch HPS leaves radially (xi) and n_core leaves tangentially (eta);
+               leaves are uniform in xi.  With stretch beta != 0 the radial blend
+               parameter is x = g(xi) (arch_stretch.py): leaves graded physically
+               toward the wall, but the leaf-index structure -- and so this whole
+               tree -- is unchanged.  The tree must be given the SAME stretch as
+               the discretisation (DOF -> HPS leaf goes through the inverse map);
+               a mismatch is caught by the leaf-boundary and equal-count checks.
     DOFs     : the points on the cross-section faces of the HPS leaves (e.g. the
                q x q Gauss nodes per leaf), passed in physical coordinates.
 
@@ -33,11 +39,18 @@ For the pie levels this forces n_core = 4 * m_arch with m_arch a power of two
 (then the core quarter and the arched pair of a quarter hold equally many HPS
 leaves), and the same number of DOFs on every HPS leaf face.
 
+Below the pie levels every split is by HPS-leaf (or point-grid) INDEX, never by a
+geometric midpoint, so a non-uniform physical leaf layout (radial stretch) still
+gives equal-size children; the pie levels split by x = 0, y = 0 and patch id,
+which the radial stretch does not move.
+
 Interface used by HBSMAT: perm_leaf, nleaves, nlevels.  slabTree-style queries
 (get_leaves, get_boxes_level, get_nodes_level, get_node, get_box_inds) are
 provided as well; node indices follow slabTree: children of b are 2b+1, 2b+2.
 """
 import numpy as np
+
+from arch_stretch import blend_of_xi, xi_of_blend
 
 CORE = 0
 ARCH_NAMES = {1: "arch E", 2: "arch N", 3: "arch W", 4: "arch S"}
@@ -50,10 +63,11 @@ class CircCrossSection:
     """Maps between reference and physical coordinates of the 5 patches.
     Patch ids: 0 = core, 1..4 = arches rotated by (id-1)*pi/2."""
 
-    def __init__(self, Rc=1.0, s=0.5, n_core=4, m_arch=1):
+    def __init__(self, Rc=1.0, s=0.5, n_core=4, m_arch=1, stretch=0.0):
         if not 0 < s < 1 / np.sqrt(2):
             raise ValueError("need 0 < s < 1/sqrt(2) for a valid arch map")
         self.Rc, self.s, self.n, self.m = float(Rc), float(s), int(n_core), int(m_arch)
+        self.stretch = float(stretch)          # arch radial clustering (arch_stretch.py)
 
     # leaf counts per patch, as (count along ref dir 0, count along ref dir 1)
     def leaf_shape(self, patch):
@@ -69,7 +83,7 @@ class CircCrossSection:
         ref = np.atleast_2d(ref)
         if patch == CORE:
             return ref.copy()
-        xi, eta = ref[:, 0], ref[:, 1]
+        xi, eta = blend_of_xi(ref[:, 0], self.stretch), ref[:, 1]   # xi: blend parameter x
         th = np.pi * eta / 4
         u = (1 - xi) / 2 * self.s + (1 + xi) / 2 * np.cos(th)
         v = (1 - xi) / 2 * self.s * eta + (1 + xi) / 2 * np.sin(th)
@@ -86,7 +100,8 @@ class CircCrossSection:
         return pid
 
     def to_ref(self, patch, X, tol=1e-13, maxit=50):
-        """Inverse map (Newton) for points X (N, 2) known to lie in `patch`."""
+        """Inverse map for points X (N, 2) known to lie in `patch`: Newton for the
+        (unstretched) blend parameter x and eta, then xi = g^{-1}(x)."""
         X = np.atleast_2d(X)
         if patch == CORE:
             return X.copy()
@@ -111,7 +126,7 @@ class CircCrossSection:
             xi, eta = xi - dxi, eta - deta
             if max(np.abs(dxi).max(initial=0), np.abs(deta).max(initial=0)) < tol:
                 break
-        return np.c_[xi, eta]
+        return np.c_[xi_of_blend(xi, self.stretch), eta]
 
     def ref_box(self, patch):
         """Reference-coordinate box of a patch: ((lo0, hi0), (lo1, hi1))."""
@@ -202,14 +217,14 @@ class circInterfaceTree:
     """
 
     def __init__(self, XX, Rc=1.0, s=0.5, n_core=4, m_arch=1, extra_levels=0,
-                 max_level=None, patch_id=None, ref=None, tol=1e-10):
+                 max_level=None, patch_id=None, ref=None, tol=1e-10, stretch=0.0):
         if hasattr(XX, "detach"):                    # torch tensor (e.g. stMap.XXI)
             XX = XX.detach().cpu().numpy()
         XX = np.asarray(XX, float)
         if XX.ndim != 2 or XX.shape[1] not in (2, 3):
             raise ValueError("XX must be (N, 2) or (N, 3)")
         self._XX = XX
-        self.geom = G = CircCrossSection(Rc, s, n_core, m_arch)
+        self.geom = G = CircCrossSection(Rc, s, n_core, m_arch, stretch)
         n, m = G.n, G.m
         if n != 4 * m or m & (m - 1):
             raise ValueError(
@@ -238,6 +253,7 @@ class circInterfaceTree:
             if sel.any():
                 li[sel], lj[sel] = G.leaf_of(p, R[sel])
         self.patch_id, self.ref, self.leaf_i, self.leaf_j = pid, R, li, lj
+        self._check_leaf_interior(pid, R)
 
         # DOFs per HPS leaf must all be equal (equal HBS block sizes)
         key = pid * 10 ** 6 + li * 10 ** 3 + lj
@@ -405,6 +421,28 @@ class circInterfaceTree:
         node.box = (0, len(u0), 0, len(u1))
 
     # ------------------------------------------------------------------ checks
+    def _check_leaf_interior(self, pid, R, rel_tol=1e-6):
+        """Every DOF must lie strictly inside one HPS leaf in reference space
+        (Gauss face nodes never sit on a leaf boundary).  A DOF on a boundary
+        means the reference coordinates are wrong -- typically the tree was
+        given a different arch stretch than the discretisation -- and the
+        leaf assignment (hence the whole tree) would be ambiguous."""
+        G = self.geom
+        for p in range(5):
+            sel = pid == p
+            if not sel.any():
+                continue
+            (l0, h0), (l1, h1) = G.ref_box(p)
+            c0, c1 = G.leaf_shape(p)
+            for a, (lo, hi, c) in enumerate(((l0, h0, c0), (l1, h1, c1))):
+                f = (R[sel, a] - lo) / (hi - lo) * c
+                d = np.abs(f - np.rint(f))
+                if d.min() < rel_tol:
+                    raise ValueError(
+                        f"patch {p}: DOF on an HPS leaf boundary along reference axis {a} "
+                        f"(distance {d.min():.1e} leaf widths); wrong stretch "
+                        f"(tree has {G.stretch})?")
+
     def _check_complete(self):
         leaves = [b for b in self._boxes.values() if b.is_leaf]
         depth = {b.level for b in leaves}
@@ -467,4 +505,5 @@ class circInterfaceTree:
     def __repr__(self):
         return (f"circInterfaceTree(N={len(self._XX)}, levels={self.nlevels}, "
                 f"leaves={self.nleaves}, leaf size={len(self.perm_leaf) // self.nleaves}, "
-                f"n_core={self.geom.n}, m_arch={self.geom.m}, s={self.geom.s})")
+                f"n_core={self.geom.n}, m_arch={self.geom.m}, s={self.geom.s}, "
+                f"stretch={self.geom.stretch})")
