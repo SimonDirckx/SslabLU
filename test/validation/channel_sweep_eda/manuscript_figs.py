@@ -2,7 +2,9 @@
 sweeps, see manuscript_load.py). Writes SSLABLU_EDA_OUT/manuscript_figs/*.pdf
 and *.png and prints the numbers quoted with them.
 
-  fig1 problem (bathymetry, slabs, eta and velocity of the reference run)
+  fig1 problem (bathymetry, slabs, eta and velocity of the reference run) and,
+       if the Oceananigans runs are found (SSLABLU_MS_OCEAN, below), the
+       difference from Oceananigans with its grid convergence as an inset
   fig2 spin-up of the reference run
   fig3 self-convergence, slab-count invariance, volume drift / wall flux
   fig4 cost vs DoF, setup in time steps, composition of one step (N = 8, dense rb)
@@ -17,14 +19,25 @@ Reference: the dense N = 8 run with the most DoF (manuscript_common.REF); the
 next finest bounds its error (REF_ERR). A layout's discretization error is its
 dense N = 8 run vs REF. Run times: setup (assemble/factor/keep) + 800 steps of
 the conservative form; the solver preset steps both forms, rankiso one, so
-total wall times of the two presets are not comparable."""
+total wall times of the two presets are not comparable.
+
+Oceananigans comparison (fig1 d): oceananigans_n<n>.npz files, converted from
+the data_final.jld2 of reentrant_channel_sslablu.jl (SSLABLU_RIDGE_MIDPANEL=0,
+run to the reference run's final time), in SSLABLU_MS_OCEAN (default
+central_ridge_runs/oceananigans_ridgectr). Both fields are de-meaned and
+compared at the Oceananigans cell centers, as in channel_ssh_compare.py. Grids
+the reference run did not sample (640^2) come from a rerun of it,
+SSLABLU_MS_REF_RERUN (default central_ridge_runs/reference_rerun_ssh640/<run>),
+used only if it reproduces the reference's own samples to 1e-10."""
 import os
+import glob
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from manuscript_common import *
+from eda_common import REPO
 
 FIG = os.path.join(OUT, "manuscript_figs", "")
 os.makedirs(FIG, exist_ok=True)
@@ -72,7 +85,43 @@ X, Y = np.meshgrid(xs, xs, indexing="ij")
 gap = 1 - 0.5 * (np.tanh((Y - GY0) / GW) - np.tanh((Y - GY1) / GW))
 Hf = 1 - RHR * gap * np.exp(RKB * (np.cos(2 * np.pi * (X - 0.5)) - 1))
 eta, u, v = fld(REF, "eta"), fld(REF, "u"), fld(REF, "v")
-fig, ax = plt.subplots(1, 3, figsize=(7.4, 2.45), gridspec_kw=dict(wspace=0.62))
+
+# Oceananigans runs at the reference run's final time, one per grid n
+OCE_DIR = os.environ.get("SSLABLU_MS_OCEAN", os.path.join(REPO, "central_ridge_runs", "oceananigans_ridgectr"))
+_REFNPZ = np.load(os.path.join(REPO, ROOTS[REF["sweep"]], REF["dir"], "channel_timestep_ssh.npz"))
+# a rerun of the reference that also samples finer grids (SSLABLU_SSH_NS), used
+# only if it reproduces the reference on the grids both have
+_RERUN = os.environ.get("SSLABLU_MS_REF_RERUN", os.path.join(REPO, "central_ridge_runs", "reference_rerun_ssh640", REF["dir"],
+                                                             "channel_timestep_ssh.npz"))
+if os.path.exists(_RERUN):
+    _X = np.load(_RERUN)
+    _dev = max(rel(_X["eta_final_%d" % n], _REFNPZ["eta_final_%d" % n]) for n in _REFNPZ["ns"] if "eta_final_%d" % n in _X)
+    if _dev < 1e-10:
+        print("reference samples from the rerun %s (reproduces the reference to %.1e)" % (_RERUN, _dev))
+        _REFNPZ = _X
+    else:
+        print("ignoring the rerun %s: differs from the reference by %.1e" % (_RERUN, _dev))
+OCE = {}
+for _f in sorted(glob.glob(os.path.join(OCE_DIR, "oceananigans_n*.npz"))):
+    _O = dict(np.load(_f))
+    if abs(float(_O["t_final"]) - float(_REFNPZ["t_final"])) > 1.0 or abs(float(_O["ridge_xc"]) - 0.5) > 1e-12:
+        print("skip %s: t = %.0f s, ridge x/L = %.4f (reference: t = %.0f s, centered ridge)"
+              % (_f, _O["t_final"], _O["ridge_xc"], _REFNPZ["t_final"]))
+        continue
+    n = int(_O["n"])
+    if "eta_final_%d" % n not in _REFNPZ:
+        print("skip %s: the reference run has no samples on the %d^2 grid" % (_f, n))
+        continue
+    eS = _REFNPZ["eta_final_%d" % n] - float(_REFNPZ["eta_mean_final"])
+    eO = _O["eta_final"] - _O["eta_final"].mean()
+    OCE[n] = dict(d=eS - eO, rel=rel(eO, eS), dt=float(_O["dt"]), nsteps=int(_O["nsteps"]))
+
+if OCE:
+    fig, ax = plt.subplots(2, 2, figsize=(5.9, 5.0), gridspec_kw=dict(wspace=0.55, hspace=0.42))
+    ax = ax.ravel()
+else:
+    print("no Oceananigans runs in %s: fig1 without panel (d)" % OCE_DIR)
+    fig, ax = plt.subplots(1, 3, figsize=(7.4, 2.45), gridspec_kw=dict(wspace=0.62))
 ext = (0, 1, 0, 1)
 im = ax[0].imshow(Hf.T, origin="lower", extent=ext, cmap="cividis", vmin=0.2, vmax=1)
 N_, npy_ = 8, 16
@@ -97,9 +146,28 @@ ax[2].streamplot(xs, xs, u.T, v.T, color="w", linewidth=0.45, density=1.1, arrow
 ax[2].contour(xs, xs, Hf.T, levels=[0.5], colors="#56b4e9", linewidths=0.6, linestyles="--")
 fig.colorbar(im, ax=ax[2], fraction=0.046, pad=0.03).set_label(r"$|\mathbf{u}|$  [cm/s]")
 ax[2].set_title("(c) velocity, $t$ = 100 h", fontsize=8.5, loc="left")
+if OCE:
+    nO = max(OCE)
+    dmax = np.abs(OCE[nO]["d"]).max()
+    im = ax[3].imshow(OCE[nO]["d"].T * 1e6, origin="lower", extent=ext, cmap="PuOr_r", vmin=-dmax * 1e6, vmax=dmax * 1e6)
+    ax[3].contour(xs, xs, Hf.T, levels=[0.5], colors="k", linewidths=0.5, linestyles="--")
+    fig.colorbar(im, ax=ax[3], fraction=0.046, pad=0.03).set_label(r"SslabLU $-$ Oceananigans  [$\mu$m]")
+    ax[3].set_title(r"(d) difference from Oceananigans, $%d^2$" % nO, fontsize=8.5, loc="left")
+    ns_ = sorted(OCE)
+    hx = np.array([1000.0 / n for n in ns_])                    # grid spacing [km], L = 1000 km
+    ri = np.array([OCE[n]["rel"] for n in ns_])
+    ins = ax[3].inset_axes([0.14, 0.08, 0.29, 0.25])           # quiet lower-left quadrant, clear of ridge and gap
+    ins.loglog(hx, ri, "o-", color="k", ms=2.5, lw=0.9)
+    ins.loglog(hx, 0.6 * ri[-1] * (hx / hx[-1]), color=GREY, lw=0.6, ls=":")    # first order (observed)
+    ins.text(hx[1], 0.6 * ri[-1] * (hx[1] / hx[-1]) * 0.75, "1", color=GREY, fontsize=6, ha="center", va="top")
+    ins.set_xticks(hx); ins.set_xticklabels(["%.2g" % h for h in hx]); ins.minorticks_off()
+    ins.tick_params(labelsize=5.5, length=1.5, pad=1)
+    ins.set_xlabel(r"$\Delta x_{\rm O}$ [km]", fontsize=5.5, labelpad=1)
+    ins.set_title(r"rel. $L^2$ difference", fontsize=5.5, pad=2)
+    ins.patch.set_alpha(0.85)
 for i, a in enumerate(ax):
-    a.set_xlabel("$x/L$"); a.set_ylabel("$y/L$") if i == 0 else None
-    a.set_xticks([0, 0.5, 1]); a.set_yticks([0, 0.5, 1])
+    a.set_xlabel("$x/L$"); a.set_ylabel("$y/L$") if i % (2 if OCE else 3) == 0 else None
+    a.set_xticks([0, 0.5, 1]); a.set_yticks([0, 0.5, 1]); a.set_xlim(0, 1); a.set_ylim(0, 1)
 save(fig, "fig1_problem")
 
 # ---------------------------------------------------------------- 2. spin-up (reference run)
@@ -364,6 +432,14 @@ g = lambda v: "%.1e" % v
 print("data:", ROOTS)
 print("reference: dense p = %d, %s leaves, N = 8 (%s sweep); closest other dense run p = %d, %s differs by %s (reference error bound)"
       % (REF["p"], leaves(REF["npy"]).replace("$\\times$", "x"), REF["sweep"], REF2["p"], leaves(REF2["npy"]).replace("$\\times$", "x"), g(REF_ERR)))
+if OCE:
+    print("vs Oceananigans (%s), eta at t = 100 h, de-meaned; SSH range %.2f cm:" % (OCE_DIR, 100 * np.ptp(eta)))
+    for n in sorted(OCE):
+        print("  n = %3d (dx %5.2f km, dt %g s x %d): rel L2 %s, max |diff| %.1f um = %.2f%% of the SSH range"
+              % (n, 1000.0 / n, OCE[n]["dt"], OCE[n]["nsteps"], g(OCE[n]["rel"]), 1e6 * np.abs(OCE[n]["d"]).max(),
+                 100 * np.abs(OCE[n]["d"]).max() / np.ptp(eta)))
+    _ns = sorted(OCE)
+    print("  observed order in dx:", ", ".join("%.2f" % np.log2(OCE[a]["rel"] / OCE[b]["rel"]) for a, b in zip(_ns, _ns[1:])))
 print("discretization error in eta, t = 100 h:")
 for p in PS:
     print("  p=%2d: %s" % (p, "  ".join("%s %s" % (leaves(n).replace("$\\times$", "x"), g(ERR[(p, n)])) for n in NPYS if (p, n) in ERR)))

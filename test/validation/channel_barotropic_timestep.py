@@ -132,8 +132,7 @@
 #   Dirichlet walls, as in runs made before Neumann walls existed), _ridgectr
 #   marks SSLABLU_RIDGE_MIDPANEL=0, _rng<SEED> a non-zero SSLABLU_RNG_SEED
 #   (randomized runs only, i.e. RK > 0), _vtx one eta per leaf vertex
-#   (SSLABLU_VERTEX_ETA, the default; no token = per-leaf corner values, as in
-#   runs made before the fix).
+#   (SSLABLU_VERTEX_ETA=1; no token = per-leaf corner values, the default).
 #   channel_timestep_diag.csv        per-step diagnostics
 #   channel_timestep_ssh.npz         eta/u/v samples for channel_ssh_compare.py
 #   channel_timestep_fields.png      eta snapshots at t = 0, T/2, T
@@ -199,7 +198,10 @@
 #   SSLABLU_VERTEX_ETA 1 = one eta per leaf vertex: every copy (the leaves and
 #                      overlapping slabs sharing it) gets the mean of the
 #                      leaves' corner extrapolations; 0 = each leaf keeps its
-#                      own, as in runs without _vtx                (default 1)
+#                      own, as in runs without _vtx                (default 0)
+#                      Off by default: with it on, runs develop a slowly
+#                      growing mode at the y-walls (e-folding ~15 h, blow-up
+#                      by ~300 h at p = 16, N = 8, 64x32 leaves).
 #   SSLABLU_WALLS      neumann | emulated | dirichlet           (default neumann)
 #   SSLABLU_WALL_AMP   tidal wall SSH amplitude [m] (dirichlet walls, bump scenario)
 #   SSLABLU_SPONGE_W   wall band width [y/L] (sponge; emulated v* taper) (default 0.1)
@@ -1634,9 +1636,9 @@ if SOLVER == "rbhbs":
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
-# one eta per leaf vertex (ChannelModel.average_vertices); 0 = the pre-fix
-# per-leaf corner extrapolation, for comparison with older runs
-VERTEX_ETA = os.environ.get("SSLABLU_VERTEX_ETA", "1") != "0"
+# one eta per leaf vertex (ChannelModel.average_vertices); 0 (default) = per-leaf
+# corner extrapolation. Off by default: the averaging is unstable at the y-walls
+VERTEX_ETA = os.environ.get("SSLABLU_VERTEX_ETA", "0") != "0"
 # flux_budget() return order, as contributions to the step's volume change dM [m]
 BUDGET_COLS = ["dM", "steric", "res_interior", "res_edge", "res_wall", "res_corner",
                "product_rule", "wall_noncorner", "wall_corner", "jump_noncorner_x",

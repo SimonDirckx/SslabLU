@@ -48,7 +48,7 @@
 #                        and the spatial error is skipped unless SSLABLU_DTC_REF
 #                        names a bdf2 reference: the default reference is a
 #                        backward-Euler run, whose time error would not cancel
-#   SSLABLU_VERTEX_ETA   1 (default) / 0, passed to the runs. 1 adds _vtx to the
+#   SSLABLU_VERTEX_ETA   0 (default) / 1, passed to the runs. 1 adds _vtx to the
 #                        run and default output directories; the default
 #                        spatial reference predates the fix, so it is skipped
 #                        then unless SSLABLU_DTC_REF names a _vtx run
@@ -81,7 +81,7 @@ STOK = "" if SCHEME == "be" else "_" + SCHEME
 RAMP_H = float(os.environ.get("SSLABLU_WIND_RAMP_H", "0"))       # passed to the runs
 if os.environ.get("SSLABLU_FORCED", "1") != "0" and RAMP_H > 0.0:
     STOK += "_ramp%gh" % RAMP_H
-if os.environ.get("SSLABLU_VERTEX_ETA", "1") != "0":             # passed to the runs
+if os.environ.get("SSLABLU_VERTEX_ETA", "0") != "0":             # passed to the runs
     STOK += "_vtx"
 OUT =REPO / os.environ.get("SSLABLU_DTC_OUTDIR", "central_ridge_dtconv%s_%s_runs" % (STOK, "gpu" if GPU else "cpu"))
 _REFNAME = "run_sslablu_channel_p12_N8_pan64x128_rb_dt450s_nsteps800_neumann_ridgectr"

@@ -34,6 +34,12 @@
 #   (Δt in seconds, %g-formatted exactly as channel_barotropic_timestep.py
 #   formats its dt, so paired runs share the dt/nsteps tokens; _ridgectr marks
 #   SSLABLU_RIDGE_MIDPANEL=0). Rerunning identical settings overwrites.
+#
+# GPU: SSLABLU_OCE_GPU=1 runs on GPU() (default 0, CPU). Needs CUDA.jl in the
+#   active environment. A V100 (sm_70) also needs a CUDA 12.x runtime, since
+#   CUDA 13 dropped Volta: once per project,
+#     julia --project -e 'using CUDA; CUDA.set_runtime_version!(v"12.6"; local_toolkit=false)'
+#   (writes LocalPreferences.toml). Same output directory and file as on CPU.
 # =============================================================================
 
 using Oceananigans
@@ -43,6 +49,11 @@ using Oceananigans.Operators: Δzᶠᶜᶜ, Δzᶜᶠᶜ
 using Oceananigans.ImmersedBoundaries: static_column_depthᶜᶜᵃ, static_column_depthᶠᶜᵃ
 using Printf
 using JLD2
+
+const USE_GPU = get(ENV, "SSLABLU_OCE_GPU", "0") == "1"
+if USE_GPU
+    using CUDA
+end
 
 Oceananigans.defaults.FloatType = Float64
 
@@ -183,8 +194,8 @@ function spinup!(model, Δt, nsteps)
 end
 
 # ---- run --------------------------------------------------------------------
-arch = CPU()
-Δt   = 112.5            # 900 s (SslabLU dt = 0.25 h); the implicit free
+arch = USE_GPU ? GPU() : CPU()
+Δt   = 112.5           # 900 s (SslabLU dt = 0.25 h); the implicit free
                             # surface removes the fast-gravity-wave CFL limit
 
 # one output directory per configuration (see the header), so runs don't
@@ -195,8 +206,8 @@ graph_directory = @sprintf("run_oceananigans_channel_n%d_dt%gs_nsteps%d%s/",
 grid  = make_grid(arch)
 model = build_model(grid, parameters)
 
-@info @sprintf("Built model on %d x %d x %d grid; spinning up %d steps (Δt = %.0f s)...",
-               Nx, Ny, Nz, Nspinup, Δt)
+@info @sprintf("Built model on %d x %d x %d grid (%s); spinning up %d steps (Δt = %.0f s)...",
+               Nx, Ny, Nz, USE_GPU ? "GPU" : "CPU", Nspinup, Δt)
 
 # Uniform SSH at rest: all prognostic fields default to 0, so NO initial
 # condition is set -- the meridional tilt + gap finger are INDUCED by the
@@ -213,6 +224,7 @@ tic = time()
 spinup!(model, Δt, Nmid)
 mid = snapshot(model)
 spinup!(model, Δt, Nspinup - Nmid)
+USE_GPU && CUDA.synchronize()   # kernels are asynchronous: time the finished work
 spinup_toc = time() - tic
 @info @sprintf("spin-up done in %.1f s", spinup_toc)
 
@@ -222,13 +234,16 @@ filename = graph_directory * "data_final.jld2"
 
 # cell-center coordinates and the column depth the model ACTUALLY used
 # (PartialCellBottom-adjusted, incl. the minimum-fractional-cell-height cap);
-# channel_ssh_compare.py differences this against the analytic SslabLU H(x,y)
-xc = collect(xnodes(grid, Center()))
-yc = collect(ynodes(grid, Center()))
-Hc = [static_column_depthᶜᶜᵃ(i, j, grid) for i in 1:Nx, j in 1:Ny]
+# channel_ssh_compare.py differences this against the analytic SslabLU H(x,y).
+# Read off a CPU copy of the grid (same construction): element-wise indexing of
+# a GPU grid is scalar indexing, which CUDA.jl disallows.
+hgrid = USE_GPU ? make_grid(CPU()) : grid
+xc = collect(xnodes(hgrid, Center()))
+yc = collect(ynodes(hgrid, Center()))
+Hc = [static_column_depthᶜᶜᵃ(i, j, hgrid) for i in 1:Nx, j in 1:Ny]
 # u-face depth min(H[i-1], H[i]): what the momentum/drag/continuity terms use
-xf = collect(xnodes(grid, Face()))
-Hu = [static_column_depthᶠᶜᵃ(i, j, grid) for i in 1:Nx, j in 1:Ny]
+xf = collect(xnodes(hgrid, Face()))
+Hu = [static_column_depthᶠᶜᵃ(i, j, hgrid) for i in 1:Nx, j in 1:Ny]
 
 jldsave(filename;
     Nx, Ny, Nz, Lx, Ly, Lz, xc, yc, Hc, xf, Hu, ridge_xc = RIDGE_XC,
