@@ -9,7 +9,9 @@ and *.png and prints the numbers quoted with them.
   fig3 self-convergence, slab-count invariance, volume drift / wall flux
   fig4 cost vs DoF, setup in time steps, composition of one step (N = 8, dense rb)
   fig5 slab count at a fixed discretization (the finest npan_y of the solver
-       sweep with every p)
+       sweep with every p); panel (d) memory held, if the memory runs are found
+  fig9 memory held after setup vs DoF (N = 8) and its composition
+  tab_memory.tex / tab_memory.csv  memory by component, dense and HBS
   fig6 HBS compression error vs rank (rankiso sweep, npan_y = 32)
   fig7 error vs run time (solver sweep)
   fig8 compression across interface sizes: error vs interface size and vs N,
@@ -28,13 +30,26 @@ central_ridge_runs/oceananigans_ridgectr). Both fields are de-meaned and
 compared at the Oceananigans cell centers, as in channel_ssh_compare.py. Grids
 the reference run did not sample (640^2) come from a rerun of it,
 SSLABLU_MS_REF_RERUN (default central_ridge_runs/reference_rerun_ssh640/<run>),
-used only if it reproduces the reference's own samples to 1e-10."""
+used only if it reproduces the reference's own samples to 1e-10.
+
+Memory (fig5 d, fig9, tab_memory): channel_timestep_mem.json files of the
+SSLABLU_MEMSTATS=1 runs (central_ridge_runs/run_memstats.sh: setup + 5 steps,
+same settings as the timing runs) under SSLABLU_MS_MEM (default
+central_ridge_runs/memstats_novtx). Memory held after setup, from the buffers
+reachable from each component (shared buffers once); MUMPS slab factors are
+INFOG(9)/(10) entries, working storage excluded. Components partition the total:
+leaf cache (GPU) | MUMPS slab factors | rest of the slab solvers (hpsalt slab
+discretization: sparse slab systems, grids, leaf operators) | S-maps |
+interface factorization | other (model state)."""
 import os
 import glob
+import json
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches
+import matplotlib.transforms
 from matplotlib.lines import Line2D
 from manuscript_common import *
 from eda_common import REPO
@@ -228,6 +243,32 @@ for i, (a, t) in enumerate(zip(ax, ("self-convergence", "slab-count invariance",
     tidy(a); a.set_title("(%s) %s" % ("abc"[i], t), fontsize=8.5, loc="left")
 save(fig, "fig3_accuracy")
 
+# ---------------------------------------------------------------- memory runs (optional)
+MEM_DIR = os.environ.get("SSLABLU_MS_MEM", os.path.join(REPO, "central_ridge_runs", "memstats_novtx"))
+_tb = lambda h: h["cpu"] + h["gpu"] + h["mumps"]
+
+
+def _memrow(d):
+    h, ph = d["held"], d["phases"]
+    m = dict(p=d["p"], npy=d["npan_y"], N=d["N"], solver=d["solver"], fastleaf=bool(d["fastleaf"]),
+             cache=_tb(h["  leaf cache"]), mumps=h["slab solvers (all)"]["mumps"], smap=_tb(h["S-maps"]),
+             ifac=_tb(h["interface factor"]), total=_tb(h["model total"]),
+             gpu_peak=max(v.get("gpu_peak", 0) for v in ph.values()), host_peak=max(v["cpu_peak"] for v in ph.values()))
+    m["slab"] = _tb(h["slab solvers (all)"]) - m["cache"] - m["mumps"]
+    m["iface"] = m["smap"] + m["ifac"]
+    m["other"] = m["total"] - m["cache"] - m["mumps"] - m["slab"] - m["iface"]
+    nx = 2 * m["npy"]                                   # as manuscript_common
+    m["dof"] = nx * m["npy"] * m["p"] ** 2 + m["p"] * nx * (2 * m["npy"] + 1)
+    return m
+
+
+MEM = {}
+for _f in glob.glob(os.path.join(MEM_DIR, "**", "channel_timestep_mem.json"), recursive=True):
+    _m = _memrow(json.load(open(_f)))
+    MEM[(_m["p"], _m["npy"], _m["N"], _m["solver"], _m["fastleaf"])] = _m
+mem = lambda p, n, N=8, s="rb", fl=True: MEM.get((p, n, N, s, fl))
+GB = 1e-9
+
 # ---------------------------------------------------------------- 4. cost scaling, N = 8, dense rb
 # (a) absolute times; (b) setup in units of steps; (c) composition of one step.
 # Nothing here depends on the 800-step run length. Factorization (~0.1% of
@@ -244,15 +285,15 @@ for p in PS:
 dd = np.array([2e4, 6e6])
 a.loglog(dd, 0.0035 * dd / 2e4, color=GREY, lw=0.7)          # below rhs + recon.
 a.text(2.5e5, 0.012, r"$\propto$ DoF", color=GREY, fontsize=7)
-a.loglog(dd, 2.0 * (dd / 2e4) ** 1.5, color=GREY, lw=0.7)    # above assembly
-a.text(6e6, 2.2e4, r"$\propto$ DoF$^{3/2}$", color=GREY, fontsize=7, ha="right")
+a.loglog(dd, 3.0 * dd / 2e4, color=GREY, lw=0.7)             # above assembly / storage
+a.text(6e6, 1.25e3, r"$\propto$ DoF", color=GREY, fontsize=7, ha="right")
 a.set_xlabel("degrees of freedom"); a.set_ylabel("wall time  [s]")
 a.legend(handles=[Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="S-map assembly"),
                   Line2D([], [], color=GREY, ls="-.", marker="D", mfc="none", ms=3.5, label="slab storage"),
                   Line2D([], [], color=GREY, ls="-", marker="o", label="rhs + recon., per step"),
                   Line2D([], [], color=GREY, ls=":", marker="^", mfc="none", label="interface solve, per step")],
          loc="upper left", handlelength=2.2, fontsize=6.5)
-a.set_ylim(3e-4, 2e5)
+a.set_ylim(3e-4, 1e5)
 a = ax[1]
 for p in PS:
     rr = [rbany(n, p) for n in NPYS if (p, n) in LAY]
@@ -260,8 +301,9 @@ for p in PS:
 a.axhline(800, color=GREY, lw=0.6, ls="--")
 a.text(1.1e4, 800 * 1.12, "800 steps (runs here)", color=GREY, fontsize=6.5, va="bottom")
 a.set_xlabel("degrees of freedom"); a.set_ylabel("setup cost  [time steps]")
-a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS], loc="lower right")
-a.set_ylim(40, 2000)
+a.legend(handles=[Line2D([], [], color=PC[p], marker="o", label="$p$ = %d" % p) for p in PS],
+         loc="upper right", bbox_to_anchor=(1, 0.86))             # between the 800 line and the curves
+a.set_ylim(50, 1100)
 a.yaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
 a = ax[2]
 for p in PS:
@@ -283,7 +325,12 @@ save(fig, "fig4_cost")
 # ---------------------------------------------------------------- 5. slab count at fixed discretization
 NPY5 = max(n for n in NPYS if all(one(sweep="solver", npy=n, p=p, N=8, kind="rb") for p in PS))
 NS = NSOF(NPY5)
-fig, ax = plt.subplots(1, 3, figsize=(7.2, 2.4), gridspec_kw=dict(wspace=0.4))
+MEM5 = all(mem(p, NPY5, N, s) for p in PS for N in NS for s in ("rb", "rbhbs"))
+if MEM5:
+    fig, ax = plt.subplots(2, 2, figsize=(6.4, 4.7), gridspec_kw=dict(wspace=0.36, hspace=0.55))
+    ax = ax.ravel()
+else:
+    fig, ax = plt.subplots(1, 3, figsize=(7.2, 2.4), gridspec_kw=dict(wspace=0.4))
 for p in PS:
     rb_ = [one(sweep="solver", npy=NPY5, p=p, N=N, kind="rb") for N in NS]
     hb_ = [one(sweep="solver", npy=NPY5, p=p, N=N, kind="both", rk=p) for N in NS]
@@ -305,13 +352,131 @@ ax[2].legend(handles=[Line2D([], [], color=GREY, marker="o", label="assembly, de
                       Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="assembly, HBS"),
                       Line2D([], [], color=GREY, ls="-.", marker="o", ms=3, label="factor, dense"),
                       Line2D([], [], color=GREY, ls=":", marker="s", mfc="none", ms=3, label="factor, HBS")],
-             loc="lower left", ncol=2, columnspacing=0.6, handlelength=1.8, bbox_to_anchor=(0, -0.02))
-ax[2].set_ylim(1e-2, 2e3)
+             **(dict(loc="upper left") if MEM5 else dict(loc="lower left", bbox_to_anchor=(0, -0.02))),
+             ncol=2, columnspacing=0.6, handlelength=1.8)
+ax[2].set_ylim(3e-2 if MEM5 else 1e-2, 2e4 if MEM5 else 2e3)
+if MEM5:                       # (d) memory held after setup: total and interface (S-maps + factorization)
+    a = ax[3]
+    for p in PS:
+        rb_ = [mem(p, NPY5, N, "rb") for N in NS]
+        hb_ = [mem(p, NPY5, N, "rbhbs") for N in NS]
+        a.semilogy(NS, [GB * m["total"] for m in rb_], "-o", color=PC[p])
+        a.semilogy(NS, [GB * m["total"] for m in hb_], "--s", color=PC[p], mfc="none")
+        a.semilogy(NS, [GB * m["iface"] for m in rb_], "-.o", color=PC[p], ms=3)
+        a.semilogy(NS, [GB * m["iface"] for m in hb_], ":s", color=PC[p], mfc="none", ms=3)
+    a.set_ylabel("memory held  [GB]")
+    a.legend(handles=[Line2D([], [], color=GREY, marker="o", label="total, dense"),
+                      Line2D([], [], color=GREY, ls="--", marker="s", mfc="none", label="total, HBS"),
+                      Line2D([], [], color=GREY, ls="-.", marker="o", ms=3, label="interface, dense"),
+                      Line2D([], [], color=GREY, ls=":", marker="s", mfc="none", ms=3, label="interface, HBS")],
+             loc="upper left", ncol=2, columnspacing=0.6, handlelength=1.8)
+    a.set_ylim(5e-3, 2e3)
+    a.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: "%g" % v))
+T5 = ("leaf work per step", "interface solve per step", "one-time setup", "memory held after setup")
 for i, a in enumerate(ax):
     a.set_xscale("log", base=2); a.set_xticks(NS); a.set_xticklabels([str(N) for N in NS]); a.minorticks_off()
     a.set_xlabel("double slabs $N$ (= interfaces)"); tidy(a)   # all at leaves(NPY5) leaves: in the caption
-    a.set_title("(%s) %s" % ("abc"[i], ("leaf work per step", "interface solve per step", "one-time setup")[i]), fontsize=8.5, loc="left")
+    a.set_title("(%s) %s" % ("abcd"[i], T5[i]), fontsize=8.5, loc="left")
 save(fig, "fig5_slabcount")
+
+
+# ---------------------------------------------------------------- 9. memory vs problem size, N = 8
+# (a) held memory by component vs DoF, dense rb (HBS interface for contrast); (b) composition of the
+# largest layout per p: dense | HBS | dense without the leaf cache (where run).
+MEMCOMP = (("cache", "leaf cache (GPU)", "#56B4E9"), ("mumps", "slab factors (MUMPS)", "#0072B2"),
+           ("slab", "slab discretization", "#999999"), ("smap", "S-maps", "#E69F00"),
+           ("ifac", "interface factorization", "#D55E00"), ("other", "other", "#dddddd"))
+LAY9 = [(p, n) for p, n in LAY if mem(p, n) and mem(p, n, s="rbhbs")]
+if LAY9:
+    fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.8), gridspec_kw=dict(wspace=0.3, width_ratios=(1, 1.15)))
+    a = ax[0]
+    for p in PS:
+        mm = [mem(p, n) for n in NPYS if (p, n) in LAY9]
+        hh = [mem(p, n, s="rbhbs") for n in NPYS if (p, n) in LAY9]
+        d = [m["dof"] for m in mm]
+        a.loglog(d, [GB * m["total"] for m in mm], "-o", color=PC[p])
+        a.loglog(d, [GB * m["cache"] for m in mm], "--d", color=PC[p], mfc="none", ms=4)
+        a.loglog(d, [GB * m["mumps"] for m in mm], "-.v", color=PC[p], mfc="none", ms=4)
+        a.loglog(d, [GB * m["iface"] for m in mm], ":^", color=PC[p], mfc="none")
+        a.loglog(d, [GB * m["iface"] for m in hh], ":", color=PC[p], lw=0.8, marker="x", ms=3.5)
+        for n in NPYS:
+            m = mem(p, n, fl=False)
+            if m:
+                a.loglog(m["dof"], GB * m["total"], "*", color=PC[p], ms=7, mec="k", mew=0.4, zorder=5)
+    dd = np.array([1e4, 6e6])
+    a.loglog(dd, 2e-5 * dd, color=GREY, lw=0.7)                # above the totals
+    a.text(6e6, 2e-5 * 6e6 * 1.4, r"$\propto$ DoF", color=GREY, fontsize=7, ha="right", va="bottom")
+    a.set_xlabel("degrees of freedom"); a.set_ylabel("memory held  [GB]")
+    a.legend(handles=[Line2D([], [], color=GREY, marker="o", label="total"),
+                      Line2D([], [], color=GREY, ls="--", marker="d", mfc="none", ms=4, label="leaf cache"),
+                      Line2D([], [], color=GREY, ls="-.", marker="v", mfc="none", ms=4, label="slab factors"),
+                      Line2D([], [], color=GREY, ls=":", marker="^", mfc="none", label="interface, dense"),
+                      Line2D([], [], color=GREY, ls=":", lw=0.8, marker="x", ms=3.5, label="interface, HBS"),
+                      Line2D([], [], color=GREY, ls="none", marker="*", ms=7, mec="k", mew=0.4, label="total, no leaf cache")]
+             + [Line2D([], [], color=PC[p], lw=3, label="$p$ = %d" % p) for p in PS],
+             loc="upper left", fontsize=6.2, handlelength=2.0, ncol=2, columnspacing=0.8)
+    a.set_ylim(3e-4, 3e3)
+    a = ax[1]
+    big = [(p, max(n for q, n in LAY9 if q == p)) for p in PS if any(q == p for q, _ in LAY9)]
+    bars, labs, x, xt = [], [], 0.0, []
+    for p, n in big:
+        grp = [("dense", mem(p, n)), ("HBS", mem(p, n, s="rbhbs"))] + ([("no cache", mem(p, n, fl=False))] if mem(p, n, fl=False) else [])
+        for nm, m in grp:
+            bars.append((x, m)); labs.append(nm.replace(" ", "\n")); x += 1
+        xt.append((x - (len(grp) + 1) / 2, "$p$ = %d, %s\n%.1fM DoF" % (p, leaves(n), grp[0][1]["dof"] / 1e6)))
+        x += 0.6
+    for xb, m in bars:
+        y0 = 0.0
+        for k, _, c in MEMCOMP:
+            a.bar(xb, GB * m[k], bottom=y0, width=0.8, color=c, edgecolor="white", lw=0.3)
+            y0 += GB * m[k]
+        a.text(xb, y0 + 0.3, "%.1f" % y0, ha="center", va="bottom", fontsize=6)
+    a.set_xticks([b[0] for b in bars]); a.set_xticklabels(labs, fontsize=6.5, rotation=0)
+    for xc, s in xt:
+        a.text(xc, -0.2, s, transform=matplotlib.transforms.blended_transform_factory(a.transData, a.transAxes),
+               ha="center", va="top", fontsize=7)
+    a.set_ylabel("memory held  [GB]")
+    a.legend(handles=[matplotlib.patches.Patch(color=c, label=l) for _, l, c in MEMCOMP][::-1],
+             loc="upper right", fontsize=6.3, handlelength=1.2)
+    a.set_ylim(0, 1.18 * max(GB * m["total"] for _, m in bars))
+    for i, (a, t) in enumerate(zip(ax, ("memory vs. problem size ($N$ = 8)", "composition, largest layouts"))):
+        tidy(a); a.set_title("(%s) %s" % ("ab"[i], t), fontsize=8.5, loc="left")
+    save(fig, "fig9_memory")
+
+# ---------------------------------------------------------------- memory table (LaTeX + CSV)
+# fig5 layout at every N, plus the largest N = 8 layout per p, dense and HBS rank p.
+TROWS = sorted({(p, NPY5, N) for p in PS for N in NS} | {(p, max(n for q, n in LAY9 if q == p), 8) for p in {q for q, _ in LAY9}},
+               key=lambda t: (t[1] != NPY5, t[0], t[1], t[2]))
+TROWS = [t for t in TROWS if mem(*t) and mem(*t, s="rbhbs")]
+if TROWS:
+    hdr = ["p", "leaves", "N", "DoF", "leaf_cache", "slab_factors", "slab_disc", "other",
+           "smap_dense", "smap_hbs", "ifac_dense", "ifac_hbs", "total_dense", "total_hbs", "saving_pct",
+           "gpu_peak_dense", "host_peak_dense"]
+    csv = [",".join(hdr)]
+    tex = [r"\begin{tabular}{rrrr|rrr|rr|rr|rrr}", r"\toprule",
+           r" & & & & leaf & slab & slab & \multicolumn{2}{c|}{S-maps} & \multicolumn{2}{c|}{interface factor.} & \multicolumn{3}{c}{total} \\",
+           r"$p$ & leaves & $N$ & DoF & cache & factors & discr. & dense & HBS & dense & HBS & dense & HBS & saving \\", r"\midrule"]
+    prev = None
+    for p, n, N in TROWS:
+        d, h = mem(p, n, N), mem(p, n, N, "rbhbs")
+        sav = 100 * (1 - h["total"] / d["total"])
+        csv.append(",".join(str(v) for v in [p, "%dx%d" % (2 * n, n), N, d["dof"]] +
+                   ["%.4f" % (GB * v) for v in (d["cache"], d["mumps"], d["slab"], d["other"], d["smap"], h["smap"],
+                                                d["ifac"], h["ifac"], d["total"], h["total"])] +
+                   ["%.1f" % sav, "%.3f" % (GB * d["gpu_peak"]), "%.3f" % (GB * d["host_peak"])]))
+        grp = n == NPY5
+        if prev is not None and prev != grp:
+            tex.append(r"\midrule")
+        prev = grp
+        f2 = lambda v: "%.2f" % (GB * v)
+        tex.append(" & ".join([str(p), leaves(n), str(N), "%.2fM" % (d["dof"] / 1e6), f2(d["cache"]), f2(d["mumps"]),
+                               f2(d["slab"] + d["other"]), f2(d["smap"]), f2(h["smap"]), f2(d["ifac"]), f2(h["ifac"]),
+                               f2(d["total"]), f2(h["total"]), "%.0f\\%%" % sav]) + r" \\")
+    tex += [r"\bottomrule", r"\end{tabular}"]
+    open(FIG + "tab_memory.csv", "w").write("\n".join(csv) + "\n")
+    open(FIG + "tab_memory.tex", "w").write("%% memory held after setup [GB]; generated by manuscript_figs.py from %s\n" % MEM_DIR
+                                           + "% 'slab discr.' includes model state (other); leaf cache is GPU, the rest host\n"
+                                           + "\n".join(tex) + "\n")
 
 
 # ---------------------------------------------------------------- 6. HBS rank (rankiso, npan_y = 32)
@@ -482,4 +647,18 @@ for n in NPYS:
         y = one(sweep="rankiso", npy=n, p=8, N=N, solver="rbhbs", rk=12, rbrk=12)
         if x and y:
             print("  %8s N=%3d: error %s / %s, difference %s" % (leaves(n).replace("$\\times$", "x"), N, g(rel(fld(x), fld(rbof(x)))), g(rel(fld(y), fld(rbof(y)))), g(rel(fld(x), fld(y)))))
+if MEM:
+    print("memory held after setup [GB] (%s), dense | HBS rank p; interface = S-maps + factorization:" % MEM_DIR)
+    for p, n, N in TROWS:
+        d, h = mem(p, n, N), mem(p, n, N, "rbhbs")
+        print("  p=%2d %8s N=%2d DoF %8d: total %6.2f | %6.2f (saving %4.1f%%) | interface %.3f | %.3f (x%.1f, %4.1f%% of dense total)"
+              " | leaf cache %5.2f (%2.0f%%) slab factors %5.2f slab discr. %5.2f | peak GPU %5.2f host %5.2f" % (
+              p, leaves(n).replace("$\\times$", "x"), N, d["dof"], GB * d["total"], GB * h["total"], 100 * (1 - h["total"] / d["total"]),
+              GB * d["iface"], GB * h["iface"], d["iface"] / h["iface"], 100 * d["iface"] / d["total"],
+              GB * d["cache"], 100 * d["cache"] / d["total"], GB * d["mumps"], GB * d["slab"], GB * d["gpu_peak"], GB * d["host_peak"]))
+    for (p, n, N, s, fl), m in sorted(MEM.items()):
+        if not fl:
+            c = mem(p, n, N, s)
+            print("  no leaf cache p=%d %s N=%d: total %.2f GB vs %.2f with the cache (x%.1f)" % (
+                p, leaves(n).replace("$\\times$", "x"), N, GB * m["total"], GB * c["total"], c["total"] / m["total"]))
 print("wrote", FIG)

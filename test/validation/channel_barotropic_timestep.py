@@ -195,6 +195,9 @@
 #   SSLABLU_COMPARE_FORMS  1 = also run non-conservative form   (default 1)
 #   SSLABLU_DTCONV     1 = run dt-convergence study             (default 0)
 #   SSLABLU_FLUXBUDGET 1 = per-step volume budget (see above)   (default 0)
+#   SSLABLU_MEMSTATS   1 = memory accounting (held bytes by component, per-phase
+#                      host/GPU peaks; MEMORY block + channel_timestep_mem.json);
+#                      skips the per-run solver check                (default 0)
 #   SSLABLU_VERTEX_ETA 1 = one eta per leaf vertex: every copy (the leaves and
 #                      overlapping slabs sharing it) gets the mean of the
 #                      leaves' corner extrapolations; 0 = each leaf keeps its
@@ -518,6 +521,130 @@ def cheb_quad_weights(nodes):
     ks = np.arange(0, n, 2)
     m[ks] = 2.0 / (1.0 - ks.astype(float) ** 2)
     return np.linalg.solve(V.T, m) * (b - a) / 2.0
+
+
+# =============================================================================
+# Memory accounting (SSLABLU_MEMSTATS=1)
+# =============================================================================
+def held_bytes(*roots, seen=None):
+    """{'cpu': B, 'gpu': B, 'mumps': B} of the array buffers reachable from roots.
+
+    Walks attributes, __slots__, lists, tuples, dicts, sets and function
+    closures; counts every numpy / torch buffer once (by its owning buffer, so
+    views and shared blocks are not double counted; pass one `seen` set to
+    several calls to de-duplicate across them). scipy sparse matrices are
+    reached through their data/indices/indptr arrays. A python-mumps Context is
+    opaque to the walk: its factors are counted from MUMPS' own INFOG(9)
+    (real entries, 8 B) and INFOG(10) (integer entries, 4 B)."""
+    import types
+    seen = set() if seen is None else seen
+    out = {"cpu": 0, "gpu": 0, "mumps": 0}
+    skip = (types.ModuleType, type, types.BuiltinFunctionType, str, bytes,
+            int, float, complex, bool, type(None))
+    stack, visited = list(roots), set()
+    while stack:
+        o = stack.pop()
+        if isinstance(o, skip) or id(o) in visited:
+            continue
+        visited.add(id(o))
+        if isinstance(o, np.ndarray):
+            own = o
+            while isinstance(own.base, np.ndarray):
+                own = own.base
+            key = ("np", own.__array_interface__["data"][0], own.nbytes)
+            if key not in seen:
+                seen.add(key)
+                out["cpu"] += own.nbytes
+            if o.dtype == object:
+                stack.extend(o.ravel().tolist())
+            continue
+        if torch.is_tensor(o):
+            st = o.untyped_storage()
+            key = ("t", o.device.type, st.data_ptr())
+            if key not in seen:
+                seen.add(key)
+                out["gpu" if o.is_cuda else "cpu"] += st.nbytes()
+            continue
+        if hasattr(o, "mumps_instance"):            # python-mumps Context
+            key = ("mumps", id(o))
+            if key not in seen:
+                seen.add(key)
+                g = o.mumps_instance.infog
+                n = lambda v: -v * 1_000_000 if v < 0 else v   # <0: millions
+                out["mumps"] += 8 * n(g[9]) + 4 * n(g[10])
+            continue
+        if isinstance(o, dict):
+            stack.extend(o.values())
+        elif isinstance(o, (list, tuple, set, frozenset)):
+            stack.extend(o)
+        elif isinstance(o, (types.FunctionType, types.MethodType)):
+            if isinstance(o, types.MethodType):
+                stack.extend((o.__self__, o.__func__))
+            else:
+                stack.extend(c.cell_contents for c in (o.__closure__ or ())
+                             if c.cell_contents is not None)
+        else:
+            d = getattr(o, "__dict__", None)
+            if isinstance(d, dict):
+                stack.extend(d.values())
+            for sl in getattr(type(o), "__slots__", ()):
+                if hasattr(o, sl):
+                    stack.append(getattr(o, sl))
+    return out
+
+
+def _vm_bytes(field):
+    """/proc/self/status field (VmRSS, VmHWM, ...) in bytes, nan if unavailable."""
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith(field + ":"):
+                return 1024.0 * float(line.split()[1])
+    except OSError:
+        pass
+    return float("nan")
+
+
+class MemPhase:
+    """Peak memory of one setup phase (SSLABLU_MEMSTATS): host peak RSS (VmHWM,
+    reset on entry via /proc/self/clear_refs) and the GPU allocator's peak
+    (torch.cuda.max_memory_allocated, reset on entry). Records into `log` as
+    name -> dict of bytes: cpu_peak, cpu_end (RSS on exit), cpu_start, and
+    gpu_peak, gpu_end, gpu_start when CUDA is in use. A no-op unless on."""
+
+    def __init__(self, name, log, on):
+        self.name, self.log, self.on = name, log, on
+
+    def __enter__(self):
+        if not self.on:
+            return self
+        gc.collect()
+        self.cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+        if self.cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            self.g0 = torch.cuda.memory_allocated()
+        try:
+            with open("/proc/self/clear_refs", "w") as fh:
+                fh.write("5")                    # VmHWM := current RSS
+            self.hwm_reset = True
+        except OSError:
+            self.hwm_reset = False               # then VmHWM is the process peak
+        self.c0 = _vm_bytes("VmRSS")
+        return self
+
+    def __exit__(self, *exc):
+        if not self.on:
+            return False
+        rec = {"cpu_start": self.c0, "cpu_peak": _vm_bytes("VmHWM"),
+               "cpu_end": _vm_bytes("VmRSS"), "cpu_peak_is_phase": self.hwm_reset}
+        cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+        if cuda:
+            torch.cuda.synchronize()
+            rec.update(gpu_start=getattr(self, "g0", 0),
+                       gpu_peak=torch.cuda.max_memory_allocated(),
+                       gpu_end=torch.cuda.memory_allocated())
+        self.log[self.name] = rec
+        return False
 
 
 class SlabSolve:
@@ -1010,15 +1137,17 @@ class ChannelModel:
 
         zero_bc = lambda p: np.zeros(p.shape[0])
 
+        self.mem_phases = {}                     # SSLABLU_MEMSTATS: per-phase peaks
         tic = time.perf_counter()
         # offload=False: every S-block is handed to the interface solver at
         # once, so keep them resident (the oms default moves device-resident
         # blocks to host and streams them back one slab at a time)
-        self.OMS = oms.oms(dSlabs, self.diff_op, gb, opts, connectivity,
-                           offload=False)
-        with redirect_stdout(io.StringIO()):
-            rhs0, self.Ntot = \
-                self.OMS.construct_Stot_helper(zero_bc, assembler, dbg=0)
+        with MemPhase("assembly", self.mem_phases, MEMSTATS):
+            self.OMS = oms.oms(dSlabs, self.diff_op, gb, opts, connectivity,
+                               offload=False)
+            with redirect_stdout(io.StringIO()):
+                rhs0, self.Ntot = \
+                    self.OMS.construct_Stot_helper(zero_bc, assembler, dbg=0)
         S_list, self.nc = self.OMS.hbs_blocks, self.OMS.nc
         self.t_asm = time.perf_counter() - tic
 
@@ -1029,6 +1158,8 @@ class ChannelModel:
 
         I_nc = np.eye(self.nc)
         tic = time.perf_counter()
+        _fac_phase = MemPhase("factor", self.mem_phases, MEMSTATS)
+        _fac_phase.__enter__()
         if SOLVER == "rb":
             # identity diagonal (Stot = I + S); cyclic=True: the wrap-around
             # couplings S_list[0][0] and S_list[-1][1] are reduced like any
@@ -1060,6 +1191,7 @@ class ChannelModel:
         else:
             self.T, self.smw = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
                 self.OMS, S_list, rhs0, self.Ntot, self.nc)
+        _fac_phase.__exit__(None, None, None)
         self.t_fac = time.perf_counter() - tic
 
         # per-run solver check on one random rhs (reference factors discarded):
@@ -1069,24 +1201,29 @@ class ChannelModel:
         #            RB_RK (the S-map compression at rank RK is common to both)
         self.solver_check, self.solver_check_label = np.nan, ""
         r = np.random.default_rng(0).standard_normal(self.Ntot)
-        if SOLVER == "rb":
+        if MEMSTATS:
+            # skipped: the dense reference factorization would dominate the
+            # peaks being measured (and outlive the factor phase)
+            self.solver_check_label = "skipped (SSLABLU_MEMSTATS)"
+        elif SOLVER == "rb":
             T_, smw_ = omsdirectsolve.build_block_cyclic_tridiagonal_solver(
                 self.OMS, S_list, rhs0, self.Ntot, self.nc)
             x_ref = omsdirectsolve.block_cyclic_tridiagonal_solve(self.OMS, T_, smw_, r)
             self.solver_check_label = "red-black vs Thomas"
-        elif SOLVER == "rbhbs":
+        elif SOLVER == "rbhbs" and not MEMSTATS:
             ref_ = RedBlackSolver(self.nc, cyclic=True)
             ref_.factorize([[np.asarray(b @ I_nc) for b in blocks] for blocks in S_list])
             x_ref = np.asarray(ref_.solve(r)).ravel()
             self.solver_check_label = ("HBS red-black (rank %d) vs dense red-black"
                                        % RB_RK)
-        if SOLVER in ("rb", "rbhbs"):
+        if SOLVER in ("rb", "rbhbs") and not MEMSTATS:
             self.solver_check = (np.linalg.norm(self.solve(r) - x_ref)
                                  / np.linalg.norm(x_ref))
 
         tic = time.perf_counter()
-        self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
-                             own_split=n * H) for n in range(self.N)]
+        with MemPhase("keep-slabs", self.mem_phases, MEMSTATS):
+            self.sl = [SlabSolve(dSlabs[n], self.diff_op, opts, gb,
+                                 own_split=n * H) for n in range(self.N)]
         self.t_keep = time.perf_counter() - tic
         self.cache_bytes = sum(getattr(s, "cache_bytes", 0) for s in self.sl)
         # copies of each leaf vertex over all boxes of all slabs (built once)
@@ -1225,6 +1362,24 @@ class ChannelModel:
         mean = tot / cnt
         for E, (bb, jj, gg) in zip(etas, per_slab):
             E[bb, jj] = mean[gg]
+
+    def memory_report(self):
+        """Held bytes by component (SSLABLU_MEMSTATS), each counted on its own;
+        'total' walks the whole model once, so shared buffers count once."""
+        fac = (getattr(self, "rb", None) if SOLVER == "rb" else
+               getattr(self, "rbhbs", None) if SOLVER == "rbhbs" else
+               (getattr(self, "T", None), getattr(self, "smw", None)))
+        comp = {
+            "S-maps": held_bytes(self.OMS.hbs_blocks),
+            "interface factor": held_bytes(fac),
+            "oms (incl. S-maps)": held_bytes(self.OMS),
+            "slab solvers (all)": held_bytes(self.sl),
+            "  leaf cache": held_bytes([(s.lu, s.piv, s.S) for s in self.sl
+                                        if hasattr(s, "lu")]),
+            "  slab sparse solvers (sv)": held_bytes([s.sv for s in self.sl]),
+            "model total": held_bytes(self),
+        }
+        return comp
 
     def solve(self, rhs):
         """Interface system (I + S) u = rhs with the stored factorization."""
@@ -1634,6 +1789,10 @@ if SOLVER == "rbhbs":
         else:
             import direct_solve.omsdirectsolveHBS as omsdirectsolveHBS
 CMP_FORM = os.environ.get("SSLABLU_COMPARE_FORMS", "1") != "0"
+# 1 = memory accounting: held bytes by component and per-phase peaks, printed
+# after the run and written to channel_timestep_mem.json; skips the per-run
+# solver check (its dense reference would dominate the peaks)
+MEMSTATS = os.environ.get("SSLABLU_MEMSTATS", "0") != "0"
 DO_DTCNV = os.environ.get("SSLABLU_DTCONV", "0") != "0"
 FLUXBUDGET = os.environ.get("SSLABLU_FLUXBUDGET", "0") != "0"
 # one eta per leaf vertex (ChannelModel.average_vertices); 0 (default) = per-leaf
@@ -1818,6 +1977,8 @@ if FORCED:
 else:
     print(" step   t[h]    |M-M0| div-form   |M-M0| non-cons    E/E0     max|eta|"
           "   t_rhs   t_slv   t_rec")
+_steps_phase = MemPhase("steps", modC.mem_phases, MEMSTATS)
+_steps_phase.__enter__()
 for n in range(1, NSTEPS + 1):
     eta_old = [e.copy() for e in modC.eta] if FLUXBUDGET else None
     dC = modC.step()
@@ -1867,6 +2028,31 @@ for n in range(1, NSTEPS + 1):
             ssh_export["eta_%s_%d" % (tag, ns)] = e_
             ssh_export["u_%s_%d" % (tag, ns)] = u_
             ssh_export["v_%s_%d" % (tag, ns)] = v_
+_steps_phase.__exit__(None, None, None)
+
+if MEMSTATS:
+    import json
+    held = modC.memory_report()
+    GB = 1e-9
+    print("")
+    print("=============MEMORY (SSLABLU_MEMSTATS, divergence-form model)=============")
+    print("held after setup + %d steps, GB        host      GPU   MUMPS (host)" % NSTEPS)
+    for k, v in held.items():
+        print("  %-28s %9.3f %8.3f %8.3f" % (k, GB * v["cpu"], GB * v["gpu"], GB * v["mumps"]))
+    print("peak per phase, GB      host RSS start/peak/end    GPU alloc start/peak/end")
+    for k, v in modC.mem_phases.items():
+        print("  %-12s %8.3f %8.3f %8.3f%s    %s" % (
+            k, GB * v["cpu_start"], GB * v["cpu_peak"], GB * v["cpu_end"],
+            "" if v["cpu_peak_is_phase"] else " (process peak)",
+            ("%8.3f %8.3f %8.3f" % (GB * v["gpu_start"], GB * v["gpu_peak"], GB * v["gpu_end"]))
+            if "gpu_peak" in v else "   (no CUDA)"))
+    print("===========================================================================")
+    os.makedirs(graph_directory, exist_ok=True)
+    with open(outpath("channel_timestep_mem.json"), "w") as fh:
+        json.dump(dict(held=held, phases=modC.mem_phases, p=p, N=N, npan_x=npan_x,
+                       npan_y=npan_y, solver=SOLVER, rk=RK, rb_rk=RB_RK, nc=modC.nc,
+                       nsteps=NSTEPS, fastleaf=FASTLEAF, gpu=GPU), fh, indent=1)
+    print("Wrote %s" % outpath("channel_timestep_mem.json"))
 
 maxeta_run = max(hist["maxeta"])
 stable = maxeta_run < 50.0 * max(ETA0, STERIC_AMP)
