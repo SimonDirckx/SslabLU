@@ -5,7 +5,8 @@ variants.
 
 DEFAULT (--problem manufactured): manufactured solution of limited regularity
 (pb.manufactured.PBPedestal): phi* = F(psi) + eps (1 - psi) Re[w^m e^{-i n zeta}],
-F with a C^{ceil(beta)-1} kink at the flux surface psi0, load f* = -Lap phi* +
+F a pedestal at the flux surface psi0: tanh of width --delta (default; analytic)
+or --mms-profile kink (C^{ceil(beta)-1}), load f* = -Lap phi* +
 g(phi*), Dirichlet data phi*.  Errors vs phi* are exact (interface and volume);
 the flux-function fit and the a-posteriori estimator are skipped.
 
@@ -159,10 +160,13 @@ def parse():
     ap.add_argument("--compare", type=str, nargs="*", default=[], help="probe .npz files of other runs")
     ap.add_argument("--problem", type=str, default="manufactured", choices=["manufactured", "physical"],
                     help="manufactured (default: PBPedestal phi*, exact errors) or physical (f = 0, phi_b = 0)")
-    ap.add_argument("--mms-amp", type=float, default=3.0, help="phi* = amp [-(1-psi) + kink q^beta] + ...")
-    ap.add_argument("--mms-kink", type=float, default=0.5, help="pedestal size (0: no kink, smooth)")
-    ap.add_argument("--mms-beta", type=float, default=2.5, help="regularity exponent (>= 2; phi* in C^ceil(beta)-1)")
-    ap.add_argument("--mms-psi0", type=float, default=0.7, help="flux surface of the kink")
+    ap.add_argument("--mms-profile", type=str, default="tanh", choices=["tanh", "kink"],
+                    help="pedestal H(psi): tanh (analytic, width --delta) or kink (C^ceil(beta)-1)")
+    ap.add_argument("--delta", type=float, default=0.5, help="tanh pedestal width in psi")
+    ap.add_argument("--mms-amp", type=float, default=3.0, help="phi* = amp [-(1-psi) + kink H(psi)] + ...")
+    ap.add_argument("--mms-kink", type=float, default=0.5, help="pedestal height / amp (0: no pedestal)")
+    ap.add_argument("--mms-beta", type=float, default=2.5, help="kink profile: H = q^beta (>= 2)")
+    ap.add_argument("--mms-psi0", type=float, default=0.7, help="flux surface of the pedestal")
     ap.add_argument("--mms-eps", type=float, default=0.2, help="3D term eps (1-psi) Re[w^m e^{-i n zeta}]")
     ap.add_argument("--mms-mode", type=str, default="2,1", help="m,n of the 3D term (n per field period)")
     ap.add_argument("--variants", type=str, default="schwarz,dh",
@@ -316,7 +320,8 @@ def main():
             model = PBPedestal(torus, pdo_geo, Lam=Lam, N=args.N, tau_slope=args.tau_slope,
                                amp=args.mms_amp, kink=args.mms_kink, beta=args.mms_beta,
                                psi0=args.mms_psi0, eps=args.mms_eps, mode=args.mms_mode,
-                               cache=mms_cache, cache_size=Ns + 8)
+                               cache=mms_cache, cache_size=Ns + 8, profile=args.mms_profile,
+                               delta=args.delta)
             mms_cache = model._cache
         else:
             model = PBProfiles(torus, Lam=Lam, N=args.N, tau_slope=args.tau_slope)
@@ -328,7 +333,7 @@ def main():
                         Lam=Lam_in, lam_unit=args.lam_unit, Lam_code=Lam, N=args.N,
                         tau_slope=args.tau_slope, arch_stretch=beta, tol=args.tol, eta=args.eta)
         if mms:
-            base_row.update(mms_amp=args.mms_amp, mms_kink=args.mms_kink, mms_beta=args.mms_beta,
+            base_row.update(mms_profile=args.mms_profile, mms_delta=args.delta, mms_amp=args.mms_amp, mms_kink=args.mms_kink, mms_beta=args.mms_beta,
                             mms_psi0=args.mms_psi0, mms_eps=args.mms_eps, mms_mode="%d,%d" % args.mms_mode)
         rows, outer_rows = [], []
 
@@ -535,7 +540,9 @@ def main():
 
         tag = "Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s%s%s" % (Ns, nz, n, m, "-".join(map(str, triple(p_f))),
                                                         Lam_in, args.N, st_tag, geo_tag,
-                                                        "_mms" if mms else "")
+                                                        ("_mms-%s%s" % (args.mms_profile, "%g" % args.delta
+                                                         if args.mms_profile == "tanh" else "%g" % args.mms_beta))
+                                                        if mms else "")
         npz = os.path.join(args.out, "probes_%s.npz" % tag)
         np.savez(npz, values=pv, coarse=pv_c, **probes,
                  meta_Ns=Ns, meta_nz=nz, meta_n=n, meta_m=m, meta_p=np.array(triple(p_f)),

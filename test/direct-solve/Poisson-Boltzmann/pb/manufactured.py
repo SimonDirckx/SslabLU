@@ -126,11 +126,16 @@ class PBPedestal:
 
     defined in REFERENCE coordinates W = (t, x, y):
         phi*  = F(psi) + eps (1 - psi) Re[w^m e^{-i n zeta}],
-        F     = amp ( -(1 - psi) + kink q^beta ),   q = max(0, (psi - psi0) / (1 - psi0)),
+        F     = amp ( -(1 - psi) + kink H(psi) ),
+        H     = (1 + tanh((psi - psi0) / delta)) / 2           (profile 'tanh', default)
+              = q^beta,  q = max(0, (psi - psi0) / (1 - psi0))   (profile 'kink'),
         psi   = (x^2 + y^2) / Rc^2,  w = (x + i y) / Rc,  zeta = 2 pi nfp t / L.
-    F is C^{ceil(beta)-1} across the flux surface psi = psi0 (a 'pedestal' kink,
-    not aligned with any leaf boundary); f* contains q^(beta-2), so beta > 2
-    keeps f* continuous (beta = 2: f* jumps).  The Fourier term is smooth, L-
+    'tanh': an analytic pedestal of height amp*kink and width ~delta (in psi)
+    around psi0; its nearest complex singularities sit at psi - psi0 = +-i pi
+    delta / 2, so delta sets how hard it is (spectral convergence once resolved).
+    'kink': F is C^{ceil(beta)-1} across the flux surface psi = psi0 (not aligned
+    with any leaf boundary); f* contains q^(beta-2), so beta > 2 keeps f*
+    continuous (beta = 2: f* jumps).  The Fourier term is smooth, L-
     periodic in t, regular at the axis (w^m is a polynomial) and vanishes on
     the wall; it makes phi* genuinely 3D.  kink = 0 or eps alone: smooth control.
 
@@ -140,11 +145,17 @@ class PBPedestal:
     point set (LRU, shared by with_Lam copies: it does not depend on Lam)."""
 
     def __init__(self, geom, pdo_geo, Lam=20.0, N="vanishing", tau_slope=0.4, amp=3.0, kink=0.5,
-                 beta=2.5, psi0=0.7, eps=0.2, mode=(2, 1), cache=None, cache_size=64):
+                 beta=2.5, psi0=0.7, eps=0.2, mode=(2, 1), cache=None, cache_size=64,
+                 profile="tanh", delta=0.5):
         from collections import OrderedDict
         from pb.profiles import PBProfiles
-        if beta < 2:
+        if profile not in ("tanh", "kink"):
+            raise ValueError("profile must be 'tanh' or 'kink', got %r" % (profile,))
+        if profile == "kink" and beta < 2:
             raise ValueError("beta must be >= 2 (beta < 2 makes f* unbounded at psi = psi0)")
+        if profile == "tanh" and not delta > 0:
+            raise ValueError("delta must be > 0")
+        self.profile, self.delta = profile, float(delta)
         if not 0.0 <= psi0 < 1.0:
             raise ValueError("psi0 must be in [0, 1)")
         self.geom, self.pdo_geo = geom, pdo_geo
@@ -158,7 +169,8 @@ class PBPedestal:
 
     def with_Lam(self, Lam):
         return PBPedestal(self.geom, self.pdo_geo, Lam, self.prof.N_kind, self.prof.tau_slope, self.amp,
-                          self.kink, self.beta, self.psi0, self.eps, self.mode, self._cache, self.cache_size)
+                          self.kink, self.beta, self.psi0, self.eps, self.mode, self._cache, self.cache_size,
+                          self.profile, self.delta)
 
     # ---- profiles / nonlinearity (PBProfiles)
     @property
@@ -183,6 +195,14 @@ class PBPedestal:
     # ---- phi* and its reference derivatives
     def _F(self, psi):
         a, k, b, p0 = self.amp, self.kink, self.beta, self.psi0
+        if self.profile == "tanh":
+            dl = self.delta
+            th = np.tanh((psi - p0) / dl)
+            sech2 = 1.0 - th * th
+            F = a * (-(1.0 - psi) + k * 0.5 * (1.0 + th))
+            F1 = a * (1.0 + k * 0.5 * sech2 / dl)
+            F2 = -a * k * th * sech2 / dl ** 2
+            return F, F1, F2
         d = 1.0 - p0
         q = np.clip((psi - p0) / d, 0.0, None)
         on = psi > p0
@@ -273,6 +293,9 @@ class PBPedestal:
         return self.neg_lap_phistar(W) + self.g(W, self.phistar(W))
 
     def describe(self):
-        return ("manufactured phi* = %g [-(1-psi) + %g q^%g] + %g (1-psi) Re[w^%d e^{-i %d zeta}], "
-                "q = (psi - %g)_+ / %g;  %s" % (self.amp, self.kink, self.beta, self.eps, self.mode[0],
-                                               self.mode[1], self.psi0, 1 - self.psi0, self.prof.describe()))
+        if self.profile == "tanh":
+            H = "(1 + tanh((psi - %g)/%g))/2" % (self.psi0, self.delta)
+        else:
+            H = "q^%g, q = (psi - %g)_+/%g" % (self.beta, self.psi0, 1 - self.psi0)
+        return ("manufactured phi* = %g [-(1-psi) + %g H] + %g (1-psi) Re[w^%d e^{-i %d zeta}], H = %s;  %s"
+                % (self.amp, self.kink, self.eps, self.mode[0], self.mode[1], H, self.prof.describe()))
