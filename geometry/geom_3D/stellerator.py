@@ -596,6 +596,7 @@ def fit_wout(path, deg=8, mmax=None, nmax=None, s=0.5, w_edge=1e4, w_axis=1e2):
         xm = np.asarray(v["xm"].data).astype(int)
         xn = np.asarray(v["xn"].data)
         rmnc, zmns = np.asarray(v["rmnc"].data, float), np.asarray(v["zmns"].data, float)
+        aminor = float(v["Aminor_p"].data) if "Aminor_p" in v else None
     ns = rmnc.shape[0]
     rho = np.sqrt(np.linspace(0, 1, ns))
     wts = np.ones(ns)
@@ -619,6 +620,7 @@ def fit_wout(path, deg=8, mmax=None, nmax=None, s=0.5, w_edge=1e4, w_axis=1e2):
     z10 = sum(z for lay in layers for m, n, r, z in lay if (m, n) == (1, 0))
     tor = VmecTorus(layers, nfp, float(np.sqrt(abs(r10 * z10))), s)
     tor.fit_info = dict(rho=rho, err=err)
+    tor.aminor = aminor                                  # VMEC minor radius (Aminor_p), if present
     return tor
 
 

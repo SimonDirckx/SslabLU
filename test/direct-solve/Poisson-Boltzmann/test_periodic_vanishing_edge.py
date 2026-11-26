@@ -1,6 +1,27 @@
 """
-test_periodic_vanishing_edge: Approach 1 on the full periodic twisted elliptic
-torus for the PHYSICAL problem (no manufactured solution):
+test_periodic_vanishing_edge: Approach 1 on the full periodic torus (twisted
+elliptic torus, or a stellarator with --input), with a comparison of solver
+variants.
+
+DEFAULT (--problem manufactured): manufactured solution of limited regularity
+(pb.manufactured.PBPedestal): phi* = F(psi) + eps (1 - psi) Re[w^m e^{-i n zeta}],
+F with a C^{ceil(beta)-1} kink at the flux surface psi0, load f* = -Lap phi* +
+g(phi*), Dirichlet data phi*.  Errors vs phi* are exact (interface and volume);
+the flux-function fit and the a-posteriori estimator are skipped.
+
+Variants (--variants, default both), after the baseline (= the pipeline below):
+  schwarz : P = I on the SAME OMS, c_ref and start (P phi_c): classical
+            nonlinear overlapping Schwarz (additive), --schwarz-maxit;
+  dh      : Debye-Hueckel linearization c_ref = d_s g(psi, 0) = Lam^2 N / tau for
+            both the local chord solves and the preconditioner (its own OMS and
+            compressed red-black), start phi = 0, no coarse problem;
+            --dh-maxit, --dh-local-maxit.
+Per variant: outer its, |R|, rates (last, asymptotic = geometric mean of the last
+5), local chord steps, setup/outer times, c_ref mismatch max|c_ref - c(phi)| /
+max|c(phi)| at the final phi, probe difference to the baseline, and (manufactured)
+the exact errors.  One CSV row per variant (column 'variant').
+
+--problem physical: the PHYSICAL problem (no manufactured solution):
 
     -Lap phi + Lam^2 N(psi) exp(phi / tau(psi)) = 0,   phi = 0 on the wall,
     N = 1 - psi^2 (vanishing edge; --N linear gives 1 - psi/2),  tau = 1 - 0.4 psi.
@@ -21,15 +42,27 @@ No exact solution, so it reports instead:
   - phi at fixed probe points, saved to --out; --compare <npz> prints the max
     difference against another run (self-convergence across resolutions).
 
+Stellarator geometry (geometry/geom_3D/stellerator.py) with --input, e.g. the
+CSX equilibrium --input wout_csx.nc (VMEC flux coordinates: psi = normalized
+toroidal flux).  With --input the profile defaults change to
+    N = 1 - psi ('vanishing-linear'),  tau = 1,  Lam^2 = 70 per minor radius^2
+(--lam-unit minor: code Lam = Lam / a, a = VMEC Aminor_p, else Rc); any of
+--N / --tau-slope / --Lam / --lam-unit given explicitly overrides them.
+
 Run from this folder with the repo root on PYTHONPATH, e.g.
     PYTHONPATH=../../.. python test_periodic_vanishing_edge.py --Ns 32 --nz 2 --nm 8,2 --p 8 --coarsen 2,2,1 --pc 6 --Lam 20
   radially clustered arch leaves (graded toward the wall, ratio 0.5 per leaf):
     ... --nm 16,4 --arch-ratio 0.5        (or --arch-stretch <beta>)
+  CSX (defaults N = 1 - psi, tau = 1, Lam^2 = 70 / a^2), manufactured + both variants:
+    PYTHONPATH=../../.. python test_periodic_vanishing_edge.py --input wout_csx.nc --Ns 64 --nz 2 --nm 8,2 --p 8
+  physical problem, baseline only:
+    ... --problem physical --variants none
 """
 import argparse
 import csv
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -44,8 +77,8 @@ from direct_solve.omsdirectsolveHBS_torch_new2 import rkStrat as rkStrat_new
 from circInterfaceTree import circInterfaceTree
 import arch_stretch
 
-from pb.manufactured import transform_pdo
-from pb.profiles import PBProfiles
+from pb.manufactured import transform_pdo, PBPedestal
+from pb.profiles import PBProfiles, NKINDS
 from pb.local_chord import CondensedSlab
 from pb.prolong import Prolongation, check_prolongation
 from pb.coarse import coarse_newton_fast
@@ -86,10 +119,19 @@ def parse():
     ap.add_argument("--p", type=ints, default=8, help="fine order: p or p_n,p_m,p_z")
     ap.add_argument("--coarsen", type=ints, default=(2, 2, 1), help="leaf ratios r_n,r_m,r_z")
     ap.add_argument("--pc", type=ints, default=6, help="coarse order: p or p_n,p_m,p_z")
-    ap.add_argument("--Lam", type=float, nargs="+", default=[20.0])
-    ap.add_argument("--N", type=str, default="vanishing", choices=["vanishing", "linear"],
-                    help="density profile: 1 - psi^2 (vanishing) or 1 - psi/2 (linear)")
-    ap.add_argument("--tau-slope", type=float, default=0.4, help="tau = 1 - slope psi")
+    ap.add_argument("--input", type=str, default=None,
+                    help="stellarator geometry (VMEC input or wout_*.nc, e.g. wout_csx.nc) "
+                         "instead of the twisted elliptic torus")
+    ap.add_argument("--Lam", type=float, nargs="+", default=None,
+                    help="Lam values (default 20; with --input sqrt(70))")
+    ap.add_argument("--lam-unit", type=str, default=None, choices=["geom", "minor"],
+                    help="Lam per geometry length unit (geom, default) or per minor radius "
+                         "(minor: code Lam = Lam / a; default with --input)")
+    ap.add_argument("--N", type=str, default=None, choices=list(NKINDS),
+                    help="density profile: 1 - psi^2 (vanishing, default), 1 - psi "
+                         "(vanishing-linear, default with --input) or 1 - psi/2 (linear)")
+    ap.add_argument("--tau-slope", type=float, default=None,
+                    help="tau = 1 - slope psi (default 0.4; with --input 0, i.e. tau = 1)")
     ap.add_argument("--no-cont", action="store_true", help="no continuation in Lam (coarse Newton)")
     ap.add_argument("--newton-tol", type=float, default=1e-10)
     ap.add_argument("--newton-maxit", type=int, default=30)
@@ -115,8 +157,43 @@ def parse():
                     help="estimator check: face points per batch re-evaluated with the volume polynomial (0 = off)")
     ap.add_argument("--est-dump", action="store_true", help="save every eta sample (coords, psi, patch) to --out")
     ap.add_argument("--compare", type=str, nargs="*", default=[], help="probe .npz files of other runs")
+    ap.add_argument("--problem", type=str, default="manufactured", choices=["manufactured", "physical"],
+                    help="manufactured (default: PBPedestal phi*, exact errors) or physical (f = 0, phi_b = 0)")
+    ap.add_argument("--mms-amp", type=float, default=3.0, help="phi* = amp [-(1-psi) + kink q^beta] + ...")
+    ap.add_argument("--mms-kink", type=float, default=0.5, help="pedestal size (0: no kink, smooth)")
+    ap.add_argument("--mms-beta", type=float, default=2.5, help="regularity exponent (>= 2; phi* in C^ceil(beta)-1)")
+    ap.add_argument("--mms-psi0", type=float, default=0.7, help="flux surface of the kink")
+    ap.add_argument("--mms-eps", type=float, default=0.2, help="3D term eps (1-psi) Re[w^m e^{-i n zeta}]")
+    ap.add_argument("--mms-mode", type=str, default="2,1", help="m,n of the 3D term (n per field period)")
+    ap.add_argument("--variants", type=str, default="schwarz,dh",
+                    help="comparisons after the baseline: comma list of schwarz (P = I, same c_ref/start), "
+                         "dh (Debye-Hueckel c_ref = d_s g(0), start 0, its own red-black), or none")
+    ap.add_argument("--schwarz-maxit", type=int, default=300, help="outer iterations of the P = I variant")
+    ap.add_argument("--dh-maxit", type=int, default=100, help="outer iterations of the Debye-Hueckel variant")
+    ap.add_argument("--dh-local-maxit", type=int, default=200, help="local chord steps of the Debye-Hueckel variant")
+    ap.add_argument("--quiet-outer", action="store_true", help="no per-iteration lines (summaries only)")
     ap.add_argument("--out", type=str, default="results_test_periodic_vanishing_edge")
-    return ap.parse_args()
+    args = ap.parse_args()
+    v = args.variants.strip().lower()
+    args.variants = [] if v in ("", "none") else [x.strip() for x in v.split(",")]
+    bad = [x for x in args.variants if x not in ("schwarz", "dh")]
+    if bad:
+        ap.error("unknown variant(s) %s (choose from schwarz, dh, none)" % bad)
+    try:
+        args.mms_mode = tuple(int(x) for x in args.mms_mode.split(","))
+        assert len(args.mms_mode) == 2 and args.mms_mode[0] >= 0
+    except (ValueError, AssertionError):
+        ap.error("--mms-mode must be m,n with m >= 0, got %r" % args.mms_mode)
+    stell = args.input is not None                   # profile defaults per geometry
+    if args.Lam is None:
+        args.Lam = [float(np.sqrt(70.0))] if stell else [20.0]
+    if args.lam_unit is None:
+        args.lam_unit = "minor" if stell else "geom"
+    if args.N is None:
+        args.N = "vanishing-linear" if stell else "vanishing"
+    if args.tau_slope is None:
+        args.tau_slope = 0.0 if stell else 0.4
+    return args
 
 
 def write_csv(path, rows):
@@ -153,7 +230,20 @@ def clock(dev):
 
 # ---------------------------------------------------------------- main
 def main():
+    global torus
     args = parse()
+    geo_tag = ""
+    if args.input is not None:                       # stellarator (e.g. CSX) instead of the twisted torus
+        import geometry.geom_3D.stellerator as stell
+        stell.configure(args.input)
+        stell.s = 0.55
+        torus = stell
+        geo_tag = "_" + os.path.splitext(os.path.basename(args.input))[0]
+        if args.out == "results_test_periodic_vanishing_edge":
+            args.out += geo_tag
+    a_ref = 1.0
+    if args.lam_unit == "minor":
+        a_ref = getattr(getattr(torus, "_geom", None), "aminor", None) or torus.Rc
     os.makedirs(args.out, exist_ok=True)
     Ns, nz = args.Ns, args.nz
     assert Ns >= 4 and not Ns & (Ns - 1), "cyclic red-black needs Ns = 2^k"
@@ -173,7 +263,10 @@ def main():
     pn, pm, pz = triple(p_f)
     n_iface = n * n * (pn - 2) ** 2 + 4 * m * n * (pm - 2) * (pn - 2)
     mem_slab = (n * n + 4 * m * n) * nz * (2 * (pn - 2) ** 6) * 8 / 1e9   # leaf LU + Y, rough
-    print("torus: L = %.4f, Ns = %d, H = %.4f, s = %.2f, Rc = %.4f" % (torus.L, Ns, H, torus.s, torus.Rc))
+    print("%s: L = %.4f, Ns = %d, H = %.4f, s = %.2f, Rc = %.4f"
+          % ("stellarator " + args.input if args.input else "twisted torus", torus.L, Ns, H, torus.s, torus.Rc))
+    if args.lam_unit == "minor":
+        print("Lam given per minor radius a = %.4f: code Lam = Lam / a" % a_ref)
     print("fine  : n=%d m=%d nz=%d p=%s per slab, interface dofs %d, total %d"
           % (n, m, nz, triple(p_f), n_iface, Ns * n_iface))
     print("coarse: periodic, n=%d m=%d axial leaves=%d p=%s"
@@ -209,18 +302,43 @@ def main():
                                  m_arch=m, max_level=max_level, stretch=beta)
     leaf_size = n_iface // 2 ** max_level
     gb = lambda p: torus.gb(p, jax_avail=False, torch_avail=True)
+    kw = {} if args.rk_max is None else dict(rk_max=args.rk_max)
+    strat = rkStrat_new.linear(args.rk_start, args.rk_step, skip_first_level=False, **kw)
+    ranks = [int(strat.rank(st)) for st in range(int(np.log2(Ns)))]
+    print("red-black ranks per stage %s (HBS leaf size %d); variants: %s"
+          % (ranks, leaf_size, ", ".join(["coarse"] + args.variants)))
 
+    mms_cache = None                                     # -Lap phi* per point set, shared over Lam
     phi_c, prev_Lam = None, None
-    for Lam in args.Lam:
-        model = PBProfiles(torus, Lam=Lam, N=args.N, tau_slope=args.tau_slope)
-        print("== %s" % model.describe())
-        row = dict(Ns=Ns, H=H, n=n, m=m, nz=nz, p=str(triple(p_f)), nc=n // rn, mc=m // rm,
-                   ntc=nt_c, pc=str(triple(p_c)), Lam=Lam, N=args.N, tau_slope=args.tau_slope,
-                   precond=args.precond, arch_stretch=beta)
+    for Lam_in in args.Lam:
+        Lam = Lam_in / a_ref                             # Lam of the equation in geometry units
+        if args.problem == "manufactured":
+            model = PBPedestal(torus, pdo_geo, Lam=Lam, N=args.N, tau_slope=args.tau_slope,
+                               amp=args.mms_amp, kink=args.mms_kink, beta=args.mms_beta,
+                               psi0=args.mms_psi0, eps=args.mms_eps, mode=args.mms_mode,
+                               cache=mms_cache, cache_size=Ns + 8)
+            mms_cache = model._cache
+        else:
+            model = PBProfiles(torus, Lam=Lam, N=args.N, tau_slope=args.tau_slope)
+        mms = args.problem == "manufactured"
+        print("== %s%s" % (model.describe(), "" if a_ref == 1.0 else
+                           "  (Lam a = %g, (Lam a)^2 = %g)" % (Lam_in, Lam_in ** 2)))
+        base_row = dict(problem=args.problem, geometry=args.input or "twisted_torus", Ns=Ns, H=H, n=n, m=m,
+                        nz=nz, p=str(triple(p_f)), nc=n // rn, mc=m // rm, ntc=nt_c, pc=str(triple(p_c)),
+                        Lam=Lam_in, lam_unit=args.lam_unit, Lam_code=Lam, N=args.N,
+                        tau_slope=args.tau_slope, arch_stretch=beta, tol=args.tol, eta=args.eta)
+        if mms:
+            base_row.update(mms_amp=args.mms_amp, mms_kink=args.mms_kink, mms_beta=args.mms_beta,
+                            mms_psi0=args.mms_psi0, mms_eps=args.mms_eps, mms_mode="%d,%d" % args.mms_mode)
+        rows, outer_rows = [], []
+
+        def bc(pts):
+            pts = pts.detach().cpu().numpy() if torch.is_tensor(pts) else np.asarray(pts)
+            return model.phi_b(pts)
 
         # ---- 1. global coarse Newton.  phi = 0 and the solution at any smaller
-        # Lam are supersolutions, from which Newton on this convex problem
-        # decreases monotonically: warm start only when Lam increases.
+        # Lam are supersolutions of the physical problem, from which Newton on this
+        # convex problem decreases monotonically: warm start only when Lam increases.
         warm = phi_c is not None and Lam >= prev_Lam
         sched = lam_schedule(Lam, not args.no_cont)
         if warm:
@@ -228,111 +346,152 @@ def main():
         phi_c, clog = coarse_newton_fast(model, cs_c, lam_schedule=sched, tol=args.newton_tol,
                                          maxit=args.newton_maxit, phi0=phi_c if warm else None)
         prev_Lam = Lam
+        err_c = np.max(np.abs(phi_c - model.phistar(grid_c.nodes))) if mms else np.nan
         print("  coarse: %d Newton steps, %.2fs (set_c %.2fs, factor %.2fs, solve %.2fs per step); "
-              "phi in [%.3f, %.3f]"
+              "phi in [%.3f, %.3f]%s"
               % (clog["newton_steps"], clog["t_total"], clog["t_set_c_per_step"],
-                 clog["t_factor_per_step"], clog["t_solve_per_step"], phi_c.min(), phi_c.max()))
-        row.update(newton_steps=clog["newton_steps"], t_coarse=clog["t_total"],
-                   phi_c_min=phi_c.min(), phi_c_max=phi_c.max())
+                 clog["t_factor_per_step"], clog["t_solve_per_step"], phi_c.min(), phi_c.max(),
+                 "; err vs phi* %.2e" % err_c if mms else ""))
 
-        # ---- 2. fine OMS for -Lap + c_ref, c_ref from P phi_c per slab
-        store_c, store_phi, info = {}, {}, {}
+        # ---- fine OMS + red-black for -Lap + c_ref; slab_fields(i, ops, info) -> (c_ref, phi0)
+        def build_fine(slab_fields, label):
+            store_c, store_phi, info = {}, {}, {}
 
-        def c_nodal(ops, geom):
-            i = int(round(float(geom[0][0]) / H)) % Ns
+            def c_nodal(ops, geom):
+                i = int(round(float(geom[0][0]) / H)) % Ns
+                c, phi0 = slab_fields(i, ops, info)
+                store_c[i], store_phi[i] = c, phi0
+                return c
+
+            cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n, m=m, nz=nz, flux="conormal",
+                            fast=True, c_nodal=c_nodal, keep_geometry=False, device=dev,
+                            stretch=beta)
+            opts = solverWrap.solverOptions("cylhps", p_f, None, use_ctxT=False, mumps_stats=False,
+                                            reduced_gpu=False, cyl=cyl_opts)
+            assembler = mA.rkHMatAssembler(leaf_size, args.rk0, ndim=3, tree=make_tree)
+            t0 = time.perf_counter()
+            OMS = oms.oms(dSlabs, pdo_geo, gb, opts, connectivity, stiff_mat_const=False,
+                          constructHBS=True, keepLU=True, keepDense=False, offload=False)
+            Stot, _ = OMS.construct_Stot_and_rhstot(bc, assembler, dbg=0)
+            t_oms = time.perf_counter() - t0
+            t0 = clock(args.compute_device)
+            rb = omsdirectHBS_new.RedBlackSolverHBS(
+                strat, OMS, tree=make_tree(OMS.interface_points), quad=False,
+                compute_device=args.compute_device, seed=None, dbg=0, normalized=False,
+                constant_blocks=False, operator="hbs", cyclic=True)
+            rb.factorize()
+            t_rb = clock(args.compute_device) - t0
+            print("  [%s] fine OMS built in %.1fs (Ntot %d), red-black setup + factor %.1fs"
+                  % (label, t_oms, OMS.Ntot, t_rb))
+            return SimpleNamespace(OMS=OMS, Stot=Stot, rb=rb, store_c=store_c, store_phi=store_phi,
+                                   info=info, t_oms=t_oms, t_rb=t_rb)
+
+        # ---- outer iteration on a built OMS, with summary
+        def run_outer(fine, P, label, maxit, local_maxit):
+            it = InterfaceIteration(fine.OMS, model, bc, fine.store_c, fine.store_phi)
+            u_exact = fine.OMS.interface_values(lambda pts: model.phistar(np.asarray(pts))) if mms else None
+            u0 = it.traces_of_fields()
+            print("  [%s] outer iteration (maxit %d, local maxit %d)%s"
+                  % (label, maxit, local_maxit,
+                     ": u0 err_iface %.2e" % np.max(np.abs(u0 - u_exact)) if mms else ""))
+            t0 = time.perf_counter()
+            u, logs = it.run(P, u0, u_exact=u_exact, tol=args.tol, maxit=maxit, eta=args.eta,
+                             local_tol_min=args.local_tol_min, local_maxit=local_maxit,
+                             verbose=not args.quiet_outer)
+            t_outer = time.perf_counter() - t0
+            res = np.array([l["residual"] for l in logs])
+            rates = res[1:] / res[:-1]
+            k5 = min(5, len(rates))
+            rate_asym = float(np.prod(rates[-k5:]) ** (1.0 / k5)) if k5 else np.nan
+            conv = bool(res[-1] < args.tol)
+            if conv:
+                its_tol = float(len(logs))
+            elif 0 < rate_asym < 1:
+                its_tol = len(logs) + float(np.log(args.tol / res[-1]) / np.log(rate_asym))
+            else:
+                its_tol = np.inf
+            smax = max(l["local_steps_max"] for l in logs)
+            S_ = it.slabs
+            cmis = max(np.max(np.abs(s.c - model.dg(s.W, s.phi, s.psi))) for s in S_) \
+                / max(np.max(np.abs(model.dg(s.W, s.phi, s.psi))) for s in S_)
+            out = dict(outer_its=len(logs), converged=conv, residual=res[-1],
+                       rate_last=rates[-1] if len(rates) else np.nan, rate_asym=rate_asym,
+                       its_to_tol=its_tol, local_steps_total=int(round(sum(l["local_steps_mean"] * Ns for l in logs))),
+                       local_steps_max=smax, local_capped=bool(smax >= local_maxit),
+                       t_outer=t_outer, t_local=sum(l["t_local"] for l in logs),
+                       t_precond=sum(l.get("t_precond", 0.0) for l in logs),
+                       du_iface=np.max(np.abs(u - u0)), c_mismatch=cmis)
+            if mms:
+                ev = it.volume_errors()
+                out.update(err_iface=np.max(np.abs(u - u_exact)), err_iface_u0=np.max(np.abs(u0 - u_exact)),
+                           err_volume=ev.max())
+            print("  [%s] -> %d outer its (%s), |R| %.2e, rate last %.1e asym %.1e%s; local steps %d "
+                  "(max %d%s); c_ref mismatch %.1e; %.1fs%s"
+                  % (label, len(logs), "converged" if conv else "NOT converged", res[-1], out["rate_last"],
+                     rate_asym, "" if conv else ", ~%.0f its to tol" % its_tol, out["local_steps_total"],
+                     smax, ", CAPPED" if out["local_capped"] else "", cmis, t_outer,
+                     "; err iface %.2e, volume %.2e" % (out["err_iface"], out["err_volume"]) if mms else ""))
+            outer_rows.extend(dict(variant=label, Ns=Ns, p=str(triple(p_f)), Lam=Lam_in, N=args.N,
+                                   problem=args.problem, **l) for l in logs)
+            return it, u, out
+
+        # ---- 2. baseline: c_ref = d_s g(P phi_c), start from P phi_c, P = red-black (--precond)
+        def fields_coarse(i, ops, info):
             Pr = Prolongation(grid_c, ops.grid, t_offset=i * nz // 2, nt_global=nt_f)
             if i == 0:
                 info["P_exact"] = check_prolongation(Pr)
             phf = Pr(phi_c)
-            c = model.dg(ops.nodes(), phf)
-            store_c[i], store_phi[i] = c, phf
-            return c
+            return model.dg(ops.nodes(), phf), phf
 
-        def bc(pts):
-            pts = pts.detach().cpu().numpy() if torch.is_tensor(pts) else np.asarray(pts)
-            return model.phi_b(pts)
-
-        cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n, m=m, nz=nz, flux="conormal",
-                        fast=True, c_nodal=c_nodal, keep_geometry=False, device=dev,
-                        stretch=beta)
-        opts = solverWrap.solverOptions("cylhps", p_f, None, use_ctxT=False, mumps_stats=False,
-                                        reduced_gpu=False, cyl=cyl_opts)
-        assembler = mA.rkHMatAssembler(leaf_size, args.rk0, ndim=3, tree=make_tree)
-        t0 = time.perf_counter()
-        OMS = oms.oms(dSlabs, pdo_geo, gb, opts, connectivity, stiff_mat_const=False,
-                      constructHBS=True, keepLU=True, keepDense=False, offload=False)
-        Stot, _ = OMS.construct_Stot_and_rhstot(bc, assembler, dbg=0)
-        t_oms = time.perf_counter() - t0
-        print("  fine OMS built in %.1fs (Ntot %d); prolongation exactness (slab 0) %.2e"
-              % (t_oms, OMS.Ntot, info.get("P_exact", np.nan)))
-        row.update(t_oms=t_oms, Ntot=OMS.Ntot, P_exact=info.get("P_exact"))
-
-        t0 = clock(args.compute_device)
-        kw = {} if args.rk_max is None else dict(rk_max=args.rk_max)
-        strat = rkStrat_new.linear(args.rk_start, args.rk_step, skip_first_level=False, **kw)
-        ranks = [int(strat.rank(st)) for st in range(int(np.log2(Ns)))]
-        print("  red-black ranks per stage %s (HBS leaf size %d)" % (ranks, leaf_size))
-        row.update(rk_asm=args.rk0, rk_start=args.rk_start, rk_step=args.rk_step,
-                   rk_max=args.rk_max, rk_stages=str(ranks))
-        rb = omsdirectHBS_new.RedBlackSolverHBS(
-            strat, OMS, tree=make_tree(OMS.interface_points), quad=False,
-            compute_device=args.compute_device, seed=None, dbg=0, normalized=False,
-            constant_blocks=False, operator="hbs", cyclic=True)
-        rb.factorize()
-        t_rb = clock(args.compute_device) - t0
-        print("  red-black: setup + factor %.1fs" % t_rb)
-        row["t_rb"] = t_rb
-
+        base = build_fine(fields_coarse, "coarse")
         if args.precond == "rb":
-            P = rb.solve
+            P = base.rb.solve
         elif args.precond == "none":
             P = lambda v: v
         else:
-            M = LinearOperator(Stot.shape, matvec=rb.solve, dtype=np.float64)
+            M = LinearOperator(base.Stot.shape, matvec=base.rb.solve, dtype=np.float64)
 
             def P(v):
-                x, _ = gmres(Stot, v, M=M, restart=50, maxiter=4, **GMRES_TOL)
+                x, _ = gmres(base.Stot, v, M=M, restart=50, maxiter=4, **GMRES_TOL)
                 return x
-
-        # ---- 3. outer iteration
-        it = InterfaceIteration(OMS, model, bc, store_c, store_phi)
         if args.check:
-            print("  check: |(I-K) v - Stot v| / |Stot v| = %.2e (expect ~1e-12)" % it.check_jacobian(Stot))
-        u0 = it.traces_of_fields()
-        t0 = time.perf_counter()
-        u, logs = it.run(P, u0, u_exact=None, tol=args.tol, maxit=args.maxit, eta=args.eta,
-                         local_tol_min=args.local_tol_min, local_maxit=args.local_maxit)
-        t_outer = time.perf_counter() - t0
-        rates = [logs[k + 1]["residual"] / logs[k]["residual"] for k in range(len(logs) - 1)]
-        print("  -> %d outer its, |R| %.2e, rates %s, |u - u0| %.2e, %.1fs"
-              % (len(logs), logs[-1]["residual"], " ".join("%.1e" % r for r in rates),
-                 np.max(np.abs(u - u0)), t_outer))
-        row.update(outer_its=len(logs), residual=logs[-1]["residual"], t_outer=t_outer,
-                   rate_last=rates[-1] if rates else np.nan,
-                   local_steps_total=int(sum(l["local_steps_mean"] * Ns for l in logs)),
-                   du_iface=np.max(np.abs(u - u0)))
+            it_chk = InterfaceIteration(base.OMS, model, bc, base.store_c, base.store_phi)
+            print("  check: |(I-K) v - Stot v| / |Stot v| = %.2e (expect ~1e-12)" % it_chk.check_jacobian(base.Stot))
+            del it_chk
+        it, u, summ = run_outer(base, P, "coarse", args.maxit, args.local_maxit)
+        rows.append(dict(base_row, variant="coarse", precond=args.precond, newton_steps=clog["newton_steps"],
+                         t_coarse=clog["t_total"], err_coarse=err_c, phi_c_min=phi_c.min(),
+                         phi_c_max=phi_c.max(), t_oms=base.t_oms, t_rb=base.t_rb, Ntot=base.OMS.Ntot,
+                         P_exact=base.info.get("P_exact"), rk_asm=args.rk0, rk_start=args.rk_start,
+                         rk_step=args.rk_step, rk_max=args.rk_max, rk_stages=str(ranks), **summ))
+        row = rows[-1]
 
-        # ---- 4. diagnostics (no exact solution)
+        # ---- 3. diagnostics of the baseline
         S = it.slabs
-        d_cf = max(np.max(np.abs(s.phi - store_phi[i])) for i, s in enumerate(S))
+        d_cf = max(np.max(np.abs(s.phi - base.store_phi[i])) for i, s in enumerate(S))
         ov, ov_pairs, unmatched = diag.overlap_mismatch(
             [s.W for s in S], [s.phi for s in S], [s.I for s in S],
             [s.ops.zbounds for s in S], torus.L)
-        psi_all = np.concatenate([s.psi[s.I] for s in S])
         phi_all = np.concatenate([s.phi[s.I] for s in S])
-        res_ff, F, _ = diag.flux_function_fit(psi_all, phi_all, psi_max=args.psi_max)
         pv = diag.eval_probes_slabs(probes, [(s.ops, s.phi) for s in S], H, torus.L)
         pv_c = diag.eval_probes_global(probes, cs_c.slab, phi_c, torus.L)
         print("  phi in [%.4f, %.4f]; coarse vs fine: nodes %.2e, probes %.2e"
               % (phi_all.min(), phi_all.max(), d_cf, np.max(np.abs(pv - pv_c))))
         print("  overlap consistency: max %.2e over %d pairs (%d unmatched nodes)"
               % (ov, Ns, unmatched))
-        print("  flux function on psi <= %.2f: max |phi - F(psi)| %.2e (phi range %.2e)"
-              % (args.psi_max, res_ff, np.ptp(phi_all)))
-        print("  F(psi) at psi = %s:\n    %s"
-              % (" ".join("%.2f" % x for x in np.linspace(0, args.psi_max, 9)),
-                 " ".join("%.5f" % x for x in F)))
-        if not args.no_estimate:
+        row.update(phi_min=phi_all.min(), phi_max=phi_all.max(), coarse_vs_fine=d_cf,
+                   coarse_vs_fine_probes=np.max(np.abs(pv - pv_c)), overlap=ov,
+                   overlap_unmatched=unmatched)
+        if not mms:
+            psi_all = np.concatenate([s.psi[s.I] for s in S])
+            res_ff, F, _ = diag.flux_function_fit(psi_all, phi_all, psi_max=args.psi_max)
+            print("  flux function on psi <= %.2f: max |phi - F(psi)| %.2e (phi range %.2e)"
+                  % (args.psi_max, res_ff, np.ptp(phi_all)))
+            print("  F(psi) at psi = %s:\n    %s"
+                  % (" ".join("%.2f" % x for x in np.linspace(0, args.psi_max, 9)),
+                     " ".join("%.5f" % x for x in F)))
+            row.update(flux_dev=res_ff, F_axis=F[0])
+        if not mms and not args.no_estimate:
             t0 = time.perf_counter()
             est = ResidualEstimator(pdo_geo, model, torus.Rc, nsamp=args.est_samples,
                                     node_samples=args.est_node_samples, dump=args.est_dump,
@@ -369,20 +528,19 @@ def main():
             row["est_face_eval_err"] = comp["face_eval_err"]
             row.update({"est_" + t: comp[t] for t in TIMERS})
             if args.est_dump:
-                dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s.npz" % (
-                    Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam, args.N, st_tag))
+                dpath = os.path.join(args.out, "eta_Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s%s.npz" % (
+                    Ns, nz, n, m, "-".join(map(str, triple(p_f))), Lam_in, args.N, st_tag, geo_tag))
                 save_dump(dpath, comp)
                 print("    eta samples saved to", dpath)
-        row.update(phi_min=phi_all.min(), phi_max=phi_all.max(), coarse_vs_fine=d_cf,
-                   coarse_vs_fine_probes=np.max(np.abs(pv - pv_c)), overlap=ov,
-                   overlap_unmatched=unmatched, flux_dev=res_ff, F_axis=F[0])
 
-        tag = "Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s" % (Ns, nz, n, m, "-".join(map(str, triple(p_f))),
-                                                    Lam, args.N, st_tag)
+        tag = "Ns%d_nz%d_n%d_m%d_p%s_Lam%g_%s%s%s%s" % (Ns, nz, n, m, "-".join(map(str, triple(p_f))),
+                                                        Lam_in, args.N, st_tag, geo_tag,
+                                                        "_mms" if mms else "")
         npz = os.path.join(args.out, "probes_%s.npz" % tag)
         np.savez(npz, values=pv, coarse=pv_c, **probes,
                  meta_Ns=Ns, meta_nz=nz, meta_n=n, meta_m=m, meta_p=np.array(triple(p_f)),
-                 meta_Lam=Lam, meta_N=args.N, meta_tau_slope=args.tau_slope, meta_stretch=beta)
+                 meta_Lam=Lam_in, meta_Lam_code=Lam, meta_N=args.N, meta_tau_slope=args.tau_slope,
+                 meta_stretch=beta, meta_problem=args.problem)
         print("  probes saved to", npz)
         for path in args.compare:
             try:
@@ -391,13 +549,52 @@ def main():
                 print("  compare %s: %s" % (path, e))
                 continue
             print("  vs %s: max |diff| %.2e (rel %.2e)" % (os.path.basename(path), d_abs, d_rel))
+        del it
 
-        write_csv(os.path.join(args.out, "test_periodic_vanishing_edge.csv"), [row])
-        write_csv(os.path.join(args.out, "test_periodic_vanishing_edge_outer.csv"),
-                  [dict(Ns=Ns, p=str(triple(p_f)), Lam=Lam, N=args.N, precond=args.precond, **l)
-                   for l in logs])
-        OMS.close()
-        del OMS, rb, it
+        def probe_diff(it_v):
+            pv_v = diag.eval_probes_slabs(probes, [(s.ops, s.phi) for s in it_v.slabs], H, torus.L)
+            return np.max(np.abs(pv_v - pv))
+
+        # ---- 4. variant (1): P = I on the SAME OMS / c_ref / start (nonlinear overlapping Schwarz)
+        if "schwarz" in args.variants:
+            it_s, _, summ = run_outer(base, lambda v: v, "schwarz", args.schwarz_maxit, args.local_maxit)
+            summ["probes_vs_coarse"] = probe_diff(it_s)
+            print("  [schwarz] probes vs baseline: max |diff| %.2e" % summ["probes_vs_coarse"])
+            rows.append(dict(base_row, variant="schwarz", precond="none", t_oms=0.0, t_rb=0.0, **summ))
+            del it_s
+        base.OMS.close()
+        del base, P
+
+        # ---- 5. variant (2): Debye-Hueckel c_ref = d_s g(phi = 0), start phi = 0, P = its red-black
+        if "dh" in args.variants:
+            def fields_dh(i, ops, info):
+                W = ops.nodes()
+                z = np.zeros(len(W))
+                return model.dg(W, z), z
+
+            dh = build_fine(fields_dh, "dh")
+            it_d, _, summ = run_outer(dh, dh.rb.solve, "dh", args.dh_maxit, args.dh_local_maxit)
+            summ["probes_vs_coarse"] = probe_diff(it_d)
+            print("  [dh] probes vs baseline: max |diff| %.2e" % summ["probes_vs_coarse"])
+            rows.append(dict(base_row, variant="dh", precond="rb", t_oms=dh.t_oms, t_rb=dh.t_rb,
+                             Ntot=dh.OMS.Ntot, **summ))
+            dh.OMS.close()
+            del dh, it_d
+
+        # ---- summary table
+        print("  summary (Lam = %g):" % Lam_in)
+        print("    %-8s %6s %10s %9s %9s %8s %10s %9s%s"
+              % ("variant", "its", "|R|", "rate", "steps", "setup s", "outer s", "c mism.",
+                 "  err iface  err vol" if mms else ""))
+        for r in rows:
+            setup = r.get("t_oms", 0.0) + r.get("t_rb", 0.0) + r.get("t_coarse", 0.0)
+            print("    %-8s %6d %10.2e %9.1e %9d %8.1f %10.1f %9.1e%s"
+                  % (r["variant"], r["outer_its"], r["residual"], r["rate_asym"], r["local_steps_total"],
+                     setup, r["t_outer"], r["c_mismatch"],
+                     "  %9.2e %8.2e" % (r["err_iface"], r["err_volume"]) if mms else ""))
+
+        write_csv(os.path.join(args.out, "test_periodic_vanishing_edge.csv"), rows)
+        write_csv(os.path.join(args.out, "test_periodic_vanishing_edge_outer.csv"), outer_rows)
 
 
 if __name__ == "__main__":

@@ -115,3 +115,164 @@ def check_transform_pdo(param_geom, kh=3.0, npts=50, seed=0):
             continue
         err = max(err, float(torch.max(torch.abs(torch.as_tensor(f(W)) - torch.as_tensor(g(W))))))
     return err
+
+
+# ---------------------------------------------------------------- limited-regularity solution
+class PBPedestal:
+    """Manufactured solution with controlled regularity for the PB model of
+    pb.profiles.PBProfiles (same N, tau, g, d_s g):
+
+        -Lap phi + Lam^2 N(psi) exp(phi / tau(psi)) = f*  in Omega,   phi = phi* on dOmega,
+
+    defined in REFERENCE coordinates W = (t, x, y):
+        phi*  = F(psi) + eps (1 - psi) Re[w^m e^{-i n zeta}],
+        F     = amp ( -(1 - psi) + kink q^beta ),   q = max(0, (psi - psi0) / (1 - psi0)),
+        psi   = (x^2 + y^2) / Rc^2,  w = (x + i y) / Rc,  zeta = 2 pi nfp t / L.
+    F is C^{ceil(beta)-1} across the flux surface psi = psi0 (a 'pedestal' kink,
+    not aligned with any leaf boundary); f* contains q^(beta-2), so beta > 2
+    keeps f* continuous (beta = 2: f* jumps).  The Fourier term is smooth, L-
+    periodic in t, regular at the axis (w^m is a polynomial) and vanishes on
+    the wall; it makes phi* genuinely 3D.  kink = 0 or eps alone: smooth control.
+
+    -Lap phi* is evaluated with the SAME PDO coefficients the solver uses
+    (pdo_geo, hpsmultidomain convention), from closed-form reference
+    derivatives -- exact for any geometry, no inverse map.  It is cached per
+    point set (LRU, shared by with_Lam copies: it does not depend on Lam)."""
+
+    def __init__(self, geom, pdo_geo, Lam=20.0, N="vanishing", tau_slope=0.4, amp=3.0, kink=0.5,
+                 beta=2.5, psi0=0.7, eps=0.2, mode=(2, 1), cache=None, cache_size=64):
+        from collections import OrderedDict
+        from pb.profiles import PBProfiles
+        if beta < 2:
+            raise ValueError("beta must be >= 2 (beta < 2 makes f* unbounded at psi = psi0)")
+        if not 0.0 <= psi0 < 1.0:
+            raise ValueError("psi0 must be in [0, 1)")
+        self.geom, self.pdo_geo = geom, pdo_geo
+        self.prof = PBProfiles(geom, Lam=Lam, N=N, tau_slope=tau_slope)
+        self.amp, self.kink, self.beta, self.psi0, self.eps = float(amp), float(kink), float(beta), float(psi0), float(eps)
+        self.mode = tuple(int(v) for v in mode)
+        self.Rc, self.L = float(geom.Rc), float(geom.L)
+        self.nfp = int(getattr(geom, "nfp", 1))
+        self._cache = OrderedDict() if cache is None else cache
+        self.cache_size = int(cache_size)
+
+    def with_Lam(self, Lam):
+        return PBPedestal(self.geom, self.pdo_geo, Lam, self.prof.N_kind, self.prof.tau_slope, self.amp,
+                          self.kink, self.beta, self.psi0, self.eps, self.mode, self._cache, self.cache_size)
+
+    # ---- profiles / nonlinearity (PBProfiles)
+    @property
+    def Lam(self):
+        return self.prof.Lam
+
+    def psi(self, W):
+        return self.prof.psi(W)
+
+    def N(self, psi):
+        return self.prof.N(psi)
+
+    def tau(self, psi):
+        return self.prof.tau(psi)
+
+    def g(self, W, s, psi=None):
+        return self.prof.g(W, s, psi)
+
+    def dg(self, W, s, psi=None):
+        return self.prof.dg(W, s, psi)
+
+    # ---- phi* and its reference derivatives
+    def _F(self, psi):
+        a, k, b, p0 = self.amp, self.kink, self.beta, self.psi0
+        d = 1.0 - p0
+        q = np.clip((psi - p0) / d, 0.0, None)
+        on = psi > p0
+        F = a * (-(1.0 - psi) + k * q ** b)
+        F1 = a * (1.0 + k * b * q ** (b - 1) / d)
+        F2 = a * k * b * (b - 1) * np.where(on, q ** (b - 2) if b > 2 else 1.0, 0.0) / d ** 2
+        return F, F1, F2
+
+    def derivs(self, W, order=2):
+        """phi* and its (t, x, y) derivatives: dict with keys '', 't', 'x', 'y'
+        (order >= 1), 'tt', 'tx', 'ty', 'xx', 'xy', 'yy' (order 2)."""
+        W = np.asarray(W, dtype=np.float64)
+        t, x, y = W[:, 0], W[:, 1], W[:, 2]
+        Rc = self.Rc
+        psi = (x * x + y * y) / Rc ** 2
+        F, F1, F2 = self._F(psi)
+        m, n = self.mode
+        kk = 2 * np.pi * self.nfp / self.L
+        wc = (x + 1j * y) / Rc
+        E = np.exp(-1j * n * kk * t)
+        Wm = wc ** m
+        S = {"": (Wm * E).real}
+        D = {"": F + self.eps * (1.0 - psi) * S[""]}
+        if order == 0:
+            return D
+        zero = 0.0 * t
+        px, py = 2 * x / Rc ** 2, 2 * y / Rc ** 2
+        Wx = m * wc ** (m - 1) / Rc if m >= 1 else 0.0 * wc
+        Wy = 1j * Wx
+        Et = -1j * n * kk * E
+        S.update(t=(Wm * Et).real, x=(Wx * E).real, y=(Wy * E).real)
+        e = self.eps
+        D["t"] = e * (1.0 - psi) * S["t"]
+        D["x"] = F1 * px + e * (-px * S[""] + (1.0 - psi) * S["x"])
+        D["y"] = F1 * py + e * (-py * S[""] + (1.0 - psi) * S["y"])
+        if order == 1:
+            return D
+        Wxx = m * (m - 1) * wc ** (m - 2) / Rc ** 2 if m >= 2 else 0.0 * wc
+        Wxy, Wyy = 1j * Wxx, -Wxx
+        Ett = -(n * kk) ** 2 * E
+        S.update(tt=(Wm * Ett).real, tx=(Wx * Et).real, ty=(Wy * Et).real,
+                 xx=(Wxx * E).real, xy=(Wxy * E).real, yy=(Wyy * E).real)
+        pxx = pyy = 2 / Rc ** 2
+        D["tt"] = e * (1.0 - psi) * S["tt"]
+        D["tx"] = e * (-px * S["t"] + (1.0 - psi) * S["tx"])
+        D["ty"] = e * (-py * S["t"] + (1.0 - psi) * S["ty"])
+        D["xx"] = F2 * px * px + F1 * pxx + e * (-pxx * S[""] - 2 * px * S["x"] + (1.0 - psi) * S["xx"])
+        D["yy"] = F2 * py * py + F1 * pyy + e * (-pyy * S[""] - 2 * py * S["y"] + (1.0 - psi) * S["yy"])
+        D["xy"] = F2 * px * py + zero + e * (-px * S["y"] - py * S["x"] + (1.0 - psi) * S["xy"])
+        return D
+
+    def phistar(self, W):
+        return self.derivs(W, order=0)[""]
+
+    def phi_b(self, W):
+        return self.phistar(W)
+
+    def _coef(self, W):
+        Wt = torch.from_numpy(np.ascontiguousarray(W, dtype=np.float64))
+        out = {}
+        for name in ("c11", "c22", "c33", "c12", "c13", "c23", "c1", "c2", "c3"):
+            f = getattr(self.pdo_geo, name, None)
+            v = 0.0 if f is None else f(Wt)
+            v = v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v, dtype=np.float64)
+            out[name] = v * np.ones(len(W))
+        return out
+
+    def neg_lap_phistar(self, W):
+        """-Lap phi* at reference points W (hpsmultidomain PDO convention:
+        -Lap u = -(c11 u_tt + c22 u_xx + c33 u_yy + c12 u_tx + c13 u_ty + c23 u_xy)
+                 + c1 u_t + c2 u_x + c3 u_y)."""
+        import hashlib
+        W = np.ascontiguousarray(W, dtype=np.float64)
+        key = (W.shape, hashlib.blake2b(W.tobytes(), digest_size=16).hexdigest())
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        D, c = self.derivs(W, order=2), self._coef(W)
+        v = -(c["c11"] * D["tt"] + c["c22"] * D["xx"] + c["c33"] * D["yy"]
+              + c["c12"] * D["tx"] + c["c13"] * D["ty"] + c["c23"] * D["xy"]) \
+            + c["c1"] * D["t"] + c["c2"] * D["x"] + c["c3"] * D["y"]
+        self._cache[key] = v
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return v
+
+    def fstar(self, W):
+        return self.neg_lap_phistar(W) + self.g(W, self.phistar(W))
+
+    def describe(self):
+        return ("manufactured phi* = %g [-(1-psi) + %g q^%g] + %g (1-psi) Re[w^%d e^{-i %d zeta}], "
+                "q = (psi - %g)_+ / %g;  %s" % (self.amp, self.kink, self.beta, self.eps, self.mode[0],
+                                               self.mode[1], self.psi0, 1 - self.psi0, self.prof.describe()))

@@ -2,8 +2,11 @@
 Physical (non-manufactured) normalized PB, model (A):
 
     -Lap phi + Lam^2 N(psi) exp(phi / tau(psi)) = 0  in Omega,   phi = phi_b on dOmega,
-    psi = (x^2 + y^2) / Rc^2 (reference coordinates, psi = 1 on the wall),
+    psi = (x^2 + y^2) / Rc^2 (reference coordinates, psi = 1 on the wall; on a
+          VMEC map (stellerator.VmecTorus) this is exactly the normalized toroidal
+          flux s = phi / phi_edge of the wout file),
     N(psi)   = 1 - psi^2            ('vanishing': zero density at the edge)
+             = 1 - psi              ('vanishing-linear': zero at the edge, linear in psi)
              = 1 - psi / 2          ('linear': the manufactured-test profile),
     tau(psi) = 1 - tau_slope psi,
     phi_b = 0, no source.
@@ -13,11 +16,13 @@ Lam), plus phi_b(W) and with_Lam(Lam).  No exact solution.
 """
 import numpy as np
 
+NKINDS = ("vanishing", "vanishing-linear", "linear")
+
 
 class PBProfiles:
     def __init__(self, geom, Lam=20.0, N="vanishing", tau_slope=0.4, phi_b=0.0):
-        if N not in ("vanishing", "linear"):
-            raise ValueError("N must be 'vanishing' or 'linear', got %r" % (N,))
+        if N not in NKINDS:
+            raise ValueError("N must be one of %s, got %r" % (NKINDS, N))
         if not 0.0 <= tau_slope < 1.0:
             raise ValueError("tau_slope must be in [0, 1) so that tau > 0 on psi <= 1")
         self.geom, self.Lam = geom, float(Lam)
@@ -34,6 +39,8 @@ class PBProfiles:
     def N(self, psi):
         if self.N_kind == "vanishing":
             return np.clip(1.0 - psi ** 2, 0.0, None)     # clip: rounding at psi = 1
+        if self.N_kind == "vanishing-linear":
+            return np.clip(1.0 - psi, 0.0, None)
         return 1.0 - 0.5 * psi
 
     def tau(self, psi):
@@ -55,6 +62,6 @@ class PBProfiles:
         return np.full(len(W), self.phi_b_val)
 
     def describe(self):
-        Ns = "1 - psi^2" if self.N_kind == "vanishing" else "1 - psi/2"
+        Ns = {"vanishing": "1 - psi^2", "vanishing-linear": "1 - psi", "linear": "1 - psi/2"}[self.N_kind]
         return "N = %s, tau = 1 - %g psi, phi_b = %g, Lam = %g" % (
             Ns, self.tau_slope, self.phi_b_val, self.Lam)
