@@ -423,8 +423,126 @@ class VmecTorus(FourierTorus):
                             r, sum(zz for m, nn, rr, zz in layers[0] if m == 0 and nn == n), z)
                            for m, n, r, z in self.modes if m == 0]   # (info only)
         self.fit_info = None
+        # dense coefficients for the vectorized evaluation: A[j, k, m] for n = ns[j]
+        self._ns = np.array(sorted({n for lay in self.layers for m, n, r, z in lay}), dtype=float)
+        K, M = self.deg + 1, self.mmax + 1
+        jn = {int(n): j for j, n in enumerate(self._ns)}
+        AR, AZ = np.zeros((len(self._ns), K, M)), np.zeros((len(self._ns), K, M))
+        for k, lay in enumerate(self.layers):
+            for m, n, r, z in lay:
+                AR[jn[n], k, m] += r
+                AZ[jn[n], k, m] += z
+        self._AR, self._AZ = AR.reshape(len(self._ns), K * M), AZ.reshape(len(self._ns), K * M)
+
+    chunk = 8192                                       # points per block in fields
 
     def fields(self, p, order=2):
+        """Vectorized: per point block, R = sum_k g^k sum_m [Re W_m (E A_k)_m]
+        with E = e^{-i n zeta} (matrix products over n), W_m = w^m (einsum over
+        m), and the product rule in g^k for the x, y derivatives.  Same result
+        as _fields_loop (mode-by-mode reference)."""
+        xp = _xp(p)
+        keys = _KEYS[:1] if order == 0 else (_KEYS[:4] if order == 1 else _KEYS)
+        shape = p.shape[:-1]
+        q = p.reshape(-1, 3)
+        n = q.shape[0]
+        if n <= self.chunk:
+            R, Z = self._fields_block(xp, q, keys, order)
+        else:
+            parts = [self._fields_block(xp, q[i:i + self.chunk], keys, order) for i in range(0, n, self.chunk)]
+            cat = (lambda L: xp.cat(L)) if xp.__name__ == "torch" else xp.concatenate
+            R = {key: cat([pr[0][key] for pr in parts]) for key in keys}
+            Z = {key: cat([pr[1][key] for pr in parts]) for key in keys}
+        return ({key: R[key].reshape(shape) for key in keys}, {key: Z[key].reshape(shape) for key in keys})
+
+    def _fields_block(self, xp, q, keys, order):
+        if xp.__name__ == "torch":
+            import torch
+            const = lambda a: torch.as_tensor(a, dtype=q.dtype, device=q.device)
+        else:
+            const = lambda a: xp.asarray(a, dtype=q.dtype)
+        K, M, Rc = self.deg + 1, self.mmax + 1, self.Rc
+        npt = q.shape[0]
+        t, x, y = q[:, 0], q[:, 1], q[:, 2]
+        zero = 0. * t
+        u, v = x / Rc, y / Rc
+        g = u * u + v * v
+        # W_m = w^m = P_m + i Q_m and its x/y-derivative variants (npt, M)
+        P, Q = [zero + 1.], [zero]
+        for _ in range(M - 1):
+            P.append(P[-1] * u - Q[-1] * v)
+            Q.append(P[-2] * v + Q[-1] * u)
+        P, Q = xp.stack(P, 1), xp.stack(Q, 1)
+        mv = const(np.arange(M, dtype=float))
+        Z0 = 0. * P[:, :1]
+        W = {"": (P, Q)}
+        if order >= 1:
+            sh = lambda A, j: xp.concatenate([Z0] * j + [A[:, :M - j]], 1) if xp.__name__ != "torch" \
+                else xp.cat([Z0] * j + [A[:, :M - j]], 1)
+            Wx = (mv * sh(P, 1) / Rc, mv * sh(Q, 1) / Rc)
+            W["x"], W["y"] = Wx, (-Wx[1], Wx[0])
+            if order >= 2:
+                c2 = mv * (mv - 1) / Rc ** 2
+                Wxx = (c2 * sh(P, 2), c2 * sh(Q, 2))
+                W["xx"], W["xy"], W["yy"] = Wxx, (-Wxx[1], Wxx[0]), (-Wxx[0], -Wxx[1])
+        # E_n = e^{-i n zeta} and t-derivative variants (npt, N), then (E A) -> (npt, K, M)
+        kk = self.nfp * 2 * np.pi / self.L
+        nk = const(self._ns * kk)
+        ang = (kk * t)[:, None] * const(self._ns)[None, :]
+        c, s = xp.cos(ang), xp.sin(ang)
+        Ev = {"": (c, -s)}
+        if order >= 1:
+            Ev["t"] = (-nk * s, -nk * c)
+        if order >= 2:
+            Ev["tt"] = (-nk * nk * c, nk * nk * s)
+        AR, AZ = const(self._AR), const(self._AZ)
+        EA = {}
+        for tk, (er, ei) in Ev.items():
+            EA[tk] = [(e @ A).reshape(npt, K, M) for e in (er, ei) for A in (AR, AZ)]   # erR, erZ, eiR, eiZ
+        # F_k for every key: Re / Im of sum_m W_m (E A_k)_m
+        FR, FZ = {}, {}
+        for key in keys:
+            tk = "".join(ch for ch in key if ch == "t")
+            sk = key.replace("t", "")
+            Wr, Wi = W[sk]
+            erR, erZ, eiR, eiZ = EA[tk]
+            FR[key] = xp.einsum("pm,pkm->pk", Wr, erR) - xp.einsum("pm,pkm->pk", Wi, eiR)
+            FZ[key] = xp.einsum("pm,pkm->pk", Wr, eiZ) + xp.einsum("pm,pkm->pk", Wi, erZ)
+        # h_k = g^k and its x/y derivatives (npt, K)
+        G = [zero + 1.]
+        for _ in range(K - 1):
+            G.append(G[-1] * g)
+        G = xp.stack(G, 1)
+        kv = const(np.arange(K, dtype=float))
+        h = {"": G}
+        if order >= 1:
+            Zk = 0. * G[:, :1]
+            cat = xp.cat if xp.__name__ == "torch" else xp.concatenate
+            G1 = cat([Zk, G[:, :K - 1]], 1)
+            G2 = cat([Zk, Zk, G[:, :K - 2]], 1) if K >= 2 else 0. * G
+            gd = {"x": (2 * u / Rc)[:, None], "y": (2 * v / Rc)[:, None]}
+            for a_ in ("x", "y"):
+                h[a_] = kv * G1 * gd[a_]
+            if order >= 2:
+                for a_, b_ in (("x", "x"), ("x", "y"), ("y", "y")):
+                    gab = (2 / Rc ** 2) if a_ == b_ else 0.
+                    h[a_ + b_] = kv * (kv - 1) * G2 * gd[a_] * gd[b_] + kv * G1 * gab
+        R, Z = {}, {}
+        for F, out in ((FR, R), (FZ, Z)):
+            for key in keys:
+                tk = "t" if "t" in key else ""
+                sk = key.replace("t", "")
+                val = F[key] * h[""]
+                if len(sk) == 1:
+                    val = val + F[tk] * h[sk]
+                elif len(sk) == 2:
+                    a_, b_ = sk
+                    val = val + F[tk + a_ if tk else a_] * h[b_] + F[tk + b_ if tk else b_] * h[a_] + F[tk] * h[sk]
+                out[key] = val.sum(1)
+        return R, Z
+
+    def _fields_loop(self, p, order=2):
+        """Mode-by-mode reference implementation of fields (slow)."""
         keys = _KEYS[:1] if order == 0 else (_KEYS[:4] if order == 1 else _KEYS)
         x, y = p[..., 1], p[..., 2]
         zero = 0. * x
