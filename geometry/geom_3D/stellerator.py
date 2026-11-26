@@ -111,16 +111,15 @@ class FourierTorus:
             self.modes = [md for md in self.modes if md[0] != 0]
 
     # ------------------------------------------------------------ R, Z and derivatives
-    def fields(self, p, order=2):
-        """R, Z and their derivatives w.r.t. the reference coords (t, x, y):
-        dicts with keys '', 't', 'x', 'y' (order >= 1), 'tt', 'tx', 'ty', 'xx',
-        'xy', 'yy' (order 2)."""
+    def _series(self, p, modes, order=2, mmax=None):
+        """sum over modes (m, n, R_mn, Z_mn) of R_mn Re / Z_mn Im [w^m e^{-i n zeta}]
+        and its (t, x, y) derivatives (dict keys as in fields)."""
         xp = _xp(p)
         t, x, y = p[..., 0], p[..., 1], p[..., 2]
         zero = 0. * t
         u, v = x / self.Rc, y / self.Rc
         P, Q = [zero + 1.], [zero]                                  # w^m = P_m + i Q_m
-        for _ in range(self.mmax):
+        for _ in range(self.mmax if mmax is None else mmax):
             P.append(P[-1] * u - Q[-1] * v)
             Q.append(P[-2] * v + Q[-1] * u)
         k = self.nfp * 2 * np.pi / self.L                           # d zeta / dt
@@ -129,7 +128,7 @@ class FourierTorus:
         R = {key: zero for key in keys}
         Z = {key: zero for key in keys}
         Rc = self.Rc
-        for m, n, rmn, zmn in self.modes:
+        for m, n, rmn, zmn in modes:
             cn, sn = xp.cos(n * zeta), xp.sin(n * zeta)
             E0 = (cn, -sn)                                          # e^{-i n zeta}
             nk = n * k
@@ -161,6 +160,21 @@ class FourierTorus:
                     R[key] = R[key] + rmn * re
                 if zmn:
                     Z[key] = Z[key] + zmn * im
+        return R, Z
+
+    def fields(self, p, order=2):
+        """R, Z and their derivatives w.r.t. the reference coords (t, x, y):
+        dicts with keys '', 't', 'x', 'y' (order >= 1), 'tt', 'tx', 'ty', 'xx',
+        'xy', 'yy' (order 2)."""
+        R, Z = self._series(p, self.modes, order)
+        xp = _xp(p)
+        t, x, y = p[..., 0], p[..., 1], p[..., 2]
+        zero = 0. * t
+        u, v = x / self.Rc, y / self.Rc
+        k = self.nfp * 2 * np.pi / self.L                           # d zeta / dt
+        zeta = k * t
+        keys = _KEYS[:1] if order == 0 else (_KEYS[:4] if order == 1 else _KEYS)
+        Rc = self.Rc
         if self.axis_terms:                        # m = 0, blended axis -> boundary
             g = u * u + v * v                      # rho^2
             gd = {"x": 2 * u / Rc, "y": 2 * v / Rc, "xx": zero + 2 / Rc ** 2,
@@ -230,8 +244,12 @@ class FourierTorus:
                     c1=ck[0], c2=ck[1], c3=ck[2], det=det)
 
     # ------------------------------------------------------------ Newton inverse
-    def inverse(self, q, tol=1e-13, maxit=60):
-        """Reference points p = Phi^{-1}(q) for physical points q (numpy (..., 3))."""
+    def inverse(self, q, tol=1e-13, maxit=60, rmax=1.05):
+        """Reference points p = Phi^{-1}(q) for physical points q (numpy (..., 3)).
+        Newton at fixed toroidal angle; iterates are kept in rho <= rmax (outside
+        the disk the map can fold back onto the domain, e.g. the high-degree
+        VmecTorus, giving spurious roots).  Points that still end at rho > 1 or
+        unconverged are restarted from the nearest point of a (rho, theta) table."""
         q = np.asarray(q, dtype=np.float64)
         shape = q.shape
         q = q.reshape(-1, 3)
@@ -245,11 +263,38 @@ class FourierTorus:
         p[:, 1] = (Z["y"] * dR - R["y"] * dZ) / det
         p[:, 2] = (-Z["x"] * dR + R["x"] * dZ) / det
         scale = max(1.0, np.max(np.abs(q)))
+        p, res = self._newton(p, Rq, Zq, tol * scale, maxit, rmax)
+        bad = (np.hypot(p[:, 1], p[:, 2]) > self.Rc * (1 + 1e-9)) | (res > tol * scale)
+        if bad.any():                                              # restart from a lookup table
+            ib = np.flatnonzero(bad)
+            rr, tt = np.meshgrid(np.linspace(0.05, 1, 16), np.linspace(0, 2 * np.pi, 48, endpoint=False),
+                                 indexing="ij")
+            gx, gy = self.Rc * (rr * np.cos(tt)).ravel(), self.Rc * (rr * np.sin(tt)).ravel()
+            G = len(gx)
+            for c0 in range(0, len(ib), max(1, 20000 // G)):
+                ic = ib[c0:c0 + max(1, 20000 // G)]
+                P = np.c_[np.repeat(t[ic], G), np.tile(gx, len(ic)), np.tile(gy, len(ic))]
+                Rg, Zg = self.fields(P, order=0)
+                d = (Rg[""].reshape(len(ic), G) - Rq[ic, None]) ** 2 + (Zg[""].reshape(len(ic), G) - Zq[ic, None]) ** 2
+                j = np.argmin(d, axis=1)
+                p[ic, 1], p[ic, 2] = gx[j], gy[j]
+            p[ib], _ = self._newton(p[ib], Rq[ib], Zq[ib], tol * scale, maxit, rmax)
+        return p.reshape(shape)
+
+    def _newton(self, p, Rq, Zq, tol, maxit, rmax):
+        def clamp(pp):
+            r = np.hypot(pp[:, 1], pp[:, 2])
+            f = np.minimum(1.0, rmax * self.Rc / np.maximum(r, 1e-300))
+            pp[:, 1] *= f
+            pp[:, 2] *= f
+            return pp
+        p = clamp(p.copy())
+        res = np.full(len(p), np.inf)
         for _ in range(maxit):
             R, Z = self.fields(p, order=1)
             rR, rZ = R[""] - Rq, Z[""] - Zq
             res = np.hypot(rR, rZ)
-            if np.max(res) < tol * scale:
+            if np.max(res, initial=0.) < tol:
                 break
             det = R["x"] * Z["y"] - R["y"] * Z["x"]
             sx = -(Z["y"] * rR - R["y"] * rZ) / det
@@ -259,13 +304,17 @@ class FourierTorus:
                 trial = p.copy()
                 trial[:, 1] += beta * sx
                 trial[:, 2] += beta * sy
+                trial = clamp(trial)
                 Rt, Zt = self.fields(trial, order=0)
                 worse = np.hypot(Rt[""] - Rq, Zt[""] - Zq) > res
                 if not worse.any():
                     break
                 beta = np.where(worse, beta / 2, beta)
             p = trial
-        return p.reshape(shape)
+        else:
+            R, Z = self.fields(p, order=0)
+            res = np.hypot(R[""] - Rq, Z[""] - Zq)
+        return p, res
 
 
 ####################################
@@ -321,6 +370,140 @@ def read_vmec_input(path):
     return dict(nfp=int(m_nfp.group(1)), modes=modes, axis=axis)
 
 
+def read_vmec_wout(path):
+    """Boundary (last flux surface) and axis of a VMEC output file wout_*.nc.
+    Same dict as read_vmec_input.  wout stores rmnc/zmns(radius, mn) with the
+    physical toroidal number xn = n nfp, cos(xm theta - xn phi); here n = xn / nfp.
+    The axis raxis_cc / zaxis_cs uses the same sign convention as the m = 0
+    terms (checked: they equal rmnc / zmns of the m = 0 modes at js = 0)."""
+    from scipy.io import netcdf_file
+    with netcdf_file(path, "r", mmap=False) as f:
+        v = f.variables
+        if "lasym__logical__" in v and int(v["lasym__logical__"].data):
+            raise ValueError("%s: non-stellarator-symmetric (lasym) equilibria are not supported" % path)
+        nfp = int(v["nfp"].data)
+        xm = np.asarray(v["xm"].data).astype(int)
+        xn = np.asarray(v["xn"].data)
+        rb, zb = np.asarray(v["rmnc"].data)[-1], np.asarray(v["zmns"].data)[-1]
+        rax = np.asarray(v["raxis_cc"].data).ravel()
+        zax = np.asarray(v["zaxis_cs"].data).ravel()
+    n = np.rint(xn / nfp).astype(int)
+    if np.any(np.abs(n * nfp - xn) > 1e-8):
+        raise ValueError("%s: xn not a multiple of nfp" % path)
+    modes = [(int(m), int(k), float(r), float(z)) for m, k, r, z in zip(xm, n, rb, zb)
+             if (m, k) == (0, 0) or abs(r) > 0 or abs(z) > 0]
+    axis = [(k, float(rax[k]), float(zax[k])) for k in range(len(rax))]
+    return dict(nfp=nfp, modes=modes, axis=axis)
+
+
+class VmecTorus(FourierTorus):
+    """Map through VMEC's own flux coordinates (interior surfaces from wout):
+        R = sum_mn R_mn(rho) cos(m theta - n zeta),  Z = sum_mn Z_mn(rho) sin(...)
+        R_mn(rho) = rho^m sum_{k=0}^{deg} a_mnk rho^(2k)       (likewise Z_mn)
+    i.e. R = sum_k g^k F_k with g = rho^2 = (x^2 + y^2)/Rc^2 and F_k an ordinary
+    Fourier series (FourierTorus._series): a polynomial in (x, y) at each zeta,
+    smooth through the axis, with closed-form derivatives.  rho^2 = s (VMEC's
+    flux label), so rho = const are VMEC's flux surfaces; rho = 0 is the axis
+    (the k = 0, m = 0 terms), rho = 1 the last closed surface.
+
+    layers: list over k of modes (m, n, a_Rmnk, a_Zmnk).  Use fit_wout / build."""
+
+    def __init__(self, layers, nfp, Rc, s=0.5):
+        bd = {}
+        for lay in layers:                                     # boundary = sum_k a_k
+            for m, n, r, z in lay:
+                rb, zb = bd.get((m, n), (0., 0.))
+                bd[(m, n)] = (rb + r, zb + z)
+        super().__init__([(m, n, r, z) for (m, n), (r, z) in sorted(bd.items())], nfp, Rc, s)
+        self.layers = [[(int(m), int(n), float(r), float(z)) for m, n, r, z in lay if r or z]
+                       for lay in layers]
+        self.deg = len(layers) - 1
+        self.boundary_modes = self.modes
+        self.axis_terms = [(n, sum(r for m, nn, r, z in layers[0] if m == 0 and nn == n),
+                            r, sum(zz for m, nn, rr, zz in layers[0] if m == 0 and nn == n), z)
+                           for m, n, r, z in self.modes if m == 0]   # (info only)
+        self.fit_info = None
+
+    def fields(self, p, order=2):
+        keys = _KEYS[:1] if order == 0 else (_KEYS[:4] if order == 1 else _KEYS)
+        x, y = p[..., 1], p[..., 2]
+        zero = 0. * x
+        Rc = self.Rc
+        u, v = x / Rc, y / Rc
+        g = u * u + v * v
+        gd = {"x": 2 * u / Rc, "y": 2 * v / Rc, "xx": zero + 2 / Rc ** 2, "xy": zero, "yy": zero + 2 / Rc ** 2}
+        gp = [zero + 1.]                                       # g^j
+        for _ in range(self.deg):
+            gp.append(gp[-1] * g)
+        gpow = lambda j: gp[j] if j >= 0 else zero
+        R = {key: zero for key in keys}
+        Z = {key: zero for key in keys}
+        for k, lay in enumerate(self.layers):
+            if not lay:
+                continue
+            FR, FZ = self._series(p, lay, order)
+            h = {"": gp[k]}                                    # derivatives of g^k
+            if order >= 1:
+                for a in ("x", "y"):
+                    h[a] = k * gpow(k - 1) * gd[a]
+            if order >= 2:
+                for a, b in (("x", "x"), ("x", "y"), ("y", "y")):
+                    h[a + b] = k * (k - 1) * gpow(k - 2) * gd[a] * gd[b] + k * gpow(k - 1) * gd[a + b]
+            for F, out in ((FR, R), (FZ, Z)):
+                for key in keys:                               # product rule F * g^k
+                    tk = "t" if "t" in key else ""
+                    sk = key.replace("t", "")
+                    val = F[key] * h[""]
+                    if len(sk) == 1:
+                        val = val + F[tk] * h[sk]
+                    elif len(sk) == 2:
+                        a, b = sk
+                        val = val + F[a] * h[b] + F[b] * h[a] + F[""] * h[sk]
+                    out[key] = out[key] + val
+        return R, Z
+
+
+def fit_wout(path, deg=8, mmax=None, nmax=None, s=0.5, w_edge=1e4, w_axis=1e2):
+    """VmecTorus from wout_*.nc: per (m, n) least-squares fit of rmnc / zmns over
+    all ns surfaces, R_mn(rho) = rho^m P(rho^2), deg(P) = deg, rho = sqrt(s_j).
+    The last surface (and the axis) are weighted by w_edge (w_axis) so the
+    boundary is matched to ~ fit precision.  Rc as in build: sqrt(|R_10 Z_10|)
+    of the boundary.  fit_info: max fit error per surface (R and Z together)."""
+    from scipy.io import netcdf_file
+    with netcdf_file(path, "r", mmap=False) as f:
+        v = f.variables
+        if "lasym__logical__" in v and int(v["lasym__logical__"].data):
+            raise ValueError("%s: non-stellarator-symmetric (lasym) equilibria are not supported" % path)
+        nfp = int(v["nfp"].data)
+        xm = np.asarray(v["xm"].data).astype(int)
+        xn = np.asarray(v["xn"].data)
+        rmnc, zmns = np.asarray(v["rmnc"].data, float), np.asarray(v["zmns"].data, float)
+    ns = rmnc.shape[0]
+    rho = np.sqrt(np.linspace(0, 1, ns))
+    wts = np.ones(ns)
+    wts[-1], wts[0] = w_edge, w_axis
+    n_all = np.rint(xn / nfp).astype(int)
+    layers = [[] for _ in range(deg + 1)]
+    err = np.zeros(ns)
+    for i, (m, n) in enumerate(zip(xm, n_all)):
+        if (mmax is not None and m > mmax) or (nmax is not None and abs(n) > nmax):
+            continue
+        A = np.stack([rho ** (m + 2 * k) for k in range(deg + 1)], 1)
+        sc = np.linalg.norm(A, axis=0)
+        sc[sc == 0] = 1
+        Aw = A * wts[:, None] / sc
+        aR = np.linalg.lstsq(Aw, wts * rmnc[:, i], rcond=None)[0] / sc
+        aZ = np.linalg.lstsq(Aw, wts * zmns[:, i], rcond=None)[0] / sc
+        err += np.abs(A @ aR - rmnc[:, i]) + np.abs(A @ aZ - zmns[:, i])
+        for k in range(deg + 1):
+            layers[k].append((int(m), int(n), aR[k], aZ[k]))
+    r10 = sum(r for lay in layers for m, n, r, z in lay if (m, n) == (1, 0))
+    z10 = sum(z for lay in layers for m, n, r, z in lay if (m, n) == (1, 0))
+    tor = VmecTorus(layers, nfp, float(np.sqrt(abs(r10 * z10))), s)
+    tor.fit_info = dict(rho=rho, err=err)
+    return tor
+
+
 def toy_modes():
     """Toy W7-X-like boundary (aspect ~5): nfp = 5, an ellipse rotating half a
     turn per field period, rotating triangularity, axis excursion."""
@@ -330,12 +513,24 @@ def toy_modes():
                 axis=None, Rc=float(np.sqrt(abar ** 2 - ell ** 2)))
 
 
-def build(source=None, mmax=None, nmax=None, s=0.5):
+def build(source=None, mmax=None, nmax=None, s=0.5, fill="vmec", deg=10):
     """FourierTorus from a VMEC input path (default DEFAULT_INPUT) or 'toy'.
     mmax / nmax truncate the boundary spectrum.  Rc = sqrt(|R_10 Z_10|) (radius
     of the m = 1, n = 0 cross-section, so the reference disk has the physical
-    size of the plasma)."""
-    data = toy_modes() if source == "toy" else read_vmec_input(source or DEFAULT_INPUT)
+    size of the plasma).
+    For a wout_*.nc file, fill = 'vmec' (default) maps through VMEC's interior
+    flux surfaces (VmecTorus, fit degree deg in rho^2); fill = 'boundary' uses
+    only the last surface + axis with the rho^m fill (FourierTorus)."""
+    if str(source).endswith(".nc") and fill == "vmec":
+        return fit_wout(source, deg=deg, mmax=mmax, nmax=nmax, s=s)
+    if fill not in ("vmec", "boundary"):
+        raise ValueError("fill must be 'vmec' or 'boundary'")
+    if source == "toy":
+        data = toy_modes()
+    elif str(source).endswith(".nc"):
+        data = read_vmec_wout(source)                # VMEC output (wout_*.nc)
+    else:
+        data = read_vmec_input(source or DEFAULT_INPUT)
     modes = [md for md in data["modes"]
              if (mmax is None or md[0] <= mmax) and (nmax is None or abs(md[1]) <= nmax)]
     Rc = data.get("Rc")
@@ -346,11 +541,11 @@ def build(source=None, mmax=None, nmax=None, s=0.5):
     return FourierTorus(modes, data["nfp"], Rc, s, axis=data.get("axis"))
 
 
-def configure(source=None, mmax=None, nmax=None, s=0.5):
+def configure(source=None, mmax=None, nmax=None, s=0.5, fill="vmec", deg=10):
     """Select the module geometry (rebinds _geom, nfp, modes, Rc, s, R0, L,
     bnds).  Call before param_geom / dSlabs; default is DEFAULT_INPUT (W7-X)."""
     global _geom, nfp, modes, Rc, R0, L, bnds
-    _geom = build(source, mmax, nmax, s)
+    _geom = build(source, mmax, nmax, s, fill=fill, deg=deg)
     globals()["s"] = _geom.s
     nfp, modes, Rc = _geom.nfp, _geom.modes, _geom.Rc
     R0, L, bnds = _geom.R00, _geom.L, _geom.bnds

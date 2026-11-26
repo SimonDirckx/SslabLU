@@ -14,6 +14,8 @@ Also prints the geometry checks (stellerator.check_param) unless --no-check.
 
 Run from this folder with the repo root on PYTHONPATH:
     PYTHONPATH=../../.. python plot_stellarator_boundary.py [--show] [--out stellarator.png]
+    ... --input wout_csx.nc   a VMEC output file, e.g. CSX: mapped through VMEC's interior
+                              flux surfaces (--fill vmec, --deg 10) or the rho^m fill (--fill boundary)
     ... --toy            the toy W7-X-like boundary;  --mmax/--nmax truncate the spectrum
     ... --twisted        same plots for the twisted elliptic torus (Fourier form)
 """
@@ -59,7 +61,10 @@ def main():
     ap.add_argument("--nt", type=int, default=400, help="toroidal resolution of the surface")
     ap.add_argument("--nth", type=int, default=64, help="poloidal resolution of the surface")
     ap.add_argument("--ncut", type=int, default=6, help="cross-sections over one field period")
-    ap.add_argument("--input", default=None, help="VMEC input file (default: input.w7x via stellerator.DEFAULT_INPUT)")
+    ap.add_argument("--input", default=None, help="VMEC input file or wout_*.nc (default: input.w7x via stellerator.DEFAULT_INPUT)")
+    ap.add_argument("--fill", default="vmec", choices=("vmec", "boundary"),
+                    help="wout input: map through VMEC's interior surfaces (vmec) or the rho^m boundary fill")
+    ap.add_argument("--deg", type=int, default=10, help="--fill vmec: fit degree in rho^2 of R_mn(rho) / rho^m")
     ap.add_argument("--toy", action="store_true", help="plot the toy W7-X-like boundary instead")
     ap.add_argument("--mmax", type=int, default=None, help="truncate the boundary spectrum to m <= mmax")
     ap.add_argument("--nmax", type=int, default=None, help="truncate the boundary spectrum to |n| <= nmax")
@@ -79,13 +84,20 @@ def main():
         torus = st.FourierTorus(st.twisted_torus_modes(ftt.R0, ftt.a, ftt.b, int(ftt.twist)), 1, ftt.Rc, ftt.s)
         name = "twisted elliptic torus"
     else:
-        torus = st.build("toy" if args.toy else args.input, mmax=args.mmax, nmax=args.nmax)
+        torus = st.build("toy" if args.toy else args.input, mmax=args.mmax, nmax=args.nmax,
+                         fill=args.fill, deg=args.deg)
         name = "%s (nfp = %d)" % ("toy stellarator" if args.toy else "W7-X" if args.input is None
                                   else args.input, torus.nfp)
     print("%s: R00 = %.3f, Rc = %.3f, L = %.3f, %d boundary modes (m > 0), axis terms (n, Rax, Rbd, Zax, Zbd):"
           % (name, torus.R00, torus.Rc, torus.L, len(torus.modes)))
     for a in torus.axis_terms:
         print("   ", a)
+    fi = getattr(torus, "fit_info", None)
+    if fi is not None:
+        e = fi["err"]
+        print("VMEC fit (deg %d): max |fit - wout| over modes, summed: axis %.2e, rho<0.5 %.2e, "
+              "rho>=0.5 %.2e, boundary %.2e" % (torus.deg, e[0], e[fi["rho"] < 0.5].max(),
+                                                 e[fi["rho"] >= 0.5].max(), e[-1]))
     if not args.no_check:
         st.check_param(torus=torus)
 
@@ -146,7 +158,8 @@ def main():
     lo = np.array([[min(c[0][0].min() for c in cv), min(c[0][1].min() for c in cv)] for _, cv, _ in panels])
     hi = np.array([[max(c[0][0].max() for c in cv), max(c[0][1].max() for c in cv)] for _, cv, _ in panels])
     span = 1.06 * max((hi - lo).max(axis=0).max(), 1e-12)   # one square window for all panels
-    fig2, axs = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 4.2 * nrow), squeeze=False)
+    tile = 5.0                                       # inches per panel
+    fig2, axs = plt.subplots(nrow, ncol, figsize=(tile * ncol, tile * nrow), squeeze=False)
     for k, (ang, curves, ax_pt) in enumerate(panels):
         a2 = axs[k // ncol][k % ncol]
         for (R, Z), kw in curves:
@@ -156,11 +169,12 @@ def main():
         a2.set_xlim(c[0] - span / 2, c[0] + span / 2)
         a2.set_ylim(c[1] - span / 2, c[1] + span / 2)
         a2.set_aspect("equal", adjustable="box")
-        a2.set_title(zeta_label(k, args.ncut))
-        a2.set_xlabel(r"$R$"); a2.set_ylabel(r"$Z$")
+        a2.set_title(zeta_label(k, args.ncut), fontsize=25)
+        a2.set_xlabel(r"$R$", fontsize=16); a2.set_ylabel(r"$Z$", fontsize=16)
+        a2.tick_params(labelsize=13)
     for k in range(args.ncut, nrow * ncol):
         axs[k // ncol][k % ncol].axis("off")
-    fig2.tight_layout()
+    fig2.tight_layout(pad=0.6, w_pad=0.8, h_pad=0.8)
     out2d = args.out.replace(".png", "_cuts.png")
     fig2.savefig(out2d, dpi=150, bbox_inches="tight")
     print("saved", out2d)
