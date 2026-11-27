@@ -58,6 +58,9 @@ Run from this folder with the repo root on PYTHONPATH, e.g.
     PYTHONPATH=../../.. python test_periodic_vanishing_edge.py --input wout_csx.nc --Ns 64 --nz 2 --nm 8,2 --p 8
   physical problem, baseline only:
     ... --problem physical --variants none
+  + figures of the baseline phi (cross-sections and the wall field E_n, pb.fieldviz /
+    plot_fields.py; checked by test_field_plots.py):
+    ... --problem physical --variants none --field-plots
 """
 import argparse
 import csv
@@ -176,6 +179,13 @@ def parse():
     ap.add_argument("--dh-maxit", type=int, default=100, help="outer iterations of the Debye-Hueckel variant")
     ap.add_argument("--dh-local-maxit", type=int, default=200, help="local chord steps of the Debye-Hueckel variant")
     ap.add_argument("--quiet-outer", action="store_true", help="no per-iteration lines (summaries only)")
+    ap.add_argument("--field-plots", action="store_true",
+                    help="stellarator: save phi on cross-sections + the wall field E_n of the baseline "
+                         "(pb.fieldviz, fields_<tag>.npz) and render them (plot_fields.py)")
+    ap.add_argument("--field-ncut", type=int, default=6, help="--field-plots: cross-sections per field period")
+    ap.add_argument("--field-ns", type=int, default=41, help="--field-plots: section samples per patch direction")
+    ap.add_argument("--field-wall-nt", type=int, default=256, help="--field-plots: toroidal wall samples")
+    ap.add_argument("--field-wall-neta", type=int, default=32, help="--field-plots: wall samples per arch")
     ap.add_argument("--out", type=str, default="results_test_periodic_vanishing_edge")
     args = ap.parse_args()
     v = args.variants.strip().lower()
@@ -549,6 +559,28 @@ def main():
                  meta_Lam=Lam_in, meta_Lam_code=Lam, meta_N=args.N, meta_tau_slope=args.tau_slope,
                  meta_stretch=beta, meta_problem=args.problem)
         print("  probes saved to", npz)
+        if args.field_plots and args.input is not None:
+            from pb import fieldviz
+            t0 = time.perf_counter()
+            samp = fieldviz.FieldSampler.from_ops([(s.ops, s.phi) for s in S], torus._geom)
+            fd = samp.collect(ncut=args.field_ncut, ns=args.field_ns, nt=args.field_wall_nt,
+                              neta=args.field_wall_neta, aref=a_ref,
+                              label="%s, %s, $\\Lambda a$ = %g" % (os.path.basename(args.input), args.problem, Lam_in))
+            fnpz = os.path.join(args.out, "fields_%s.npz" % tag)
+            fieldviz.save(fnpz, fd)
+            aE = a_ref * fd["wall_En"]
+            print("  fields saved to %s (%.1fs): phi on sections in [%.4f, %.4f], wall phi max |.| %.1e, "
+                  "a E_n in [%.4f, %.4f]" % (fnpz, time.perf_counter() - t0, np.nanmin(fd["sec_phi"]),
+                                            np.nanmax(fd["sec_phi"]), np.nanmax(np.abs(fd["wall_phi"])),
+                                            aE.min(), aE.max()))
+            if mms:
+                Ws = fd["sec_W"].reshape(-1, 3)
+                print("    sections vs phi*: max |diff| %.2e" % np.max(np.abs(fd["sec_phi"].ravel() - model.phistar(Ws))))
+            try:
+                import plot_fields
+                plot_fields.plot_all(fd, os.path.splitext(fnpz)[0])
+            except Exception as e:                       # plotting is optional on the run machine
+                print("    plotting skipped (%s); run: python plot_fields.py %s" % (e, fnpz))
         for path in args.compare:
             try:
                 d_abs, d_rel, meta = diag.compare_probes(path, probes, pv)
