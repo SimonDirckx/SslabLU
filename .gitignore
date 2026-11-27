@@ -162,3 +162,29 @@ cython_debug/
 #.idea/
 
 # 'obscure' test folders
+
+# Data and output files (results, figures, logs)
+*.csv
+*.tsv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+*.eps
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.mat
+*.pkl
+*.pickle
+*.pt
+*.vtk
+*.vtu
+*.dat
+results_*/
+# run logs kept as .txt (e.g. comparison_iter.txt); other .txt files (requirements) stay tracked
+test/direct-solve/Poisson-Boltzmann/*_iter*.txt
+# inputs that ARE tracked: VMEC equilibria (*.nc, input.*) are deliberately not ignored
