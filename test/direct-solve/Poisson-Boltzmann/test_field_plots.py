@@ -8,7 +8,8 @@ evaluates the leaf polynomials on the cross-sections and differentiates them at
 the wall, exactly as for a solver run.  Cases (--cases, default all):
 
   flux   phi = psi - 1   (a flux function, 0 on the wall)
-         sections: every phi contour lies ON a dashed flux surface;
+         sections: the black phi contours are drawn at phi = psi_k - 1 for the
+         dashed psi_k = 0.2 .. 0.8, so each black line lies ON a white one;
          wall: a E_n = -a |grad psi| < 0 everywhere (sequential map), largest
          in magnitude where the flux surfaces are packed closest to the wall.
   z      phi = Z / a      (linear in the vertical coordinate)
@@ -138,7 +139,9 @@ def main():
                  "PASS" if ok else "CHECK"))
         npz = os.path.join(args.out, "fields_test_%s.npz" % name)
         fieldviz.save(npz, d)
-        plot_fields.plot_all(dict(np.load(npz)), os.path.splitext(npz)[0], patches=args.patches)
+        lines = [ps - 1.0 for ps in plot_fields.PSI_LINES] if name == "flux" else None
+        plot_fields.plot_all(dict(np.load(npz)), os.path.splitext(npz)[0], patches=args.patches,
+                             phi_lines=lines)
     print("all numerical checks passed" if ok_all else
           "some checks above tolerance (see CHECK); rerun with a larger --p to see whether they decrease")
     print("visual checks: see the docstring of this file for what each figure must show")

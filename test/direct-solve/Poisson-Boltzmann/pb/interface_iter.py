@@ -17,12 +17,14 @@ from types import SimpleNamespace
 
 
 class InterfaceIteration:
-    def __init__(self, OMS, mms, bc, c_of_slab, phi0_of_slab):
+    def __init__(self, OMS, mms, bc, c_of_slab, phi0_of_slab, fstar_of_slab=None):
         """OMS        : built multislab.oms.oms (keepLU=True, cylhps fast)
         mms        : PBManufactured (f*, g, d_s g, phi*)
         bc         : wall data callable (numpy OMS points -> values)
         c_of_slab  : dict slab -> c_ref at that slab's leaf nodes (as used in set_c)
-        phi0_of_slab: dict slab -> initial leaf-grid field (P phi_c)"""
+        phi0_of_slab: dict slab -> initial leaf-grid field (P phi_c)
+        fstar_of_slab: optional dict slab -> f* at that slab's leaf nodes, precomputed
+                   (e.g. at the OMS stage); slabs missing from it are computed here"""
         self.OMS, self.mms = OMS, mms
         self.N = len(OMS.slabList)
         self.gtd = [np.asarray(list(g), dtype=np.int64) if not isinstance(g, slice)
@@ -34,9 +36,12 @@ class InterfaceIteration:
             info = OMS._slab_info[i]
             W = ops.nodes()
             psi = mms.psi(W)
+            fst = None if fstar_of_slab is None else fstar_of_slab.get(i)
+            if fst is None or len(fst) != len(W):
+                fst = mms.fstar(W)
             self.slabs.append(SimpleNamespace(
                 hnd=hnd, ops=ops, info=info, W=W, psi=psi, I=ops.interior_mask(),
-                fst=mms.fstar(W), c=np.asarray(c_of_slab[i]), phi=np.asarray(phi0_of_slab[i]).copy(),
+                fst=np.asarray(fst), c=np.asarray(c_of_slab[i]), phi=np.asarray(phi0_of_slab[i]).copy(),
                 g_wall=np.asarray(bc(info.pts_gb)).reshape(-1),
                 L=OMS.connectivity[i][0], R=OMS.connectivity[i][1]))
         self.timers = dict(local=0.0, precond=0.0)

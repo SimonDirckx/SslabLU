@@ -368,14 +368,25 @@ def main():
                  clog["t_factor_per_step"], clog["t_solve_per_step"], phi_c.min(), phi_c.max(),
                  "; err vs phi* %.2e" % err_c if mms else ""))
 
+        # f* at the leaf nodes of each slab, computed at the OMS stage (inside c_nodal, where
+        # the slab's nodes are at hand) and only for the manufactured problem (physical: f* = 0,
+        # left to InterfaceIteration).  Shared by every OMS built for this Lam (baseline, dh):
+        # same discretization -> same nodes, so each slab's f* is computed once.
+        fstar_store, t_fstar = {}, [0.0]
+
         # ---- fine OMS + red-black for -Lap + c_ref; slab_fields(i, ops, info) -> (c_ref, phi0)
         def build_fine(slab_fields, label):
             store_c, store_phi, info = {}, {}, {}
+            t_f0 = t_fstar[0]
 
             def c_nodal(ops, geom):
                 i = int(round(float(geom[0][0]) / H)) % Ns
                 c, phi0 = slab_fields(i, ops, info)
                 store_c[i], store_phi[i] = c, phi0
+                if mms and i not in fstar_store:
+                    t1 = time.perf_counter()
+                    fstar_store[i] = np.asarray(model.fstar(ops.nodes()))
+                    t_fstar[0] += time.perf_counter() - t1
                 return c
 
             cyl_opts = dict(Rc=torus.Rc, s=torus.s, n=n, m=m, nz=nz, flux="conormal",
@@ -396,19 +407,25 @@ def main():
                 constant_blocks=False, operator="hbs", cyclic=True)
             rb.factorize()
             t_rb = clock(args.compute_device) - t0
-            print("  [%s] fine OMS built in %.1fs (Ntot %d), red-black setup + factor %.1fs"
-                  % (label, t_oms, OMS.Ntot, t_rb))
+            print("  [%s] fine OMS built in %.1fs (Ntot %d%s), red-black setup + factor %.1fs"
+                  % (label, t_oms, OMS.Ntot, ", incl. f* %.1fs" % (t_fstar[0] - t_f0) if mms else "", t_rb))
             return SimpleNamespace(OMS=OMS, Stot=Stot, rb=rb, store_c=store_c, store_phi=store_phi,
                                    info=info, t_oms=t_oms, t_rb=t_rb)
 
         # ---- outer iteration on a built OMS, with summary
         def run_outer(fine, P, label, maxit, local_maxit):
-            it = InterfaceIteration(fine.OMS, model, bc, fine.store_c, fine.store_phi)
+            t0 = time.perf_counter()
+            it = InterfaceIteration(fine.OMS, model, bc, fine.store_c, fine.store_phi,
+                                    fstar_of_slab=fstar_store if mms else None)
+            t_init = time.perf_counter() - t0
+            t0 = time.perf_counter()
             u_exact = fine.OMS.interface_values(lambda pts: model.phistar(np.asarray(pts))) if mms else None
             u0 = it.traces_of_fields()
-            print("  [%s] outer iteration (maxit %d, local maxit %d)%s"
+            t_u0 = time.perf_counter() - t0
+            print("  [%s] outer iteration (maxit %d, local maxit %d)%s  [setup: slab data %.1fs, "
+                  "u0/u_exact %.1fs]"
                   % (label, maxit, local_maxit,
-                     ": u0 err_iface %.2e" % np.max(np.abs(u0 - u_exact)) if mms else ""))
+                     ": u0 err_iface %.2e" % np.max(np.abs(u0 - u_exact)) if mms else "", t_init, t_u0))
             t0 = time.perf_counter()
             u, logs = it.run(P, u0, u_exact=u_exact, tol=args.tol, maxit=maxit, eta=args.eta,
                              local_tol_min=args.local_tol_min, local_maxit=local_maxit,
@@ -470,7 +487,8 @@ def main():
                 x, _ = gmres(base.Stot, v, M=M, restart=50, maxiter=4, **GMRES_TOL)
                 return x
         if args.check:
-            it_chk = InterfaceIteration(base.OMS, model, bc, base.store_c, base.store_phi)
+            it_chk = InterfaceIteration(base.OMS, model, bc, base.store_c, base.store_phi,
+                                        fstar_of_slab=fstar_store if mms else None)
             print("  check: |(I-K) v - Stot v| / |Stot v| = %.2e (expect ~1e-12)" % it_chk.check_jacobian(base.Stot))
             del it_chk
         it, u, summ = run_outer(base, P, "coarse", args.maxit, args.local_maxit)
