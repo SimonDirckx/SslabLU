@@ -61,6 +61,38 @@ def _memoize_pdo(hps):
         setattr(pdo, name, g)
 
 
+def _tensor_eval(Ls, idxs, ph, max_bytes=1 << 28):
+    """v[l, s] = sum_n prod_a Ls[a][l, s, idxs[a][n]] ph[l, n]: leaf polynomials
+    (nodal values ph, leaf l) at points s, from 1D Lagrange weights Ls[a]
+    (nb, se, n_a).  When the nodes form the full tensor grid (the leaf case),
+    ph is scattered to (nb, n0, n1, n2) and contracted one axis at a time,
+    O(se n^3) per leaf with small temporaries; otherwise the (se, npl) weight
+    matrix is formed explicitly.  Both are chunked over leaves (temporaries
+    <= max_bytes), so memory stays bounded whatever the patch size."""
+    nb, se = Ls[0].shape[:2]
+    na = [L.shape[2] for L in Ls]
+    npl = ph.shape[1]
+    flat = (idxs[0] * na[1] + idxs[1]) * na[2] + idxs[2]
+    tensor = np.prod(na) == npl and len(np.unique(flat)) == npl
+    per_leaf = se * (na[0] * na[1] if tensor else npl) * 8
+    ch = max(1, int(max_bytes // max(per_leaf, 1)))
+    out = np.empty((nb, se))
+    for a in range(0, nb, ch):
+        b = min(nb, a + ch)
+        L0, L1, L2 = (L[a:b] for L in Ls)
+        if tensor:
+            T = np.zeros((b - a, na[0] * na[1] * na[2]))
+            T[:, flat] = ph[a:b]
+            T = T.reshape(b - a, *na)
+            tmp = np.einsum("lsk,lijk->lsij", L2, T)
+            tmp = np.einsum("lsj,lsij->lsi", L1, tmp)
+            out[a:b] = np.einsum("lsi,lsi->ls", L0, tmp)
+        else:
+            B = L0[:, :, idxs[0]] * L1[:, :, idxs[1]] * L2[:, :, idxs[2]]
+            out[a:b] = np.einsum("lsn,ln->ls", B, ph[a:b])
+    return out
+
+
 def patch_order(p, kind):
     """Per-axis order of a patch.  p: int (all axes), or (p_n, p_m, p_z) with
         p_n : tangential -- core x and y, arch eta   (shared faces, n leaves)
@@ -459,7 +491,7 @@ class CylinderSlabOps:
             lo, hi = grid.min(axis=1), grid.max(axis=1)
             rel0 = (grid[0] - lo[0]) / (hi[0] - lo[0])
             r = (X - lo[leaf]) / (hi[leaf] - lo[leaf])
-            B = np.ones((nb * se, npl))
+            Ls, idxs = [], []                      # 1D barycentric Lagrange weights per axis
             for a in range(3):
                 u, idx = np.unique(np.round(rel0[:, a], 12), return_inverse=True)
                 wb = 1.0 / np.prod(u[:, None] - u[None, :] + np.eye(len(u)), axis=1)
@@ -470,9 +502,10 @@ class CylinderSlabOps:
                 La = t / t.sum(axis=1, keepdims=True)
                 rows = hit.any(axis=1)
                 La[rows] = hit[rows]
-                B *= La[:, idx]
+                Ls.append(La.reshape(nb, se, len(u)))
+                idxs.append(idx.reshape(-1))
             ph = np.asarray(phi[self._node_off[i]:self._node_off[i + 1]], float).reshape(nb, npl)
-            v = np.einsum("lsn,ln->ls", B.reshape(nb, se, npl), ph).reshape(-1)
+            v = _tensor_eval(Ls, idxs, ph).reshape(-1)
             vals[self.dof_of_slot[self._slot_off[i]:self._slot_off[i + 1]]] = v
         return vals
 
